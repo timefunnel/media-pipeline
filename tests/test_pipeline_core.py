@@ -1,4 +1,5 @@
 import json
+import hashlib
 import io
 import sqlite3
 import sys
@@ -33,7 +34,7 @@ from pipeline.mediastation import (
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes, normalize_task, task_can_cancel, wait_for_task
 from pipeline.openlist import OpenListClient, OpenListTokenProvider
 from pipeline.openlist_tokens import OpenListTokenStore
-from pipeline.prowlarr import ProwlarrClient, ProwlarrConfig
+from pipeline.prowlarr import ProwlarrClient, ProwlarrConfig, torrent_bytes_to_magnet
 from pipeline.resource_selector import ResourceSelector
 
 
@@ -3963,6 +3964,23 @@ class ProwlarrClientTest(unittest.TestCase):
                 }
             ],
         )
+
+    def test_torrent_bytes_to_magnet_uses_bencoded_info_hash(self):
+        info = (
+            b"d"
+            b"6:lengthi123e"
+            b"4:name8:test.mkv"
+            b"12:piece lengthi16384e"
+            b"6:pieces20:aaaaaaaaaaaaaaaaaaaa"
+            b"e"
+        )
+        torrent = b"d8:announce14:http://tracker4:info" + info + b"e"
+
+        magnet = torrent_bytes_to_magnet(torrent)
+
+        self.assertIn("xt=urn:btih:%s" % hashlib.sha1(info).hexdigest(), magnet)
+        self.assertIn("dn=test.mkv", magnet)
+        self.assertIn("tr=http:%2F%2Ftracker", magnet)
 
 
 class ResourceSelectorTest(unittest.TestCase):
