@@ -36,7 +36,7 @@ from pipeline.openlist import OpenListClient, OpenListTokenProvider
 from pipeline.openlist_tokens import OpenListTokenStore
 from pipeline.prowlarr import ProwlarrClient, ProwlarrConfig, torrent_bytes_to_magnet
 from pipeline.resource_selector import ResourceSelector
-from pipeline.subtitle_proxy import normalize_webvtt_timestamps, redact_sensitive_query_values, should_normalize_subtitle
+from pipeline.subtitle_proxy import inject_subtitle_track_bootstrap, normalize_webvtt_timestamps, redact_sensitive_query_values, should_normalize_subtitle
 
 
 class BotConfigTest(unittest.TestCase):
@@ -176,6 +176,26 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertNotIn("secret-value", redacted)
         self.assertIn("token=REDACTED", redacted)
+
+    def test_inject_subtitle_track_bootstrap_adds_script_before_body_close(self):
+        html = "<html><body><div id=\"root\"></div></body></html>"
+
+        injected = inject_subtitle_track_bootstrap(html)
+
+        self.assertIn("subtitleAutoEnabled", injected)
+        self.assertLess(injected.index("subtitleAutoEnabled"), injected.index("</body>"))
+
+    def test_injected_subtitle_parser_trims_webvtt_end_time(self):
+        injected = inject_subtitle_track_bootstrap("<html><body></body></html>")
+
+        self.assertIn("parts[1].trim().split", injected)
+
+    def test_inject_subtitle_track_bootstrap_is_idempotent(self):
+        html = inject_subtitle_track_bootstrap("<html><body></body></html>")
+
+        injected = inject_subtitle_track_bootstrap(html)
+
+        self.assertEqual(injected.count("subtitleAutoEnabled"), html.count("subtitleAutoEnabled"))
 
 class CandidateStoreTest(unittest.TestCase):
     def test_candidate_store_persists_candidate_for_callback(self):
