@@ -1,0 +1,37 @@
+services:
+  media-pipeline:
+    build: .
+    container_name: media-pipeline
+    network_mode: host
+    environment:
+      OPENLIST_TOKEN: "${OPENLIST_TOKEN:?OPENLIST_TOKEN missing}"
+    restart: "no"
+    command: ["folders"]
+    volumes:
+      - /data/OpenList/data:/openlist-data:ro
+      - /data/Prowlarr/config:/prowlarr-config:ro
+
+  media-pipeline-bot:
+    build: .
+    container_name: media-pipeline-bot
+    network_mode: host
+    environment:
+      OPENLIST_TOKEN: "${OPENLIST_TOKEN:?OPENLIST_TOKEN missing}"
+      TG_BOT_TOKEN: "${TG_BOT_TOKEN:?TG_BOT_TOKEN missing}"
+      TG_ALLOWED_USER_IDS: "700656624"
+      BOT_STATE_DB: /bot-data/state.db
+      MSG_BASE_URL: "${MSG_BASE_URL:-http://127.0.0.1:18080/api}"
+      MSG_ADMIN_USER: "${MSG_ADMIN_USER:-admin}"
+      MSG_ADMIN_PASSWORD: "${MSG_ADMIN_PASSWORD:?MSG_ADMIN_PASSWORD missing}"
+      MSG_ENABLED: "${MSG_ENABLED:-1}"
+      MSG_SYNC_POLL_SECONDS: "${MSG_SYNC_POLL_SECONDS:-60}"
+      MSG_SYNC_POLL_INTERVAL_SECONDS: "${MSG_SYNC_POLL_INTERVAL_SECONDS:-5}"
+      OPENLIST_PRE_SCAN_CLEAN_ENABLED: "${OPENLIST_PRE_SCAN_CLEAN_ENABLED:-1}"
+      OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES: "${OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES:-20971520}"
+      OPENLIST_ADULT_CODE_FORMAT_ENABLED: "${OPENLIST_ADULT_CODE_FORMAT_ENABLED:-1}"
+    restart: unless-stopped
+    command: ["bot"]
+    volumes:
+      - /data/OpenList/data:/openlist-data:ro
+      - /data/Prowlarr/config:/prowlarr-config:ro
+      - /data/media-pipeline/bot:/bot-data
