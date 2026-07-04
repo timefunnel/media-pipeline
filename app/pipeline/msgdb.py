@@ -238,8 +238,8 @@ class MediaStationDbClient:
               if current_setting('media_pipeline.allow_cloud_media_migration', true) = 'on' then
                 return new;
               end if;
-              if old.library_id = any (%s)
-                 and old.library_root_id = any (%s)
+              if old.library_id = any (%s::varchar[])
+                 and old.library_root_id = any (%s::varchar[])
                  and coalesce(old.path, '') like 'cloud://openlist%%' then
                 new.library_id := old.library_id;
                 new.library_root_id := old.library_root_id;
