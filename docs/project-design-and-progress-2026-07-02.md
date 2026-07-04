@@ -777,7 +777,7 @@ sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[
 - Bot 搜索执行方式改为按 profile 选中的 Prowlarr indexer 并发查询，并由 `PROWLARR_SEARCH_TIMEOUT_SECONDS` 控制总等待，默认 4 秒，目标是 5 秒内返回首屏结果。
 - Prowlarr priority 已纳入 Bot 排序；后续源优先级尽量在 Prowlarr 后台调整，不在 Bot 里硬编码站点排序。
 - 强番号形态（例如 `MIDE-882`、`BDMV-001`、`FC2-PPV-1234567`）默认走成人 profile；非番号普通搜索默认不碰成人源。
-- 非番号搜索结果页提供“成人源补查”按钮，点击后新发一条成人源结果消息，不覆盖原普通搜索结果。
+- 非番号搜索结果页提供短补查按钮：`🔞` 查成人源、`动漫` 查动漫源；点击后新发一条对应源结果消息，不覆盖原普通搜索结果。
 
 需要继续完善：
 

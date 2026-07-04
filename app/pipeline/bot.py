@@ -654,6 +654,9 @@ class PipelineBotService:
     def search_adult(self, query, limit=DEFAULT_SEARCH_LIMIT):
         return self.search(query, "adult", limit=limit, profile=SEARCH_PROFILE_ADULT)
 
+    def search_anime(self, query, limit=DEFAULT_SEARCH_LIMIT):
+        return self.search(query, "movie", limit=limit, profile=SEARCH_PROFILE_ANIME)
+
     def submit(self, category, download_uri):
         download_uri = self._resolve_download_uri(download_uri)
         result = summarize_submit(
@@ -1086,6 +1089,9 @@ class TelegramBot:
         if action == "adult_search":
             self._handle_adult_search_callback(user_id, chat_id, callback_id, value)
             return
+        if action == "anime_search":
+            self._handle_anime_search_callback(user_id, chat_id, callback_id, value)
+            return
         if action == "tasks_page":
             self._handle_task_page_callback(user_id, chat_id, message_id, callback_id, value)
             return
@@ -1199,6 +1205,44 @@ class TelegramBot:
             candidate_ids.append(candidate_id)
         adult_session_id = self.store.save_search_session(user_id, session["chat_id"], "adult", session["query"], candidate_ids)
         text, reply_markup = self._render_search_page(adult_session_id, page=0)
+        self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
+
+    def _handle_anime_search_callback(self, user_id, chat_id, callback_id, session_id):
+        try:
+            session = self.store.load_search_session(session_id)
+        except RuntimeError:
+            self.telegram.answer_callback_query(callback_id, "搜索结果不存在")
+            return
+        if session["user_id"] != user_id:
+            self.telegram.answer_callback_query(callback_id, "无权查看此搜索")
+            return
+        if session["category"] == "anime" or should_search_anime(DEFAULT_SEARCH_CATEGORY, session["query"]):
+            self.telegram.answer_callback_query(callback_id, "当前已是动漫源结果")
+            return
+
+        self.telegram.answer_callback_query(callback_id, "正在补查动漫源")
+        try:
+            with self._typing_action(session["chat_id"]):
+                candidates = self.service.search_anime(session["query"], limit=self.config.search_limit)
+        except RuntimeError as exc:
+            if "no acceptable resource" in str(exc):
+                self.telegram.send_message(session["chat_id"], "动漫源未找到可用资源")
+                return
+            self.telegram.send_message(session["chat_id"], "动漫源补查失败：%s" % exc)
+            return
+        except Exception as exc:
+            self.telegram.send_message(session["chat_id"], "动漫源补查失败：%s" % exc)
+            return
+        if not candidates:
+            self.telegram.send_message(session["chat_id"], "动漫源未找到可用资源")
+            return
+
+        candidate_ids = []
+        for candidate in candidates:
+            candidate_id = self.store.save_candidate(user_id, session["chat_id"], "anime", session["query"], candidate)
+            candidate_ids.append(candidate_id)
+        anime_session_id = self.store.save_search_session(user_id, session["chat_id"], "anime", session["query"], candidate_ids)
+        text, reply_markup = self._render_search_page(anime_session_id, page=0)
         self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
 
     def _handle_choose_library_callback(self, user_id, chat_id, message_id, callback_id, candidate_id):
@@ -1575,19 +1619,29 @@ class TelegramBot:
             record = self.store.load_candidate(candidate_id)
             candidates.append((candidate_id, record["candidate"]))
         is_adult_session = session["category"] == "adult"
+        is_anime_session = session["category"] == "anime"
+        title = "搜索结果"
+        if is_adult_session:
+            title = "成人源搜索结果"
+        elif is_anime_session:
+            title = "动漫源搜索结果"
         return format_search_page_message(
             session["query"],
             candidates,
             page,
             page_count,
             len(candidate_ids),
-            title="成人源搜索结果" if is_adult_session else "搜索结果",
+            title=title,
         ), search_page_reply_markup(
             session_id,
             candidates,
             page,
             page_count,
-            allow_adult_retry=not is_adult_session and not is_strong_adult_code_query(session["query"]),
+            allow_adult_retry=not is_adult_session and not is_anime_session and not is_strong_adult_code_query(session["query"]),
+            allow_anime_retry=not is_adult_session
+            and not is_anime_session
+            and not is_strong_adult_code_query(session["query"])
+            and not should_search_anime(DEFAULT_SEARCH_CATEGORY, session["query"]),
         )
 
     def _save_tasks_from_submit(self, record, candidate, result, category, telegram_status_message_id=None, content_profile=None):
@@ -2992,6 +3046,8 @@ def parse_callback_data(value):
         return "close_search", int(payload)
     if action == "adult_search":
         return "adult_search", int(payload)
+    if action == "anime_search":
+        return "anime_search", int(payload)
     if action == "profile":
         profile, profile_sep, candidate_id = payload.partition(":")
         if profile_sep:
@@ -3487,7 +3543,7 @@ def submit_reply_markup(result):
     return None
 
 
-def search_page_reply_markup(session_id, candidates, page, page_count, allow_adult_retry=False):
+def search_page_reply_markup(session_id, candidates, page, page_count, allow_adult_retry=False, allow_anime_retry=False):
     rows = []
     for candidate_id, candidate in candidates:
         rows.append([{"text": "选择 %s" % candidate.get("rank"), "callback_data": "choose:%s" % candidate_id}])
@@ -3498,8 +3554,13 @@ def search_page_reply_markup(session_id, candidates, page, page_count, allow_adu
         nav.append({"text": "下一页", "callback_data": "page:%s:%s" % (session_id, page + 1)})
     if nav:
         rows.append(nav)
+    retry = []
     if allow_adult_retry:
-        rows.append([{"text": "成人源补查", "callback_data": "adult_search:%s" % session_id}])
+        retry.append({"text": "🔞", "callback_data": "adult_search:%s" % session_id})
+    if allow_anime_retry:
+        retry.append({"text": "动漫", "callback_data": "anime_search:%s" % session_id})
+    if retry:
+        rows.append(retry)
     rows.append([{"text": "关闭本页", "callback_data": "close_search:%s" % session_id}])
     return {"inline_keyboard": rows}
 
