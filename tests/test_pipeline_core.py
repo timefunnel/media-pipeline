@@ -503,6 +503,8 @@ class TelegramBotTest(unittest.TestCase):
             sent = telegram.messages[0]
             self.assertIn("已选择：Sintel 1080p", sent["text"])
             self.assertIn("站点：磁链", sent["text"])
+            self.assertIn("链接类型：磁链", sent["text"])
+            self.assertIn("info_hash：ABCDEF1234567890", sent["text"])
             buttons = [button for row in sent["reply_markup"]["inline_keyboard"] for button in row]
             self.assertEqual([button["text"] for button in buttons], ["电影", "剧集", "成人", "其他"])
             self.assertRegex(buttons[0]["callback_data"], r"^profile:movie:\d+$")
@@ -550,8 +552,9 @@ class TelegramBotTest(unittest.TestCase):
             self.assertIn("第 1/2 页，共 7 条", first["text"])
             self.assertIn("5. Sintel 05 1080p", first["text"])
             self.assertNotIn("6. Sintel 06 1080p", first["text"])
-            nav = first["reply_markup"]["inline_keyboard"][-1]
+            nav = first["reply_markup"]["inline_keyboard"][-2]
             self.assertEqual([button["text"] for button in nav], ["下一页"])
+            self.assertEqual(first["reply_markup"]["inline_keyboard"][-1][0]["text"], "关闭本页")
 
             bot.handle_update(
                 {
@@ -572,7 +575,34 @@ class TelegramBotTest(unittest.TestCase):
             self.assertIn("第 2/2 页，共 7 条", telegram.edits[0]["text"])
             self.assertIn("6. Sintel 06 1080p", telegram.edits[0]["text"])
             self.assertNotIn("1. Sintel 01 1080p", telegram.edits[0]["text"])
-            self.assertEqual([button["text"] for button in telegram.edits[0]["reply_markup"]["inline_keyboard"][-1]], ["上一页"])
+            self.assertEqual([button["text"] for button in telegram.edits[0]["reply_markup"]["inline_keyboard"][-2]], ["上一页"])
+            self.assertEqual(telegram.edits[0]["reply_markup"]["inline_keyboard"][-1][0]["text"], "关闭本页")
+
+    def test_callback_close_search_deletes_search_message(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(search_results=[{"title": "Sintel", "download_uri": "magnet:?xt=urn:btih:AAA", "rank": 1}])
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "sintel"}})
+            close_button = telegram.messages[0]["reply_markup"]["inline_keyboard"][-1][0]
+
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-close-search",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 701},
+                        "data": close_button["callback_data"],
+                    }
+                }
+            )
+
+            self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-close-search", "text": "已关闭搜索结果"})
+            self.assertEqual(telegram.deletes, [{"chat_id": 9001, "message_id": 701}])
 
     def test_callback_choose_candidate_prompts_library_without_submitting(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -608,6 +638,9 @@ class TelegramBotTest(unittest.TestCase):
             self.assertEqual(len(telegram.messages), 1)
             self.assertEqual(telegram.messages[0]["chat_id"], 9001)
             self.assertIn("已选择：Sintel 1080p", telegram.messages[0]["text"])
+            self.assertIn("候选：#2", telegram.messages[0]["text"])
+            self.assertIn("链接类型：磁链", telegram.messages[0]["text"])
+            self.assertIn("info_hash：BBB", telegram.messages[0]["text"])
             buttons = [button for row in telegram.messages[0]["reply_markup"]["inline_keyboard"] for button in row]
             self.assertEqual([button["text"] for button in buttons], ["电影", "剧集", "成人", "其他", "返回选种"])
             self.assertEqual(buttons[0]["callback_data"], "profile:movie:%s" % candidate_id)
@@ -1169,10 +1202,55 @@ class TelegramBotTest(unittest.TestCase):
 
             bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/tasks"}})
 
-            self.assertIn("最近任务", telegram.messages[0]["text"])
+            self.assertIn("最近任务：第 1/1 页，共 1 条", telegram.messages[0]["text"])
             self.assertIn("Sintel", telegram.messages[0]["text"])
+            self.assertIn("入库：电影库  状态：downloading  进度：5", telegram.messages[0]["text"])
             buttons = telegram.messages[0]["reply_markup"]["inline_keyboard"][0]
             self.assertEqual([button["text"] for button in buttons], ["刷新 1", "取消 1"])
+
+    def test_tasks_command_prioritizes_actionable_tasks_and_paginates(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            store.save_task(700656624, 9001, "movie", "Done 1", {"info_hash": "DONE1", "status_name": "success", "percent_done": 100})
+            store.save_task(700656624, 9001, "movie", "Done 2", {"info_hash": "DONE2", "status_name": "success", "percent_done": 100})
+            store.save_task(700656624, 9001, "adult", "Retry", {"info_hash": "RETRY", "status_name": "success", "msg_sync_status": "failed", "msg_scan_status": "success"})
+            store.save_task(700656624, 9001, "tv", "Downloading", {"info_hash": "RUN", "status_name": "downloading", "percent_done": 12, "content_profile": "tv"})
+            store.save_task(700656624, 9001, "other", "Failed", {"info_hash": "FAILED", "status_name": "failed"})
+            store.save_task(700656624, 9001, "movie", "Done 3", {"info_hash": "DONE3", "status_name": "success", "percent_done": 100})
+            telegram = FakeTelegram()
+            service = FakeBotService()
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/tasks"}})
+
+            self.assertIn("最近任务：第 1/2 页，共 6 条", telegram.messages[0]["text"])
+            self.assertLess(telegram.messages[0]["text"].index("1. Retry"), telegram.messages[0]["text"].index("2. Downloading"))
+            self.assertLess(telegram.messages[0]["text"].index("2. Downloading"), telegram.messages[0]["text"].index("3. Failed"))
+            self.assertIn("入库：成人库  状态：success  进度：-", telegram.messages[0]["text"])
+            self.assertIn("MSG：失败", telegram.messages[0]["text"])
+            self.assertIn("入库：剧集库  状态：downloading  进度：12", telegram.messages[0]["text"])
+            self.assertIn("内容：剧集", telegram.messages[0]["text"])
+            self.assertEqual(telegram.messages[0]["reply_markup"]["inline_keyboard"][0][0]["text"], "重试MSG 1")
+            self.assertEqual(telegram.messages[0]["reply_markup"]["inline_keyboard"][1][0]["text"], "刷新 2")
+            self.assertEqual(telegram.messages[0]["reply_markup"]["inline_keyboard"][-1][0]["text"], "下一页")
+
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-tasks-page",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 901},
+                        "data": "tasks_page:1",
+                    }
+                }
+            )
+
+            self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-tasks-page", "text": "第 2/2 页"})
+            self.assertIn("最近任务：第 2/2 页，共 6 条", telegram.edits[-1]["text"])
+            self.assertIn("6. Done", telegram.edits[-1]["text"])
+            self.assertEqual(telegram.edits[-1]["reply_markup"]["inline_keyboard"][-1][0]["text"], "上一页")
 
     def test_status_callback_refreshes_task_status(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot

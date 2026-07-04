@@ -49,6 +49,8 @@ DEFAULT_PRIMARY_INDEXER_TIMEOUT_SECONDS = 12
 DEFAULT_OPTIONAL_INDEXER_TIMEOUT_SECONDS = 12
 SEARCH_PAGE_SIZE = 5
 DEFAULT_TASK_LIST_LIMIT = 10
+DEFAULT_TASK_LIST_PAGE_SIZE = 5
+DEFAULT_TASK_LIST_FETCH_LIMIT = 100
 DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES = 20 * 1024 * 1024
 FINAL_TASK_STATUS_NAMES = {"success", "failed", "cancelled"}
 ACTIVE_115_STATUS_NAMES = {"submitted", "allocating", "downloading"}
@@ -1040,6 +1042,12 @@ class TelegramBot:
             session_id, page = value
             self._handle_search_page_callback(user_id, chat_id, message_id, callback_id, session_id, page)
             return
+        if action == "close_search":
+            self._handle_close_search_callback(user_id, chat_id, message_id, callback_id, value)
+            return
+        if action == "tasks_page":
+            self._handle_task_page_callback(user_id, chat_id, message_id, callback_id, value)
+            return
         if action == "choose":
             self._handle_choose_library_callback(user_id, chat_id, message_id, callback_id, value)
             return
@@ -1101,6 +1109,18 @@ class TelegramBot:
             reply_markup=reply_markup,
             fallback_chat_id=session["chat_id"],
         )
+
+    def _handle_close_search_callback(self, user_id, chat_id, message_id, callback_id, session_id):
+        try:
+            session = self.store.load_search_session(session_id)
+        except RuntimeError:
+            self.telegram.answer_callback_query(callback_id, "搜索结果不存在")
+            return
+        if session["user_id"] != user_id:
+            self.telegram.answer_callback_query(callback_id, "无权查看此搜索")
+            return
+        self.telegram.answer_callback_query(callback_id, "已关闭搜索结果")
+        self._delete_callback_message(chat_id, message_id)
 
     def _handle_choose_library_callback(self, user_id, chat_id, message_id, callback_id, candidate_id):
         record = self.store.load_candidate(candidate_id)
@@ -1398,11 +1418,37 @@ class TelegramBot:
         self.telegram.send_message(chat_id, format_task_status_message(record["title"], task, category=record["category"]), reply_markup=task_reply_markup(task))
 
     def _send_task_list(self, chat_id, user_id):
-        records = self.store.list_tasks(user_id, limit=DEFAULT_TASK_LIST_LIMIT)
+        records, page, page_count, total = self._task_list_page(user_id, page=0)
         if not records:
             self.telegram.send_message(chat_id, "暂无任务")
             return
-        self.telegram.send_message(chat_id, format_task_list_message(records), reply_markup=task_list_reply_markup(records))
+        self.telegram.send_message(
+            chat_id,
+            format_task_list_message(records, page=page, page_count=page_count, total=total),
+            reply_markup=task_list_reply_markup(records, page=page, page_count=page_count),
+        )
+
+    def _handle_task_page_callback(self, user_id, chat_id, message_id, callback_id, page):
+        records, page, page_count, total = self._task_list_page(user_id, page=page)
+        if not records:
+            self.telegram.answer_callback_query(callback_id, "暂无任务")
+            self._update_callback_message(chat_id, message_id, "暂无任务", reply_markup={"inline_keyboard": []})
+            return
+        self.telegram.answer_callback_query(callback_id, "第 %s/%s 页" % (page + 1, page_count))
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_task_list_message(records, page=page, page_count=page_count, total=total),
+            reply_markup=task_list_reply_markup(records, page=page, page_count=page_count),
+        )
+
+    def _task_list_page(self, user_id, page=0):
+        records = prioritized_task_records(self.store.list_tasks(user_id, limit=DEFAULT_TASK_LIST_FETCH_LIMIT))
+        total = len(records)
+        page_count = task_page_count(total)
+        page = normalize_page(page, page_count)
+        start = page * DEFAULT_TASK_LIST_PAGE_SIZE
+        return records[start : start + DEFAULT_TASK_LIST_PAGE_SIZE], page, page_count, total
 
     def _handle_dedupe_refresh_command(self, chat_id):
         self.telegram.send_message(chat_id, DEDUPE_REFRESH_WARNING_TEXT, reply_markup=dedupe_refresh_confirm_reply_markup())
@@ -2713,6 +2759,8 @@ def parse_callback_data(value):
         return "back_search", int(payload)
     if action == "close_choice":
         return "close_choice", int(payload)
+    if action == "close_search":
+        return "close_search", int(payload)
     if action == "profile":
         profile, profile_sep, candidate_id = payload.partition(":")
         if profile_sep:
@@ -2721,6 +2769,8 @@ def parse_callback_data(value):
         session_id, session_sep, page = payload.partition(":")
         if session_sep:
             return "page", (int(session_id), int(page))
+    if action == "tasks_page":
+        return "tasks_page", int(payload)
     if action == "submit":
         parts = payload.split(":")
         if len(parts) >= 2 and parts[0] in CATEGORY_LABELS:
@@ -2878,6 +2928,26 @@ def format_size(value):
         size = size / 1024
 
 
+def download_uri_label(value):
+    value = str(value or "")
+    if value.lower().startswith("magnet:"):
+        return "磁链"
+    if is_prowlarr_download_uri(value):
+        return "Prowlarr下载项"
+    if value:
+        return "下载链接"
+    return "-"
+
+
+def msg_sync_status_label(value):
+    return {
+        "success": "已完成",
+        "running": "进行中",
+        "failed": "失败",
+        "skipped": "已跳过",
+    }.get(value, value or "-")
+
+
 def search_page_count(total):
     if total <= 0:
         return 1
@@ -2945,7 +3015,13 @@ def format_search_page_message(query, candidates, page, page_count, total):
 
 def format_library_choice_message(candidate):
     lines = ["已选择：%s" % candidate.get("title")]
+    if candidate.get("rank"):
+        lines.append("候选：#%s" % candidate.get("rank"))
     lines.append("站点：%s  做种：%s  大小：%s" % (candidate.get("indexer"), candidate.get("seeders"), format_size(candidate.get("size"))))
+    lines.append("链接类型：%s" % download_uri_label(candidate.get("download_uri")))
+    info_hash = candidate_info_hash(candidate)
+    if info_hash:
+        lines.append("info_hash：%s" % info_hash)
     return "\n".join(lines)
 
 
@@ -3067,13 +3143,28 @@ def format_auto_cancel_result_message(title, result, task, category=None):
     return "\n".join(lines)
 
 
-def format_task_list_message(records):
-    lines = ["最近任务："]
+def format_task_list_message(records, page=0, page_count=1, total=None):
+    if total is None:
+        total = len(records)
+    lines = ["最近任务：第 %s/%s 页，共 %s 条" % (page + 1, page_count, total)]
+    start_index = page * DEFAULT_TASK_LIST_PAGE_SIZE + 1
     for idx, record in enumerate(records, 1):
         task = record["task"]
         title = record["title"] or task.get("name") or task.get("info_hash")
-        lines.append("%s. %s" % (idx, title))
-        lines.append("状态：%s  进度：%s" % (task.get("status_name") or "-", format_percent(task.get("percent_done"))))
+        display_index = start_index + idx - 1
+        lines.append("%s. %s" % (display_index, title))
+        lines.append(
+            "入库：%s  状态：%s  进度：%s"
+            % (
+                CATEGORY_LABELS.get(record.get("category"), record.get("category") or "-"),
+                task.get("status_name") or "-",
+                format_percent(task.get("percent_done")),
+            )
+        )
+        if task.get("content_profile"):
+            lines.append("内容：%s" % CONTENT_PROFILE_LABELS.get(task.get("content_profile"), task.get("content_profile")))
+        if task.get("msg_sync_status"):
+            lines.append("MSG：%s" % msg_sync_status_label(task.get("msg_sync_status")))
         if task.get("info_hash"):
             lines.append("info_hash：%s" % task["info_hash"])
     return "\n".join(lines)
@@ -3176,6 +3267,7 @@ def search_page_reply_markup(session_id, candidates, page, page_count):
         nav.append({"text": "下一页", "callback_data": "page:%s:%s" % (session_id, page + 1)})
     if nav:
         rows.append(nav)
+    rows.append([{"text": "关闭本页", "callback_data": "close_search:%s" % session_id}])
     return {"inline_keyboard": rows}
 
 
@@ -3236,20 +3328,57 @@ def task_is_final(task):
     return (task or {}).get("status_name") in FINAL_TASK_STATUS_NAMES
 
 
-def task_list_reply_markup(records):
+def task_page_count(total):
+    if total <= 0:
+        return 1
+    return (total + DEFAULT_TASK_LIST_PAGE_SIZE - 1) // DEFAULT_TASK_LIST_PAGE_SIZE
+
+
+def task_list_priority(record):
+    task = (record or {}).get("task") or {}
+    status = task.get("status_name")
+    if task_can_retry_msg_sync(task):
+        return 0
+    if status not in FINAL_TASK_STATUS_NAMES:
+        return 1
+    if status in {"failed", "cancelled"}:
+        return 2
+    return 3
+
+
+def prioritized_task_records(records):
+    def sort_key(record):
+        return (
+            task_list_priority(record),
+            -int(record.get("updated_at") or 0),
+            -int(record.get("created_at") or 0),
+        )
+
+    return sorted(records or [], key=sort_key)
+
+
+def task_list_reply_markup(records, page=0, page_count=1):
     rows = []
     for idx, record in enumerate(records, 1):
         task = record["task"]
         info_hash = task.get("info_hash") or record["info_hash"]
+        display_index = page * DEFAULT_TASK_LIST_PAGE_SIZE + idx
         if task_can_retry_msg_sync(task):
-            rows.append([{"text": "重试MSG %s" % idx, "callback_data": "retry_msg:%s" % info_hash}])
+            rows.append([{"text": "重试MSG %s" % display_index, "callback_data": "retry_msg:%s" % info_hash}])
             continue
         if task_is_final(task):
             continue
-        row = [{"text": "刷新 %s" % idx, "callback_data": "status:%s" % info_hash}]
+        row = [{"text": "刷新 %s" % display_index, "callback_data": "status:%s" % info_hash}]
         if task_can_cancel(task):
-            row.append({"text": "取消 %s" % idx, "callback_data": "cancel:%s" % info_hash})
+            row.append({"text": "取消 %s" % display_index, "callback_data": "cancel:%s" % info_hash})
         rows.append(row)
+    nav = []
+    if page > 0:
+        nav.append({"text": "上一页", "callback_data": "tasks_page:%s" % (page - 1)})
+    if page + 1 < page_count:
+        nav.append({"text": "下一页", "callback_data": "tasks_page:%s" % (page + 1)})
+    if nav:
+        rows.append(nav)
     if not rows:
         return None
     return {"inline_keyboard": rows}
