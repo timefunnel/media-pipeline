@@ -60,6 +60,14 @@ ACTIVE_115_SLOW_AFTER_POLLS = 10
 ACTIVE_115_SLOW_POLL_INTERVAL_SECONDS = 600
 ACTIVE_115_TIMEOUT_SECONDS = 7200
 CATEGORY_LABELS = {"movie": "电影库", "tv": "剧集库", "adult": "成人库", "other": "其他库"}
+ANIME_QUERY_HINT_PATTERN = re.compile(
+    r"(anime|bangumi|mikan|nyaa|acg|动漫|動畫|动画|番剧|番劇|新番|日漫|"
+    r"鬼灭|鬼滅|葬送|芙莉莲|芙莉蓮|海贼|海賊|火影|柯南|进击|進擊|咒术|咒術|"
+    r"电锯|電鋸|间谍过家家|間諜家家酒|孤独摇滚|孤獨搖滾|我推|药屋|藥屋|"
+    r"高达|高達|宝可梦|寶可夢|名侦探|名偵探|灌篮|灌籃|排球|无职|無職|"
+    r"刀剑神域|刀劍神域|fate|re0|re:0|[ぁ-んァ-ン])",
+    re.IGNORECASE,
+)
 CONTENT_PROFILE_LABELS = {
     "adult": "成人",
     "movie": "电影",
@@ -614,7 +622,8 @@ class PipelineBotService:
         candidates = search_primary_indexer_results(prowlarr, query, max(int(limit), DEFAULT_UPSTREAM_SEARCH_LIMIT), indexers=indexers)
         if should_search_sukebei(category, query):
             candidates.extend(search_sukebei_indexer_results(prowlarr, query, indexers=indexers))
-        candidates.extend(search_anime_indexer_results(prowlarr, query, indexers=indexers))
+        if should_search_anime(category, query):
+            candidates.extend(search_anime_indexer_results(prowlarr, query, indexers=indexers))
         return ResourceSelector().select_ranked_limited(candidates, query=query, limit=limit)
 
     def submit(self, category, download_uri):
@@ -1866,7 +1875,7 @@ def search_primary_indexer_results(prowlarr, query, limit, indexers=None):
     primary_indexers = [
         indexer
         for indexer in indexers
-        if indexer.get("enable") is not False
+        if indexer_enabled(indexer)
         and not ResourceSelector.is_anime_specialized_item(indexer)
         and not ResourceSelector.is_sukebei_item(indexer)
         and indexer.get("id") is not None
@@ -1906,6 +1915,18 @@ def should_search_sukebei(category, query):
     return category == "adult" or bool(extract_codes(query))
 
 
+def should_search_anime(category, query):
+    if category == "adult" or extract_codes(query):
+        return False
+    if category == "tv" and ANIME_QUERY_HINT_PATTERN.search(str(query or "")):
+        return True
+    return bool(ANIME_QUERY_HINT_PATTERN.search(str(query or "")))
+
+
+def indexer_enabled(indexer):
+    return (indexer or {}).get("enable", (indexer or {}).get("enabled", True)) is not False
+
+
 def search_sukebei_indexer_results(prowlarr, query, indexers=None):
     return search_required_indexer_results(
         prowlarr,
@@ -1933,6 +1954,8 @@ def search_required_indexer_results(prowlarr, query, predicate, limit, indexers=
     if indexers is None:
         indexers = prowlarr.indexers()
     for indexer in indexers:
+        if not indexer_enabled(indexer):
+            continue
         if not predicate(indexer):
             continue
         indexer_id = indexer.get("id")

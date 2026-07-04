@@ -3531,6 +3531,20 @@ class ResourceSelectorTest(unittest.TestCase):
 
         self.assertEqual([item["indexer"] for item in ranked], ["sukebei.nyaa.si"])
 
+    def test_select_ranked_keeps_zero_seed_dht_candidates_but_penalizes_them(self):
+        selector = ResourceSelector()
+
+        ranked = selector.select_ranked(
+            [
+                {"title": "Sintel 1080p", "indexer": "Knaben", "seeders": 0, "infoHash": "DHT"},
+                {"title": "Sintel 1080p", "indexer": "LimeTorrents", "seeders": 1, "infoHash": "SEEDED"},
+                {"title": "Sintel 1080p", "indexer": "Unknown", "seeders": 0, "infoHash": "DROP"},
+            ],
+            query="Sintel",
+        )
+
+        self.assertEqual([item["infoHash"] for item in ranked], ["SEEDED", "DHT"])
+
     def test_select_ranked_limited_preserves_all_sukebei_candidates(self):
         selector = ResourceSelector()
 
@@ -3926,16 +3940,49 @@ class CliSubmitSearchTest(unittest.TestCase):
         self.assertEqual({item["indexer"] for item in payload["results"]}, {"Knaben", "Mikan"})
         self.assertEqual(fake_prowlarr.search_calls, [("鬼灭之刃", 100, (1,)), ("鬼灭之刃", 100, (10,))])
 
+    def test_search_skips_anime_supplements_for_plain_movie_query(self):
+        fake_prowlarr = FakeProwlarr(
+            [],
+            indexers=[
+                {"id": 1, "name": "Knaben", "enable": True},
+                {"id": 5, "name": "Nyaa.si", "enable": True},
+                {"id": 6, "name": "ACG.RIP", "enable": True},
+                {"id": 8, "name": "sukebei.nyaa.si", "enable": True},
+                {"id": 10, "name": "Mikan", "enable": True},
+                {"id": 11, "name": "Bangumi Moe", "enable": True},
+            ],
+            indexer_results={
+                (1,): [{"title": "Sintel 1080p", "indexer": "Knaben", "seeders": 20, "infoHash": "K1"}],
+                (5,): [{"title": "Sintel Nyaa", "indexer": "Nyaa.si", "seeders": 20, "infoHash": "N1"}],
+                (6,): [{"title": "Sintel ACG", "indexer": "ACG.RIP", "seeders": 20, "infoHash": "A1"}],
+                (10,): [{"title": "Sintel Mikan", "indexer": "Mikan", "seeders": 20, "infoHash": "M1"}],
+                (11,): [{"title": "Sintel Bangumi", "indexer": "Bangumi Moe", "seeders": 20, "infoHash": "B1"}],
+            },
+        )
+        stdout = io.StringIO()
+
+        with patch("pipeline.cli.build_prowlarr_client", return_value=fake_prowlarr), patch("sys.stdout", stdout):
+            code = cli_main(["search", "--query", "Sintel", "--limit", "10"])
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual([item["indexer"] for item in payload["results"]], ["Knaben"])
+        self.assertEqual(fake_prowlarr.search_calls, [("Sintel", 100, (1,))])
+
     def test_search_excludes_anime_specialized_indexers_from_primary_call_and_adds_them_as_supplements(self):
         fake_prowlarr = FakeProwlarr(
             [],
             indexers=[
                 {"id": 1, "name": "Knaben", "enable": True},
+                {"id": 5, "name": "Nyaa.si", "enable": True},
+                {"id": 6, "name": "ACG.RIP", "enable": True},
                 {"id": 10, "name": "Mikan", "enable": True},
                 {"id": 11, "name": "Bangumi Moe", "enable": True},
             ],
             indexer_results={
                 (1,): [{"title": "葬送的芙莉莲 1080p", "indexer": "Knaben", "seeders": 20, "infoHash": "K1"}],
+                (5,): [{"title": "葬送的芙莉莲 Nyaa", "indexer": "Nyaa.si", "seeders": 2, "infoHash": "N1"}],
+                (6,): [{"title": "葬送的芙莉莲 ACG", "indexer": "ACG.RIP", "seeders": 3, "infoHash": "A1"}],
                 (10,): [{"title": "葬送的芙莉莲 Mikan", "indexer": "Mikan", "seeders": 1, "infoHash": "M1"}],
                 (11,): [{"title": "葬送的芙莉莲 Bangumi", "indexer": "Bangumi Moe", "seeders": 1, "infoHash": "B1"}],
             },
@@ -3947,12 +3994,42 @@ class CliSubmitSearchTest(unittest.TestCase):
 
         payload = json.loads(stdout.getvalue())
         self.assertEqual(code, 0)
-        self.assertEqual(payload["count"], 3)
-        self.assertEqual({item["indexer"] for item in payload["results"]}, {"Knaben", "Mikan", "Bangumi Moe"})
+        self.assertEqual(payload["count"], 5)
+        self.assertEqual({item["indexer"] for item in payload["results"]}, {"Knaben", "Nyaa.si", "ACG.RIP", "Mikan", "Bangumi Moe"})
         self.assertEqual(
             fake_prowlarr.search_calls,
-            [("葬送的芙莉莲", 100, (1,)), ("葬送的芙莉莲", 100, (10,)), ("葬送的芙莉莲", 100, (11,))],
+            [
+                ("葬送的芙莉莲", 100, (1,)),
+                ("葬送的芙莉莲", 100, (5,)),
+                ("葬送的芙莉莲", 100, (6,)),
+                ("葬送的芙莉莲", 100, (10,)),
+                ("葬送的芙莉莲", 100, (11,)),
+            ],
         )
+
+    def test_search_skips_disabled_supplement_indexers(self):
+        fake_prowlarr = FakeProwlarr(
+            [],
+            indexers=[
+                {"id": 1, "name": "Knaben", "enable": True},
+                {"id": 8, "name": "sukebei.nyaa.si", "enable": False},
+                {"id": 10, "name": "Mikan", "enable": False},
+            ],
+            indexer_results={
+                (1,): [{"title": "ATFB-309 1080p", "indexer": "Knaben", "seeders": 20, "infoHash": "K1"}],
+                (8,): [{"title": "ATFB-309 sukebei", "indexer": "sukebei.nyaa.si", "seeders": 0, "infoHash": "S1"}],
+                (10,): [{"title": "ATFB-309 Mikan", "indexer": "Mikan", "seeders": 1, "infoHash": "M1"}],
+            },
+        )
+        stdout = io.StringIO()
+
+        with patch("pipeline.cli.build_prowlarr_client", return_value=fake_prowlarr), patch("sys.stdout", stdout):
+            code = cli_main(["search", "--query", "ATFB-309", "--limit", "10"])
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual([item["indexer"] for item in payload["results"]], ["Knaben"])
+        self.assertEqual(fake_prowlarr.search_calls, [("ATFB-309", 100, (1,))])
 
     def test_primary_search_falls_back_to_single_indexers_when_aggregate_times_out(self):
         from pipeline.bot import search_primary_indexer_results

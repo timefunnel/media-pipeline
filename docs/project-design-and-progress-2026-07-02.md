@@ -142,6 +142,8 @@ YTS
 
 原因：当前服务器路径访问时命中 Cloudflare、镜像不可用或请求超时。`0Magnet` 已在 2026-07-04 因 `相泽南` 搜索拖慢/超时被禁用；后续如必须使用，需要 FlareSolverr、可用镜像或私有 indexer。
 
+2026-07-04 已通过 Prowlarr schema 只读确认 `1337x` 可添加，但 `1337x.to`、`1337x.st`、`x1337x.ws`、`x1337x.eu`、`x1337x.cc` 均未通过 Prowlarr test，返回 Cloudflare Protection 拦截；未强制保存该 indexer。
+
 ## 5. OpenList 与 115 目录
 
 OpenList：
@@ -373,6 +375,7 @@ description=Adult / 番号元数据（JavDB 优先；当前 MSG 内置默认源�
 设计点：
 
 - 搜索阶段使用 Prowlarr 聚合，不按普通/成人模式拆开搜索源。
+- 搜索请求按关键词类型分流：普通关键词只查通用源；番号会额外补查 `sukebei.nyaa.si`；疑似动漫关键词才额外补查 Nyaa/ACG/Mikan/Bangumi 等动漫源。
 - 搜索结果先选择资源，再手动选择内容分类；选择资源时不编辑/删除原搜索结果消息，方便同一批候选中连续入库多个资源。
 - 当前内容分类固定为四类：电影、剧集、成人、其他。
 - 电影分类走 115 电影目录和 MSG 电影云盘库；剧集分类走 115 剧集目录和 MSG 剧集云盘库；成人分类走 115 成人目录和 MSG 成人云盘库；其他分类走 115 其他目录和 MSG 其他媒体云盘库。
@@ -442,6 +445,8 @@ OpenList 基线索引：
 - 不按 reported size 过滤资源。
 - 普通 BT 源仍以 seeders 为主要排序权重。
 - sukebei 等成人源有额外加分规则，允许保留部分 0 seed 候选。
+- Knaben、MagnetDownload、TorrentProject、TorrentKitty、0Magnet、1337x、The Pirate Bay 等 DHT/聚合源的 0 seed 候选保留但降权，避免因 seeders 数据不准漏掉中文资源。
+- Bot 点名补查单个 indexer 时会尊重 Prowlarr 的 `enable=false`，避免禁用源仍被请求。
 - Prowlarr 主聚合搜索失败时，会按主 indexer 单站点降级重试；单个站点超时只记录失败，不再拖垮整次搜索。如果所有主站点都失败，则显式报错。
 - CAM/TS/TC/SCR/SAMPLE 等标题降权。
 - 对 2160p/4K、1080p、720p 加质量分。

@@ -10,6 +10,7 @@ from pipeline.bot import (
     build_bot,
     search_anime_indexer_results,
     search_primary_indexer_results,
+    should_search_anime,
     should_search_sukebei,
     search_sukebei_indexer_results,
 )
@@ -113,7 +114,8 @@ def main(argv=None):
         raw_candidates = search_primary_indexer_results(prowlarr, args.query, max(args.limit, DEFAULT_UPSTREAM_SEARCH_LIMIT), indexers=indexers)
         if should_search_sukebei(getattr(args, "category", "movie"), args.query):
             raw_candidates.extend(search_sukebei_indexer_results(prowlarr, args.query, indexers=indexers))
-        raw_candidates.extend(search_anime_indexer_results(prowlarr, args.query, indexers=indexers))
+        if should_search_anime(getattr(args, "category", "movie"), args.query):
+            raw_candidates.extend(search_anime_indexer_results(prowlarr, args.query, indexers=indexers))
         candidates = ResourceSelector().select_ranked_limited(raw_candidates, query=args.query, limit=args.limit)
         if args.command == "search":
             print(

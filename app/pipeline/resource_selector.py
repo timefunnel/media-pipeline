@@ -20,6 +20,16 @@ EXACT_TITLE_BONUS = 300000
 TITLE_EXTRA_CHAR_PENALTY = 3000
 MAX_TITLE_EXTRA_PENALTY = 120000
 SEEDER_BONUS_SCALE = 1000
+ZERO_SEED_DHT_PENALTY = 50000
+ZERO_SEED_DHT_INDEXER_TOKENS = (
+    "0magnet",
+    "1337x",
+    "knaben",
+    "magnetdownload",
+    "the pirate bay",
+    "torrentkitty",
+    "torrentproject",
+)
 
 
 class ResourceSelector:
@@ -74,7 +84,8 @@ class ResourceSelector:
 
         seeders = int(item.get("seeders") or 0)
         is_sukebei = self.is_sukebei_item(item)
-        if seeders <= 0 and not is_sukebei:
+        zero_seed_dht = seeders <= 0 and self.is_zero_seed_dht_item(item)
+        if seeders <= 0 and not is_sukebei and not zero_seed_dht:
             return None
 
         magnet_url = item.get("magnetUrl")
@@ -90,6 +101,8 @@ class ResourceSelector:
         match_bonus = self._match_bonus(title, query, query_tokens or [])
         quality_bonus = self._quality_bonus(title)
         preference_bonus = self._preference_bonus(title) + self._indexer_bonus(item)
+        if zero_seed_dht:
+            preference_bonus -= ZERO_SEED_DHT_PENALTY
         score = match_bonus + self._seeder_bonus(seeders) + quality_bonus + preference_bonus - penalty
         result = dict(item)
         result["download_uri"] = download_uri
@@ -170,7 +183,33 @@ class ResourceSelector:
             item.get("details"),
         ]
         text = " ".join(str(value or "") for value in values).casefold()
-        return "mikan" in text or "mikanani" in text or "bangumi moe" in text or "bangumi.moe" in text
+        if "sukebei" in text:
+            return False
+        return (
+            "acg.rip" in text
+            or "bangumi moe" in text
+            or "bangumi.moe" in text
+            or "mikan" in text
+            or "mikanani" in text
+            or "nyaa.si" in text
+            or "nyaa" in text
+        )
+
+    @staticmethod
+    def is_zero_seed_dht_item(item):
+        values = [
+            item.get("name"),
+            item.get("indexer"),
+            item.get("indexerName"),
+            item.get("site"),
+            item.get("tracker"),
+            item.get("downloadUrl"),
+            item.get("guid"),
+            item.get("infoUrl"),
+            item.get("details"),
+        ]
+        text = " ".join(str(value or "") for value in values).casefold()
+        return any(token in text for token in ZERO_SEED_DHT_INDEXER_TOKENS)
 
     def _limit_preserving_sukebei(self, ranked, limit):
         sukebei = [item for item in ranked if self.is_sukebei_item(item)]
