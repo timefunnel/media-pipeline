@@ -368,11 +368,11 @@ description=Adult / 番号元数据（JavDB 优先；当前 MSG 内置默认源�
 /dedupe_refresh        -> 刷新已入库记录；先显示风险提示，二次确认后才执行
 /version               -> 查看当前 media-pipeline 版本和 revision
 未知 / 命令             -> 不作为搜索入口，提示直接发送关键词或磁链
-点击候选分页按钮       -> 翻页，不重新搜索
-点击关闭本页           -> 删除当前搜索结果消息
-点击资源               -> 选择资源，另发内容分类选择消息，原资源列表保留
-点击内容分类           -> 电影提交到电影 115 目录；剧集提交到剧集 115 目录；成人提交到成人 115 目录；其他提交到其他 115 目录
-点击返回选种           -> 关闭当前内容分类选择消息，回到保留的资源列表继续选择
+点击候选分页按钮       -> 上一页/下一页或页码直跳，不重新搜索
+点击关闭               -> 删除当前搜索结果消息
+点击资源入库           -> 选择资源，另发内容分类选择消息，原资源列表保留
+点击内容分类           -> 电影提交到电影 115 目录；剧集提交到剧集 115 目录；动漫提交到动漫 115 目录；成人提交到成人 115 目录；其他提交到其他 115 目录
+点击返回结果           -> 关闭当前内容分类选择消息，回到保留的资源列表继续选择
 点击仍然入库           -> 弱重复提示后确认继续提交 115
 点击刷新状态           -> 查询 115 状态；完成后尝试同步 MediaStationGo
 点击重试MSG同步        -> 从失败阶段恢复 MediaStationGo 同步
@@ -781,7 +781,7 @@ sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[
   - Prowlarr tag `media-adult`：sukebei.nyaa.si。
   - Prowlarr tag `media-anime`：ACG.RIP、Nyaa.si、Mikan、Bangumi Moe。
   - Prowlarr tag `media-fallback`：MagnetDownload、TorrentProject2，默认首屏不查，用于后续补漏入口。
-- Bot 搜索执行方式改为按 profile 选中的 Prowlarr indexer 并发查询，并由 `PROWLARR_SEARCH_TIMEOUT_SECONDS` 控制总等待，默认 4 秒，目标是 5 秒内返回首屏结果。
+- Bot 搜索执行方式改为按 profile 选中的 Prowlarr indexer 并发查询，并由 `PROWLARR_SEARCH_TIMEOUT_SECONDS` 控制总等待，默认 4 秒，目标是 5 秒内返回首屏结果；默认返回上限为 100 条，每页 5 条，页码按钮支持直接跳页。
 - Prowlarr priority 已纳入 Bot 排序；后续源优先级尽量在 Prowlarr 后台调整，不在 Bot 里硬编码站点排序。
 - 强番号形态（例如 `MIDE-882`、`BDMV-001`、`FC2-PPV-1234567`）默认走成人 profile；非番号普通搜索默认不碰成人源。
 - 非番号搜索结果页提供短补查按钮：`🔞` 查成人源、`动漫` 查动漫源；点击后新发一条对应源结果消息，不覆盖原普通搜索结果。

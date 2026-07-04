@@ -42,7 +42,7 @@ from pipeline.version import format_version_info
 
 DEFAULT_STATE_DB = "/bot-data/state.db"
 DEFAULT_OPENLIST_DB = "/openlist-data/data.db"
-DEFAULT_SEARCH_LIMIT = 30
+DEFAULT_SEARCH_LIMIT = 100
 DEFAULT_UPSTREAM_SEARCH_LIMIT = 100
 DEFAULT_REQUIRED_INDEXER_SEARCH_LIMIT = 1000
 DEFAULT_ANIME_INDEXER_SEARCH_LIMIT = 100
@@ -1274,7 +1274,7 @@ class TelegramBot:
         if record["user_id"] != user_id:
             self.telegram.answer_callback_query(callback_id, "无权查看此搜索")
             return
-        self.telegram.answer_callback_query(callback_id, "返回选种")
+        self.telegram.answer_callback_query(callback_id, "返回结果")
         self._delete_callback_message(chat_id, message_id)
 
     def _handle_back_to_search_callback(self, user_id, chat_id, message_id, callback_id, candidate_id):
@@ -1299,7 +1299,7 @@ class TelegramBot:
         candidate_ids = [int(value) for value in session["candidate_ids"]]
         page = candidate_ids.index(int(candidate_id)) // SEARCH_PAGE_SIZE
         text, reply_markup = self._render_search_page(session["id"], page)
-        self.telegram.answer_callback_query(callback_id, "返回选种")
+        self.telegram.answer_callback_query(callback_id, "返回结果")
         self._update_callback_message(
             chat_id,
             message_id,
@@ -3554,7 +3554,7 @@ def submit_reply_markup(result):
 def search_page_reply_markup(session_id, candidates, page, page_count, allow_adult_retry=False, allow_anime_retry=False):
     rows = []
     for candidate_id, candidate in candidates:
-        rows.append([{"text": "选择 %s" % candidate.get("rank"), "callback_data": "choose:%s" % candidate_id}])
+        rows.append([{"text": "#%s 入库" % candidate.get("rank"), "callback_data": "choose:%s" % candidate_id}])
     nav = []
     if page > 0:
         nav.append({"text": "上一页", "callback_data": "page:%s:%s" % (session_id, page - 1)})
@@ -3562,6 +3562,9 @@ def search_page_reply_markup(session_id, candidates, page, page_count, allow_adu
         nav.append({"text": "下一页", "callback_data": "page:%s:%s" % (session_id, page + 1)})
     if nav:
         rows.append(nav)
+    page_jump = search_page_jump_buttons(session_id, page, page_count)
+    if page_jump:
+        rows.append(page_jump)
     retry = []
     if allow_adult_retry:
         retry.append({"text": "🔞", "callback_data": "adult_search:%s" % session_id})
@@ -3569,8 +3572,35 @@ def search_page_reply_markup(session_id, candidates, page, page_count, allow_adu
         retry.append({"text": "动漫", "callback_data": "anime_search:%s" % session_id})
     if retry:
         rows.append(retry)
-    rows.append([{"text": "关闭本页", "callback_data": "close_search:%s" % session_id}])
+    rows.append([{"text": "关闭", "callback_data": "close_search:%s" % session_id}])
     return {"inline_keyboard": rows}
+
+
+def search_page_jump_buttons(session_id, page, page_count):
+    if page_count <= 1:
+        return []
+
+    candidates = {0, page_count - 1}
+    for offset in (-1, 0, 1):
+        target = page + offset
+        if 0 <= target < page_count:
+            candidates.add(target)
+    if page <= 2:
+        candidates.update(range(0, min(5, page_count)))
+    if page >= page_count - 3:
+        candidates.update(range(max(0, page_count - 5), page_count))
+
+    row = []
+    previous = None
+    for target in sorted(candidates):
+        if previous is not None and target - previous > 1:
+            row.append({"text": "...", "callback_data": "page:%s:%s" % (session_id, page)})
+        text = str(target + 1)
+        if target == page:
+            text = "[%s]" % text
+        row.append({"text": text, "callback_data": "page:%s:%s" % (session_id, target)})
+        previous = target
+    return row
 
 
 def library_choice_reply_markup(candidate_id, include_back=False):
@@ -3586,7 +3616,7 @@ def library_choice_reply_markup(candidate_id, include_back=False):
         ],
     ]
     if include_back:
-        rows.append([{"text": "返回选种", "callback_data": "close_choice:%s" % candidate_id}])
+        rows.append([{"text": "返回结果", "callback_data": "close_choice:%s" % candidate_id}])
     return {"inline_keyboard": rows}
 
 

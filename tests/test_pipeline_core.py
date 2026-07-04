@@ -429,10 +429,10 @@ class TelegramBotTest(unittest.TestCase):
             )
 
             sent = telegram.messages[0]
-            self.assertEqual(service.search_calls, [("sintel", "movie", 30)])
+            self.assertEqual(service.search_calls, [("sintel", "movie", 100)])
             self.assertIn("1. Sintel 720p", sent["text"])
             self.assertIn("第 1/1 页，共 2 条", sent["text"])
-            self.assertEqual(sent["reply_markup"]["inline_keyboard"][0][0]["text"], "选择 1")
+            self.assertEqual(sent["reply_markup"]["inline_keyboard"][0][0]["text"], "#1 入库")
             self.assertRegex(sent["reply_markup"]["inline_keyboard"][0][0]["callback_data"], r"^choose:\d+$")
 
     def test_message_search_sends_typing_action_before_search(self):
@@ -455,7 +455,7 @@ class TelegramBotTest(unittest.TestCase):
             )
 
         self.assertEqual(telegram.chat_actions, [{"chat_id": 9001, "action": "typing"}])
-        self.assertEqual(service.search_calls, [("sintel", "movie", 30)])
+        self.assertEqual(service.search_calls, [("sintel", "movie", 100)])
 
     def test_typing_action_failure_does_not_block_search(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -476,7 +476,7 @@ class TelegramBotTest(unittest.TestCase):
                 }
             )
 
-        self.assertEqual(service.search_calls, [("sintel", "movie", 30)])
+        self.assertEqual(service.search_calls, [("sintel", "movie", 100)])
         self.assertIn("搜索结果：sintel", telegram.messages[0]["text"])
 
     def test_message_magnet_prompts_library_without_searching(self):
@@ -549,17 +549,21 @@ class TelegramBotTest(unittest.TestCase):
             )
 
             first = telegram.messages[0]
-            self.assertEqual(service.search_calls, [("sintel", "movie", 30)])
+            self.assertEqual(service.search_calls, [("sintel", "movie", 100)])
             self.assertIn("第 1/2 页，共 7 条", first["text"])
             self.assertIn("5. Sintel 05 1080p", first["text"])
             self.assertNotIn("6. Sintel 06 1080p", first["text"])
-            nav = first["reply_markup"]["inline_keyboard"][-3]
+            nav = first["reply_markup"]["inline_keyboard"][-4]
             self.assertEqual([button["text"] for button in nav], ["下一页"])
+            self.assertEqual(
+                [(button["text"], button["callback_data"]) for button in first["reply_markup"]["inline_keyboard"][-3]],
+                [("[1]", "page:1:0"), ("2", "page:1:1")],
+            )
             self.assertEqual(
                 [(button["text"], button["callback_data"].split(":", 1)[0]) for button in first["reply_markup"]["inline_keyboard"][-2]],
                 [("🔞", "adult_search"), ("动漫", "anime_search")],
             )
-            self.assertEqual(first["reply_markup"]["inline_keyboard"][-1][0]["text"], "关闭本页")
+            self.assertEqual(first["reply_markup"]["inline_keyboard"][-1][0]["text"], "关闭")
 
             bot.handle_update(
                 {
@@ -572,7 +576,7 @@ class TelegramBotTest(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(service.search_calls, [("sintel", "movie", 30)])
+            self.assertEqual(service.search_calls, [("sintel", "movie", 100)])
             self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-page", "text": "第 2/2 页"})
             self.assertEqual(telegram.messages[1:], [])
             self.assertEqual(telegram.edits[0]["chat_id"], 9001)
@@ -580,7 +584,11 @@ class TelegramBotTest(unittest.TestCase):
             self.assertIn("第 2/2 页，共 7 条", telegram.edits[0]["text"])
             self.assertIn("6. Sintel 06 1080p", telegram.edits[0]["text"])
             self.assertNotIn("1. Sintel 01 1080p", telegram.edits[0]["text"])
-            self.assertEqual([button["text"] for button in telegram.edits[0]["reply_markup"]["inline_keyboard"][-3]], ["上一页"])
+            self.assertEqual([button["text"] for button in telegram.edits[0]["reply_markup"]["inline_keyboard"][-4]], ["上一页"])
+            self.assertEqual(
+                [(button["text"], button["callback_data"]) for button in telegram.edits[0]["reply_markup"]["inline_keyboard"][-3]],
+                [("1", "page:1:0"), ("[2]", "page:1:1")],
+            )
             self.assertEqual(
                 [
                     (button["text"], button["callback_data"].split(":", 1)[0])
@@ -588,7 +596,47 @@ class TelegramBotTest(unittest.TestCase):
                 ],
                 [("🔞", "adult_search"), ("动漫", "anime_search")],
             )
-            self.assertEqual(telegram.edits[0]["reply_markup"]["inline_keyboard"][-1][0]["text"], "关闭本页")
+            self.assertEqual(telegram.edits[0]["reply_markup"]["inline_keyboard"][-1][0]["text"], "关闭")
+
+    def test_search_results_can_jump_directly_to_page_number(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                search_results=[
+                    {
+                        "title": "Sintel %03d 1080p" % rank,
+                        "download_uri": "magnet:?xt=urn:btih:%03d" % rank,
+                        "rank": rank,
+                    }
+                    for rank in range(1, 101)
+                ]
+            )
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "sintel"}})
+            page_jump_row = telegram.messages[0]["reply_markup"]["inline_keyboard"][-3]
+            last_page_button = [button for button in page_jump_row if button["text"] == "20"][0]
+
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-page-20",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 701},
+                        "data": last_page_button["callback_data"],
+                    }
+                }
+            )
+
+            self.assertEqual(service.search_calls, [("sintel", "movie", 100)])
+            self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-page-20", "text": "第 20/20 页"})
+            self.assertIn("第 20/20 页，共 100 条", telegram.edits[0]["text"])
+            self.assertIn("96. Sintel 096 1080p", telegram.edits[0]["text"])
+            self.assertIn("100. Sintel 100 1080p", telegram.edits[0]["text"])
+            self.assertNotIn("95. Sintel 095 1080p", telegram.edits[0]["text"])
 
     def test_callback_adult_search_sends_separate_adult_result_message(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -616,8 +664,8 @@ class TelegramBotTest(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(service.search_calls, [("sintel", "movie", 30)])
-            self.assertEqual(service.adult_search_calls, [("sintel", 30)])
+            self.assertEqual(service.search_calls, [("sintel", "movie", 100)])
+            self.assertEqual(service.adult_search_calls, [("sintel", 100)])
             self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-adult-search", "text": "正在补查成人源"})
             self.assertEqual(len(telegram.messages), 2)
             self.assertIn("成人源搜索结果：sintel", telegram.messages[1]["text"])
@@ -654,8 +702,8 @@ class TelegramBotTest(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(service.search_calls, [("frieren", "movie", 30)])
-            self.assertEqual(service.anime_search_calls, [("frieren", 30)])
+            self.assertEqual(service.search_calls, [("frieren", "movie", 100)])
+            self.assertEqual(service.anime_search_calls, [("frieren", 100)])
             self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-anime-search", "text": "正在补查动漫源"})
             self.assertEqual(len(telegram.messages), 2)
             self.assertIn("动漫源搜索结果：frieren", telegram.messages[1]["text"])
@@ -675,7 +723,7 @@ class TelegramBotTest(unittest.TestCase):
 
             bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "MIDE-882"}})
 
-            self.assertEqual(service.search_calls, [("MIDE-882", "adult", 30)])
+            self.assertEqual(service.search_calls, [("MIDE-882", "adult", 100)])
             self.assertIn("成人源搜索结果：MIDE-882", telegram.messages[0]["text"])
             self.assertNotIn("adult_search", json.dumps(telegram.messages[0]["reply_markup"], ensure_ascii=False))
 
@@ -743,7 +791,7 @@ class TelegramBotTest(unittest.TestCase):
             self.assertIn("链接类型：磁链", telegram.messages[0]["text"])
             self.assertIn("info_hash：BBB", telegram.messages[0]["text"])
             buttons = [button for row in telegram.messages[0]["reply_markup"]["inline_keyboard"] for button in row]
-            self.assertEqual([button["text"] for button in buttons], ["电影", "剧集", "动漫", "成人", "其他", "返回选种"])
+            self.assertEqual([button["text"] for button in buttons], ["电影", "剧集", "动漫", "成人", "其他", "返回结果"])
             self.assertEqual(buttons[0]["callback_data"], "profile:movie:%s" % candidate_id)
             self.assertEqual(buttons[1]["callback_data"], "profile:tv:%s" % candidate_id)
             self.assertEqual(buttons[2]["callback_data"], "profile:anime:%s" % candidate_id)
@@ -775,7 +823,7 @@ class TelegramBotTest(unittest.TestCase):
                 }
             )
             choose_button = telegram.messages[0]["reply_markup"]["inline_keyboard"][1][0]
-            self.assertEqual(choose_button["text"], "选择 2")
+            self.assertEqual(choose_button["text"], "#2 入库")
 
             bot.handle_update(
                 {
@@ -805,15 +853,15 @@ class TelegramBotTest(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(service.search_calls, [("sintel", "movie", 30)])
+            self.assertEqual(service.search_calls, [("sintel", "movie", 100)])
             self.assertEqual(service.submit_calls, [])
-            self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-back", "text": "返回选种"})
+            self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-back", "text": "返回结果"})
             self.assertEqual(telegram.edits, [])
             self.assertEqual(telegram.deletes, [{"chat_id": 9001, "message_id": 1002}])
             self.assertIn("搜索结果：sintel", telegram.messages[0]["text"])
             self.assertIn("第 1/1 页，共 2 条", telegram.messages[0]["text"])
             self.assertIn("2. Sintel 1080p", telegram.messages[0]["text"])
-            self.assertEqual(telegram.messages[0]["reply_markup"]["inline_keyboard"][1][0]["text"], "选择 2")
+            self.assertEqual(telegram.messages[0]["reply_markup"]["inline_keyboard"][1][0]["text"], "#2 入库")
 
     def test_callback_profile_submit_saves_manual_content_profile(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -2093,7 +2141,7 @@ class TelegramBotTest(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(service.adult_search_calls, [("missing movie", 30)])
+            self.assertEqual(service.adult_search_calls, [("missing movie", 100)])
             self.assertEqual(len(telegram.messages), 2)
             self.assertIn("成人源搜索结果：missing movie", telegram.messages[1]["text"])
 
@@ -2108,7 +2156,7 @@ class TelegramBotTest(unittest.TestCase):
 
             bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "流浪地球1"}})
 
-            self.assertEqual(service.search_calls, [("流浪地球1", "movie", 30)])
+            self.assertEqual(service.search_calls, [("流浪地球1", "movie", 100)])
             self.assertEqual(telegram.messages[0]["chat_id"], 9001)
             self.assertIn("搜索失败", telegram.messages[0]["text"])
             self.assertIn("timed out", telegram.messages[0]["text"])
