@@ -375,6 +375,35 @@ class TelegramBotTest(unittest.TestCase):
         self.assertEqual(service.search_calls, [])
         self.assertEqual(telegram.messages[0]["text"], "media-pipeline 9.9.9\nrevision: abc123")
 
+    def test_message_help_describes_direct_keyword_flow(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService()
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/help"}})
+
+        self.assertEqual(service.search_calls, [])
+        self.assertIn("直接发送关键词、番号或磁链即可", telegram.messages[0]["text"])
+        self.assertIn("/tasks 查看最近任务", telegram.messages[0]["text"])
+
+    def test_legacy_search_command_is_not_used_as_search_entry(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(search_results=[{"title": "Sintel", "download_uri": "magnet:?xt=urn:btih:AAA"}])
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/movie sintel"}})
+
+        self.assertEqual(service.search_calls, [])
+        self.assertIn("不再作为搜索入口", telegram.messages[0]["text"])
+
     def test_message_search_saves_candidates_and_sends_rank_buttons(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
 
@@ -394,7 +423,7 @@ class TelegramBotTest(unittest.TestCase):
                     "message": {
                         "chat": {"id": 9001},
                         "from": {"id": 700656624},
-                        "text": "/movie sintel",
+                        "text": "sintel",
                     }
                 }
             )

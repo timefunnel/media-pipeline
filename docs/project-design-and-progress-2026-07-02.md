@@ -351,15 +351,14 @@ description=Adult / 番号元数据（JavDB 优先；当前 MSG 内置默认源�
 当前交互能力：
 
 ```text
-发送影片名             -> 搜索资源
-/movie 关键词          -> 搜索资源，电影库作为上下文
-/adult 关键词          -> 搜索资源，成人库作为上下文
-/other 关键词          -> 搜索资源，其他库作为上下文
+发送影片名/关键词/番号 -> 搜索资源
 发送 magnet            -> 不搜索，直接进入内容分类选择
+/help                  -> 查看当前功能入口
 /tasks                 -> 查看最近任务
 /status <info_hash>    -> 查询任务状态
 /dedupe_refresh        -> 手动刷新 OpenList 基线重复索引
 /version               -> 查看当前 media-pipeline 版本和 revision
+未知 / 命令             -> 不作为搜索入口，提示直接发送关键词或磁链
 点击候选分页按钮       -> 翻页，不重新搜索
 点击资源               -> 选择资源，另发内容分类选择消息，原资源列表保留
 点击内容分类           -> 电影提交到电影 115 目录；剧集提交到剧集 115 目录；成人提交到成人 115 目录；其他提交到其他 115 目录
@@ -681,6 +680,8 @@ MSG guard scope check -> non-pipeline row updates are not intercepted
 日常入口：
 
 ```text
+Bot 直接发送关键词/番号/磁链 -> 搜索资源或进入入库分类选择
+Bot /help          -> 查看功能入口
 Bot /version       -> 查看版本
 Bot /tasks         -> 查看最近任务
 Bot /status <hash> -> 查询任务状态

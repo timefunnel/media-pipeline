@@ -64,6 +64,17 @@ CONTENT_PROFILE_LABELS = {
     "tv": "剧集",
     "other": "其他",
 }
+DEFAULT_SEARCH_CATEGORY = "movie"
+START_TEXT = "直接发送关键词、番号或磁链即可搜索/入库；/help 查看功能；/tasks 查看最近任务；/version 查看版本"
+HELP_TEXT = """直接发送关键词、番号或磁链即可。
+
+常用入口：
+/tasks 查看最近任务
+/status <info_hash> 查询任务状态
+/dedupe_refresh 手动刷新 OpenList 基线重复索引
+/version 查看当前版本
+
+搜索结果里选择资源后，再选择入电影、剧集、成人或其他库。"""
 SUBTITLE_EXTENSIONS = {".ass", ".idx", ".srt", ".ssa", ".sub", ".vtt"}
 VIDEO_EXTENSIONS = {
     ".avi",
@@ -935,11 +946,17 @@ class TelegramBot:
             return
 
         text = (message.get("text") or "").strip()
-        if not text or text == "/start":
-            self.telegram.send_message(chat_id, "发送影片名搜索，或直接发送磁链选择入库目录；/tasks 查看最近任务；/version 查看版本")
+        if not text:
+            self.telegram.send_message(chat_id, START_TEXT)
             return
 
         command, argument = split_command(text)
+        if command == "/start":
+            self.telegram.send_message(chat_id, START_TEXT)
+            return
+        if command == "/help":
+            self.telegram.send_message(chat_id, HELP_TEXT)
+            return
         if command == "/tasks":
             self._send_task_list(chat_id, user_id)
             return
@@ -954,11 +971,19 @@ class TelegramBot:
         if command == "/version":
             self.telegram.send_message(chat_id, format_version_info())
             return
+        if text.startswith("/"):
+            self.telegram.send_message(chat_id, "这个命令不再作为搜索入口。直接发送关键词、番号或磁链即可；/help 查看功能。")
+            return
 
         direct_candidate = magnet_candidate_from_text(text)
         if direct_candidate:
-            category, _query = parse_query(text)
-            candidate_id = self.store.save_candidate(user_id, chat_id, category, direct_candidate["title"], direct_candidate)
+            candidate_id = self.store.save_candidate(
+                user_id,
+                chat_id,
+                DEFAULT_SEARCH_CATEGORY,
+                direct_candidate["title"],
+                direct_candidate,
+            )
             self.telegram.send_message(
                 chat_id,
                 format_library_choice_message(direct_candidate),
@@ -966,7 +991,7 @@ class TelegramBot:
             )
             return
 
-        category, query = parse_query(text)
+        category, query = DEFAULT_SEARCH_CATEGORY, text
         if not query:
             self.telegram.send_message(chat_id, "请输入影片名")
             return
@@ -1747,16 +1772,6 @@ class TypingActionPulse:
     def _run(self):
         while not self._stop.wait(self.interval_seconds):
             self.bot._send_typing_action(self.chat_id)
-
-
-def parse_query(text):
-    if text.startswith("/adult"):
-        return "adult", text[len("/adult") :].strip()
-    if text.startswith("/other"):
-        return "other", text[len("/other") :].strip()
-    if text.startswith("/movie"):
-        return "movie", text[len("/movie") :].strip()
-    return "movie", text
 
 
 def split_command(text):
