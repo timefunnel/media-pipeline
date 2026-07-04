@@ -71,10 +71,15 @@ HELP_TEXT = """直接发送关键词、番号或磁链即可。
 常用入口：
 /tasks 查看最近任务
 /status <info_hash> 查询任务状态
-/dedupe_refresh 手动刷新 OpenList 基线重复索引
+/dedupe_refresh 刷新已入库记录（需二次确认）
 /version 查看当前版本
 
 搜索结果里选择资源后，再选择入电影、剧集、成人或其他库。"""
+DEDUPE_REFRESH_WARNING_TEXT = """刷新已入库记录？
+
+这个操作会主动刷新 OpenList 目录并重建 Bot 的重复判断基线，可能增加网盘侧请求量，资源多时也会比较慢。
+
+不会删除文件，也不会提交新的离线任务。确认今天确实需要更新重复判断后再执行。"""
 SUBTITLE_EXTENSIONS = {".ass", ".idx", ".srt", ".ssa", ".sub", ".vtt"}
 VIDEO_EXTENSIONS = {
     ".avi",
@@ -965,8 +970,7 @@ class TelegramBot:
                 self._handle_status_command(chat_id, user_id, argument)
             return
         if command == "/dedupe_refresh":
-            with self._typing_action(chat_id):
-                self._handle_dedupe_refresh_command(chat_id)
+            self._handle_dedupe_refresh_command(chat_id)
             return
         if command == "/version":
             self.telegram.send_message(chat_id, format_version_info())
@@ -1065,6 +1069,12 @@ class TelegramBot:
             return
         if action == "cancel":
             self._handle_cancel_callback(user_id, chat_id, message_id, callback_id, value)
+            return
+        if action == "dedupe_refresh_confirm":
+            self._handle_dedupe_refresh_confirm_callback(chat_id, message_id, callback_id)
+            return
+        if action == "dedupe_refresh_cancel":
+            self._handle_dedupe_refresh_cancel_callback(chat_id, message_id, callback_id)
             return
         else:
             self.telegram.answer_callback_query(callback_id, "不支持的操作")
@@ -1395,14 +1405,38 @@ class TelegramBot:
         self.telegram.send_message(chat_id, format_task_list_message(records), reply_markup=task_list_reply_markup(records))
 
     def _handle_dedupe_refresh_command(self, chat_id):
-        self.telegram.send_message(chat_id, "开始刷新 OpenList 重复索引")
+        self.telegram.send_message(chat_id, DEDUPE_REFRESH_WARNING_TEXT, reply_markup=dedupe_refresh_confirm_reply_markup())
+
+    def _handle_dedupe_refresh_confirm_callback(self, chat_id, message_id, callback_id):
+        self.telegram.answer_callback_query(callback_id, "开始刷新已入库记录")
+        self._update_callback_message(chat_id, message_id, "正在刷新已入库记录，请稍候...", reply_markup={"inline_keyboard": []})
+        with self._typing_action(chat_id):
+            self._run_dedupe_refresh(chat_id, message_id=message_id)
+
+    def _handle_dedupe_refresh_cancel_callback(self, chat_id, message_id, callback_id):
+        self.telegram.answer_callback_query(callback_id, "已取消刷新")
+        self._update_callback_message(chat_id, message_id, "已取消刷新已入库记录。", reply_markup={"inline_keyboard": []})
+
+    def _run_dedupe_refresh(self, chat_id, message_id=None):
         try:
             entries = self.service.collect_openlist_dedupe_entries(refresh=True)
             count = self.store.replace_dedupe_entries("openlist", entries)
         except (RuntimeError, ValueError) as exc:
-            self.telegram.send_message(chat_id, "OpenList重复索引刷新失败：%s" % exc)
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                "OpenList已入库记录刷新失败：%s" % exc,
+                reply_markup={"inline_keyboard": []},
+                fallback_chat_id=chat_id,
+            )
             return
-        self.telegram.send_message(chat_id, format_dedupe_refresh_message(entries, count))
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_dedupe_refresh_message(entries, count),
+            reply_markup={"inline_keyboard": []},
+            fallback_chat_id=chat_id,
+        )
 
     def _render_search_page(self, session_id, page):
         session = self.store.load_search_session(session_id)
@@ -2700,6 +2734,8 @@ def parse_callback_data(value):
             return "force_submit", (parts[0], int(parts[1]), content_profile)
     if action in ("status", "cancel", "retry_msg") and payload:
         return action, payload
+    if action in ("dedupe_refresh_confirm", "dedupe_refresh_cancel") and payload:
+        return action, payload
     return None, None
 
 
@@ -2969,7 +3005,7 @@ def format_dedupe_refresh_message(entries, count):
     for entry in entries or []:
         category_counts[entry.get("category")] += 1
         identity_counts[entry.get("identity_type")] += 1
-    lines = ["OpenList重复索引刷新完成", "写入：%s" % count]
+    lines = ["OpenList已入库记录刷新完成", "写入：%s" % count]
     lines.append("电影库：%s" % category_counts.get("movie", 0))
     lines.append("剧集库：%s" % category_counts.get("tv", 0))
     lines.append("成人库：%s" % category_counts.get("adult", 0))
@@ -3155,6 +3191,17 @@ def library_choice_reply_markup(candidate_id, include_back=False):
     if include_back:
         rows.append([{"text": "返回选种", "callback_data": "close_choice:%s" % candidate_id}])
     return {"inline_keyboard": rows}
+
+
+def dedupe_refresh_confirm_reply_markup():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "确认刷新", "callback_data": "dedupe_refresh_confirm:1"},
+                {"text": "取消", "callback_data": "dedupe_refresh_cancel:1"},
+            ]
+        ]
+    }
 
 
 def duplicate_reply_markup(duplicate, category, candidate_id, content_profile=None):

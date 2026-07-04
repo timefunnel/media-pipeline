@@ -1012,7 +1012,26 @@ class TelegramBotTest(unittest.TestCase):
             self.assertEqual(telegram.edits[0]["reply_markup"]["inline_keyboard"][-1][0]["text"], "仍然入库")
             self.assertEqual(service.submit_calls, [("movie", "magnet:?xt=urn:btih:BBB")])
 
-    def test_dedupe_refresh_command_replaces_openlist_index(self):
+    def test_dedupe_refresh_command_requires_confirmation(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(dedupe_entries=[{"category": "movie", "source": "openlist", "identity_type": "normalized_title", "identity_value": "sintel"}])
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/dedupe_refresh"}})
+
+            self.assertEqual(service.dedupe_refresh_calls, [])
+            self.assertIn("刷新已入库记录？", telegram.messages[0]["text"])
+            self.assertIn("可能增加网盘侧请求量", telegram.messages[0]["text"])
+            buttons = telegram.messages[0]["reply_markup"]["inline_keyboard"][0]
+            self.assertEqual([button["text"] for button in buttons], ["确认刷新", "取消"])
+            self.assertEqual(buttons[0]["callback_data"], "dedupe_refresh_confirm:1")
+            self.assertEqual(buttons[1]["callback_data"], "dedupe_refresh_cancel:1")
+
+    def test_dedupe_refresh_confirm_replaces_openlist_index(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1053,15 +1072,52 @@ class TelegramBotTest(unittest.TestCase):
             bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
 
             bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/dedupe_refresh"}})
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-dedupe",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 1001},
+                        "data": "dedupe_refresh_confirm:1",
+                    }
+                }
+            )
 
             self.assertEqual(service.dedupe_refresh_calls, [True])
+            self.assertEqual(telegram.answers, [{"callback_query_id": "cb-dedupe", "text": "开始刷新已入库记录"}])
+            self.assertEqual(telegram.edits[0]["text"], "正在刷新已入库记录，请稍候...")
             self.assertEqual(store.find_dedupe_entries("adult", [{"identity_type": "adult_code", "identity_value": "OLD-001"}]), [])
             self.assertEqual(
                 store.find_dedupe_entries("adult", [{"identity_type": "adult_code", "identity_value": "SSIS-450"}])[0]["title"],
                 "SSIS-450 Existing",
             )
-            self.assertIn("OpenList重复索引刷新完成", telegram.messages[-1]["text"])
-            self.assertIn("写入：2", telegram.messages[-1]["text"])
+            self.assertIn("OpenList已入库记录刷新完成", telegram.edits[-1]["text"])
+            self.assertIn("写入：2", telegram.edits[-1]["text"])
+
+    def test_dedupe_refresh_cancel_does_not_refresh_index(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(dedupe_entries=[{"category": "movie", "source": "openlist", "identity_type": "normalized_title", "identity_value": "sintel"}])
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/dedupe_refresh"}})
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-dedupe-cancel",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 1001},
+                        "data": "dedupe_refresh_cancel:1",
+                    }
+                }
+            )
+
+            self.assertEqual(service.dedupe_refresh_calls, [])
+            self.assertEqual(telegram.answers, [{"callback_query_id": "cb-dedupe-cancel", "text": "已取消刷新"}])
+            self.assertEqual(telegram.edits[-1]["text"], "已取消刷新已入库记录。")
 
     def test_callback_submit_reports_current_task_status(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot

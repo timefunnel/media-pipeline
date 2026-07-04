@@ -356,7 +356,7 @@ description=Adult / 番号元数据（JavDB 优先；当前 MSG 内置默认源�
 /help                  -> 查看当前功能入口
 /tasks                 -> 查看最近任务
 /status <info_hash>    -> 查询任务状态
-/dedupe_refresh        -> 手动刷新 OpenList 基线重复索引
+/dedupe_refresh        -> 刷新已入库记录；先显示风险提示，二次确认后才执行
 /version               -> 查看当前 media-pipeline 版本和 revision
 未知 / 命令             -> 不作为搜索入口，提示直接发送关键词或磁链
 点击候选分页按钮       -> 翻页，不重新搜索
@@ -685,6 +685,7 @@ Bot /help          -> 查看功能入口
 Bot /version       -> 查看版本
 Bot /tasks         -> 查看最近任务
 Bot /status <hash> -> 查询任务状态
+Bot /dedupe_refresh -> 刷新已入库记录，需按钮二次确认
 Bot 按钮           -> 入库、刷新进度、取消、重试 MSG 同步
 ```
 
