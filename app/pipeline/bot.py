@@ -36,6 +36,7 @@ from pipeline.prowlarr import (
     is_prowlarr_download_uri,
 )
 from pipeline.resource_selector import ResourceSelector
+from pipeline.version import format_version_info
 
 
 DEFAULT_STATE_DB = "/bot-data/state.db"
@@ -935,7 +936,7 @@ class TelegramBot:
 
         text = (message.get("text") or "").strip()
         if not text or text == "/start":
-            self.telegram.send_message(chat_id, "发送影片名搜索，或直接发送磁链选择入库目录；/tasks 查看最近任务")
+            self.telegram.send_message(chat_id, "发送影片名搜索，或直接发送磁链选择入库目录；/tasks 查看最近任务；/version 查看版本")
             return
 
         command, argument = split_command(text)
@@ -949,6 +950,9 @@ class TelegramBot:
         if command == "/dedupe_refresh":
             with self._typing_action(chat_id):
                 self._handle_dedupe_refresh_command(chat_id)
+            return
+        if command == "/version":
+            self.telegram.send_message(chat_id, format_version_info())
             return
 
         direct_candidate = magnet_candidate_from_text(text)

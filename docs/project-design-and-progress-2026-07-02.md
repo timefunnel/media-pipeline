@@ -81,9 +81,10 @@ mediastationgo-postgres-1           Up healthy
 - `media-pipeline`：一次性 CLI service，默认命令 `folders`。
 - `media-pipeline-bot`：常驻 Bot service，`restart: unless-stopped`。
 
-当前 Bot service 已配置以下环境变量类别：
+当前生产交互以 `media-pipeline-bot` 为准；CLI 不再作为维护目标，不再追平 Bot 能力。Bot service 已配置以下环境变量类别：
 
 ```text
+MEDIA_PIPELINE_VERSION / MEDIA_PIPELINE_REVISION
 OPENLIST_TOKEN
 TG_BOT_TOKEN
 TG_ALLOWED_USER_IDS=700656624
@@ -97,9 +98,14 @@ MSG_SYNC_POLL_INTERVAL_SECONDS
 OPENLIST_PRE_SCAN_CLEAN_ENABLED
 OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES
 OPENLIST_ADULT_CODE_FORMAT_ENABLED
+BOT_SEARCH_LIMIT / TG_API_TIMEOUT / BOT_SYNC_RECOVERY_INTERVAL_SECONDS
+OPENLIST_DB / OPENLIST_URL
+PROWLARR_URL / PROWLARR_CONFIG
 ```
 
-`MSG_*` 值来自远端 `/opt/media-pipeline/.env` 或 compose 插值。文档只记录变量存在，不记录任何 token/key/password。
+这些值来自远端 `/opt/media-pipeline/.env` 或 compose 默认插值；`docker-compose.yml` 只保留变量引用。文档只记录变量存在，不记录任何 token/key/password。
+
+当前版本可通过 Bot 发送 `/version` 查看，返回 `media-pipeline <version>` 和 `revision`。
 
 ## 4. Prowlarr
 
@@ -340,7 +346,7 @@ description=Adult / 番号元数据（JavDB 优先；当前 MSG 内置默认源�
 - 允许用户：`700656624`
 - 状态库：`/data/media-pipeline/bot/state.db`
 - 容器内状态库路径：`/bot-data/state.db`
-- token 维护方式：远端 compose service environment。
+- token 维护方式：远端 `/opt/media-pipeline/.env`，由 compose 变量插值注入容器环境。
 
 当前交互能力：
 
@@ -353,6 +359,7 @@ description=Adult / 番号元数据（JavDB 优先；当前 MSG 内置默认源�
 /tasks                 -> 查看最近任务
 /status <info_hash>    -> 查询任务状态
 /dedupe_refresh        -> 手动刷新 OpenList 基线重复索引
+/version               -> 查看当前 media-pipeline 版本和 revision
 点击候选分页按钮       -> 翻页，不重新搜索
 点击资源               -> 选择资源，另发内容分类选择消息，原资源列表保留
 点击内容分类           -> 电影提交到电影 115 目录；剧集提交到剧集 115 目录；成人提交到成人 115 目录；其他提交到其他 115 目录
@@ -667,37 +674,20 @@ MSG guard GREEN check -> trigger restored library/root/path/relative_path/file_i
 MSG guard scope check -> non-pipeline row updates are not intercepted
 ```
 
-## 13. CLI 命令
+## 13. CLI 状态
 
-基础命令：
+生产交互全部以 Telegram Bot 为准。CLI 保留为历史诊断代码，不再作为维护目标，也不要求与 Bot 功能对齐。
 
-```bash
-cd /opt/media-pipeline
-docker compose run --rm media-pipeline folders
-docker compose run --rm media-pipeline search --query "sintel" --limit 5
-docker compose run --rm media-pipeline submit-search --query "sintel" --category movie --limit 5 --rank 1
-docker compose run --rm media-pipeline submit-search --query "sintel" --category movie --limit 5 --rank 1 --commit
+日常入口：
+
+```text
+Bot /version       -> 查看版本
+Bot /tasks         -> 查看最近任务
+Bot /status <hash> -> 查询任务状态
+Bot 按钮           -> 入库、刷新进度、取消、重试 MSG 同步
 ```
 
-115 状态：
-
-```bash
-cd /opt/media-pipeline
-docker compose run --rm media-pipeline verify-folders
-docker compose run --rm media-pipeline probe
-docker compose run --rm media-pipeline task-status --info-hash <hash> --max-pages 10
-docker compose run --rm media-pipeline wait-task --info-hash <hash> --timeout-seconds 600 --interval-seconds 15 --max-pages 10
-```
-
-MediaStationGo：
-
-```bash
-cd /opt/media-pipeline
-docker exec media-pipeline-bot python -m pipeline.cli msg-login
-docker exec media-pipeline-bot python -m pipeline.cli msg-scan --category movie
-docker exec media-pipeline-bot python -m pipeline.cli msg-scan --category adult
-docker exec media-pipeline-bot python -m pipeline.cli msg-scan --category other
-```
+如需临时排障，可以在确认不会触发额外 115 风控请求后，从 `media-pipeline-bot` 容器内手动调用 Python 模块；这些命令不作为标准交互文档继续维护。
 
 Bot 运维：
 
@@ -712,14 +702,15 @@ docker inspect media-pipeline-bot --format '{{.State.Running}} {{.RestartCount}}
 
 ```bash
 cd /opt/media-pipeline
+sed -E -e 's/(OPENLIST_TOKEN=.*/OPENLIST_TOKEN=REDACTED/' -e 's/(TG_BOT_TOKEN=.*/TG_BOT_TOKEN=REDACTED/' -e 's/(MSG_ADMIN_PASSWORD=.*/MSG_ADMIN_PASSWORD=REDACTED/' .env
 sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[:space:]]*).*/\1REDACTED/' docker-compose.yml
 ```
 
 ## 14. 安全与凭据
 
 - 不在文档、日志摘要、最终回复中输出任何 token/key/password 明文。
-- OpenList token 和 Telegram bot token 当前维护在远端 `docker-compose.yml` 对应 service environment 中。
-- MediaStationGo 相关配置通过 `/opt/media-pipeline/.env` 提供给 compose 插值。
+- OpenList token、Telegram bot token、MediaStationGo 管理员密码当前维护在远端 `/opt/media-pipeline/.env` 中。
+- `docker-compose.yml` 只保留变量引用；真实凭据不进入 Git。
 - `temp_tg_bot_key` 已删除。
 - Prowlarr API key 从配置文件读取，不复制到文档。
 - 115 access token 从 OpenList DB 只读读取，不落盘到 pipeline 自有配置。

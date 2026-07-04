@@ -356,6 +356,25 @@ class TelegramBotTest(unittest.TestCase):
         self.assertGreaterEqual(sent_count, 2)
         self.assertEqual(bot.actions, [9001] * sent_count)
 
+    def test_message_version_reports_runtime_version(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService()
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            with patch.dict("os.environ", {"MEDIA_PIPELINE_VERSION": "9.9.9", "MEDIA_PIPELINE_REVISION": "abc123"}):
+                bot.handle_update(
+                    {
+                        "message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/version"}
+                    }
+                )
+
+        self.assertEqual(service.search_calls, [])
+        self.assertEqual(telegram.messages[0]["text"], "media-pipeline 9.9.9\nrevision: abc123")
+
     def test_message_search_saves_candidates_and_sends_rank_buttons(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
 
