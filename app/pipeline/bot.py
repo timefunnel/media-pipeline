@@ -545,6 +545,61 @@ class CandidateStore:
             conn.close()
         return len(normalized_entries)
 
+    def migrate_dedupe_entries(self, source_path, target_path, source_category, target_category, source="openlist"):
+        source = str(source or "").strip()
+        source_path = normalize_openlist_path(source_path)
+        target_path = normalize_openlist_path(target_path)
+        source_category = str(source_category or "").strip()
+        target_category = str(target_category or "").strip()
+        if not source or not source_path or not target_path:
+            raise ValueError("dedupe migration paths must not be empty")
+        if source_category not in CATEGORY_LABELS or target_category not in CATEGORY_LABELS:
+            raise ValueError("invalid dedupe migration category")
+
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                select id, category, source, identity_type, identity_value, title, path, metadata_json, created_at
+                from dedupe_index
+                where source = ?
+                  and category = ?
+                  and (path = ? or path like ?)
+                """,
+                (source, source_category, source_path, source_path.rstrip("/") + "/%"),
+            ).fetchall()
+            for row in rows:
+                new_path = replace_openlist_path_prefix(row[6], source_path, target_path)
+                conn.execute("delete from dedupe_index where id = ?", (row[0],))
+                conn.execute(
+                    """
+                    insert into dedupe_index (
+                        category, source, identity_type, identity_value, title, path, metadata_json, created_at, updated_at
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    on conflict(category, source, identity_type, identity_value) do update set
+                        title = excluded.title,
+                        path = excluded.path,
+                        metadata_json = excluded.metadata_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        target_category,
+                        source,
+                        row[3],
+                        row[4],
+                        row[5],
+                        new_path,
+                        row[7],
+                        row[8],
+                        now,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return len(rows)
+
     def find_dedupe_entries(self, category, identities, limit=20):
         normalized = []
         seen = set()
@@ -762,6 +817,15 @@ class PipelineBotService:
 
         result = db_client.migrate_media_group(candidate, target_category)
         result["openlist_moved"] = True
+        try:
+            result["dedupe_index_count"] = CandidateStore(self.config.state_db_path).migrate_dedupe_entries(
+                candidate["source_openlist_path"],
+                target["target_openlist_path"],
+                candidate.get("category") or "",
+                target_category,
+            )
+        except (RuntimeError, ValueError, sqlite3.Error) as exc:
+            result["dedupe_index_error"] = str(exc)
         return result
 
     def check_duplicate(self, category, query, candidate):
@@ -3261,6 +3325,29 @@ def openlist_child_exists(client, path):
         if item.get("name") == source_name:
             return True
     return False
+
+
+def normalize_openlist_path(path):
+    raw = str(path or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    normalized = posixpath.normpath(raw)
+    if normalized == ".":
+        return ""
+    return normalized
+
+
+def replace_openlist_path_prefix(path, old_prefix, new_prefix):
+    path = normalize_openlist_path(path)
+    old_prefix = normalize_openlist_path(old_prefix).rstrip("/")
+    new_prefix = normalize_openlist_path(new_prefix).rstrip("/")
+    if path == old_prefix:
+        return new_prefix
+    if path.startswith(old_prefix + "/"):
+        return new_prefix + path[len(old_prefix) :]
+    raise ValueError("path does not start with source prefix: %s" % path)
 
 
 def normalize_openlist_text(value):

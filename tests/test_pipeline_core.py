@@ -317,6 +317,33 @@ class CandidateStoreTest(unittest.TestCase):
         self.assertEqual(new_match[0]["title"], "IPX-789 Existing")
 
 
+    def test_candidate_store_migrates_openlist_dedupe_entries(self):
+        from pipeline.bot import CandidateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            store.replace_dedupe_entries(
+                "openlist",
+                [
+                    {
+                        "category": "tv",
+                        "identity_type": "normalized_title",
+                        "identity_value": "jackie",
+                        "title": "Jackie",
+                        "path": "/115/tv/Jackie",
+                    }
+                ],
+            )
+
+            changed = store.migrate_dedupe_entries("/115/tv/Jackie", "/115/anime/Jackie", "tv", "anime")
+            old_match = store.find_dedupe_entries("tv", [{"identity_type": "normalized_title", "identity_value": "jackie"}])
+            new_match = store.find_dedupe_entries("anime", [{"identity_type": "normalized_title", "identity_value": "jackie"}])
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(old_match, [])
+        self.assertEqual(new_match[0]["path"], "/115/anime/Jackie")
+
+
 class TelegramBotTest(unittest.TestCase):
     def test_telegram_api_send_chat_action_uses_send_chat_action_endpoint(self):
         from pipeline.bot import TelegramApi
