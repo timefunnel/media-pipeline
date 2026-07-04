@@ -3132,6 +3132,9 @@ class PipelineBotServiceTest(unittest.TestCase):
             def validate_migration_target_available(self, candidate, target_category):
                 events.append(("db_validate", candidate["source_openlist_path"], target_category))
 
+            def validate_migration_source_ready(self, candidate):
+                events.append(("db_preflight", candidate["source_openlist_path"]))
+
             def migrate_media_group(self, candidate, target_category):
                 events.append(("db_migrate", candidate["source_openlist_path"], target_category))
                 return {
@@ -3165,8 +3168,9 @@ class PipelineBotServiceTest(unittest.TestCase):
                 "anime",
             )
 
+        self.assertEqual(events[1], ("db_preflight", result["source_openlist_path"]))
         self.assertEqual(
-            events,
+            events[:1] + events[2:],
             [
                 ("db_validate", "/115/剧集/成龙历险记", "anime"),
                 ("list_all", "/115/剧集", False),

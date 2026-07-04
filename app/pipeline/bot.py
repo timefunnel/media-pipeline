@@ -744,6 +744,7 @@ class PipelineBotService:
         target = build_migration_target(candidate, target_category)
         db_client = self._build_msg_db_client()
         db_client.validate_migration_target_available(candidate, target_category)
+        db_client.validate_migration_source_ready(candidate)
 
         openlist_client = OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
         source_path = candidate["source_openlist_path"]

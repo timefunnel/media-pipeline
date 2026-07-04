@@ -69,6 +69,24 @@ class MediaStationDbClient:
             raise RuntimeError("MediaStationGo target already exists: %s" % target["target_openlist_path"])
         return target
 
+    def validate_migration_source_ready(self, candidate):
+        source_cloud_path = openlist_path_to_cloud_path(candidate["source_openlist_path"])
+        with self._connect() as conn:
+            with conn.transaction():
+                rows = self._load_source_rows_for_update(conn, candidate, source_cloud_path)
+                if not rows:
+                    raise RuntimeError("MediaStationGo source media not found: %s" % candidate["source_openlist_path"])
+
+                media_ids = [row["id"] for row in rows]
+                series_ids = sorted({row.get("series_id") for row in rows if row.get("series_id")})
+                self._assert_series_not_partial(conn, series_ids, media_ids)
+
+        return {
+            "source_openlist_path": candidate["source_openlist_path"],
+            "media_count": len(media_ids),
+            "series_count": len(series_ids),
+        }
+
     def migrate_media_group(self, candidate, target_category):
         target = build_migration_target(candidate, target_category)
         source_cloud_path = openlist_path_to_cloud_path(candidate["source_openlist_path"])
