@@ -62,5 +62,8 @@ services:
       MSG_SUBTITLE_PROXY_HOST: "${MSG_SUBTITLE_PROXY_HOST:-127.0.0.1}"
       MSG_SUBTITLE_PROXY_PORT: "${MSG_SUBTITLE_PROXY_PORT:-18081}"
       MSG_SUBTITLE_PROXY_UPSTREAM: "${MSG_SUBTITLE_PROXY_UPSTREAM:-http://127.0.0.1:18080}"
+      MSG_BASE_URL: "${MSG_BASE_URL:-http://127.0.0.1:18080/api}"
+      MSG_ADMIN_USER: "${MSG_ADMIN_USER:-admin}"
+      MSG_ADMIN_PASSWORD: "${MSG_ADMIN_PASSWORD:?MSG_ADMIN_PASSWORD missing}"
     restart: unless-stopped
     command: ["subtitle-proxy"]

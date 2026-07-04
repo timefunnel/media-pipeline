@@ -1,4 +1,5 @@
 import posixpath
+import re
 import urllib.parse
 from collections import OrderedDict
 
@@ -7,6 +8,12 @@ from pipeline.config import MSG_LIBRARY_ROOTS, category_to_msg_library_root, cat
 
 DEFAULT_MSG_DATABASE_DSN = "postgresql://mediastation:mediastation@127.0.0.1:15432/mediastation"
 MSG_CLOUD_PREFIX = "cloud://openlist"
+
+SXX_EXX_RE = re.compile(r"(?i)(?:^|[^a-z0-9])S(?P<season>\d{1,2})\s*E(?P<episode>\d{1,4})(?:[^a-z0-9]|$)")
+CHINESE_EPISODE_RE = re.compile(r"第\s*(?P<episode>\d{1,4})\s*[集話话]")
+EPISODE_TOKEN_RE = re.compile(r"(?i)(?:^|[^a-z0-9])(?:EP|E)\s*(?P<episode>\d{1,4})(?:[^a-z0-9]|$)")
+BRACKET_EPISODE_RE = re.compile(r"(?:^|[\s._\-\[\(])(?P<episode>\d{1,3})(?:v\d+)?(?:[\s._\-\]\)]|$)", re.IGNORECASE)
+IGNORED_EPISODE_NUMBERS = {720, 1080, 2160, 264, 265}
 
 
 class MediaStationDbClient:
@@ -166,6 +173,52 @@ class MediaStationDbClient:
             "series_count": len(series_ids),
         }
 
+    def repair_episode_visibility(self, category, media_id=None):
+        if category not in ("tv", "anime"):
+            return {"status": "skipped", "updated": 0, "reason": "not_episode_library"}
+
+        root = category_to_msg_library_root(category)
+        root_openlist_path = category_to_openlist_path(category)
+        root_cloud_path = openlist_path_to_cloud_path(root_openlist_path)
+
+        with self._connect() as conn:
+            with conn.transaction():
+                self._ensure_cloud_media_guard(conn)
+                conn.execute("set local media_pipeline.allow_cloud_media_migration = 'on'")
+                rows = self._load_episode_visibility_rows_for_update(conn, root, root_openlist_path, media_id)
+                if not rows:
+                    raise RuntimeError("MediaStationGo episode visibility target not found")
+
+                updates = build_episode_visibility_updates(rows, root_cloud_path)
+                for update in updates:
+                    conn.execute(
+                        """
+                        update media
+                        set relative_path = %s,
+                            season_num = %s,
+                            episode_num = %s,
+                            episode_title = %s,
+                            updated_at = now()
+                        where id = %s
+                        """,
+                        (
+                            update["relative_path"],
+                            update["season_num"],
+                            update["episode_num"],
+                            update["episode_title"],
+                            update["id"],
+                        ),
+                    )
+
+                self._assert_episode_visibility_repaired(conn, [row["id"] for row in rows])
+
+        return {
+            "status": "success",
+            "updated": len(updates),
+            "media_count": len(rows),
+            "reason": "repaired" if updates else "already_valid",
+        }
+
     def _connect(self):
         if self._connect_override is not None:
             return self._connect_override()
@@ -175,6 +228,75 @@ class MediaStationDbClient:
         except ImportError as exc:
             raise RuntimeError("psycopg missing; rebuild media-pipeline image with Postgres support") from exc
         return psycopg.connect(self.dsn, row_factory=dict_row)
+
+    def _load_episode_visibility_rows_for_update(self, conn, root, root_openlist_path, media_id):
+        if media_id:
+            row = conn.execute(
+                """
+                select id, path, relative_path, season_num, episode_num, episode_title
+                from media
+                where deleted_at is null
+                  and library_id = %s
+                  and library_root_id = %s
+                  and id = %s
+                for update
+                """,
+                (root["library_id"], root["root_id"], media_id),
+            ).fetchone()
+            if not row:
+                return []
+            media_path = cloud_path_to_openlist_path(row.get("path"))
+            source_path, source_kind = media_work_item_path(media_path, root_openlist_path)
+            source_cloud_path = openlist_path_to_cloud_path(source_path)
+            if source_kind == "file":
+                condition = "path = %s"
+                params = (source_cloud_path,)
+            else:
+                condition = "(path = %s or path like %s)"
+                params = (source_cloud_path, source_cloud_path + "/%")
+            return conn.execute(
+                """
+                select id, path, relative_path, season_num, episode_num, episode_title
+                from media
+                where deleted_at is null
+                  and library_id = %s
+                  and library_root_id = %s
+                  and """ + condition + """
+                order by path
+                for update
+                """,
+                (root["library_id"], root["root_id"], *params),
+            ).fetchall()
+
+        return conn.execute(
+            """
+            select id, path, relative_path, season_num, episode_num, episode_title
+            from media
+            where deleted_at is null
+              and library_id = %s
+              and library_root_id = %s
+            order by path
+            for update
+            """,
+            (root["library_id"], root["root_id"]),
+        ).fetchall()
+
+    def _assert_episode_visibility_repaired(self, conn, media_ids):
+        row = conn.execute(
+            """
+            select count(*) as bad_count
+            from media
+            where id = any(%s)
+              and (
+                coalesce(relative_path, '') = ''
+                or coalesce(season_num, 0) <= 0
+                or coalesce(episode_num, 0) <= 0
+              )
+            """,
+            (media_ids,),
+        ).fetchone()
+        if int(row["bad_count"] or 0) != 0:
+            raise RuntimeError("MediaStationGo episode visibility validation failed")
 
     def _load_source_rows_for_update(self, conn, candidate, source_cloud_path):
         if candidate.get("source_kind") == "file":
@@ -373,6 +495,88 @@ def build_migration_candidates(rows, limit=20):
         except (TypeError, ValueError):
             pass
     return list(grouped.values())[: int(limit)]
+
+
+def build_episode_visibility_updates(rows, root_cloud_path):
+    rows = list(rows or [])
+    used_episode_numbers = {
+        int(row.get("episode_num"))
+        for row in rows
+        if positive_int(row.get("episode_num")) is not None
+    }
+    next_episode = 1
+    updates = []
+    for row in rows:
+        relative_path = str(row.get("relative_path") or "")
+        inferred_relative_path = cloud_relative_path(row.get("path"), root_cloud_path)
+        if not relative_path:
+            relative_path = inferred_relative_path
+        season_num = positive_int(row.get("season_num"))
+        episode_num = positive_int(row.get("episode_num"))
+        parsed_season, parsed_episode = season_episode_from_path(relative_path or row.get("path") or "")
+        if season_num is None:
+            season_num = parsed_season or 1
+        if episode_num is None:
+            candidate_episode = parsed_episode if parsed_episode and parsed_episode not in used_episode_numbers else None
+            if candidate_episode is None:
+                while next_episode in used_episode_numbers:
+                    next_episode += 1
+                candidate_episode = next_episode
+            episode_num = candidate_episode
+            used_episode_numbers.add(episode_num)
+        episode_title = str(row.get("episode_title") or "").strip()
+        if not episode_title:
+            episode_title = episode_title_from_relative_path(relative_path, episode_num)
+
+        update = {
+            "id": row["id"],
+            "relative_path": relative_path,
+            "season_num": season_num,
+            "episode_num": episode_num,
+            "episode_title": episode_title,
+        }
+        if episode_visibility_update_needed(row, update):
+            updates.append(update)
+    return updates
+
+
+def episode_visibility_update_needed(row, update):
+    return (
+        str(row.get("relative_path") or "") != update["relative_path"]
+        or positive_int(row.get("season_num")) != update["season_num"]
+        or positive_int(row.get("episode_num")) != update["episode_num"]
+        or str(row.get("episode_title") or "").strip() != update["episode_title"]
+    )
+
+
+def season_episode_from_path(path):
+    value = str(path or "")
+    match = SXX_EXX_RE.search(value)
+    if match:
+        return int(match.group("season")), int(match.group("episode"))
+    for pattern in (CHINESE_EPISODE_RE, EPISODE_TOKEN_RE, BRACKET_EPISODE_RE):
+        match = pattern.search(value)
+        if not match:
+            continue
+        episode = int(match.group("episode"))
+        if episode in IGNORED_EPISODE_NUMBERS:
+            continue
+        return None, episode
+    return None, None
+
+
+def episode_title_from_relative_path(relative_path, episode_num):
+    basename = posixpath.basename(str(relative_path or "").rstrip("/"))
+    title = posixpath.splitext(basename)[0].strip()
+    return title or "Episode %s" % int(episode_num or 1)
+
+
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def build_migration_target(candidate, target_category):

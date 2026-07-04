@@ -36,7 +36,15 @@ from pipeline.openlist import OpenListClient, OpenListTokenProvider
 from pipeline.openlist_tokens import OpenListTokenStore
 from pipeline.prowlarr import ProwlarrClient, ProwlarrConfig, torrent_bytes_to_magnet
 from pipeline.resource_selector import ResourceSelector
-from pipeline.subtitle_proxy import inject_subtitle_track_bootstrap, normalize_webvtt_timestamps, redact_sensitive_query_values, should_normalize_subtitle
+from pipeline.subtitle_proxy import (
+    MsgApiAuthenticator,
+    inject_emby_subtitle_streams,
+    inject_subtitle_track_bootstrap,
+    normalize_webvtt_timestamps,
+    parse_emby_subtitle_stream_path,
+    redact_sensitive_query_values,
+    should_normalize_subtitle,
+)
 
 
 class BotConfigTest(unittest.TestCase):
@@ -177,6 +185,12 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertNotIn("secret-value", redacted)
         self.assertIn("token=REDACTED", redacted)
 
+    def test_msg_api_authenticator_rejects_missing_credentials(self):
+        auth = MsgApiAuthenticator("http://127.0.0.1:18080/api", "", "")
+
+        with self.assertRaisesRegex(RuntimeError, "credentials missing"):
+            auth.authorization_header()
+
     def test_inject_subtitle_track_bootstrap_adds_script_before_body_close(self):
         html = "<html><body><div id=\"root\"></div></body></html>"
 
@@ -196,6 +210,43 @@ class SubtitleProxyTest(unittest.TestCase):
         injected = inject_subtitle_track_bootstrap(html)
 
         self.assertEqual(injected.count("subtitleAutoEnabled"), html.count("subtitleAutoEnabled"))
+
+    def test_inject_emby_subtitle_streams_adds_external_vtt_tracks(self):
+        payload = {"MediaSources": [{"Id": "source-1", "MediaStreams": [{"Index": 0, "Type": "Video"}]}]}
+
+        changed = inject_emby_subtitle_streams(
+            payload,
+            "media-1",
+            [
+                {"lang": "tc", "label": "tc", "path": "cloud://subtitle.tc.ass"},
+                {"lang": "sc", "label": "sc", "path": "cloud://subtitle.sc.ass"},
+            ],
+        )
+
+        streams = payload["MediaSources"][0]["MediaStreams"]
+        self.assertTrue(changed)
+        self.assertEqual([stream["Type"] for stream in streams], ["Video", "Subtitle", "Subtitle"])
+        self.assertEqual(streams[1]["Index"], 1)
+        self.assertEqual(streams[1]["Codec"], "webvtt")
+        self.assertEqual(streams[1]["DeliveryMethod"], "External")
+        self.assertEqual(streams[1]["DeliveryUrl"], "/emby/Videos/media-1/source-1/Subtitles/1/Stream.vtt?mp_track=0")
+        self.assertEqual(streams[2]["DeliveryUrl"], "/emby/Videos/media-1/source-1/Subtitles/2/Stream.vtt?mp_track=1")
+
+    def test_inject_emby_subtitle_streams_keeps_native_subtitles(self):
+        payload = {"MediaSources": [{"Id": "source-1", "MediaStreams": [{"Index": 0, "Type": "Video"}, {"Index": 1, "Type": "Subtitle"}]}]}
+
+        changed = inject_emby_subtitle_streams(payload, "media-1", [{"lang": "sc", "label": "sc", "path": "cloud://subtitle.sc.ass"}])
+
+        self.assertFalse(changed)
+        self.assertEqual(len(payload["MediaSources"][0]["MediaStreams"]), 2)
+
+    def test_parse_emby_subtitle_stream_path_reads_track_mapping(self):
+        parsed = parse_emby_subtitle_stream_path("/emby/Videos/media-1/source-1/Subtitles/2/Stream.vtt?mp_track=1&api_key=secret")
+
+        self.assertEqual(parsed["media_id"], "media-1")
+        self.assertEqual(parsed["source_id"], "source-1")
+        self.assertEqual(parsed["stream_index"], 2)
+        self.assertEqual(parsed["track_index"], 1)
 
 class CandidateStoreTest(unittest.TestCase):
     def test_candidate_store_persists_candidate_for_callback(self):
@@ -2523,6 +2574,54 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["msg_media_id"], "media-1")
         self.assertIsNone(task["msg_error"])
 
+    def test_sync_completed_anime_task_repairs_episode_visibility_after_scrape(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        events = []
+        fake_msg = FakeMediaStationClient(
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "e1333358-17ff-4b90-82f0-663cec26c0df", "title": "Aki Sora"}]}}
+        )
+
+        class FakeMsgDb:
+            def __init__(self):
+                self.calls = []
+
+            def repair_episode_visibility(self, category, media_id=None):
+                self.calls.append((category, media_id))
+                return {"status": "success", "updated": 3, "media_count": 5, "reason": "repaired"}
+
+        fake_db = FakeMsgDb()
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.MediaStationDbClient", return_value=fake_db
+        ), patch("pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()), patch(
+            "pipeline.bot.OpenListClient", side_effect=lambda url, token: RetryOpenList(events)
+        ):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    msg_sync_poll_seconds=0,
+                    openlist_pre_scan_clean_enabled=False,
+                )
+            )
+            task = service.sync_completed_task(
+                "anime",
+                "Aki Sora",
+                {"info_hash": "ABC", "status_name": "success", "name": "Aki Sora.mkv"},
+            )
+
+        self.assertEqual(fake_msg.scrape_calls, ["media-1"])
+        self.assertEqual(fake_db.calls, [("anime", "media-1")])
+        self.assertEqual(task["msg_visibility_repair_status"], "success")
+        self.assertEqual(task["msg_visibility_repair_updated"], 3)
+        self.assertEqual(task["msg_visibility_repair_media_count"], 5)
+        self.assertEqual(task["msg_sync_status"], "success")
+
     def test_sync_completed_task_cleans_openlist_before_mediastation_scan(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
@@ -3456,6 +3555,38 @@ class CategoryConfigTest(unittest.TestCase):
 
         self.assertIn("%2F115%2F%E5%8A%A8%E6%BC%AB%2F%E6%88%90%E9%BE%99%E5%8E%86%E9%99%A9%E8%AE%B0", rewritten)
         self.assertNotIn("%2F115%2F%E5%89%A7%E9%9B%86%2F%E6%88%90%E9%BE%99%E5%8E%86%E9%99%A9%E8%AE%B0", rewritten)
+
+    def test_msgdb_builds_episode_visibility_updates_for_bad_anime_rows(self):
+        from pipeline.msgdb import build_episode_visibility_updates
+
+        rows = [
+            {
+                "id": "m1",
+                "path": "cloud://openlist/115/Anime/Show/Show S01E01.mkv",
+                "relative_path": "",
+                "season_num": 0,
+                "episode_num": 0,
+                "episode_title": "",
+            },
+            {
+                "id": "m2",
+                "path": "cloud://openlist/115/Anime/Show/Show 1080p.mkv",
+                "relative_path": "",
+                "season_num": None,
+                "episode_num": None,
+                "episode_title": "",
+            },
+        ]
+
+        updates = build_episode_visibility_updates(rows, "cloud://openlist/115/Anime")
+
+        self.assertEqual([item["id"] for item in updates], ["m1", "m2"])
+        self.assertEqual(updates[0]["relative_path"], "Show/Show S01E01.mkv")
+        self.assertEqual(updates[0]["season_num"], 1)
+        self.assertEqual(updates[0]["episode_num"], 1)
+        self.assertEqual(updates[1]["relative_path"], "Show/Show 1080p.mkv")
+        self.assertEqual(updates[1]["season_num"], 1)
+        self.assertEqual(updates[1]["episode_num"], 2)
 
     def test_routes_movie_tv_anime_adult_and_other_to_separate_115_folders(self):
         self.assertEqual(category_to_folder_id("movie"), "3464134653584082023")

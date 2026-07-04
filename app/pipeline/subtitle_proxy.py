@@ -1,6 +1,10 @@
 import http.server
+import json
+import os
 import re
 import socketserver
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -9,6 +13,7 @@ import urllib.request
 DEFAULT_SUBTITLE_PROXY_HOST = "127.0.0.1"
 DEFAULT_SUBTITLE_PROXY_PORT = 18081
 DEFAULT_SUBTITLE_PROXY_UPSTREAM = "http://127.0.0.1:18080"
+DEFAULT_MSG_API_BASE_URL = "http://127.0.0.1:18080/api"
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -23,6 +28,11 @@ HOP_BY_HOP_HEADERS = {
 
 WEBVTT_TIMESTAMP_RE = re.compile(r"(?P<time>\d{2}:\d{2}:\d{2})\.(?P<fraction>\d{1,2})(?=\s|$)")
 SENSITIVE_QUERY_RE = re.compile(r"([?&](?:api_?key|access_token|token)=)[^&\s\"]+", re.IGNORECASE)
+EMBY_ITEM_ID_RE = re.compile(r"^/emby/(?:Users/[^/]+/)?Items/(?P<media_id>[^/?]+)(?:/PlaybackInfo)?/?$", re.IGNORECASE)
+EMBY_SUBTITLE_STREAM_RE = re.compile(
+    r"^/emby/Videos/(?P<media_id>[^/]+)/(?P<source_id>[^/]+)/Subtitles/(?P<stream_index>\d+)/Stream\.(?:vtt|srt|ass)$",
+    re.IGNORECASE,
+)
 SUBTITLE_TRACK_BOOTSTRAP = """
 <script>
 (function () {
@@ -238,8 +248,142 @@ def inject_subtitle_track_bootstrap(text):
     return text + SUBTITLE_TRACK_BOOTSTRAP
 
 
+def parse_emby_subtitle_stream_path(path):
+    parsed = urllib.parse.urlparse(path)
+    match = EMBY_SUBTITLE_STREAM_RE.match(parsed.path)
+    if not match:
+        return None
+    query = urllib.parse.parse_qs(parsed.query)
+    track_values = query.get("mp_track") or []
+    track_index = int(track_values[0]) if track_values and str(track_values[0]).isdigit() else None
+    stream_index = int(match.group("stream_index"))
+    return {
+        "media_id": urllib.parse.unquote(match.group("media_id")),
+        "source_id": urllib.parse.unquote(match.group("source_id")),
+        "stream_index": stream_index,
+        "track_index": track_index if track_index is not None else max(0, stream_index - 1),
+    }
+
+
+def parse_emby_item_media_id(path):
+    parsed = urllib.parse.urlparse(path)
+    match = EMBY_ITEM_ID_RE.match(parsed.path)
+    if not match:
+        return ""
+    return urllib.parse.unquote(match.group("media_id"))
+
+
+def inject_emby_subtitle_streams(payload, media_id, tracks):
+    if not isinstance(payload, dict) or not media_id or not tracks:
+        return False
+    media_sources = payload.get("MediaSources")
+    if not isinstance(media_sources, list):
+        return False
+    changed = False
+    for source in media_sources:
+        if not isinstance(source, dict):
+            continue
+        streams = source.get("MediaStreams")
+        if not isinstance(streams, list):
+            continue
+        if any(isinstance(stream, dict) and stream.get("Type") == "Subtitle" for stream in streams):
+            continue
+        source_id = str(source.get("Id") or media_id)
+        next_index = max([int(stream.get("Index") or 0) for stream in streams if isinstance(stream, dict)] + [-1]) + 1
+        for track_index, track in enumerate(tracks):
+            if not isinstance(track, dict):
+                continue
+            label = str(track.get("label") or track.get("lang") or "Subtitle")
+            language = str(track.get("lang") or "und")
+            stream_index = next_index + track_index
+            delivery_url = "/emby/Videos/%s/%s/Subtitles/%d/Stream.vtt?mp_track=%d" % (
+                urllib.parse.quote(str(media_id), safe=""),
+                urllib.parse.quote(source_id, safe=""),
+                stream_index,
+                track_index,
+            )
+            streams.append(
+                {
+                    "Index": stream_index,
+                    "Type": "Subtitle",
+                    "Codec": "webvtt",
+                    "Language": language,
+                    "DisplayTitle": label,
+                    "Title": label,
+                    "IsExternal": True,
+                    "IsForced": False,
+                    "IsDefault": track_index == 0,
+                    "IsTextSubtitleStream": True,
+                    "SupportsExternalStream": True,
+                    "DeliveryMethod": "External",
+                    "DeliveryUrl": delivery_url,
+                }
+            )
+            changed = True
+    return changed
+
+
+class MsgApiAuthenticator:
+    def __init__(self, base_url=DEFAULT_MSG_API_BASE_URL, username="", password=""):
+        self.base_url = str(base_url or DEFAULT_MSG_API_BASE_URL).rstrip("/")
+        self.username = str(username or "")
+        self.password = str(password or "")
+        self._access_token = ""
+        self._refresh_token = ""
+        self._token_expires_at = 0
+        self._lock = threading.Lock()
+
+    def authorization_header(self):
+        token = self.access_token()
+        return "Bearer %s" % token
+
+    def access_token(self):
+        if self._access_token and time.time() < self._token_expires_at:
+            return self._access_token
+        with self._lock:
+            if self._access_token and time.time() < self._token_expires_at:
+                return self._access_token
+            self._login()
+            return self._access_token
+
+    def clear(self):
+        with self._lock:
+            self._access_token = ""
+            self._refresh_token = ""
+            self._token_expires_at = 0
+
+    def _login(self):
+        if not self.username or not self.password:
+            raise RuntimeError("subtitle proxy MSG credentials missing")
+        payload = json.dumps({"username": self.username, "password": self.password}).encode("utf-8")
+        request = urllib.request.Request(
+            self.base_url + "/auth/login",
+            data=payload,
+            headers={"Content-Type": "application/json", "Accept-Encoding": "identity"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:200]
+            raise RuntimeError("subtitle proxy MSG login failed: HTTP %s %s" % (exc.code, detail)) from exc
+        except (OSError, TimeoutError, ValueError) as exc:
+            raise RuntimeError("subtitle proxy MSG login failed: %s" % exc) from exc
+
+        tokens = body.get("tokens") if isinstance(body, dict) else None
+        access_token = (tokens or {}).get("access_token")
+        refresh_token = (tokens or {}).get("refresh_token")
+        if not access_token:
+            raise RuntimeError("subtitle proxy MSG login response missing access token")
+        self._access_token = str(access_token)
+        self._refresh_token = str(refresh_token or "")
+        self._token_expires_at = time.time() + 50 * 60
+
+
 class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
     upstream_base_url = DEFAULT_SUBTITLE_PROXY_UPSTREAM
+    msg_api_auth = None
 
     def do_GET(self):
         self._proxy()
@@ -247,22 +391,35 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         self._proxy(head_only=True)
 
-    def _proxy(self, head_only=False):
-        upstream_url = urllib.parse.urljoin(self.upstream_base_url.rstrip("/") + "/", self.path.lstrip("/"))
+    def do_POST(self):
+        self._proxy(method="POST")
+
+    def _proxy(self, head_only=False, method=None):
+        method = method or ("HEAD" if head_only else "GET")
+        request_body = None
+        if method not in ("GET", "HEAD"):
+            try:
+                content_length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                content_length = 0
+            request_body = self.rfile.read(content_length) if content_length > 0 else b""
         headers = {
             key: value
             for key, value in self.headers.items()
-            if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() != "host"
+            if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() not in ("host", "content-length")
         }
+        if method == "GET" and not head_only and self._serve_emby_subtitle_stream(headers):
+            return
+        upstream_url = urllib.parse.urljoin(self.upstream_base_url.rstrip("/") + "/", self.path.lstrip("/"))
         headers["Accept-Encoding"] = "identity"
-        request = urllib.request.Request(upstream_url, headers=headers, method="HEAD" if head_only else "GET")
+        request = urllib.request.Request(upstream_url, data=request_body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 body = b"" if head_only else response.read()
-                self._write_response(response.status, response.headers, body, head_only=head_only)
+                self._write_response(response.status, response.headers, body, head_only=head_only, request_headers=headers, request_path=self.path)
         except urllib.error.HTTPError as exc:
             body = b"" if head_only else exc.read()
-            self._write_response(exc.code, exc.headers, body, head_only=head_only)
+            self._write_response(exc.code, exc.headers, body, head_only=head_only, request_headers=headers, request_path=self.path)
         except (OSError, TimeoutError) as exc:
             self.send_response(502)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -270,12 +427,110 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             if not head_only:
                 self.wfile.write(("subtitle proxy upstream error: %s\n" % exc).encode("utf-8"))
 
-    def _write_response(self, status, headers, body, head_only=False):
+    def _serve_emby_subtitle_stream(self, request_headers):
+        stream_request = parse_emby_subtitle_stream_path(self.path)
+        if not stream_request:
+            return False
+        tracks = self._fetch_msg_subtitle_tracks(stream_request["media_id"])
+        track_index = stream_request["track_index"]
+        if track_index < 0 or track_index >= len(tracks):
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"subtitle track not found\n")
+            return True
+        track_path = tracks[track_index].get("path")
+        if not track_path:
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"subtitle path missing\n")
+            return True
+        query = urllib.parse.urlencode({"path": track_path})
+        upstream_path = "/api/subtitles/%s?%s" % (urllib.parse.quote(stream_request["media_id"], safe=""), query)
+        try:
+            status, headers, body = self._read_msg_api(upstream_path[len("/api") :])
+        except RuntimeError as exc:
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(("subtitle proxy MSG subtitle stream error: %s\n" % exc).encode("utf-8"))
+            return True
+        self._write_response(status, headers, body, request_headers=request_headers, request_path=self.path)
+        return True
+
+    def _fetch_msg_subtitle_tracks(self, media_id):
+        try:
+            status, _headers, body = self._read_msg_api("/media/%s/subtitles" % urllib.parse.quote(str(media_id), safe=""))
+        except RuntimeError as exc:
+            print("subtitle proxy MSG subtitle list error: %s" % exc, flush=True)
+            return []
+        if status < 200 or status >= 300 or not body:
+            print("subtitle proxy MSG subtitle list HTTP %s for media %s" % (status, media_id), flush=True)
+            return []
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (TypeError, ValueError):
+            print("subtitle proxy MSG subtitle list invalid JSON for media %s" % media_id, flush=True)
+            return []
+        tracks = payload.get("tracks") if isinstance(payload, dict) else None
+        if not isinstance(tracks, list):
+            return []
+        return [track for track in tracks if isinstance(track, dict) and track.get("path")]
+
+    def _read_msg_api(self, path, retry_auth=True):
+        if self.msg_api_auth is None:
+            raise RuntimeError("subtitle proxy MSG auth is not configured")
+        upstream_url = urllib.parse.urljoin(self.msg_api_auth.base_url.rstrip("/") + "/", str(path).lstrip("/"))
+        headers = {
+            "Accept-Encoding": "identity",
+            "Authorization": self.msg_api_auth.authorization_header(),
+        }
+        request = urllib.request.Request(upstream_url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            if exc.code == 401 and retry_auth:
+                self.msg_api_auth.clear()
+                return self._read_msg_api(path, retry_auth=False)
+            return exc.code, exc.headers, body
+
+    def _read_upstream(self, path, request_headers):
+        upstream_url = urllib.parse.urljoin(self.upstream_base_url.rstrip("/") + "/", str(path).lstrip("/"))
+        headers = {
+            key: value
+            for key, value in (request_headers or {}).items()
+            if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() != "host"
+        }
+        headers["Accept-Encoding"] = "identity"
+        request = urllib.request.Request(upstream_url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers, exc.read()
+
+    def _write_response(self, status, headers, body, head_only=False, request_headers=None, request_path=None):
         content_type = headers.get("Content-Type", "")
         no_store = False
         if not head_only and body and should_normalize_subtitle(content_type, body):
             body = normalize_webvtt_timestamps(body.decode("utf-8", "replace")).encode("utf-8")
             content_type = "text/vtt; charset=utf-8"
+        elif not head_only and body and "application/json" in (content_type or "").lower():
+            media_id = parse_emby_item_media_id(request_path or "")
+            if media_id:
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except (TypeError, ValueError):
+                    payload = None
+                if isinstance(payload, dict):
+                    tracks = self._fetch_msg_subtitle_tracks(media_id)
+                    if inject_emby_subtitle_streams(payload, media_id, tracks):
+                        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                        content_type = "application/json; charset=utf-8"
+                        no_store = True
         elif not head_only and body and "text/html" in (content_type or "").lower():
             body = inject_subtitle_track_bootstrap(body.decode("utf-8", "replace")).encode("utf-8")
             no_store = True
@@ -308,8 +563,20 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
-def run_subtitle_proxy(host=DEFAULT_SUBTITLE_PROXY_HOST, port=DEFAULT_SUBTITLE_PROXY_PORT, upstream=DEFAULT_SUBTITLE_PROXY_UPSTREAM):
+def run_subtitle_proxy(
+    host=DEFAULT_SUBTITLE_PROXY_HOST,
+    port=DEFAULT_SUBTITLE_PROXY_PORT,
+    upstream=DEFAULT_SUBTITLE_PROXY_UPSTREAM,
+    msg_api_base_url=None,
+    msg_admin_user=None,
+    msg_admin_password=None,
+):
     SubtitleProxyHandler.upstream_base_url = upstream
+    SubtitleProxyHandler.msg_api_auth = MsgApiAuthenticator(
+        msg_api_base_url or os.environ.get("MSG_BASE_URL") or DEFAULT_MSG_API_BASE_URL,
+        msg_admin_user if msg_admin_user is not None else os.environ.get("MSG_ADMIN_USER", ""),
+        msg_admin_password if msg_admin_password is not None else os.environ.get("MSG_ADMIN_PASSWORD", ""),
+    )
     server = ThreadingHTTPServer((host, port), SubtitleProxyHandler)
     print("subtitle proxy listening on %s:%s upstream=%s" % (host, port, upstream), flush=True)
     try:

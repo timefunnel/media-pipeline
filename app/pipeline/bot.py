@@ -996,6 +996,17 @@ class PipelineBotService:
             emit({"msg_scrape_status": "running", "msg_media_id": media_id, "msg_media_title": media_title})
             get_msg_client().scrape_media(media_id)
             emit({"msg_scrape_status": "success", "msg_media_id": media_id, "msg_media_title": media_title})
+        visibility_result = prefixed_task_fields(progress, "msg_visibility_repair_")
+        if category in ("tv", "anime"):
+            if not stage_is_complete(progress.get("msg_visibility_repair_status")):
+                emit({"msg_visibility_repair_status": "running", "msg_visibility_repair_error": None})
+                visibility_result = self._repair_msg_episode_visibility(category, media_id)
+                if visibility_result.get("msg_visibility_repair_status") == "skipped":
+                    apply_progress(visibility_result)
+                else:
+                    emit(visibility_result)
+            else:
+                apply_progress(visibility_result)
         artwork_result = prefixed_task_fields(progress, "msg_artwork_repair_")
         if root.get("media_type") == "adult":
             if not stage_is_complete(progress.get("msg_artwork_repair_status")):
@@ -1021,7 +1032,23 @@ class PipelineBotService:
             "msg_synced_at": int(time.time()),
             **clean_result,
             **format_result,
+            **visibility_result,
             **artwork_result,
+        }
+
+    def _repair_msg_episode_visibility(self, category, media_id):
+        result = self._build_msg_db_client().repair_episode_visibility(category, media_id=media_id)
+        if not isinstance(result, dict):
+            raise RuntimeError("MediaStationGo episode visibility repair returned invalid response")
+        status = result.get("status")
+        if status not in ("success", "skipped"):
+            raise RuntimeError("MediaStationGo episode visibility repair returned invalid status: %s" % (status or "-"))
+        return {
+            "msg_visibility_repair_status": status,
+            "msg_visibility_repair_updated": int(result.get("updated") or 0),
+            "msg_visibility_repair_media_count": int(result.get("media_count") or 0),
+            "msg_visibility_repair_reason": result.get("reason"),
+            "msg_visibility_repair_error": None,
         }
 
     def _repair_msg_adult_artwork(self, client, media_id):
@@ -2613,6 +2640,7 @@ def task_sync_is_running(task):
             "openlist_adult_format_status",
             "msg_scan_status",
             "msg_scrape_status",
+            "msg_visibility_repair_status",
             "msg_artwork_repair_status",
         )
     )
@@ -2637,6 +2665,9 @@ def mark_current_sync_stage_failed(task, error):
         task["msg_scan_status"] = "failed"
     elif task.get("msg_scrape_status") == "running":
         task["msg_scrape_status"] = "failed"
+    elif task.get("msg_visibility_repair_status") == "running":
+        task["msg_visibility_repair_status"] = "failed"
+        task["msg_visibility_repair_error"] = error
     elif task.get("msg_artwork_repair_status") == "running":
         task["msg_artwork_repair_status"] = "failed"
         task["msg_artwork_repair_error"] = error
@@ -3947,6 +3978,15 @@ def append_task_lines(lines, task, category=None):
             lines.append("MSG刮削：进行中")
         else:
             lines.append("MSG刮削：失败")
+    if category in ("tv", "anime") and task.get("msg_visibility_repair_status"):
+        if task.get("msg_visibility_repair_status") == "success":
+            lines.append("MSG可见性修复：已完成（%s 项）" % (task.get("msg_visibility_repair_updated") or 0))
+        elif task.get("msg_visibility_repair_status") == "running":
+            lines.append("MSG可见性修复：进行中")
+        elif task.get("msg_visibility_repair_status") != "skipped":
+            lines.append("MSG可见性修复：失败")
+            if task.get("msg_visibility_repair_error"):
+                lines.append("可见性修复错误：%s" % task.get("msg_visibility_repair_error"))
     if category == "adult" and task.get("msg_artwork_repair_status"):
         if task.get("msg_artwork_repair_status") == "success":
             lines.append("成人图片修复：已完成（%s 项）" % (task.get("msg_artwork_repair_updated") or 0))

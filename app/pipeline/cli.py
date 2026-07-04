@@ -53,6 +53,9 @@ def build_parser():
     subtitle_proxy_parser.add_argument("--listen-host", default=os.environ.get("MSG_SUBTITLE_PROXY_HOST", DEFAULT_SUBTITLE_PROXY_HOST))
     subtitle_proxy_parser.add_argument("--listen-port", type=int, default=int(os.environ.get("MSG_SUBTITLE_PROXY_PORT", DEFAULT_SUBTITLE_PROXY_PORT)))
     subtitle_proxy_parser.add_argument("--upstream", default=os.environ.get("MSG_SUBTITLE_PROXY_UPSTREAM", DEFAULT_SUBTITLE_PROXY_UPSTREAM))
+    subtitle_proxy_parser.add_argument("--msg-base-url", default=os.environ.get("MSG_BASE_URL", DEFAULT_MSG_BASE_URL))
+    subtitle_proxy_parser.add_argument("--msg-admin-user", default=os.environ.get("MSG_ADMIN_USER", ""))
+    subtitle_proxy_parser.add_argument("--msg-admin-password", default=os.environ.get("MSG_ADMIN_PASSWORD", ""))
 
     msg_scan_parser = subparsers.add_parser("msg-scan")
     msg_scan_parser.add_argument("--category", choices=sorted(FOLDER_IDS.keys()), required=True)
@@ -103,7 +106,14 @@ def main(argv=None):
         return 0
 
     if args.command == "subtitle-proxy":
-        run_subtitle_proxy(host=args.listen_host, port=args.listen_port, upstream=args.upstream)
+        run_subtitle_proxy(
+            host=args.listen_host,
+            port=args.listen_port,
+            upstream=args.upstream,
+            msg_api_base_url=args.msg_base_url,
+            msg_admin_user=args.msg_admin_user,
+            msg_admin_password=args.msg_admin_password,
+        )
         return 0
 
     if args.command == "msg-scan":
