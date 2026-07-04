@@ -3268,6 +3268,22 @@ class CategoryConfigTest(unittest.TestCase):
         self.assertEqual(candidates[0]["total_size"], 300)
         self.assertEqual(target["target_openlist_path"], "/115/动漫/成龙历险记")
 
+    def test_msgdb_rewrites_cloud_play_strm_url_when_migrating_paths(self):
+        from pipeline.msgdb import replace_strm_url_prefix
+
+        old_path = "/115/\u5267\u96c6/\u6210\u9f99\u5386\u9669\u8bb0"
+        new_path = "/115/\u52a8\u6f2b/\u6210\u9f99\u5386\u9669\u8bb0"
+        url = (
+            "/api/cloud/play/openlist?ref="
+            "%2F115%2F%E5%89%A7%E9%9B%86%2F%E6%88%90%E9%BE%99%E5%8E%86%E9%99%A9%E8%AE%B0"
+            "%2F%E6%88%90%E9%BE%99%E5%8E%86%E9%99%A9%E8%AE%B0+%E7%AC%AC01%E9%9B%86.mp4"
+        )
+
+        rewritten = replace_strm_url_prefix(url, old_path, new_path)
+
+        self.assertIn("%2F115%2F%E5%8A%A8%E6%BC%AB%2F%E6%88%90%E9%BE%99%E5%8E%86%E9%99%A9%E8%AE%B0", rewritten)
+        self.assertNotIn("%2F115%2F%E5%89%A7%E9%9B%86%2F%E6%88%90%E9%BE%99%E5%8E%86%E9%99%A9%E8%AE%B0", rewritten)
+
     def test_routes_movie_tv_anime_adult_and_other_to_separate_115_folders(self):
         self.assertEqual(category_to_folder_id("movie"), "3464134653584082023")
         self.assertEqual(category_to_folder_id("tv"), "3465137076394001831")

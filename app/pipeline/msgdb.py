@@ -110,6 +110,11 @@ class MediaStationDbClient:
                 for row in rows:
                     new_path = replace_path_prefix(row["path"], source_cloud_path, target_cloud_path)
                     new_relative_path = cloud_relative_path(new_path, target_root_cloud_path)
+                    new_strm_url = replace_strm_url_prefix(
+                        row.get("strm_url"),
+                        candidate["source_openlist_path"],
+                        target["target_openlist_path"],
+                    )
                     conn.execute(
                         """
                         update media
@@ -117,10 +122,18 @@ class MediaStationDbClient:
                             library_root_id = %s,
                             path = %s,
                             relative_path = %s,
+                            strm_url = %s,
                             updated_at = now()
                         where id = %s
                         """,
-                        (target_root["library_id"], target_root["root_id"], new_path, new_relative_path, row["id"]),
+                        (
+                            target_root["library_id"],
+                            target_root["root_id"],
+                            new_path,
+                            new_relative_path,
+                            new_strm_url,
+                            row["id"],
+                        ),
                     )
 
                 if series_ids:
@@ -129,8 +142,21 @@ class MediaStationDbClient:
                         (target_root["library_id"], series_ids),
                     )
 
-                self._update_strm_records(conn, media_ids, source_cloud_path, target_cloud_path)
-                self._assert_media_rows_migrated(conn, media_ids, target_root, target_cloud_path)
+                self._update_strm_records(
+                    conn,
+                    media_ids,
+                    source_cloud_path,
+                    target_cloud_path,
+                    candidate["source_openlist_path"],
+                    target["target_openlist_path"],
+                )
+                self._assert_media_rows_migrated(
+                    conn,
+                    media_ids,
+                    target_root,
+                    target_cloud_path,
+                    candidate["source_openlist_path"],
+                )
 
         return {
             "source_openlist_path": candidate["source_openlist_path"],
@@ -159,7 +185,7 @@ class MediaStationDbClient:
             params = (source_cloud_path, source_cloud_path + "/%")
         return conn.execute(
             """
-            select id, library_id, library_root_id, series_id, path, relative_path, file_id
+            select id, library_id, library_root_id, series_id, path, relative_path, file_id, strm_url
             from media
             where deleted_at is null and """ + condition + """
             for update
@@ -198,16 +224,26 @@ class MediaStationDbClient:
         if rows:
             raise RuntimeError("refuse partial series migration: %s" % rows[0]["series_id"])
 
-    def _update_strm_records(self, conn, media_ids, source_cloud_path, target_cloud_path):
+    def _update_strm_records(
+        self,
+        conn,
+        media_ids,
+        source_cloud_path,
+        target_cloud_path,
+        source_openlist_path,
+        target_openlist_path,
+    ):
+        source_ref_prefix = encode_openlist_ref_prefix(source_openlist_path)
+        target_ref_prefix = encode_openlist_ref_prefix(target_openlist_path)
         conn.execute(
             """
             update strm_records
             set file_path = case
-                    when file_path = %s or file_path like %s then replace(file_path, %s, %s)
+                    when file_path is not null then replace(replace(file_path, %s, %s), %s, %s)
                     else file_path
                 end,
                 url = case
-                    when url = %s or url like %s then replace(url, %s, %s)
+                    when url is not null then replace(replace(url, %s, %s), %s, %s)
                     else url
                 end,
                 updated_at = now()
@@ -215,18 +251,18 @@ class MediaStationDbClient:
             """,
             (
                 source_cloud_path,
-                source_cloud_path + "/%",
+                target_cloud_path,
+                source_ref_prefix,
+                target_ref_prefix,
                 source_cloud_path,
                 target_cloud_path,
-                source_cloud_path,
-                source_cloud_path + "/%",
-                source_cloud_path,
-                target_cloud_path,
+                source_ref_prefix,
+                target_ref_prefix,
                 media_ids,
             ),
         )
 
-    def _assert_media_rows_migrated(self, conn, media_ids, target_root, target_cloud_path):
+    def _assert_media_rows_migrated(self, conn, media_ids, target_root, target_cloud_path, source_openlist_path=None):
         row = conn.execute(
             """
             select count(*) as bad_count
@@ -242,6 +278,19 @@ class MediaStationDbClient:
         ).fetchone()
         if int(row["bad_count"] or 0) != 0:
             raise RuntimeError("MediaStationGo migration read-back validation failed")
+        if source_openlist_path:
+            source_ref_prefix = encode_openlist_ref_prefix(source_openlist_path)
+            row = conn.execute(
+                """
+                select count(*) as stale_count
+                from media
+                where id = any(%s)
+                  and coalesce(strm_url, '') like %s
+                """,
+                (media_ids, "%" + source_ref_prefix + "%"),
+            ).fetchone()
+            if int(row["stale_count"] or 0) != 0:
+                raise RuntimeError("MediaStationGo migration strm_url validation failed")
 
     def _ensure_cloud_media_guard(self, conn):
         library_ids = [root["library_id"] for root in MSG_LIBRARY_ROOTS.values()]
@@ -400,6 +449,38 @@ def replace_path_prefix(path, old_prefix, new_prefix):
     if str(path or "").startswith(old_prefix.rstrip("/") + "/"):
         return new_prefix.rstrip("/") + str(path)[len(old_prefix.rstrip("/")) :]
     raise ValueError("path does not start with source prefix: %s" % path)
+
+
+def replace_strm_url_prefix(strm_url, old_openlist_path, new_openlist_path):
+    if strm_url is None:
+        return None
+    value = str(strm_url)
+    for old_prefix, new_prefix in openlist_ref_prefix_pairs(old_openlist_path, new_openlist_path):
+        value = value.replace(old_prefix, new_prefix)
+    old_raw = normalize_openlist_path(old_openlist_path)
+    new_raw = normalize_openlist_path(new_openlist_path)
+    return value.replace(old_raw, new_raw)
+
+
+def openlist_ref_prefix_pairs(old_openlist_path, new_openlist_path):
+    old_path = normalize_openlist_path(old_openlist_path)
+    new_path = normalize_openlist_path(new_openlist_path)
+    pairs = [
+        (urllib.parse.quote_plus(old_path, safe=""), urllib.parse.quote_plus(new_path, safe="")),
+        (urllib.parse.quote(old_path, safe=""), urllib.parse.quote(new_path, safe="")),
+    ]
+    unique = []
+    seen = set()
+    for old_prefix, new_prefix in pairs:
+        key = (old_prefix, new_prefix)
+        if key not in seen:
+            seen.add(key)
+            unique.append(key)
+    return unique
+
+
+def encode_openlist_ref_prefix(path):
+    return urllib.parse.quote_plus(normalize_openlist_path(path), safe="")
 
 
 def cloud_relative_path(path, root_cloud_path):
