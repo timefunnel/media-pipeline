@@ -40,7 +40,7 @@ Telegram Bot 搜索/候选分页/资源选择
 -> 成人图片修复
 ```
 
-结论：MediaStationGo 已经接入 Bot 主线。当前使用 OpenList 云盘媒体库 root 扫描方案，MSG 保留 `电影`、`剧集`、`成人`、`其他媒体` 四个 pipeline active root；Bot 侧分类仍由用户手动选择。成人内容在 MSG 单项刮削后会执行图片修复，避免 JavBus 图片 403 导致封面无法加载。Bot 的 `其他` 分类在 MSG 中显示为 `其他媒体`，按普通 movie 类型处理，用于承接不适合继续留在成人库的 no_match 内容。
+结论：MediaStationGo 已经接入 Bot 主线。当前使用 OpenList 云盘媒体库 root 扫描方案，MSG 保留 `电影`、`剧集`、`动漫`、`成人`、`其他媒体` 五个 pipeline active root；Bot 侧分类仍由用户手动选择。成人内容在 MSG 单项刮削后会执行图片修复，避免 JavBus 图片 403 导致封面无法加载。Bot 的 `其他` 分类在 MSG 中显示为 `其他媒体`，按普通 movie 类型处理，用于承接不适合继续留在成人库的 no_match 内容。
 
 ## 2. 总体架构
 
@@ -251,13 +251,14 @@ MSG guard trigger: pipeline_guard_msg_cloud_media
 26768071-73bb-4b5c-85f3-ad0dd84f9fd9 | 成人 | adult | cloud://openlist/115%2F%E6%88%90%E4%BA%BA
 d150a96c-b467-4c60-82f1-207ae5949045 | 电影 | movie | cloud://openlist/115%2F%E7%94%B5%E5%BD%B1
 b6c58f40-76dc-46b5-8f27-9e74d22e5e3d | 剧集 | tv | cloud://openlist/115%2F%E5%89%A7%E9%9B%86
+e1333358-17ff-4b90-82f0-663cec26c0df | 动漫 | anime | cloud://openlist/115%2F%E5%8A%A8%E6%BC%AB
 60067bc7-eb34-466c-8bf9-5654297a609f | 其他媒体 | movie | cloud://openlist/115%2F%E5%85%B6%E4%BB%96
 ```
 
 说明：
 
 - 历史自动分类库和临时测试库已从 MSG `libraries/library_roots` 中物理清理；未删除 115/OpenList 文件。
-- MSG `/libraries` 当前只应看到 `成人`、`电影`、`剧集`、`其他媒体` 四个 pipeline active 库。
+- MSG `/libraries` 当前只应看到 `成人`、`电影`、`剧集`、`动漫`、`其他媒体` 五个 pipeline active 库。
 - Bot 的 `其他` 分类在 MSG 中显示为 `其他媒体`，当前按 MSG `movie` 类型处理；不加入 `adult.library_ids`，不执行成人番号格式化和成人图片修复。
 - 2026-07-04 已将成人库中 `scrape_status=no_match` 或确认无法刮削的存量内容迁移到 `其他媒体`：OpenList `/115/其他` 当前 15 个目录，MSG `其他媒体` 当前 24 条 no_match 媒体；成人库 no_match 当前为 0。
 
@@ -275,6 +276,12 @@ tv:
   root_id=3d2e0cb4-3537-4f7d-8d79-9d4d5f1800df
   provider=tmdb
   media_type=tv
+
+anime:
+  library_id=e1333358-17ff-4b90-82f0-663cec26c0df
+  root_id=fc7058d6-0b32-4536-bb92-4755c488be55
+  provider=tmdb
+  media_type=anime
 
 adult:
   library_id=26768071-73bb-4b5c-85f3-ad0dd84f9fd9
@@ -302,12 +309,12 @@ cloud.boot_scan_enabled=false
 当前接入方式：
 
 - 常规同步通过 MediaStationGo API 登录、扫描和刮削；不由 Bot 直接写 MSG 数据库。
-- 115 任务完成后，Bot 直接扫描旧 OpenList 云盘 root：电影任务扫描电影库，剧集任务扫描剧集库，成人任务扫描成人库，其他任务扫描其他库。
+- 115 任务完成后，Bot 直接扫描旧 OpenList 云盘 root：电影任务扫描电影库，剧集任务扫描剧集库，动漫任务扫描动漫库，成人任务扫描成人库，其他任务扫描其他库。
 - scan 后通过标题、file_id、番号等查询 MediaStationGo 媒体。
 - 找到媒体后调用单项 `scrape_media`。
 - 成人内容单项刮削后，Bot 会读取媒体元数据，识别 `javbus/cdnbus/javsee/busjav` 图片 URL，并用实际可访问的 DMM/MGStage 候选替换 `poster_url/backdrop_url`。
 - `其他` 内容按 movie 类型走普通单项刮削，不执行成人图片修复。
-- MSG 数据库触发器 `pipeline_guard_msg_cloud_media` 保护当前四个云盘库的 `library_id/library_root_id/path/relative_path/file_id`，避免刮削把媒体重新分类或挪到其他 root。
+- MSG 数据库触发器 `pipeline_guard_msg_cloud_media` 保护当前五个云盘库的 `library_id/library_root_id/path/relative_path/file_id`，避免刮削把媒体重新分类或挪到其他 root。
 - 触发器不拦截标题、简介、海报、评分、年份、外部 ID、`scrape_status` 等元数据更新。
 - 如果 API 返回认证或扫描错误，Bot 记录失败状态，不伪装成功。
 
@@ -764,8 +771,8 @@ sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[
 - `msg_sync_status=running` 任务的后台恢复检查。
 - OpenList 清理失败、成人番号格式化失败的人工处理提示。
 - 提交前重复作品识别：相同 `info_hash`、成人番号、MediaStationGo 成人番号强拦截；普通标题相似弱提示。
-- `/dedupe_refresh` 手动导入 OpenList 现有库内容到 `dedupe_index`，提交前只查本地索引；当前已包含电影、剧集、成人、其他。
-- 历史自动分类库和临时测试库已从 MSG 中物理清理；当前活跃媒体库只保留成人、电影、剧集、其他媒体 4 个。
+- `/dedupe_refresh` 手动导入 OpenList 现有库内容到 `dedupe_index`，提交前只查本地索引；当前已包含电影、剧集、动漫、成人、其他。
+- 历史自动分类库和临时测试库已从 MSG 中物理清理；当前活跃媒体库只保留成人、电影、剧集、动漫、其他媒体 5 个。
 - 已关闭 MSG `scrape.auto_on_scan`，由 Bot 显式触发单项刮削。
 - 成人库历史 JavBus 图片已替换，当前 JavBus 相关海报/背景图计数为 0。
 - 成人库历史 DMM `now_printing` 占位图片已替换或清空，当前占位重定向计数为 0。

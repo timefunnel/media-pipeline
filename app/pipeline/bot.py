@@ -61,7 +61,7 @@ ACTIVE_115_FAST_POLL_INTERVAL_SECONDS = 2
 ACTIVE_115_SLOW_AFTER_POLLS = 10
 ACTIVE_115_SLOW_POLL_INTERVAL_SECONDS = 600
 ACTIVE_115_TIMEOUT_SECONDS = 7200
-CATEGORY_LABELS = {"movie": "电影库", "tv": "剧集库", "adult": "成人库", "other": "其他库"}
+CATEGORY_LABELS = {"movie": "电影库", "tv": "剧集库", "anime": "动漫库", "adult": "成人库", "other": "其他库"}
 ANIME_QUERY_HINT_PATTERN = re.compile(
     r"(anime|bangumi|mikan|nyaa|acg|动漫|動畫|动画|番剧|番劇|新番|日漫|"
     r"鬼灭|鬼滅|葬送|芙莉莲|芙莉蓮|海贼|海賊|火影|柯南|进击|進擊|咒术|咒術|"
@@ -74,6 +74,7 @@ CONTENT_PROFILE_LABELS = {
     "adult": "成人",
     "movie": "电影",
     "tv": "剧集",
+    "anime": "动漫",
     "other": "其他",
 }
 DEFAULT_SEARCH_CATEGORY = "movie"
@@ -99,7 +100,7 @@ HELP_TEXT = """直接发送关键词、番号或磁链即可。
 /dedupe_refresh 刷新已入库记录（需二次确认）
 /version 查看当前版本
 
-搜索结果里选择资源后，再选择入电影、剧集、成人或其他库。"""
+搜索结果里选择资源后，再选择入电影、剧集、动漫、成人或其他库。"""
 DEDUPE_REFRESH_WARNING_TEXT = """刷新已入库记录？
 
 这个操作会主动刷新 OpenList 目录并重建 Bot 的重复判断基线，可能增加网盘侧请求量，资源多时也会比较慢。
@@ -3577,6 +3578,9 @@ def library_choice_reply_markup(candidate_id, include_back=False):
         [
             {"text": "电影", "callback_data": "profile:movie:%s" % candidate_id},
             {"text": "剧集", "callback_data": "profile:tv:%s" % candidate_id},
+            {"text": "动漫", "callback_data": "profile:anime:%s" % candidate_id},
+        ],
+        [
             {"text": "成人", "callback_data": "profile:adult:%s" % candidate_id},
             {"text": "其他", "callback_data": "profile:other:%s" % candidate_id},
         ],

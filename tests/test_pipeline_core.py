@@ -506,11 +506,12 @@ class TelegramBotTest(unittest.TestCase):
             self.assertIn("链接类型：磁链", sent["text"])
             self.assertIn("info_hash：ABCDEF1234567890", sent["text"])
             buttons = [button for row in sent["reply_markup"]["inline_keyboard"] for button in row]
-            self.assertEqual([button["text"] for button in buttons], ["电影", "剧集", "成人", "其他"])
+            self.assertEqual([button["text"] for button in buttons], ["电影", "剧集", "动漫", "成人", "其他"])
             self.assertRegex(buttons[0]["callback_data"], r"^profile:movie:\d+$")
             self.assertRegex(buttons[1]["callback_data"], r"^profile:tv:\d+$")
-            self.assertRegex(buttons[2]["callback_data"], r"^profile:adult:\d+$")
-            self.assertRegex(buttons[3]["callback_data"], r"^profile:other:\d+$")
+            self.assertRegex(buttons[2]["callback_data"], r"^profile:anime:\d+$")
+            self.assertRegex(buttons[3]["callback_data"], r"^profile:adult:\d+$")
+            self.assertRegex(buttons[4]["callback_data"], r"^profile:other:\d+$")
             candidate_id = int(buttons[0]["callback_data"].split(":")[-1])
             record = store.load_candidate(candidate_id)
             self.assertEqual(record["candidate"]["title"], "Sintel 1080p")
@@ -742,12 +743,13 @@ class TelegramBotTest(unittest.TestCase):
             self.assertIn("链接类型：磁链", telegram.messages[0]["text"])
             self.assertIn("info_hash：BBB", telegram.messages[0]["text"])
             buttons = [button for row in telegram.messages[0]["reply_markup"]["inline_keyboard"] for button in row]
-            self.assertEqual([button["text"] for button in buttons], ["电影", "剧集", "成人", "其他", "返回选种"])
+            self.assertEqual([button["text"] for button in buttons], ["电影", "剧集", "动漫", "成人", "其他", "返回选种"])
             self.assertEqual(buttons[0]["callback_data"], "profile:movie:%s" % candidate_id)
             self.assertEqual(buttons[1]["callback_data"], "profile:tv:%s" % candidate_id)
-            self.assertEqual(buttons[2]["callback_data"], "profile:adult:%s" % candidate_id)
-            self.assertEqual(buttons[3]["callback_data"], "profile:other:%s" % candidate_id)
-            self.assertEqual(buttons[4]["callback_data"], "close_choice:%s" % candidate_id)
+            self.assertEqual(buttons[2]["callback_data"], "profile:anime:%s" % candidate_id)
+            self.assertEqual(buttons[3]["callback_data"], "profile:adult:%s" % candidate_id)
+            self.assertEqual(buttons[4]["callback_data"], "profile:other:%s" % candidate_id)
+            self.assertEqual(buttons[5]["callback_data"], "close_choice:%s" % candidate_id)
 
     def test_callback_back_from_library_choice_closes_choice_message_without_researching(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -847,7 +849,7 @@ class TelegramBotTest(unittest.TestCase):
         self.assertIn("入库目录：剧集库", telegram.messages[0]["text"])
         self.assertIn("内容分类：剧集", telegram.messages[0]["text"])
 
-    def test_callback_profile_submit_rejects_removed_anime_profile_without_submitting(self):
+    def test_callback_profile_submit_allows_anime_profile(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -873,9 +875,13 @@ class TelegramBotTest(unittest.TestCase):
                     }
                 }
             )
+            record = store.load_task("ANIME")
 
-        self.assertEqual(service.submit_calls, [])
-        self.assertEqual(telegram.answers, [{"callback_query_id": "cb-anime", "text": "不支持的内容分类"}])
+        self.assertEqual(service.submit_calls, [("anime", "magnet:?xt=urn:btih:ANIME")])
+        self.assertEqual(record["category"], "anime")
+        self.assertEqual(record["task"]["content_profile"], "anime")
+        self.assertIn("入库目录：动漫库", telegram.messages[0]["text"])
+        self.assertIn("内容分类：动漫", telegram.messages[0]["text"])
 
     def test_callback_submit_uses_selected_library_and_saved_magnet_without_researching(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -2986,21 +2992,24 @@ class PipelineBotServiceTest(unittest.TestCase):
 
 
 class CategoryConfigTest(unittest.TestCase):
-    def test_routes_movie_tv_adult_and_other_to_separate_115_folders(self):
+    def test_routes_movie_tv_anime_adult_and_other_to_separate_115_folders(self):
         self.assertEqual(category_to_folder_id("movie"), "3464134653584082023")
         self.assertEqual(category_to_folder_id("tv"), "3465137076394001831")
+        self.assertEqual(category_to_folder_id("anime"), "3465784028030830531")
         self.assertEqual(category_to_folder_id("adult"), "3464134590896014943")
         self.assertEqual(category_to_folder_id("other"), "3465205291639899794")
 
-    def test_routes_movie_tv_adult_and_other_to_openlist_paths(self):
+    def test_routes_movie_tv_anime_adult_and_other_to_openlist_paths(self):
         self.assertEqual(category_to_openlist_path("movie"), "/115/电影")
         self.assertEqual(category_to_openlist_path("tv"), "/115/剧集")
+        self.assertEqual(category_to_openlist_path("anime"), "/115/动漫")
         self.assertEqual(category_to_openlist_path("adult"), "/115/成人")
         self.assertEqual(category_to_openlist_path("other"), "/115/其他")
 
-    def test_routes_movie_tv_adult_and_other_to_mediastation_roots(self):
+    def test_routes_movie_tv_anime_adult_and_other_to_mediastation_roots(self):
         movie = category_to_msg_library_root("movie")
         tv = category_to_msg_library_root("tv")
+        anime = category_to_msg_library_root("anime")
         adult = category_to_msg_library_root("adult")
         other = category_to_msg_library_root("other")
 
@@ -3009,6 +3018,10 @@ class CategoryConfigTest(unittest.TestCase):
         self.assertEqual(tv["library_id"], "b6c58f40-76dc-46b5-8f27-9e74d22e5e3d")
         self.assertEqual(tv["root_id"], "3d2e0cb4-3537-4f7d-8d79-9d4d5f1800df")
         self.assertEqual(tv["media_type"], "tv")
+        self.assertEqual(anime["library_id"], "e1333358-17ff-4b90-82f0-663cec26c0df")
+        self.assertEqual(anime["root_id"], "fc7058d6-0b32-4536-bb92-4755c488be55")
+        self.assertEqual(anime["provider"], "tmdb")
+        self.assertEqual(anime["media_type"], "anime")
         self.assertEqual(adult["library_id"], "26768071-73bb-4b5c-85f3-ad0dd84f9fd9")
         self.assertEqual(adult["root_id"], "3fe479e8-4a96-4e61-9f69-fa802e448446")
         self.assertEqual(other["library_id"], "60067bc7-eb34-466c-8bf9-5654297a609f")
