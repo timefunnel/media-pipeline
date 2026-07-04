@@ -2052,7 +2052,44 @@ class TelegramBotTest(unittest.TestCase):
 
             bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "missing movie"}})
 
-            self.assertEqual(telegram.messages[0]["text"], "未找到可用资源")
+            self.assertIn("未找到可用资源：missing movie", telegram.messages[0]["text"])
+            self.assertEqual(
+                [(button["text"], button["callback_data"].split(":", 1)[0]) for button in telegram.messages[0]["reply_markup"]["inline_keyboard"][-2]],
+                [("🔞", "adult_search"), ("动漫", "anime_search")],
+            )
+
+    def test_empty_search_result_keeps_retry_buttons(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                search_results=[],
+                adult_search_results=[{"title": "Missing adult", "download_uri": "magnet:?xt=urn:btih:BBB", "rank": 1, "seeders": 0}],
+            )
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "missing movie"}})
+            retry_row = telegram.messages[0]["reply_markup"]["inline_keyboard"][-2]
+
+            self.assertIn("未找到可用资源：missing movie", telegram.messages[0]["text"])
+            self.assertEqual([(button["text"], button["callback_data"].split(":", 1)[0]) for button in retry_row], [("🔞", "adult_search"), ("动漫", "anime_search")])
+
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-empty-adult-search",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 701},
+                        "data": retry_row[0]["callback_data"],
+                    }
+                }
+            )
+
+            self.assertEqual(service.adult_search_calls, [("missing movie", 30)])
+            self.assertEqual(len(telegram.messages), 2)
+            self.assertIn("成人源搜索结果：missing movie", telegram.messages[1]["text"])
 
     def test_search_timeout_replies_to_user_without_silent_failure(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot

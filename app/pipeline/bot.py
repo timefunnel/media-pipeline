@@ -1048,7 +1048,7 @@ class TelegramBot:
                 candidates = self.service.search(query, category, limit=self.config.search_limit)
         except RuntimeError as exc:
             if "no acceptable resource" in str(exc):
-                self.telegram.send_message(chat_id, "未找到可用资源")
+                self._send_empty_search_page(user_id, chat_id, category, query)
                 return
             self.telegram.send_message(chat_id, "搜索失败：%s" % exc)
             return
@@ -1056,7 +1056,7 @@ class TelegramBot:
             self.telegram.send_message(chat_id, "搜索失败：%s" % exc)
             return
         if not candidates:
-            self.telegram.send_message(chat_id, "未找到可用资源")
+            self._send_empty_search_page(user_id, chat_id, category, query)
             return
 
         candidate_ids = []
@@ -1066,6 +1066,11 @@ class TelegramBot:
         session_id = self.store.save_search_session(user_id, chat_id, category, query, candidate_ids)
         text, reply_markup = self._render_search_page(session_id, page=0)
 
+        self.telegram.send_message(chat_id, text, reply_markup=reply_markup)
+
+    def _send_empty_search_page(self, user_id, chat_id, category, query):
+        session_id = self.store.save_search_session(user_id, chat_id, category, query, [])
+        text, reply_markup = self._render_search_page(session_id, page=0)
         self.telegram.send_message(chat_id, text, reply_markup=reply_markup)
 
     def _handle_callback(self, callback):
@@ -1621,7 +1626,9 @@ class TelegramBot:
         is_adult_session = session["category"] == "adult"
         is_anime_session = session["category"] == "anime"
         title = "搜索结果"
-        if is_adult_session:
+        if not candidate_ids:
+            title = "未找到可用资源"
+        elif is_adult_session:
             title = "成人源搜索结果"
         elif is_anime_session:
             title = "动漫源搜索结果"
