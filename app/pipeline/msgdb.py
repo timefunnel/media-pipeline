@@ -219,6 +219,73 @@ class MediaStationDbClient:
             "reason": "repaired" if updates else "already_valid",
         }
 
+    def repair_movie_extras(self, category, media_id=None):
+        if category != "movie":
+            return {"status": "skipped", "updated": 0, "reason": "not_movie_library"}
+        if not media_id:
+            return {"status": "skipped", "updated": 0, "reason": "media_id_missing"}
+
+        root = category_to_msg_library_root(category)
+        root_openlist_path = category_to_openlist_path(category)
+        with self._connect() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    select id, path
+                    from media
+                    where deleted_at is null
+                      and library_id = %s
+                      and library_root_id = %s
+                      and id = %s
+                    for update
+                    """,
+                    (root["library_id"], root["root_id"], media_id),
+                ).fetchone()
+                if not row:
+                    raise RuntimeError("MediaStationGo movie extra cleanup target not found")
+                source_path, source_kind = media_work_item_path(cloud_path_to_openlist_path(row.get("path")), root_openlist_path)
+                source_cloud_path = openlist_path_to_cloud_path(source_path)
+                if source_kind == "file":
+                    condition = "path = %s"
+                    params = (source_cloud_path,)
+                else:
+                    condition = "(path = %s or path like %s)"
+                    params = (source_cloud_path, source_cloud_path + "/%")
+                rows = conn.execute(
+                    """
+                    select id, path, title
+                    from media
+                    where deleted_at is null
+                      and library_id = %s
+                      and library_root_id = %s
+                      and """ + condition + """
+                    for update
+                    """,
+                    (root["library_id"], root["root_id"], *params),
+                ).fetchall()
+                extra_ids = [
+                    item["id"]
+                    for item in rows
+                    if item["id"] != media_id and movie_media_row_looks_like_extra(item, source_path)
+                ]
+                if extra_ids:
+                    conn.execute(
+                        """
+                        update media
+                        set deleted_at = now(),
+                            updated_at = now()
+                        where id = any(%s)
+                        """,
+                        (extra_ids,),
+                    )
+
+        return {
+            "status": "success",
+            "updated": len(extra_ids),
+            "media_count": len(rows),
+            "reason": "extras_deleted" if extra_ids else "already_clean",
+        }
+
     def _connect(self):
         if self._connect_override is not None:
             return self._connect_override()
@@ -577,6 +644,39 @@ def positive_int(value):
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def movie_media_row_looks_like_extra(row, source_openlist_path):
+    path = cloud_path_to_openlist_path(row.get("path"))
+    if not path_is_same_or_child(path, source_openlist_path):
+        return False
+    relative = path[len(normalize_openlist_path(source_openlist_path)) :].strip("/")
+    parts = [part for part in relative.split("/") if part]
+    if len(parts) <= 1:
+        return False
+    text = "/".join(parts[:-1] + [posixpath.splitext(parts[-1])[0]])
+    normalized = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", text).lower()
+    tokens = {
+        "bonus",
+        "extra",
+        "extras",
+        "gallery",
+        "images",
+        "menu",
+        "pv",
+        "specials",
+        "tokuten",
+        "予告",
+        "图集",
+        "映像特典",
+        "特典",
+        "特典映像",
+        "特报",
+        "花絮",
+        "菜单",
+        "预告",
+    }
+    return any(re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", token).lower() in normalized for token in tokens)
 
 
 def build_migration_target(candidate, target_category):

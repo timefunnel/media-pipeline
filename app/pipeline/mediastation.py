@@ -126,6 +126,17 @@ class MediaStationClient:
             },
         )
 
+    def search_scrape_matches(self, media_id, query, provider, media_type):
+        params = urllib.parse.urlencode({"query": query, "provider": provider, "media_type": media_type})
+        return self._request("GET", "/media/%s/scrape/search?%s" % (quote_path(media_id), params))
+
+    def apply_scrape_match(self, media_id, match):
+        if not isinstance(match, dict):
+            raise ValueError("MediaStationGo scrape match must be an object")
+        data = dict(match)
+        data["episode_images"] = False
+        return self._request("POST", "/media/%s/scrape/apply" % quote_path(media_id), data=data)
+
     def get_media(self, media_id):
         return self._request("GET", "/media/%s" % quote_path(media_id))
 
@@ -360,6 +371,10 @@ def reachable_image_url(url, timeout=8):
 
 def extract_media_items(response):
     return extract_items(response, ("items", "media", "medias", "results", "list", "content", "records"))
+
+
+def extract_scrape_matches(response):
+    return extract_items(response, ("items", "matches", "results", "list", "content", "records"))
 
 
 def extract_library_items(response):

@@ -2574,6 +2574,46 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["msg_media_id"], "media-1")
         self.assertIsNone(task["msg_error"])
 
+    def test_sync_completed_movie_task_applies_unique_clean_scrape_match(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        title = "[DBD-Raws][4K_SDR][哥斯拉之终极战役][正片+特典映像][2160P][UHDBDRip][HEVC-10bit][简繁外挂][FLACx3][MKV]"
+        media = {
+            "id": "media-1",
+            "library_id": "d150a96c-b467-4c60-82f1-207ae5949045",
+            "title": title,
+            "path": "cloud://openlist/115/电影/%s/[DBD-Raws][4K_SDR][Godzilla Final Wars][Ver.A][2160P].mkv" % title,
+        }
+        fake_msg = FakeMediaStationClient(
+            search_response={"data": {"items": [media]}},
+            scrape_search_responses={"Godzilla Final Wars": {"items": [{"source": "tmdb", "tmdb_id": 15767, "title": "哥斯拉之终极战役"}]}},
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
+        ), patch("pipeline.bot.OpenListClient", side_effect=lambda url, token: RetryOpenList([])), patch(
+            "pipeline.bot.MediaStationDbClient"
+        ) as db_cls:
+            db_cls.return_value.repair_movie_extras.return_value = {"status": "success", "updated": 0, "media_count": 1}
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    msg_sync_poll_seconds=0,
+                    openlist_pre_scan_clean_enabled=False,
+                )
+            )
+            task = service.sync_completed_task("movie", title, {"info_hash": "ABC", "status_name": "success", "name": title})
+
+        self.assertEqual(fake_msg.scrape_calls, [])
+        self.assertEqual(fake_msg.scrape_apply_calls[0][0], "media-1")
+        self.assertEqual(task["msg_scrape_mode"], "apply")
+        self.assertEqual(task["msg_scrape_query"], "Godzilla Final Wars")
+
     def test_sync_completed_anime_task_repairs_episode_visibility_after_scrape(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
@@ -2649,7 +2689,8 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
             "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
-        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist):
+        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist), patch("pipeline.bot.MediaStationDbClient") as db_cls:
+            db_cls.return_value.repair_movie_extras.return_value = {"status": "success", "updated": 1, "media_count": 2}
             service = PipelineBotService(
                 BotConfig(
                     "token",
@@ -2836,6 +2877,35 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         self.assertEqual(result["openlist_clean_target"], "/root/Movie A")
         self.assertEqual(fake_openlist.remove_calls, [("/root/Movie A", ["ad.mp4"])])
+
+    def test_clean_openlist_movie_pack_hides_extra_directories_without_deleting_them(self):
+        from pipeline.bot import clean_openlist_task_media
+
+        fake_openlist = CleaningOpenList(
+            {
+                "/root": [{"name": "Godzilla Pack", "is_dir": True, "size": 0}],
+                "/root/Godzilla Pack": [
+                    {"name": "main.mkv", "is_dir": False, "size": 8 * 1024 * 1024 * 1024},
+                    {"name": "PV", "is_dir": True, "size": 0},
+                    {"name": "特典映像", "is_dir": True, "size": 0},
+                    {"name": "图集", "is_dir": True, "size": 0},
+                ],
+            }
+        )
+
+        result = clean_openlist_task_media(
+            fake_openlist,
+            "/root",
+            ["Godzilla Pack"],
+            hide_extra_scan_items=True,
+        )
+
+        self.assertEqual(fake_openlist.remove_calls, [])
+        self.assertEqual(result["openlist_hidden_count"], 3)
+        self.assertEqual(fake_openlist.meta_hide_calls[0][0], "/root/Godzilla Pack")
+        self.assertIn("^PV$", fake_openlist.meta_hide_calls[0][1])
+        self.assertIn("^特典映像$", fake_openlist.meta_hide_calls[0][1])
+        self.assertIn("^图集$", fake_openlist.meta_hide_calls[0][1])
 
     def test_sync_completed_adult_task_formats_code_before_mediastation_scan(self):
         from pipeline.bot import BotConfig, PipelineBotService
@@ -3587,6 +3657,28 @@ class CategoryConfigTest(unittest.TestCase):
         self.assertEqual(updates[1]["relative_path"], "Show/Show 1080p.mkv")
         self.assertEqual(updates[1]["season_num"], 1)
         self.assertEqual(updates[1]["episode_num"], 2)
+
+    def test_msgdb_detects_movie_extra_rows_under_pack_subfolders(self):
+        from pipeline.msgdb import movie_media_row_looks_like_extra
+
+        self.assertTrue(
+            movie_media_row_looks_like_extra(
+                {
+                    "path": "cloud://openlist/115/电影/Godzilla Pack/PV/[DBD-Raws][Godzilla Final Wars][PV][01].mkv",
+                    "title": "pv",
+                },
+                "/115/电影/Godzilla Pack",
+            )
+        )
+        self.assertFalse(
+            movie_media_row_looks_like_extra(
+                {
+                    "path": "cloud://openlist/115/电影/Godzilla Pack/[DBD-Raws][Godzilla Final Wars][Ver.A].mkv",
+                    "title": "Godzilla Pack",
+                },
+                "/115/电影/Godzilla Pack",
+            )
+        )
 
     def test_routes_movie_tv_anime_adult_and_other_to_separate_115_folders(self):
         self.assertEqual(category_to_folder_id("movie"), "3464134653584082023")
@@ -5096,6 +5188,7 @@ class CleaningOpenList:
         self.remove_calls = []
         self.rename_calls = []
         self.move_calls = []
+        self.meta_hide_calls = []
 
     def list_path(self, path, refresh=False):
         self.events.append(("openlist", path, refresh))
@@ -5118,6 +5211,11 @@ class CleaningOpenList:
     def move_names(self, src_dir, dst_dir, names):
         self.move_calls.append((src_dir, dst_dir, list(names)))
         self.events.append(("move", src_dir, dst_dir, tuple(names)))
+        return {"code": 200, "message": "success"}
+
+    def upsert_meta_hide(self, path, hide_patterns, h_sub=True):
+        self.meta_hide_calls.append((path, list(hide_patterns), h_sub))
+        self.events.append(("meta_hide", path, tuple(hide_patterns), h_sub))
         return {"code": 200, "message": "success"}
 
     def get_path(self, path):
@@ -5148,15 +5246,18 @@ class Retry115Client:
 
 
 class FakeMediaStationClient:
-    def __init__(self, search_response=None, list_response=None, events=None, artwork_repair_response=None):
+    def __init__(self, search_response=None, list_response=None, events=None, artwork_repair_response=None, scrape_search_responses=None):
         self.search_response = search_response or {"data": {"items": []}}
         self.list_response = list_response or {"data": {"items": []}}
         self.events = events
         self.artwork_repair_response = artwork_repair_response or {"status": "skipped", "updated": 0, "reason": "not_needed"}
+        self.scrape_search_responses = scrape_search_responses or {}
         self.scan_calls = []
         self.search_calls = []
         self.list_calls = []
         self.scrape_calls = []
+        self.scrape_search_calls = []
+        self.scrape_apply_calls = []
         self.artwork_repair_calls = []
 
     def scan_root(self, library_id, root_id):
@@ -5175,6 +5276,17 @@ class FakeMediaStationClient:
 
     def scrape_media(self, media_id):
         self.scrape_calls.append(media_id)
+        return {"ok": True}
+
+    def get_media(self, media_id):
+        return {}
+
+    def search_scrape_matches(self, media_id, query, provider, media_type):
+        self.scrape_search_calls.append((media_id, query, provider, media_type))
+        return self.scrape_search_responses.get(query, {"items": []})
+
+    def apply_scrape_match(self, media_id, match):
+        self.scrape_apply_calls.append((media_id, match))
         return {"ok": True}
 
     def repair_adult_artwork(self, media_id):

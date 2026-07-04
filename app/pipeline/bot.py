@@ -23,6 +23,7 @@ from pipeline.mediastation import (
     iter_code_matches,
     extract_media_id,
     extract_media_items,
+    extract_scrape_matches,
     find_matching_media,
     media_haystack,
 )
@@ -124,6 +125,58 @@ VIDEO_EXTENSIONS = {
     ".vob",
     ".webm",
     ".wmv",
+}
+EXTRA_SCAN_NAME_TOKENS = {
+    "bonus",
+    "cm",
+    "extra",
+    "extras",
+    "gallery",
+    "image",
+    "images",
+    "menu",
+    "menus",
+    "pv",
+    "pvs",
+    "sample",
+    "special",
+    "specials",
+    "tokuten",
+    "trailer",
+    "trailers",
+    "予告",
+    "图集",
+    "映像特典",
+    "特典",
+    "特典映像",
+    "特報",
+    "特报",
+    "花絮",
+    "菜单",
+    "預告",
+    "预告",
+}
+SCRAPE_QUERY_NOISE = {
+    "4khdr",
+    "4ksdr",
+    "aac",
+    "bdremux",
+    "dbdraws",
+    "flac",
+    "flacx3",
+    "hdr",
+    "hevc10bit",
+    "imax",
+    "mkv",
+    "mp4",
+    "uhdbdrip",
+    "webdl",
+    "x264",
+    "x265",
+    "正片",
+    "正片特典映像",
+    "特典映像",
+    "简繁外挂",
 }
 TYPING_ACTION_INTERVAL_SECONDS = 4
 
@@ -979,6 +1032,7 @@ class PipelineBotService:
         media_id = progress.get("msg_media_id")
         media_title = progress.get("msg_media_title")
         root = category_to_msg_library_root(category)
+        media = None
 
         if progress.get("msg_scan_status") != "success" or not media_id:
             get_openlist_client()
@@ -994,8 +1048,19 @@ class PipelineBotService:
 
         if progress.get("msg_scrape_status") != "success":
             emit({"msg_scrape_status": "running", "msg_media_id": media_id, "msg_media_title": media_title})
-            get_msg_client().scrape_media(media_id)
-            emit({"msg_scrape_status": "success", "msg_media_id": media_id, "msg_media_title": media_title})
+            scrape_result = self._scrape_msg_media(get_msg_client(), category, media_id, title, progress, media)
+            emit({"msg_scrape_status": "success", "msg_media_id": media_id, "msg_media_title": media_title, **scrape_result})
+        extras_result = prefixed_task_fields(progress, "msg_extra_cleanup_")
+        if category == "movie" and int(clean_result.get("openlist_hidden_count") or 0) > 0:
+            if not stage_is_complete(progress.get("msg_extra_cleanup_status")):
+                emit({"msg_extra_cleanup_status": "running", "msg_extra_cleanup_error": None})
+                extras_result = self._repair_msg_movie_extras(category, media_id)
+                if extras_result.get("msg_extra_cleanup_status") == "skipped":
+                    apply_progress(extras_result)
+                else:
+                    emit(extras_result)
+            else:
+                apply_progress(extras_result)
         visibility_result = prefixed_task_fields(progress, "msg_visibility_repair_")
         if category in ("tv", "anime"):
             if not stage_is_complete(progress.get("msg_visibility_repair_status")):
@@ -1032,8 +1097,42 @@ class PipelineBotService:
             "msg_synced_at": int(time.time()),
             **clean_result,
             **format_result,
+            **extras_result,
             **visibility_result,
             **artwork_result,
+        }
+
+    def _scrape_msg_media(self, client, category, media_id, title, task, media=None):
+        root = category_to_msg_library_root(category)
+        provider = root.get("provider")
+        media_type = root.get("media_type")
+        if category != "adult" and provider and media_type:
+            if media is None:
+                try:
+                    media = client.get_media(media_id)
+                except RuntimeError:
+                    media = None
+            for query in msg_scrape_queries(title, task, media):
+                matches = extract_scrape_matches(client.search_scrape_matches(media_id, query, provider, media_type))
+                if len(matches) == 1:
+                    client.apply_scrape_match(media_id, matches[0])
+                    return {"msg_scrape_mode": "apply", "msg_scrape_query": query}
+        client.scrape_media(media_id)
+        return {"msg_scrape_mode": "smart", "msg_scrape_query": None}
+
+    def _repair_msg_movie_extras(self, category, media_id):
+        result = self._build_msg_db_client().repair_movie_extras(category, media_id=media_id)
+        if not isinstance(result, dict):
+            raise RuntimeError("MediaStationGo movie extra cleanup returned invalid response")
+        status = result.get("status")
+        if status not in ("success", "skipped"):
+            raise RuntimeError("MediaStationGo movie extra cleanup returned invalid status: %s" % (status or "-"))
+        return {
+            "msg_extra_cleanup_status": status,
+            "msg_extra_cleanup_updated": int(result.get("updated") or 0),
+            "msg_extra_cleanup_media_count": int(result.get("media_count") or 0),
+            "msg_extra_cleanup_reason": result.get("reason"),
+            "msg_extra_cleanup_error": None,
         }
 
     def _repair_msg_episode_visibility(self, category, media_id):
@@ -1102,6 +1201,7 @@ class PipelineBotService:
                 media_search_queries(title, task),
                 task=task,
                 max_bytes=self.config.openlist_pre_scan_clean_max_bytes,
+                hide_extra_scan_items=category == "movie",
             )
         except (RuntimeError, ValueError) as exc:
             return {
@@ -2640,6 +2740,7 @@ def task_sync_is_running(task):
             "openlist_adult_format_status",
             "msg_scan_status",
             "msg_scrape_status",
+            "msg_extra_cleanup_status",
             "msg_visibility_repair_status",
             "msg_artwork_repair_status",
         )
@@ -2665,6 +2766,9 @@ def mark_current_sync_stage_failed(task, error):
         task["msg_scan_status"] = "failed"
     elif task.get("msg_scrape_status") == "running":
         task["msg_scrape_status"] = "failed"
+    elif task.get("msg_extra_cleanup_status") == "running":
+        task["msg_extra_cleanup_status"] = "failed"
+        task["msg_extra_cleanup_error"] = error
     elif task.get("msg_visibility_repair_status") == "running":
         task["msg_visibility_repair_status"] = "failed"
         task["msg_visibility_repair_error"] = error
@@ -3000,6 +3104,35 @@ def media_search_queries(title, task):
     return out
 
 
+def msg_scrape_queries(title, task, media=None):
+    values = []
+    for value in (title, (task or {}).get("name"), (task or {}).get("file_name")):
+        if value:
+            values.append(str(value))
+    if isinstance(media, dict):
+        for key in ("title", "name", "original_name", "file_name", "filename", "path", "file_path", "source_path", "relative_path"):
+            value = media.get(key)
+            if value:
+                values.append(str(value))
+
+    candidates = []
+    for value in values:
+        candidates.extend(extract_codes(value))
+        candidates.extend(extract_title_fragments(value, allow_english=True))
+
+    out = []
+    seen = set()
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if not is_useful_scrape_query(text):
+            continue
+        key = normalize_fragment(text)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out
+
+
 def duplicate_media_queries(category, query, candidate):
     values = []
     for value in (query, (candidate or {}).get("title"), (candidate or {}).get("name"), (candidate or {}).get("file_name")):
@@ -3040,17 +3173,17 @@ def unique_nonempty_values(values):
     return out
 
 
-def extract_title_fragments(value):
+def extract_title_fragments(value, allow_english=False):
     text = str(value or "")
     fragments = []
     for match in re.finditer(r"[\[\(（【](.*?)[\]\)）】]", text):
         fragment = match.group(1).strip()
-        if is_useful_title_fragment(fragment):
+        if is_useful_title_fragment(fragment, allow_english=allow_english):
             fragments.append(fragment)
     return fragments
 
 
-def is_useful_title_fragment(value):
+def is_useful_title_fragment(value, allow_english=False):
     if not value:
         return False
     normalized = normalize_fragment(value)
@@ -3072,7 +3205,26 @@ def is_useful_title_fragment(value):
         return True
     if re.search(r"[\u4e00-\u9fff]", value):
         return len(normalized) >= 2
+    if allow_english and re.search(r"[A-Za-z]", value):
+        if normalized in SCRAPE_QUERY_NOISE:
+            return False
+        words = re.findall(r"[A-Za-z][A-Za-z0-9']*", value)
+        return len(words) >= 2 and len(normalized) >= 6
     return False
+
+
+def is_useful_scrape_query(value):
+    normalized = normalize_fragment(value)
+    if not normalized or normalized in SCRAPE_QUERY_NOISE:
+        return False
+    if normalized in {normalize_fragment(token) for token in EXTRA_SCAN_NAME_TOKENS}:
+        return False
+    if re.search(r"[\u4e00-\u9fff]", value):
+        return len(normalized) >= 2
+    if extract_codes(value):
+        return True
+    words = re.findall(r"[A-Za-z][A-Za-z0-9']*", str(value or ""))
+    return len(words) >= 2 and len(normalized) >= 6
 
 
 def normalize_fragment(value):
@@ -3092,12 +3244,20 @@ def media_display_title(media):
     return ""
 
 
-def clean_openlist_task_media(client, category_path, queries, task=None, max_bytes=DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES):
+def clean_openlist_task_media(
+    client,
+    category_path,
+    queries,
+    task=None,
+    max_bytes=DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES,
+    hide_extra_scan_items=False,
+):
     target = find_openlist_task_target(client, category_path, queries, task=task)
     if target is None:
         raise RuntimeError("OpenList target not found for cleanup")
 
     target_dir, target_item = target
+    target_path = openlist_item_path(target_dir, target_item)
     groups = defaultdict(list)
     cleaned_count = 0
     cleaned_bytes = 0
@@ -3114,11 +3274,18 @@ def clean_openlist_task_media(client, category_path, queries, task=None, max_byt
     for dir_path, names in sorted(groups.items()):
         client.remove_names(dir_path, names)
 
+    hidden_patterns = []
+    if hide_extra_scan_items and openlist_item_is_dir(target_item):
+        hidden_patterns = openlist_extra_scan_hide_patterns(client, target_path)
+        if hidden_patterns:
+            client.upsert_meta_hide(target_path, hidden_patterns, h_sub=True)
+
     return {
         "openlist_clean_status": "success",
-        "openlist_clean_target": openlist_item_path(target_dir, target_item),
+        "openlist_clean_target": target_path,
         "openlist_cleaned_count": cleaned_count,
         "openlist_cleaned_bytes": cleaned_bytes,
+        "openlist_hidden_count": len(hidden_patterns),
         "openlist_cleaned_at": int(time.time()),
         "openlist_clean_error": None,
     }
@@ -3296,6 +3463,38 @@ def iter_openlist_files(client, dir_path, item):
             yield from iter_openlist_files(client, child_dir, child)
         return
     yield dir_path, item
+
+
+def openlist_extra_scan_hide_patterns(client, target_path):
+    patterns = []
+    for item in client.list_all(target_path, refresh=False):
+        name = openlist_item_name(item)
+        if not name or not openlist_item_looks_like_extra_scan_item(item):
+            continue
+        patterns.append("^%s$" % re.escape(name))
+    return patterns
+
+
+def openlist_item_looks_like_extra_scan_item(item):
+    name = openlist_item_name(item)
+    if not name:
+        return False
+    stem = posixpath.splitext(name)[0] if not openlist_item_is_dir(item) else name
+    normalized = normalize_openlist_text(stem)
+    if normalized in {normalize_openlist_text(token) for token in EXTRA_SCAN_NAME_TOKENS}:
+        return True
+    if not openlist_item_is_dir(item) and is_openlist_video_file(item):
+        return extra_scan_name_contains_token(stem)
+    return False
+
+
+def extra_scan_name_contains_token(value):
+    normalized = normalize_openlist_text(value)
+    for token in EXTRA_SCAN_NAME_TOKENS:
+        token_normalized = normalize_openlist_text(token)
+        if token_normalized and token_normalized in normalized:
+            return True
+    return False
 
 
 def should_keep_openlist_file(item, max_bytes=DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES):
