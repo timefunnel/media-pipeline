@@ -3000,7 +3000,11 @@ def is_useful_title_fragment(value):
         return False
     if normalized in {"hevc10bit", "flac", "aac", "2160p", "1080p", "720p"}:
         return False
-    return bool(re.search(r"[\u4e00-\u9fff]", value)) or bool(extract_codes(value))
+    if extract_codes(value):
+        return True
+    if re.search(r"[\u4e00-\u9fff]", value):
+        return len(normalized) >= 2
+    return False
 
 
 def normalize_fragment(value):

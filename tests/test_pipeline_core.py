@@ -3254,6 +3254,20 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertNotIn("HEVC-10", queries)
 
 
+    def test_media_search_queries_ignores_single_character_chinese_fragment(self):
+        from pipeline.bot import media_search_queries
+
+        queries = media_search_queries(
+            "[Seed-Raws] \u79cb\u8272\u4e4b\u7a7a Aki Sora - \u51683\u8a71+\u7279\u5178 (\u4e73) (BD 720p AVC AAC).mp4 [\u4e00\u822c\u5411]",
+            {
+                "file_name": "[Seed-Raws] \u79cb\u8272\u4e4b\u7a7a Aki Sora - \u51683\u8a71+\u7279\u5178 (\u4e73) (BD 720p AVC AAC).mp4 [\u4e00\u822c\u5411]"
+            },
+        )
+
+        self.assertIn("\u79cb\u8272\u4e4b\u7a7a", " ".join(queries))
+        self.assertNotIn("\u4e73", queries)
+
+
 class CategoryConfigTest(unittest.TestCase):
     def test_msgdb_groups_episode_rows_into_one_migration_candidate(self):
         from pipeline.msgdb import build_migration_candidates, build_migration_target, cloud_path_to_openlist_path
