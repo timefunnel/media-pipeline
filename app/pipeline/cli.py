@@ -21,6 +21,12 @@ from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListToke
 from pipeline.openlist_tokens import OpenListTokenStore
 from pipeline.prowlarr import DEFAULT_PROWLARR_CONFIG, DEFAULT_PROWLARR_URL, ProwlarrClient, ProwlarrConfig, is_prowlarr_download_uri
 from pipeline.resource_selector import ResourceSelector
+from pipeline.subtitle_proxy import (
+    DEFAULT_SUBTITLE_PROXY_HOST,
+    DEFAULT_SUBTITLE_PROXY_PORT,
+    DEFAULT_SUBTITLE_PROXY_UPSTREAM,
+    run_subtitle_proxy,
+)
 
 
 DEFAULT_OPENLIST_DB = "/openlist-data/data.db"
@@ -42,6 +48,11 @@ def build_parser():
     subparsers.add_parser("probe")
     subparsers.add_parser("bot")
     subparsers.add_parser("msg-login")
+
+    subtitle_proxy_parser = subparsers.add_parser("subtitle-proxy")
+    subtitle_proxy_parser.add_argument("--listen-host", default=os.environ.get("MSG_SUBTITLE_PROXY_HOST", DEFAULT_SUBTITLE_PROXY_HOST))
+    subtitle_proxy_parser.add_argument("--listen-port", type=int, default=int(os.environ.get("MSG_SUBTITLE_PROXY_PORT", DEFAULT_SUBTITLE_PROXY_PORT)))
+    subtitle_proxy_parser.add_argument("--upstream", default=os.environ.get("MSG_SUBTITLE_PROXY_UPSTREAM", DEFAULT_SUBTITLE_PROXY_UPSTREAM))
 
     msg_scan_parser = subparsers.add_parser("msg-scan")
     msg_scan_parser.add_argument("--category", choices=sorted(FOLDER_IDS.keys()), required=True)
@@ -89,6 +100,10 @@ def main(argv=None):
     if args.command == "msg-login":
         build_msg_client(args).login()
         print(json.dumps({"authenticated": True}, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.command == "subtitle-proxy":
+        run_subtitle_proxy(host=args.listen_host, port=args.listen_port, upstream=args.upstream)
         return 0
 
     if args.command == "msg-scan":

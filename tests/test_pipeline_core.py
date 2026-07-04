@@ -36,6 +36,7 @@ from pipeline.openlist import OpenListClient, OpenListTokenProvider
 from pipeline.openlist_tokens import OpenListTokenStore
 from pipeline.prowlarr import ProwlarrClient, ProwlarrConfig, torrent_bytes_to_magnet
 from pipeline.resource_selector import ResourceSelector
+from pipeline.subtitle_proxy import normalize_webvtt_timestamps, redact_sensitive_query_values, should_normalize_subtitle
 
 
 class BotConfigTest(unittest.TestCase):
@@ -139,6 +140,42 @@ class BotConfigTest(unittest.TestCase):
         )
 
         self.assertEqual(config.sync_recovery_interval_seconds, 120)
+
+
+class SubtitleProxyTest(unittest.TestCase):
+    def test_normalize_webvtt_timestamps_pads_centiseconds(self):
+        text = "WEBVTT\n\n1\n00:00:06.06 --> 00:00:08.16\nhello\n"
+
+        normalized = normalize_webvtt_timestamps(text)
+
+        self.assertIn("00:00:06.060 --> 00:00:08.160", normalized)
+
+    def test_normalize_webvtt_timestamps_keeps_valid_milliseconds(self):
+        text = "WEBVTT\n\n1\n00:00:06.123 --> 00:00:08.456\nhello\n"
+
+        normalized = normalize_webvtt_timestamps(text)
+
+        self.assertEqual(normalized, text)
+
+    def test_normalize_webvtt_timestamps_does_not_change_caption_text(self):
+        text = "WEBVTT\n\n1\n00:00:06.06 --> 00:00:08.16\nprinted 00:00:01.2 as text\n"
+
+        normalized = normalize_webvtt_timestamps(text)
+
+        self.assertIn("printed 00:00:01.2 as text", normalized)
+
+    def test_should_normalize_subtitle_accepts_vtt_content_type_or_magic(self):
+        self.assertTrue(should_normalize_subtitle("text/vtt; charset=utf-8", b"bad"))
+        self.assertTrue(should_normalize_subtitle("text/plain", b"\nWEBVTT\n"))
+        self.assertFalse(should_normalize_subtitle("text/plain", b"not vtt"))
+
+    def test_redact_sensitive_query_values_hides_tokens(self):
+        message = 'GET /api/subtitles/id?path=x&token=secret-value&name=y HTTP/1.1'
+
+        redacted = redact_sensitive_query_values(message)
+
+        self.assertNotIn("secret-value", redacted)
+        self.assertIn("token=REDACTED", redacted)
 
 class CandidateStoreTest(unittest.TestCase):
     def test_candidate_store_persists_candidate_for_callback(self):

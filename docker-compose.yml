@@ -49,3 +49,18 @@ services:
       - /data/OpenList/data:/openlist-data:ro
       - /data/Prowlarr/config:/prowlarr-config:ro
       - /data/media-pipeline/bot:/bot-data
+
+  media-pipeline-subtitle-proxy:
+    build:
+      context: .
+      args:
+        MEDIA_PIPELINE_VERSION: "${MEDIA_PIPELINE_VERSION:-0.1.0}"
+        MEDIA_PIPELINE_REVISION: "${MEDIA_PIPELINE_REVISION:-unknown}"
+    container_name: media-pipeline-subtitle-proxy
+    network_mode: host
+    environment:
+      MSG_SUBTITLE_PROXY_HOST: "${MSG_SUBTITLE_PROXY_HOST:-127.0.0.1}"
+      MSG_SUBTITLE_PROXY_PORT: "${MSG_SUBTITLE_PROXY_PORT:-18081}"
+      MSG_SUBTITLE_PROXY_UPSTREAM: "${MSG_SUBTITLE_PROXY_UPSTREAM:-http://127.0.0.1:18080}"
+    restart: unless-stopped
+    command: ["subtitle-proxy"]
