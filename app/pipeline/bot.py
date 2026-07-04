@@ -26,6 +26,7 @@ from pipeline.mediastation import (
     find_matching_media,
     media_haystack,
 )
+from pipeline.msgdb import DEFAULT_MSG_DATABASE_DSN, MediaStationDbClient, build_migration_target
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes, task_can_cancel
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListTokenProvider
 from pipeline.openlist_tokens import OpenListTokenStore
@@ -97,6 +98,7 @@ HELP_TEXT = """直接发送关键词、番号或磁链即可。
 常用入口：
 /tasks 查看最近任务
 /status <info_hash> 查询任务状态
+/migrate <关键词> 迁移已有媒体到其他库
 /dedupe_refresh 刷新已入库记录（需二次确认）
 /version 查看当前版本
 
@@ -139,6 +141,7 @@ class BotConfig:
     prowlarr_search_timeout_seconds: int = DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS
     telegram_timeout: int = 90
     msg_base_url: str = DEFAULT_MSG_BASE_URL
+    msg_database_dsn: str = DEFAULT_MSG_DATABASE_DSN
     msg_admin_user: str = ""
     msg_admin_password: str = ""
     msg_enabled: bool = False
@@ -185,6 +188,7 @@ class BotConfig:
             ),
             telegram_timeout=int(env.get("TG_API_TIMEOUT", "90")),
             msg_base_url=env.get("MSG_BASE_URL", DEFAULT_MSG_BASE_URL),
+            msg_database_dsn=env.get("MSG_DATABASE_DSN", DEFAULT_MSG_DATABASE_DSN),
             msg_admin_user=msg_admin_user,
             msg_admin_password=msg_admin_password,
             msg_enabled=parse_bool(env.get("MSG_ENABLED"), bool(msg_admin_user and msg_admin_password)),
@@ -248,6 +252,18 @@ class CandidateStore:
                     category text not null,
                     query text not null,
                     candidate_ids_json text not null,
+                    created_at integer not null
+                )
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists migration_candidates (
+                    id integer primary key autoincrement,
+                    user_id integer not null,
+                    chat_id integer not null,
+                    query text not null,
+                    candidate_json text not null,
                     created_at integer not null
                 )
                 """
@@ -375,6 +391,44 @@ class CandidateStore:
                     "candidate_ids": candidate_ids,
                 }
         raise RuntimeError("search session not found for candidate: %s" % candidate_id)
+
+    def save_migration_candidate(self, user_id, chat_id, query, candidate):
+        payload = json.dumps(candidate, ensure_ascii=False, sort_keys=True)
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """
+                insert into migration_candidates (user_id, chat_id, query, candidate_json, created_at)
+                values (?, ?, ?, ?, ?)
+                """,
+                (int(user_id), int(chat_id), query or "", payload, int(time.time())),
+            )
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    def load_migration_candidate(self, candidate_id):
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                select user_id, chat_id, query, candidate_json
+                from migration_candidates
+                where id = ?
+                """,
+                (int(candidate_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            raise RuntimeError("migration candidate not found: %s" % candidate_id)
+        return {
+            "user_id": row[0],
+            "chat_id": row[1],
+            "query": row[2],
+            "candidate": json.loads(row[3]),
+        }
 
     def save_task(self, user_id, chat_id, category, title, task):
         info_hash = str((task or {}).get("info_hash") or "").strip()
@@ -658,6 +712,9 @@ class PipelineBotService:
     def search_anime(self, query, limit=DEFAULT_SEARCH_LIMIT):
         return self.search(query, "movie", limit=limit, profile=SEARCH_PROFILE_ANIME)
 
+    def search_migration_candidates(self, query, limit=20):
+        return self._build_msg_db_client().search_migration_candidates(query, limit=limit)
+
     def submit(self, category, download_uri):
         download_uri = self._resolve_download_uri(download_uri)
         result = summarize_submit(
@@ -682,6 +739,29 @@ class PipelineBotService:
 
     def cancel_task(self, category, info_hash):
         return self._call_115(category, lambda client: cancel_task_if_active(client, info_hash, max_pages=10))
+
+    def migrate_media_candidate(self, candidate, target_category):
+        target = build_migration_target(candidate, target_category)
+        db_client = self._build_msg_db_client()
+        db_client.validate_migration_target_available(candidate, target_category)
+
+        openlist_client = OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
+        source_path = candidate["source_openlist_path"]
+        if not openlist_child_exists(openlist_client, source_path):
+            raise RuntimeError("OpenList source not found: %s" % source_path)
+        if openlist_child_exists(openlist_client, target["target_openlist_path"]):
+            raise RuntimeError("OpenList target already exists: %s" % target["target_openlist_path"])
+
+        source_dir = posixpath.dirname(source_path.rstrip("/")) or "/"
+        source_name = posixpath.basename(source_path.rstrip("/"))
+        target_root = target["target_root_openlist_path"]
+        openlist_client.move_names(source_dir, target_root, [source_name])
+        openlist_client.list_path(source_dir, refresh=True)
+        openlist_client.list_path(target_root, refresh=True)
+
+        result = db_client.migrate_media_group(candidate, target_category)
+        result["openlist_moved"] = True
+        return result
 
     def check_duplicate(self, category, query, candidate):
         if not self.config.msg_enabled:
@@ -971,6 +1051,9 @@ class PipelineBotService:
             self.config.msg_admin_password,
         )
 
+    def _build_msg_db_client(self):
+        return MediaStationDbClient(self.config.msg_database_dsn)
+
 
 class TelegramBot:
     def __init__(self, config, telegram, store, service):
@@ -1011,6 +1094,10 @@ class TelegramBot:
         if command == "/status":
             with self._typing_action(chat_id):
                 self._handle_status_command(chat_id, user_id, argument)
+            return
+        if command == "/migrate":
+            with self._typing_action(chat_id):
+                self._handle_migrate_command(chat_id, user_id, argument)
             return
         if command == "/dedupe_refresh":
             self._handle_dedupe_refresh_command(chat_id)
@@ -1130,6 +1217,20 @@ class TelegramBot:
             return
         if action == "cancel":
             self._handle_cancel_callback(user_id, chat_id, message_id, callback_id, value)
+            return
+        if action == "migrate_select":
+            self._handle_migrate_select_callback(user_id, chat_id, message_id, callback_id, value)
+            return
+        if action == "migrate_to":
+            target_category, candidate_id = value
+            self._handle_migrate_to_callback(user_id, chat_id, message_id, callback_id, target_category, candidate_id)
+            return
+        if action == "migrate_confirm":
+            target_category, candidate_id = value
+            self._handle_migrate_confirm_callback(user_id, chat_id, message_id, callback_id, target_category, candidate_id)
+            return
+        if action == "migrate_cancel":
+            self._handle_migrate_cancel_callback(user_id, chat_id, message_id, callback_id, value)
             return
         if action == "dedupe_refresh_confirm":
             self._handle_dedupe_refresh_confirm_callback(chat_id, message_id, callback_id)
@@ -1516,6 +1617,108 @@ class TelegramBot:
             fallback_chat_id=record["chat_id"],
         )
 
+    def _handle_migrate_command(self, chat_id, user_id, argument):
+        query = str(argument or "").strip()
+        if not query:
+            self.telegram.send_message(chat_id, "请输入要迁移的媒体关键词，例如：/migrate 成龙历险记")
+            return
+        try:
+            candidates = self.service.search_migration_candidates(query, limit=20)
+        except (RuntimeError, ValueError) as exc:
+            self.telegram.send_message(chat_id, "迁移搜索失败：%s" % exc)
+            return
+        if not candidates:
+            self.telegram.send_message(chat_id, "未找到可迁移媒体：%s" % query)
+            return
+
+        saved = []
+        for candidate in candidates:
+            candidate_id = self.store.save_migration_candidate(user_id, chat_id, query, candidate)
+            saved.append((candidate_id, candidate))
+        self.telegram.send_message(
+            chat_id,
+            format_migration_search_message(query, saved),
+            reply_markup=migration_search_reply_markup(saved),
+        )
+
+    def _handle_migrate_select_callback(self, user_id, chat_id, message_id, callback_id, candidate_id):
+        record = self._load_owned_migration_candidate(user_id, callback_id, candidate_id)
+        if record is None:
+            return
+        self.telegram.answer_callback_query(callback_id, "请选择目标库")
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_migration_target_choice_message(record["candidate"]),
+            reply_markup=migration_target_choice_reply_markup(candidate_id, record["candidate"]),
+            fallback_chat_id=record["chat_id"],
+        )
+
+    def _handle_migrate_to_callback(self, user_id, chat_id, message_id, callback_id, target_category, candidate_id):
+        record = self._load_owned_migration_candidate(user_id, callback_id, candidate_id)
+        if record is None:
+            return
+        candidate = record["candidate"]
+        try:
+            target = build_migration_target(candidate, target_category)
+        except ValueError as exc:
+            self.telegram.answer_callback_query(callback_id, str(exc))
+            return
+        self.telegram.answer_callback_query(callback_id, "请确认迁移")
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_migration_confirm_message(candidate, target_category, target),
+            reply_markup=migration_confirm_reply_markup(candidate_id, target_category),
+            fallback_chat_id=record["chat_id"],
+        )
+
+    def _handle_migrate_confirm_callback(self, user_id, chat_id, message_id, callback_id, target_category, candidate_id):
+        record = self._load_owned_migration_candidate(user_id, callback_id, candidate_id)
+        if record is None:
+            return
+        candidate = record["candidate"]
+        self.telegram.answer_callback_query(callback_id, "开始迁移")
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_migration_running_message(candidate, target_category),
+            reply_markup={"inline_keyboard": []},
+            fallback_chat_id=record["chat_id"],
+        )
+        try:
+            with self._typing_action(chat_id or record["chat_id"]):
+                result = self.service.migrate_media_candidate(candidate, target_category)
+        except (RuntimeError, ValueError) as exc:
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                "迁移失败：%s" % exc,
+                reply_markup={"inline_keyboard": []},
+                fallback_chat_id=record["chat_id"],
+            )
+            return
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_migration_result_message(candidate, result),
+            reply_markup={"inline_keyboard": []},
+            fallback_chat_id=record["chat_id"],
+        )
+
+    def _handle_migrate_cancel_callback(self, user_id, chat_id, message_id, callback_id, candidate_id):
+        record = self._load_owned_migration_candidate(user_id, callback_id, candidate_id)
+        if record is None:
+            return
+        self.telegram.answer_callback_query(callback_id, "已取消迁移")
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            "已取消迁移：%s" % record["candidate"].get("title"),
+            reply_markup={"inline_keyboard": []},
+            fallback_chat_id=record["chat_id"],
+        )
+
     def _handle_status_command(self, chat_id, user_id, argument):
         info_hash = argument.strip()
         if not info_hash:
@@ -1679,6 +1882,17 @@ class TelegramBot:
             return None
         if record["user_id"] != user_id:
             self.telegram.answer_callback_query(callback_id, "无权操作此任务")
+            return None
+        return record
+
+    def _load_owned_migration_candidate(self, user_id, callback_id, candidate_id):
+        try:
+            record = self.store.load_migration_candidate(candidate_id)
+        except RuntimeError:
+            self.telegram.answer_callback_query(callback_id, "迁移候选不存在")
+            return None
+        if record["user_id"] != user_id:
+            self.telegram.answer_callback_query(callback_id, "无权操作此迁移")
             return None
         return record
 
@@ -3036,6 +3250,18 @@ def openlist_item_size(item):
         return 0
 
 
+def openlist_child_exists(client, path):
+    normalized = posixpath.normpath(str(path or "").strip())
+    if not normalized or normalized == ".":
+        raise ValueError("OpenList path must not be empty")
+    source_dir = posixpath.dirname(normalized.rstrip("/")) or "/"
+    source_name = posixpath.basename(normalized.rstrip("/"))
+    for item in client.list_all(source_dir, refresh=False):
+        if item.get("name") == source_name:
+            return True
+    return False
+
+
 def normalize_openlist_text(value):
     return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", str(value or "")).lower()
 
@@ -3079,6 +3305,14 @@ def parse_callback_data(value):
             return "force_submit", (parts[0], int(parts[1]), content_profile)
     if action in ("status", "cancel", "retry_msg") and payload:
         return action, payload
+    if action == "migrate_select" and payload:
+        return "migrate_select", int(payload)
+    if action in ("migrate_to", "migrate_confirm"):
+        target_category, sep, candidate_id = payload.partition(":")
+        if sep and target_category in CATEGORY_LABELS:
+            return action, (target_category, int(candidate_id))
+    if action == "migrate_cancel" and payload:
+        return "migrate_cancel", int(payload)
     if action in ("dedupe_refresh_confirm", "dedupe_refresh_cancel") and payload:
         return action, payload
     return None, None
@@ -3232,6 +3466,12 @@ def download_uri_label(value):
     if value:
         return "下载链接"
     return "-"
+
+
+def migration_source_kind_label(candidate):
+    if (candidate or {}).get("source_kind") == "file":
+        return "文件"
+    return "目录"
 
 
 def msg_sync_status_label(value):
@@ -3438,6 +3678,62 @@ def format_auto_cancel_result_message(title, result, task, category=None):
     return "\n".join(lines)
 
 
+def format_migration_search_message(query, candidates):
+    lines = ["媒体迁移搜索：%s" % query, "请选择要迁移的媒体。"]
+    for index, (_candidate_id, candidate) in enumerate(candidates, 1):
+        lines.append("%s. %s" % (index, candidate.get("title") or "-"))
+        lines.append(
+            "当前：%s  类型：%s  数量：%s  大小：%s"
+            % (
+                CATEGORY_LABELS.get(candidate.get("category"), candidate.get("library_name") or "-"),
+                migration_source_kind_label(candidate),
+                candidate.get("media_count") or 0,
+                format_size(candidate.get("total_size")),
+            )
+        )
+        lines.append("路径：%s" % candidate.get("source_openlist_path"))
+    return "\n".join(lines)
+
+
+def format_migration_target_choice_message(candidate):
+    lines = ["迁移媒体：%s" % (candidate.get("title") or "-")]
+    lines.append("当前库：%s" % CATEGORY_LABELS.get(candidate.get("category"), candidate.get("library_name") or "-"))
+    lines.append("媒体数量：%s" % (candidate.get("media_count") or 0))
+    lines.append("源路径：%s" % candidate.get("source_openlist_path"))
+    lines.append("请选择目标库。")
+    return "\n".join(lines)
+
+
+def format_migration_confirm_message(candidate, target_category, target):
+    lines = ["确认迁移？"]
+    lines.append("媒体：%s" % (candidate.get("title") or "-"))
+    lines.append("源库：%s" % CATEGORY_LABELS.get(candidate.get("category"), candidate.get("library_name") or "-"))
+    lines.append("目标库：%s" % CATEGORY_LABELS.get(target_category, target_category))
+    lines.append("媒体数量：%s" % (candidate.get("media_count") or 0))
+    lines.append("源路径：%s" % candidate.get("source_openlist_path"))
+    lines.append("目标路径：%s" % target.get("target_openlist_path"))
+    lines.append("将移动 OpenList/115 路径并更新 MSG 数据库；不会重新扫描或重新刮削。")
+    return "\n".join(lines)
+
+
+def format_migration_running_message(candidate, target_category):
+    return "正在迁移：%s -> %s" % (
+        candidate.get("source_openlist_path"),
+        CATEGORY_LABELS.get(target_category, target_category),
+    )
+
+
+def format_migration_result_message(candidate, result):
+    lines = ["迁移完成：%s" % (candidate.get("title") or "-")]
+    lines.append("源路径：%s" % result.get("source_openlist_path"))
+    lines.append("目标路径：%s" % result.get("target_openlist_path"))
+    lines.append("目标库：%s" % CATEGORY_LABELS.get(result.get("target_category"), result.get("target_category")))
+    lines.append("MSG媒体记录：%s" % (result.get("media_count") or 0))
+    if result.get("series_count"):
+        lines.append("剧集记录：%s" % result.get("series_count"))
+    return "\n".join(lines)
+
+
 def format_task_list_message(records, page=0, page_count=1, total=None):
     if total is None:
         total = len(records)
@@ -3618,6 +3914,43 @@ def library_choice_reply_markup(candidate_id, include_back=False):
     if include_back:
         rows.append([{"text": "返回结果", "callback_data": "close_choice:%s" % candidate_id}])
     return {"inline_keyboard": rows}
+
+
+def migration_search_reply_markup(candidates):
+    rows = []
+    for index, (candidate_id, _candidate) in enumerate(candidates, 1):
+        rows.append([{"text": "迁移 %s" % index, "callback_data": "migrate_select:%s" % candidate_id}])
+    return {"inline_keyboard": rows}
+
+
+def migration_target_choice_reply_markup(candidate_id, candidate):
+    rows = []
+    current = candidate.get("category")
+    first = []
+    for category in ("movie", "tv", "anime"):
+        if category != current:
+            first.append({"text": CATEGORY_LABELS[category].replace("库", ""), "callback_data": "migrate_to:%s:%s" % (category, candidate_id)})
+    if first:
+        rows.append(first)
+    second = []
+    for category in ("adult", "other"):
+        if category != current:
+            second.append({"text": CATEGORY_LABELS[category].replace("库", ""), "callback_data": "migrate_to:%s:%s" % (category, candidate_id)})
+    if second:
+        rows.append(second)
+    rows.append([{"text": "取消", "callback_data": "migrate_cancel:%s" % candidate_id}])
+    return {"inline_keyboard": rows}
+
+
+def migration_confirm_reply_markup(candidate_id, target_category):
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "确认迁移", "callback_data": "migrate_confirm:%s:%s" % (target_category, candidate_id)},
+                {"text": "取消", "callback_data": "migrate_cancel:%s" % candidate_id},
+            ]
+        ]
+    }
 
 
 def dedupe_refresh_confirm_reply_markup():

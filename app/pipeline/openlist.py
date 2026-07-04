@@ -134,3 +134,18 @@ class OpenListClient:
         if response.get("code") != 200:
             raise RuntimeError("OpenList rename failed: %s" % (response.get("message") or response.get("code")))
         return response
+
+    def move_names(self, src_dir, dst_dir, names):
+        names = [str(name) for name in names if str(name or "").strip()]
+        if not names:
+            raise ValueError("OpenList move names missing")
+        response = self.transport.request(
+            "POST",
+            self.base_url + "/api/fs/move",
+            headers={"Authorization": self.token},
+            data={"src_dir": src_dir, "dst_dir": dst_dir, "names": names},
+            timeout=self.timeout,
+        )
+        if response.get("code") != 200:
+            raise RuntimeError("OpenList move failed: %s" % (response.get("message") or response.get("code")))
+        return response

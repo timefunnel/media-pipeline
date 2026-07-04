@@ -68,6 +68,7 @@ class BotConfigTest(unittest.TestCase):
                 "TG_BOT_TOKEN": "123:token",
                 "TG_ALLOWED_USER_IDS": "700656624",
                 "MSG_BASE_URL": "http://127.0.0.1:18080/api",
+                "MSG_DATABASE_DSN": "postgresql://mediastation:mediastation@127.0.0.1:15432/mediastation",
                 "MSG_ADMIN_USER": "admin",
                 "MSG_ADMIN_PASSWORD": "secret",
                 "MSG_SYNC_POLL_SECONDS": "0",
@@ -76,6 +77,7 @@ class BotConfigTest(unittest.TestCase):
 
         self.assertTrue(config.msg_enabled)
         self.assertEqual(config.msg_base_url, "http://127.0.0.1:18080/api")
+        self.assertEqual(config.msg_database_dsn, "postgresql://mediastation:mediastation@127.0.0.1:15432/mediastation")
         self.assertEqual(config.msg_admin_user, "admin")
         self.assertEqual(config.msg_admin_password, "secret")
         self.assertEqual(config.msg_sync_poll_seconds, 0)
@@ -195,6 +197,30 @@ class CandidateStoreTest(unittest.TestCase):
         self.assertEqual(session["chat_id"], 9001)
         self.assertEqual(session["query"], "sintel")
         self.assertEqual(session["candidate_ids"], [first_id, second_id])
+
+    def test_candidate_store_persists_migration_candidate(self):
+        from pipeline.bot import CandidateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            candidate_id = store.save_migration_candidate(
+                700656624,
+                9001,
+                "成龙历险记",
+                {
+                    "title": "成龙历险记",
+                    "category": "tv",
+                    "source_openlist_path": "/115/剧集/成龙历险记",
+                    "media_count": 95,
+                },
+            )
+
+            loaded = store.load_migration_candidate(candidate_id)
+
+        self.assertEqual(loaded["user_id"], 700656624)
+        self.assertEqual(loaded["chat_id"], 9001)
+        self.assertEqual(loaded["query"], "成龙历险记")
+        self.assertEqual(loaded["candidate"]["source_openlist_path"], "/115/剧集/成龙历险记")
 
     def test_candidate_store_lists_running_msg_sync_tasks(self):
         from pipeline.bot import CandidateStore
@@ -389,6 +415,104 @@ class TelegramBotTest(unittest.TestCase):
         self.assertEqual(service.search_calls, [])
         self.assertIn("直接发送关键词、番号或磁链即可", telegram.messages[0]["text"])
         self.assertIn("/tasks 查看最近任务", telegram.messages[0]["text"])
+        self.assertIn("/migrate <关键词>", telegram.messages[0]["text"])
+
+    def test_migrate_command_searches_msg_and_prompts_candidates(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        migration_candidate = {
+            "title": "成龙历险记",
+            "category": "tv",
+            "library_name": "剧集",
+            "source_openlist_path": "/115/剧集/成龙历险记",
+            "source_kind": "folder",
+            "media_count": 95,
+            "total_size": 10 * 1024 * 1024 * 1024,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(migration_candidates=[migration_candidate])
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/migrate 成龙历险记"}})
+
+            button = telegram.messages[0]["reply_markup"]["inline_keyboard"][0][0]
+            candidate_id = int(button["callback_data"].split(":")[-1])
+            stored = store.load_migration_candidate(candidate_id)
+
+        self.assertEqual(service.migration_search_calls, [("成龙历险记", 20)])
+        self.assertEqual(service.search_calls, [])
+        self.assertIn("媒体迁移搜索：成龙历险记", telegram.messages[0]["text"])
+        self.assertIn("/115/剧集/成龙历险记", telegram.messages[0]["text"])
+        self.assertEqual(button["text"], "迁移 1")
+        self.assertEqual(stored["candidate"]["title"], "成龙历险记")
+
+    def test_migrate_callbacks_confirm_and_execute(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        migration_candidate = {
+            "title": "成龙历险记",
+            "category": "tv",
+            "library_name": "剧集",
+            "source_openlist_path": "/115/剧集/成龙历险记",
+            "source_kind": "folder",
+            "media_count": 95,
+            "total_size": 10 * 1024 * 1024 * 1024,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(migration_candidates=[migration_candidate])
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/migrate 成龙历险记"}})
+            select_button = telegram.messages[0]["reply_markup"]["inline_keyboard"][0][0]
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-migrate-select",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 701},
+                        "data": select_button["callback_data"],
+                    }
+                }
+            )
+            anime_button = [
+                button
+                for row in telegram.edits[-1]["reply_markup"]["inline_keyboard"]
+                for button in row
+                if button["callback_data"].startswith("migrate_to:anime:")
+            ][0]
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-migrate-to",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 701},
+                        "data": anime_button["callback_data"],
+                    }
+                }
+            )
+            confirm_button = telegram.edits[-1]["reply_markup"]["inline_keyboard"][0][0]
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-migrate-confirm",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 701},
+                        "data": confirm_button["callback_data"],
+                    }
+                }
+            )
+
+        self.assertEqual(telegram.answers[0], {"callback_query_id": "cb-migrate-select", "text": "请选择目标库"})
+        self.assertEqual(telegram.answers[1], {"callback_query_id": "cb-migrate-to", "text": "请确认迁移"})
+        self.assertEqual(telegram.answers[2], {"callback_query_id": "cb-migrate-confirm", "text": "开始迁移"})
+        self.assertIn("目标路径：/115/动漫/成龙历险记", telegram.edits[1]["text"])
+        self.assertEqual(service.migration_calls, [("/115/剧集/成龙历险记", "anime")])
+        self.assertIn("迁移完成：成龙历险记", telegram.edits[-1]["text"])
+        self.assertIn("目标路径：/115/动漫/成龙历险记", telegram.edits[-1]["text"])
 
     def test_legacy_search_command_is_not_used_as_search_entry(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -2996,6 +3120,66 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertNotIn(("movie", "normalized_title", "poster"), keys)
         self.assertNotIn(("adult", "normalized_title", "ssis4501080p"), keys)
 
+    def test_migrate_media_candidate_moves_openlist_then_updates_msg_db(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        events = []
+
+        class FakeMigrationDb:
+            def search_migration_candidates(self, query, limit=20):
+                raise AssertionError("not used")
+
+            def validate_migration_target_available(self, candidate, target_category):
+                events.append(("db_validate", candidate["source_openlist_path"], target_category))
+
+            def migrate_media_group(self, candidate, target_category):
+                events.append(("db_migrate", candidate["source_openlist_path"], target_category))
+                return {
+                    "source_openlist_path": candidate["source_openlist_path"],
+                    "target_openlist_path": "/115/动漫/成龙历险记",
+                    "target_category": target_category,
+                    "media_count": 95,
+                    "series_count": 1,
+                }
+
+        fake_openlist = CleaningOpenList(
+            {
+                "/115/剧集": [{"name": "成龙历险记", "is_dir": True, "size": 0}],
+                "/115/动漫": [],
+            },
+            events=events,
+        )
+
+        with patch("pipeline.bot.MediaStationDbClient", return_value=FakeMigrationDb()), patch(
+            "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
+        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist):
+            service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
+            result = service.migrate_media_candidate(
+                {
+                    "title": "成龙历险记",
+                    "category": "tv",
+                    "source_openlist_path": "/115/剧集/成龙历险记",
+                    "source_kind": "folder",
+                    "media_count": 95,
+                },
+                "anime",
+            )
+
+        self.assertEqual(
+            events,
+            [
+                ("db_validate", "/115/剧集/成龙历险记", "anime"),
+                ("list_all", "/115/剧集", False),
+                ("list_all", "/115/动漫", False),
+                ("move", "/115/剧集", "/115/动漫", ("成龙历险记",)),
+                ("openlist", "/115/剧集", True),
+                ("openlist", "/115/动漫", True),
+                ("db_migrate", "/115/剧集/成龙历险记", "anime"),
+            ],
+        )
+        self.assertEqual(result["target_openlist_path"], "/115/动漫/成龙历险记")
+        self.assertTrue(result["openlist_moved"])
+
     def test_sync_completed_task_marks_failed_scan_stage(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
@@ -3040,6 +3224,46 @@ class PipelineBotServiceTest(unittest.TestCase):
 
 
 class CategoryConfigTest(unittest.TestCase):
+    def test_msgdb_groups_episode_rows_into_one_migration_candidate(self):
+        from pipeline.msgdb import build_migration_candidates, build_migration_target, cloud_path_to_openlist_path
+
+        rows = [
+            {
+                "id": "m1",
+                "library_id": "b6c58f40-76dc-46b5-8f27-9e74d22e5e3d",
+                "library_root_id": "3d2e0cb4-3537-4f7d-8d79-9d4d5f1800df",
+                "title": "成龙历险记",
+                "path": "cloud://openlist/115/剧集/成龙历险记/成龙历险记 第01集.mp4",
+                "root_path": "cloud://openlist/115%2F%E5%89%A7%E9%9B%86",
+                "size_bytes": 100,
+                "library_name": "剧集",
+                "library_type": "tv",
+            },
+            {
+                "id": "m2",
+                "library_id": "b6c58f40-76dc-46b5-8f27-9e74d22e5e3d",
+                "library_root_id": "3d2e0cb4-3537-4f7d-8d79-9d4d5f1800df",
+                "title": "成龙历险记",
+                "path": "cloud://openlist/115/剧集/成龙历险记/成龙历险记 第02集.mp4",
+                "root_path": "cloud://openlist/115%2F%E5%89%A7%E9%9B%86",
+                "size_bytes": 200,
+                "library_name": "剧集",
+                "library_type": "tv",
+            },
+        ]
+
+        candidates = build_migration_candidates(rows, limit=20)
+        target = build_migration_target(candidates[0], "anime")
+
+        self.assertEqual(cloud_path_to_openlist_path("cloud://openlist/115%2F%E5%89%A7%E9%9B%86"), "/115/剧集")
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["source_openlist_path"], "/115/剧集/成龙历险记")
+        self.assertEqual(candidates[0]["source_kind"], "folder")
+        self.assertEqual(candidates[0]["category"], "tv")
+        self.assertEqual(candidates[0]["media_count"], 2)
+        self.assertEqual(candidates[0]["total_size"], 300)
+        self.assertEqual(target["target_openlist_path"], "/115/动漫/成龙历险记")
+
     def test_routes_movie_tv_anime_adult_and_other_to_separate_115_folders(self):
         self.assertEqual(category_to_folder_id("movie"), "3464134653584082023")
         self.assertEqual(category_to_folder_id("tv"), "3465137076394001831")
@@ -3304,6 +3528,18 @@ class OpenListClientTest(unittest.TestCase):
         self.assertEqual(call["url"], "http://127.0.0.1:5244/api/fs/rename")
         self.assertEqual(call["headers"]["Authorization"], "openlist-token-value")
         self.assertEqual(call["data"], {"path": "/115/成人/old", "name": "MIDA-304 - old"})
+
+    def test_move_names_uses_openlist_move_endpoint(self):
+        transport = FakeTransport({"code": 200, "message": "success", "data": None})
+        client = OpenListClient("http://127.0.0.1:5244", "openlist-token-value", transport=transport)
+
+        client.move_names("/115/剧集", "/115/动漫", ["成龙历险记"])
+
+        call = transport.calls[0]
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(call["url"], "http://127.0.0.1:5244/api/fs/move")
+        self.assertEqual(call["headers"]["Authorization"], "openlist-token-value")
+        self.assertEqual(call["data"], {"src_dir": "/115/剧集", "dst_dir": "/115/动漫", "names": ["成龙历险记"]})
 
 
 class MediaStationClientTest(unittest.TestCase):
@@ -4518,6 +4754,7 @@ class CleaningOpenList:
         self.events = events if events is not None else []
         self.remove_calls = []
         self.rename_calls = []
+        self.move_calls = []
 
     def list_path(self, path, refresh=False):
         self.events.append(("openlist", path, refresh))
@@ -4535,6 +4772,11 @@ class CleaningOpenList:
     def rename_path(self, path, name):
         self.rename_calls.append((path, name))
         self.events.append(("rename", path, name))
+        return {"code": 200, "message": "success"}
+
+    def move_names(self, src_dir, dst_dir, names):
+        self.move_calls.append((src_dir, dst_dir, list(names)))
+        self.events.append(("move", src_dir, dst_dir, tuple(names)))
         return {"code": 200, "message": "success"}
 
     def get_path(self, path):
@@ -4668,6 +4910,8 @@ class FakeBotService:
         duplicate_response=None,
         dedupe_entries=None,
         statuses_response=None,
+        migration_candidates=None,
+        migration_response=None,
     ):
         self.search_results = search_results or []
         self.adult_search_results = adult_search_results or []
@@ -4696,6 +4940,16 @@ class FakeBotService:
         self.duplicate_calls = []
         self.dedupe_entries = dedupe_entries or []
         self.dedupe_refresh_calls = []
+        self.migration_candidates = migration_candidates or []
+        self.migration_response = migration_response or {
+            "source_openlist_path": "/115/剧集/成龙历险记",
+            "target_openlist_path": "/115/动漫/成龙历险记",
+            "target_category": "anime",
+            "media_count": 95,
+            "series_count": 1,
+        }
+        self.migration_search_calls = []
+        self.migration_calls = []
 
     def search(self, query, category, limit=5):
         self.search_calls.append((query, category, limit))
@@ -4740,6 +4994,16 @@ class FakeBotService:
     def collect_openlist_dedupe_entries(self, refresh=True):
         self.dedupe_refresh_calls.append(refresh)
         return list(self.dedupe_entries)
+
+    def search_migration_candidates(self, query, limit=20):
+        self.migration_search_calls.append((query, limit))
+        if self.search_error:
+            raise self.search_error
+        return list(self.migration_candidates)
+
+    def migrate_media_candidate(self, candidate, target_category):
+        self.migration_calls.append((candidate.get("source_openlist_path"), target_category))
+        return dict(self.migration_response)
 
     def sync_completed_task(self, category, title, task, progress_callback=None):
         self.sync_calls.append((category, title, (task or {}).get("info_hash")))
