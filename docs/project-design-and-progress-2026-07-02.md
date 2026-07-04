@@ -769,6 +769,15 @@ sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[
 - 已关闭 MSG `scrape.auto_on_scan`，由 Bot 显式触发单项刮削。
 - 成人库历史 JavBus 图片已替换，当前 JavBus 相关海报/背景图计数为 0。
 - 成人库历史 DMM `now_printing` 占位图片已替换或清空，当前占位重定向计数为 0。
+- Telegram 搜索已切换为 Prowlarr profile 驱动：
+  - Prowlarr tag `media-general`：Knaben、LimeTorrents、YTS、The Pirate Bay。
+  - Prowlarr tag `media-adult`：sukebei.nyaa.si。
+  - Prowlarr tag `media-anime`：ACG.RIP、Nyaa.si、Mikan、Bangumi Moe。
+  - Prowlarr tag `media-fallback`：MagnetDownload、TorrentProject2，默认首屏不查，用于后续补漏入口。
+- Bot 搜索执行方式改为按 profile 选中的 Prowlarr indexer 并发查询，并由 `PROWLARR_SEARCH_TIMEOUT_SECONDS` 控制总等待，默认 4 秒，目标是 5 秒内返回首屏结果。
+- Prowlarr priority 已纳入 Bot 排序；后续源优先级尽量在 Prowlarr 后台调整，不在 Bot 里硬编码站点排序。
+- 强番号形态（例如 `MIDE-882`、`BDMV-001`、`FC2-PPV-1234567`）默认走成人 profile；非番号普通搜索默认不碰成人源。
+- 非番号搜索结果页提供“成人源补查”按钮，点击后新发一条成人源结果消息，不覆盖原普通搜索结果。
 
 需要继续完善：
 
@@ -776,3 +785,4 @@ sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[
 - 需要时补充内容分类变更入口，用于已提交但分类选错的任务。
 - 需要时补充普通电影更精确的 TMDB/年份级重复识别。
 - 若后续必须彻底停用 JavBus，需要升级或改造 MediaStationGo 成人刮削器；仅改 `api_configs` 不能关闭 MSG 内置默认成人源回退。
+- 需要时增加“更多源补查”按钮，单独查询 `media-fallback`，避免默认搜索被慢源拖慢。

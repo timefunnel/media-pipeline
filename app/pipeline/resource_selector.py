@@ -21,6 +21,7 @@ TITLE_EXTRA_CHAR_PENALTY = 3000
 MAX_TITLE_EXTRA_PENALTY = 120000
 SEEDER_BONUS_SCALE = 1000
 ZERO_SEED_DHT_PENALTY = 50000
+PROWLARR_PRIORITY_BONUS_SCALE = 5000
 ZERO_SEED_DHT_INDEXER_TOKENS = (
     "0magnet",
     "1337x",
@@ -33,6 +34,9 @@ ZERO_SEED_DHT_INDEXER_TOKENS = (
 
 
 class ResourceSelector:
+    def __init__(self, indexer_priorities=None):
+        self.indexer_priorities = dict(indexer_priorities or {})
+
     def select_best(self, candidates, query=None):
         return self.select_rank(candidates, rank=1, query=query)
 
@@ -149,9 +153,19 @@ class ResourceSelector:
         return bonus
 
     def _indexer_bonus(self, item):
+        priority = self._indexer_priority(item)
+        if priority is not None:
+            return max(0, 50 - int(priority)) * PROWLARR_PRIORITY_BONUS_SCALE
         if self.is_sukebei_item(item):
             return SUKEBEI_BONUS
         return 0
+
+    def _indexer_priority(self, item):
+        indexer_id = item.get("indexerId") or item.get("indexer_id")
+        try:
+            return self.indexer_priorities.get(int(indexer_id))
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def is_sukebei_item(item):

@@ -90,14 +90,25 @@ class ProwlarrClient:
         self.transport = transport or ProwlarrTransport()
         self.timeout = timeout
 
-    def search(self, query, limit=20, indexer_ids=None):
+    def search(self, query, limit=20, indexer_ids=None, categories=None):
         if not query:
             raise ValueError("query must not be empty")
         params = [("query", query), ("limit", limit)]
+        for category in categories or []:
+            params.append(("categories", str(category)))
         for indexer_id in indexer_ids or []:
             params.append(("indexerIds", str(indexer_id)))
         params = urllib.parse.urlencode(params)
         url = self.base_url + "/api/v1/search?" + params
+        return self.transport.request(
+            "GET",
+            url,
+            headers={"X-Api-Key": self.api_key},
+            timeout=self.timeout,
+        )
+
+    def tags(self):
+        url = self.base_url + "/api/v1/tag"
         return self.transport.request(
             "GET",
             url,

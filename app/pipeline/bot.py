@@ -9,6 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,7 @@ DEFAULT_REQUIRED_INDEXER_SEARCH_LIMIT = 1000
 DEFAULT_ANIME_INDEXER_SEARCH_LIMIT = 100
 DEFAULT_PRIMARY_INDEXER_TIMEOUT_SECONDS = 12
 DEFAULT_OPTIONAL_INDEXER_TIMEOUT_SECONDS = 12
+DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS = 4
 SEARCH_PAGE_SIZE = 5
 DEFAULT_TASK_LIST_LIMIT = 10
 DEFAULT_TASK_LIST_PAGE_SIZE = 5
@@ -75,6 +77,19 @@ CONTENT_PROFILE_LABELS = {
     "other": "其他",
 }
 DEFAULT_SEARCH_CATEGORY = "movie"
+SEARCH_PROFILE_GENERAL = "general"
+SEARCH_PROFILE_ADULT = "adult"
+SEARCH_PROFILE_ANIME = "anime"
+SEARCH_PROFILE_CATEGORIES = {
+    SEARCH_PROFILE_GENERAL: (2000, 5000),
+    SEARCH_PROFILE_ADULT: (6000,),
+    SEARCH_PROFILE_ANIME: (2000, 5000),
+}
+SEARCH_PROFILE_TAG_LABELS = {
+    SEARCH_PROFILE_GENERAL: ("media-general", "general"),
+    SEARCH_PROFILE_ADULT: ("media-adult", "adult"),
+    SEARCH_PROFILE_ANIME: ("media-anime", "anime"),
+}
 START_TEXT = "直接发送关键词、番号或磁链即可搜索/入库；/help 查看功能；/tasks 查看最近任务；/version 查看版本"
 HELP_TEXT = """直接发送关键词、番号或磁链即可。
 
@@ -120,6 +135,7 @@ class BotConfig:
     openlist_url: str = DEFAULT_OPENLIST_URL
     prowlarr_url: str = DEFAULT_PROWLARR_URL
     prowlarr_config: str = DEFAULT_PROWLARR_CONFIG
+    prowlarr_search_timeout_seconds: int = DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS
     telegram_timeout: int = 90
     msg_base_url: str = DEFAULT_MSG_BASE_URL
     msg_admin_user: str = ""
@@ -163,6 +179,9 @@ class BotConfig:
             openlist_url=env.get("OPENLIST_URL", DEFAULT_OPENLIST_URL),
             prowlarr_url=env.get("PROWLARR_URL", DEFAULT_PROWLARR_URL),
             prowlarr_config=env.get("PROWLARR_CONFIG", DEFAULT_PROWLARR_CONFIG),
+            prowlarr_search_timeout_seconds=int(
+                env.get("PROWLARR_SEARCH_TIMEOUT_SECONDS", str(DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS))
+            ),
             telegram_timeout=int(env.get("TG_API_TIMEOUT", "90")),
             msg_base_url=env.get("MSG_BASE_URL", DEFAULT_MSG_BASE_URL),
             msg_admin_user=msg_admin_user,
@@ -615,16 +634,25 @@ class PipelineBotService:
     def __init__(self, config):
         self.config = config
 
-    def search(self, query, category, limit=DEFAULT_SEARCH_LIMIT):
+    def search(self, query, category, limit=DEFAULT_SEARCH_LIMIT, profile=None):
+        profile = profile or search_profile_for_query(category, query)
         api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
-        prowlarr = ProwlarrClient(self.config.prowlarr_url, api_key)
+        prowlarr = ProwlarrClient(self.config.prowlarr_url, api_key, timeout=self.config.prowlarr_search_timeout_seconds)
         indexers = prowlarr.indexers()
-        candidates = search_primary_indexer_results(prowlarr, query, max(int(limit), DEFAULT_UPSTREAM_SEARCH_LIMIT), indexers=indexers)
-        if should_search_sukebei(category, query):
-            candidates.extend(search_sukebei_indexer_results(prowlarr, query, indexers=indexers))
-        if should_search_anime(category, query):
-            candidates.extend(search_anime_indexer_results(prowlarr, query, indexers=indexers))
-        return ResourceSelector().select_ranked_limited(candidates, query=query, limit=limit)
+        tags = safe_prowlarr_tags(prowlarr)
+        candidates = search_profile_indexer_results(
+            prowlarr,
+            query,
+            profile,
+            max(int(limit), DEFAULT_UPSTREAM_SEARCH_LIMIT),
+            indexers=indexers,
+            tags=tags,
+            timeout_seconds=self.config.prowlarr_search_timeout_seconds,
+        )
+        return ResourceSelector(indexer_priorities=indexer_priority_map(indexers)).select_ranked_limited(candidates, query=query, limit=limit)
+
+    def search_adult(self, query, limit=DEFAULT_SEARCH_LIMIT):
+        return self.search(query, "adult", limit=limit, profile=SEARCH_PROFILE_ADULT)
 
     def submit(self, category, download_uri):
         download_uri = self._resolve_download_uri(download_uri)
@@ -1006,7 +1034,8 @@ class TelegramBot:
             )
             return
 
-        category, query = DEFAULT_SEARCH_CATEGORY, text
+        query = text
+        category = "adult" if is_strong_adult_code_query(query) else DEFAULT_SEARCH_CATEGORY
         if not query:
             self.telegram.send_message(chat_id, "请输入影片名")
             return
@@ -1053,6 +1082,9 @@ class TelegramBot:
             return
         if action == "close_search":
             self._handle_close_search_callback(user_id, chat_id, message_id, callback_id, value)
+            return
+        if action == "adult_search":
+            self._handle_adult_search_callback(user_id, chat_id, callback_id, value)
             return
         if action == "tasks_page":
             self._handle_task_page_callback(user_id, chat_id, message_id, callback_id, value)
@@ -1130,6 +1162,44 @@ class TelegramBot:
             return
         self.telegram.answer_callback_query(callback_id, "已关闭搜索结果")
         self._delete_callback_message(chat_id, message_id)
+
+    def _handle_adult_search_callback(self, user_id, chat_id, callback_id, session_id):
+        try:
+            session = self.store.load_search_session(session_id)
+        except RuntimeError:
+            self.telegram.answer_callback_query(callback_id, "搜索结果不存在")
+            return
+        if session["user_id"] != user_id:
+            self.telegram.answer_callback_query(callback_id, "无权查看此搜索")
+            return
+        if session["category"] == "adult" or is_strong_adult_code_query(session["query"]):
+            self.telegram.answer_callback_query(callback_id, "当前已是成人源结果")
+            return
+
+        self.telegram.answer_callback_query(callback_id, "正在补查成人源")
+        try:
+            with self._typing_action(session["chat_id"]):
+                candidates = self.service.search_adult(session["query"], limit=self.config.search_limit)
+        except RuntimeError as exc:
+            if "no acceptable resource" in str(exc):
+                self.telegram.send_message(session["chat_id"], "成人源未找到可用资源")
+                return
+            self.telegram.send_message(session["chat_id"], "成人源补查失败：%s" % exc)
+            return
+        except Exception as exc:
+            self.telegram.send_message(session["chat_id"], "成人源补查失败：%s" % exc)
+            return
+        if not candidates:
+            self.telegram.send_message(session["chat_id"], "成人源未找到可用资源")
+            return
+
+        candidate_ids = []
+        for candidate in candidates:
+            candidate_id = self.store.save_candidate(user_id, session["chat_id"], "adult", session["query"], candidate)
+            candidate_ids.append(candidate_id)
+        adult_session_id = self.store.save_search_session(user_id, session["chat_id"], "adult", session["query"], candidate_ids)
+        text, reply_markup = self._render_search_page(adult_session_id, page=0)
+        self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
 
     def _handle_choose_library_callback(self, user_id, chat_id, message_id, callback_id, candidate_id):
         record = self.store.load_candidate(candidate_id)
@@ -1504,11 +1574,20 @@ class TelegramBot:
         for candidate_id in page_candidate_ids:
             record = self.store.load_candidate(candidate_id)
             candidates.append((candidate_id, record["candidate"]))
-        return format_search_page_message(session["query"], candidates, page, page_count, len(candidate_ids)), search_page_reply_markup(
+        is_adult_session = session["category"] == "adult"
+        return format_search_page_message(
+            session["query"],
+            candidates,
+            page,
+            page_count,
+            len(candidate_ids),
+            title="成人源搜索结果" if is_adult_session else "搜索结果",
+        ), search_page_reply_markup(
             session_id,
             candidates,
             page,
             page_count,
+            allow_adult_retry=not is_adult_session and not is_strong_adult_code_query(session["query"]),
         )
 
     def _save_tasks_from_submit(self, record, candidate, result, category, telegram_status_message_id=None, content_profile=None):
@@ -1869,6 +1948,133 @@ def split_command(text):
     return command, argument.strip()
 
 
+def search_profile_for_query(category, query):
+    if category == "adult" or is_strong_adult_code_query(query):
+        return SEARCH_PROFILE_ADULT
+    if should_search_anime(category, query):
+        return SEARCH_PROFILE_ANIME
+    return SEARCH_PROFILE_GENERAL
+
+
+def is_strong_adult_code_query(query):
+    codes = sorted(extract_codes(query))
+    if len(codes) != 1:
+        return False
+    code = codes[0]
+    compact_query = re.sub(r"[^0-9A-Za-z]+", "", str(query or "")).upper()
+    compact_code = re.sub(r"[^0-9A-Za-z]+", "", code).upper()
+    return bool(compact_query) and compact_query == compact_code
+
+
+def safe_prowlarr_tags(prowlarr):
+    if not hasattr(prowlarr, "tags"):
+        return []
+    try:
+        return prowlarr.tags()
+    except Exception as error:
+        print("prowlarr tag load failed: %s" % error, file=sys.stderr)
+        return []
+
+
+def search_profile_indexer_results(prowlarr, query, profile, limit, indexers=None, tags=None, timeout_seconds=None):
+    if indexers is None:
+        indexers = prowlarr.indexers()
+    selected = search_profile_indexers(indexers, tags or [], profile)
+    categories = SEARCH_PROFILE_CATEGORIES.get(profile, SEARCH_PROFILE_CATEGORIES[SEARCH_PROFILE_GENERAL])
+    if not selected:
+        return prowlarr.search(query, limit=limit, categories=categories)
+    return search_indexers_concurrently(
+        prowlarr,
+        query,
+        limit,
+        selected,
+        categories=categories,
+        timeout_seconds=timeout_seconds or DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS,
+    )
+
+
+def search_profile_indexers(indexers, tags, profile):
+    enabled = [indexer for indexer in indexers if indexer_enabled(indexer) and indexer.get("id") is not None]
+    tag_ids = search_profile_tag_ids(tags, profile)
+    if tag_ids:
+        tagged = [indexer for indexer in enabled if tag_ids.intersection(set(indexer.get("tags") or []))]
+        if tagged:
+            return tagged
+    categories = SEARCH_PROFILE_CATEGORIES.get(profile, ())
+    return [indexer for indexer in enabled if indexer_supports_any_category(indexer, categories)]
+
+
+def search_profile_tag_ids(tags, profile):
+    labels = {label.casefold() for label in SEARCH_PROFILE_TAG_LABELS.get(profile, ())}
+    ids = set()
+    for tag in tags or []:
+        label = str(tag.get("label") or tag.get("name") or "").casefold()
+        if label in labels and tag.get("id") is not None:
+            ids.add(tag.get("id"))
+    return ids
+
+
+def indexer_supports_any_category(indexer, categories):
+    supported = indexer_category_ids(indexer)
+    return any(int(category) in supported for category in categories)
+
+
+def indexer_category_ids(indexer):
+    ids = set()
+
+    def visit(category):
+        if not isinstance(category, dict):
+            return
+        category_id = category.get("id")
+        try:
+            ids.add(int(category_id))
+        except (TypeError, ValueError):
+            pass
+        for child in category.get("subCategories") or []:
+            visit(child)
+
+    capabilities = (indexer or {}).get("capabilities") or {}
+    for category in capabilities.get("categories") or []:
+        visit(category)
+    return ids
+
+
+def indexer_priority_map(indexers):
+    priorities = {}
+    for indexer in indexers or []:
+        indexer_id = indexer.get("id")
+        priority = indexer.get("priority")
+        try:
+            priorities[int(indexer_id)] = int(priority)
+        except (TypeError, ValueError):
+            pass
+    return priorities
+
+
+def search_indexers_concurrently(prowlarr, query, limit, indexers, categories=None, timeout_seconds=DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS):
+    results = []
+    if not indexers:
+        return results
+    max_workers = max(1, min(8, len(indexers)))
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    future_to_indexer = {
+        executor.submit(prowlarr.search, query, limit, [indexer.get("id")], categories): indexer for indexer in indexers
+    }
+    done, pending = wait(future_to_indexer, timeout=timeout_seconds)
+    for future in done:
+        indexer = future_to_indexer[future]
+        try:
+            results.extend(future.result())
+        except Exception as error:
+            print("profile indexer search failed: %s: %s" % (indexer.get("name") or indexer.get("id"), error), file=sys.stderr)
+    for future in pending:
+        indexer = future_to_indexer[future]
+        print("profile indexer search timed out: %s" % (indexer.get("name") or indexer.get("id")), file=sys.stderr)
+        future.cancel()
+    executor.shutdown(wait=False, cancel_futures=True)
+    return results
+
+
 def search_primary_indexer_results(prowlarr, query, limit, indexers=None):
     if indexers is None:
         indexers = prowlarr.indexers()
@@ -1912,11 +2118,11 @@ def search_primary_indexers_individually(prowlarr, query, limit, indexers, aggre
 
 
 def should_search_sukebei(category, query):
-    return category == "adult" or bool(extract_codes(query))
+    return category == "adult" or is_strong_adult_code_query(query)
 
 
 def should_search_anime(category, query):
-    if category == "adult" or extract_codes(query):
+    if category == "adult" or is_strong_adult_code_query(query):
         return False
     if category == "tv" and ANIME_QUERY_HINT_PATTERN.search(str(query or "")):
         return True
@@ -2784,6 +2990,8 @@ def parse_callback_data(value):
         return "close_choice", int(payload)
     if action == "close_search":
         return "close_search", int(payload)
+    if action == "adult_search":
+        return "adult_search", int(payload)
     if action == "profile":
         profile, profile_sep, candidate_id = payload.partition(":")
         if profile_sep:
@@ -3027,8 +3235,8 @@ def access_token_invalid_text(text):
     return any(token in value for token in ("invalid", "无效", "失效", "过期", "expired"))
 
 
-def format_search_page_message(query, candidates, page, page_count, total):
-    lines = ["搜索结果：%s" % query, "第 %s/%s 页，共 %s 条" % (page + 1, page_count, total)]
+def format_search_page_message(query, candidates, page, page_count, total, title="搜索结果"):
+    lines = ["%s：%s" % (title, query), "第 %s/%s 页，共 %s 条" % (page + 1, page_count, total)]
     for _candidate_id, candidate in candidates:
         rank = candidate.get("rank")
         lines.append("%s. %s" % (rank, candidate.get("title")))
@@ -3279,7 +3487,7 @@ def submit_reply_markup(result):
     return None
 
 
-def search_page_reply_markup(session_id, candidates, page, page_count):
+def search_page_reply_markup(session_id, candidates, page, page_count, allow_adult_retry=False):
     rows = []
     for candidate_id, candidate in candidates:
         rows.append([{"text": "选择 %s" % candidate.get("rank"), "callback_data": "choose:%s" % candidate_id}])
@@ -3290,6 +3498,8 @@ def search_page_reply_markup(session_id, candidates, page, page_count):
         nav.append({"text": "下一页", "callback_data": "page:%s:%s" % (session_id, page + 1)})
     if nav:
         rows.append(nav)
+    if allow_adult_retry:
+        rows.append([{"text": "成人源补查", "callback_data": "adult_search:%s" % session_id}])
     rows.append([{"text": "关闭本页", "callback_data": "close_search:%s" % session_id}])
     return {"inline_keyboard": rows}
 

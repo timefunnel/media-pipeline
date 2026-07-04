@@ -552,8 +552,9 @@ class TelegramBotTest(unittest.TestCase):
             self.assertIn("第 1/2 页，共 7 条", first["text"])
             self.assertIn("5. Sintel 05 1080p", first["text"])
             self.assertNotIn("6. Sintel 06 1080p", first["text"])
-            nav = first["reply_markup"]["inline_keyboard"][-2]
+            nav = first["reply_markup"]["inline_keyboard"][-3]
             self.assertEqual([button["text"] for button in nav], ["下一页"])
+            self.assertEqual(first["reply_markup"]["inline_keyboard"][-2][0]["callback_data"].split(":", 1)[0], "adult_search")
             self.assertEqual(first["reply_markup"]["inline_keyboard"][-1][0]["text"], "关闭本页")
 
             bot.handle_update(
@@ -575,8 +576,62 @@ class TelegramBotTest(unittest.TestCase):
             self.assertIn("第 2/2 页，共 7 条", telegram.edits[0]["text"])
             self.assertIn("6. Sintel 06 1080p", telegram.edits[0]["text"])
             self.assertNotIn("1. Sintel 01 1080p", telegram.edits[0]["text"])
-            self.assertEqual([button["text"] for button in telegram.edits[0]["reply_markup"]["inline_keyboard"][-2]], ["上一页"])
+            self.assertEqual([button["text"] for button in telegram.edits[0]["reply_markup"]["inline_keyboard"][-3]], ["上一页"])
+            self.assertEqual(telegram.edits[0]["reply_markup"]["inline_keyboard"][-2][0]["callback_data"].split(":", 1)[0], "adult_search")
             self.assertEqual(telegram.edits[0]["reply_markup"]["inline_keyboard"][-1][0]["text"], "关闭本页")
+
+    def test_callback_adult_search_sends_separate_adult_result_message(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                search_results=[{"title": "Sintel", "download_uri": "magnet:?xt=urn:btih:AAA", "rank": 1, "seeders": 10}],
+                adult_search_results=[{"title": "Sintel adult", "download_uri": "magnet:?xt=urn:btih:BBB", "rank": 1, "seeders": 0}],
+            )
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "sintel"}})
+            adult_button = telegram.messages[0]["reply_markup"]["inline_keyboard"][-2][0]
+
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-adult-search",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 701},
+                        "data": adult_button["callback_data"],
+                    }
+                }
+            )
+
+            self.assertEqual(service.search_calls, [("sintel", "movie", 30)])
+            self.assertEqual(service.adult_search_calls, [("sintel", 30)])
+            self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-adult-search", "text": "正在补查成人源"})
+            self.assertEqual(len(telegram.messages), 2)
+            self.assertIn("成人源搜索结果：sintel", telegram.messages[1]["text"])
+            self.assertNotEqual(telegram.messages[0]["text"], telegram.messages[1]["text"])
+            self.assertNotIn(
+                "adult_search",
+                json.dumps(telegram.messages[1]["reply_markup"], ensure_ascii=False),
+            )
+            self.assertEqual(telegram.edits, [])
+
+    def test_message_strong_adult_code_uses_adult_search_without_retry_button(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(search_results=[{"title": "MIDE-882", "download_uri": "magnet:?xt=urn:btih:AAA", "rank": 1, "seeders": 0}])
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "MIDE-882"}})
+
+            self.assertEqual(service.search_calls, [("MIDE-882", "adult", 30)])
+            self.assertIn("成人源搜索结果：MIDE-882", telegram.messages[0]["text"])
+            self.assertNotIn("adult_search", json.dumps(telegram.messages[0]["reply_markup"], ensure_ascii=False))
 
     def test_callback_close_search_deletes_search_message(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -3329,6 +3384,14 @@ class MediaStationClientTest(unittest.TestCase):
             },
         )
 
+    def test_strong_adult_code_query_accepts_exact_codes_and_excludes_long_titles(self):
+        from pipeline.bot import is_strong_adult_code_query
+
+        self.assertTrue(is_strong_adult_code_query("MIDE-882"))
+        self.assertTrue(is_strong_adult_code_query("FC2-PPV-1234567"))
+        self.assertTrue(is_strong_adult_code_query("BDMV-001"))
+        self.assertFalse(is_strong_adult_code_query("电影名 MIDE-882 1080p"))
+
 
 class ProwlarrClientTest(unittest.TestCase):
     def test_search_calls_prowlarr_api_with_query_limit_and_api_key(self):
@@ -3351,6 +3414,15 @@ class ProwlarrClientTest(unittest.TestCase):
 
         call = transport.calls[0]
         self.assertEqual(call["url"], "http://127.0.0.1:9696/api/v1/search?query=ATFB-309&limit=1000&indexerIds=8")
+
+    def test_search_can_limit_to_categories(self):
+        transport = FakeTransport([])
+        client = ProwlarrClient("http://127.0.0.1:9696", "prowlarr-key-value", transport=transport)
+
+        client.search("MIDE-882", limit=30, indexer_ids=[8], categories=[6000])
+
+        call = transport.calls[0]
+        self.assertEqual(call["url"], "http://127.0.0.1:9696/api/v1/search?query=MIDE-882&limit=30&categories=6000&indexerIds=8")
 
     def test_indexers_calls_prowlarr_indexer_api(self):
         transport = FakeTransport([{"id": 8, "name": "sukebei.nyaa.si"}])
@@ -3505,6 +3577,19 @@ class ResourceSelectorTest(unittest.TestCase):
         )
 
         self.assertEqual([item["indexer"] for item in ranked], ["sukebei.nyaa.si", "TorrentKitty"])
+
+    def test_select_ranked_uses_prowlarr_indexer_priority_when_available(self):
+        selector = ResourceSelector(indexer_priorities={1: 25, 8: 1})
+
+        ranked = selector.select_ranked(
+            [
+                {"title": "MIDE-882 1080p", "indexer": "Knaben", "indexerId": 1, "seeders": 30, "infoHash": "K1"},
+                {"title": "MIDE-882 720p", "indexer": "sukebei.nyaa.si", "indexerId": 8, "seeders": 0, "infoHash": "S1"},
+            ],
+            query="MIDE-882",
+        )
+
+        self.assertEqual([item["indexer"] for item in ranked], ["sukebei.nyaa.si", "Knaben"])
 
     def test_select_ranked_does_not_let_one_extra_seeder_override_sukebei_bonus(self):
         selector = ResourceSelector()
@@ -4214,9 +4299,12 @@ class FakeProwlarr:
         self.indexer_errors = indexer_errors or {}
         self.search_calls = []
 
-    def search(self, query, limit=20, indexer_ids=None):
+    def search(self, query, limit=20, indexer_ids=None, categories=None):
         key = tuple(indexer_ids or [])
-        self.search_calls.append((query, limit, key))
+        if categories is None:
+            self.search_calls.append((query, limit, key))
+        else:
+            self.search_calls.append((query, limit, key, tuple(categories or [])))
         if key in self.indexer_errors:
             raise self.indexer_errors[key]
         if indexer_ids:
@@ -4225,6 +4313,9 @@ class FakeProwlarr:
 
     def indexers(self):
         return self.indexer_rows
+
+    def tags(self):
+        return []
 
 
 class FakeToken:
@@ -4423,6 +4514,7 @@ class FakeBotService:
     def __init__(
         self,
         search_results=None,
+        adult_search_results=None,
         submit_response=None,
         search_error=None,
         status_response=None,
@@ -4434,6 +4526,7 @@ class FakeBotService:
         statuses_response=None,
     ):
         self.search_results = search_results or []
+        self.adult_search_results = adult_search_results or []
         self.submit_response = submit_response or {"state": True, "tasks": []}
         self.search_error = search_error
         self.status_response = status_response or {"info_hash": "ABC", "status_name": "success", "percent_done": 100}
@@ -4445,6 +4538,7 @@ class FakeBotService:
             "reason": "task is not cancellable: success",
         }
         self.search_calls = []
+        self.adult_search_calls = []
         self.submit_calls = []
         self.status_calls = []
         self.statuses_calls = []
@@ -4462,6 +4556,12 @@ class FakeBotService:
         if self.search_error:
             raise self.search_error
         return self.search_results
+
+    def search_adult(self, query, limit=5):
+        self.adult_search_calls.append((query, limit))
+        if self.search_error:
+            raise self.search_error
+        return self.adult_search_results
 
     def submit(self, category, download_uri):
         self.submit_calls.append((category, download_uri))
