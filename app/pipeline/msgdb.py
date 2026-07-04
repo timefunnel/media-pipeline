@@ -228,8 +228,10 @@ class MediaStationDbClient:
     def _ensure_cloud_media_guard(self, conn):
         library_ids = [root["library_id"] for root in MSG_LIBRARY_ROOTS.values()]
         root_ids = [root["root_id"] for root in MSG_LIBRARY_ROOTS.values()]
+        library_ids_sql = sql_varchar_array(library_ids)
+        root_ids_sql = sql_varchar_array(root_ids)
         conn.execute(
-            """
+            ("""
             create or replace function public.pipeline_guard_msg_cloud_media()
             returns trigger
             language plpgsql
@@ -238,8 +240,8 @@ class MediaStationDbClient:
               if current_setting('media_pipeline.allow_cloud_media_migration', true) = 'on' then
                 return new;
               end if;
-              if old.library_id = any (%s::varchar[])
-                 and old.library_root_id = any (%s::varchar[])
+              if old.library_id = any (""" + library_ids_sql + """)
+                 and old.library_root_id = any (""" + root_ids_sql + """)
                  and coalesce(old.path, '') like 'cloud://openlist%%' then
                 new.library_id := old.library_id;
                 new.library_root_id := old.library_root_id;
@@ -250,8 +252,7 @@ class MediaStationDbClient:
               return new;
             end;
             $$;
-            """,
-            (library_ids, root_ids),
+            """)
         )
         conn.execute(
             """
@@ -397,3 +398,10 @@ def library_id_to_category(library_id):
         if root.get("library_id") == library_id:
             return category
     return ""
+
+
+def sql_varchar_array(values):
+    quoted = []
+    for value in values:
+        quoted.append("'" + str(value).replace("'", "''") + "'")
+    return "array[%s]::varchar[]" % ",".join(quoted)
