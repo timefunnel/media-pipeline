@@ -3067,6 +3067,80 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(duplicate["reason"], "mediastation_title")
         self.assertEqual(duplicate["media_id"], "media-1")
 
+    def test_check_duplicate_does_not_use_generic_release_fragments(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            search_response={"data": {"items": []}},
+            list_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-adult",
+                            "library_id": "26768071-73bb-4b5c-85f3-ad0dd84f9fd9",
+                            "title": "無防備すぎる幼馴染のノーブラぽろりに胸キュン勃起！ びんびんビーチクに我慢できず乳首こねくりラブ 石川澪",
+                        }
+                    ]
+                }
+            },
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                )
+            )
+            duplicate = service.check_duplicate(
+                "adult",
+                "秋色之空",
+                {"title": "[Seed-Raws] 秋色之空 Aki Sora - 全3話+特典 (乳) (BD 720p AVC AAC).mp4 [一般向]"},
+            )
+
+        self.assertIsNone(duplicate)
+        self.assertEqual(fake_msg.search_calls, [])
+        self.assertEqual(fake_msg.list_calls, [])
+
+    def test_check_duplicate_does_not_fallback_to_recent_library_page_for_non_adult_titles(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            search_response={"data": {"items": []}},
+            list_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-1",
+                            "library_id": "e1333358-17ff-4b90-82f0-663cec26c0df",
+                            "title": "成龙历险记",
+                        }
+                    ]
+                }
+            },
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                )
+            )
+            duplicate = service.check_duplicate("anime", "秋色之空", {"title": "秋色之空 Aki Sora"})
+
+        self.assertIsNone(duplicate)
+        self.assertEqual(fake_msg.search_calls, [("秋色之空", 20)])
+        self.assertEqual(fake_msg.list_calls, [])
+
     def test_collect_openlist_dedupe_entries_refreshes_each_library_once(self):
         from pipeline.bot import BotConfig, PipelineBotService
 

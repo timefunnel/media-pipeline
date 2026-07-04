@@ -831,10 +831,7 @@ class PipelineBotService:
     def check_duplicate(self, category, query, candidate):
         if not self.config.msg_enabled:
             return None
-        title = candidate.get("title") or query
-        queries = media_search_queries(title, {"file_name": title})
-        if query and query not in queries:
-            queries.append(query)
+        queries = duplicate_media_queries(category, query, candidate)
         if not queries:
             return None
         client = self._build_msg_client()
@@ -844,7 +841,8 @@ class PipelineBotService:
             queries,
             library_id=root["library_id"],
         )
-        if media is None:
+        codes = extract_codes(" ".join(queries))
+        if media is None and category == "adult" and codes:
             media = find_matching_media(
                 extract_media_items(client.list_library_media(root["library_id"], page=1, page_size=200, group_versions=0)),
                 queries,
@@ -852,7 +850,6 @@ class PipelineBotService:
             )
         if media is None:
             return None
-        codes = extract_codes(" ".join(queries))
         media_codes = extract_codes(media_haystack(media))
         return {
             "level": "strong" if category == "adult" and codes and codes.intersection(media_codes) else "weak",
@@ -2969,6 +2966,46 @@ def media_search_queries(title, task):
         if normalized and key not in seen:
             seen.add(key)
             out.append(normalized)
+    return out
+
+
+def duplicate_media_queries(category, query, candidate):
+    values = []
+    for value in (query, (candidate or {}).get("title"), (candidate or {}).get("name"), (candidate or {}).get("file_name")):
+        if value:
+            values.append(str(value))
+
+    if category == "adult":
+        codes = sorted(extract_codes(" ".join(values + [str((candidate or {}).get("download_uri") or "")])))
+        return unique_nonempty_values(codes)
+
+    queries = []
+    for value in values:
+        cleaned = duplicate_title_query(value)
+        if cleaned:
+            queries.append(cleaned)
+    return unique_nonempty_values(queries)
+
+
+def duplicate_title_query(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    normalized = normalize_fragment(text)
+    if len(normalized) < 4:
+        return ""
+    return text
+
+
+def unique_nonempty_values(values):
+    seen = set()
+    out = []
+    for value in values or []:
+        text = str(value or "").strip()
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            out.append(text)
     return out
 
 
