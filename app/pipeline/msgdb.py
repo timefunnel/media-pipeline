@@ -253,21 +253,22 @@ class MediaStationDbClient:
                     params = (source_cloud_path, source_cloud_path + "/%")
                 rows = conn.execute(
                     """
-                    select id, path, title
+                    select id, path, title, deleted_at
                     from media
-                    where deleted_at is null
-                      and library_id = %s
+                    where library_id = %s
                       and library_root_id = %s
                       and """ + condition + """
                     for update
                     """,
                     (root["library_id"], root["root_id"], *params),
                 ).fetchall()
-                extra_ids = [
-                    item["id"]
+                extra_rows = [
+                    item
                     for item in rows
                     if item["id"] != media_id and movie_media_row_looks_like_extra(item, source_path)
                 ]
+                extra_ids = [item["id"] for item in extra_rows if item.get("deleted_at") is None]
+                hide_patterns = movie_extra_hide_patterns(extra_rows, source_path)
                 if extra_ids:
                     conn.execute(
                         """
@@ -283,7 +284,10 @@ class MediaStationDbClient:
             "status": "success",
             "updated": len(extra_ids),
             "media_count": len(rows),
-            "reason": "extras_deleted" if extra_ids else "already_clean",
+            "openlist_hide_path": source_path if hide_patterns else "",
+            "openlist_hide_patterns": hide_patterns,
+            "openlist_hidden_count": len(hide_patterns),
+            "reason": "extras_deleted" if extra_ids else ("extras_already_deleted" if hide_patterns else "already_clean"),
         }
 
     def _connect(self):
@@ -677,6 +681,26 @@ def movie_media_row_looks_like_extra(row, source_openlist_path):
         "预告",
     }
     return any(re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", token).lower() in normalized for token in tokens)
+
+
+def movie_extra_hide_patterns(rows, source_openlist_path):
+    source_path = normalize_openlist_path(source_openlist_path)
+    patterns = []
+    seen = set()
+    for row in rows or []:
+        path = cloud_path_to_openlist_path(row.get("path"))
+        if not path_is_same_or_child(path, source_path) or path == source_path:
+            continue
+        relative = path[len(source_path) :].strip("/")
+        first_part = relative.split("/", 1)[0].strip()
+        if not first_part:
+            continue
+        pattern = "^%s$" % re.escape(first_part)
+        if pattern in seen:
+            continue
+        seen.add(pattern)
+        patterns.append(pattern)
+    return patterns
 
 
 def build_migration_target(candidate, target_category):

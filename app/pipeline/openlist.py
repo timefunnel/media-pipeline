@@ -30,6 +30,33 @@ class OpenListTokenProvider:
         raise RuntimeError("OpenList token missing; set OPENLIST_TOKEN or OPENLIST_TOKEN_FILE")
 
 
+class OpenListPasswordTokenProvider:
+    def __init__(self, base_url, username, password, transport=None, timeout=30):
+        self.base_url = str(base_url or DEFAULT_OPENLIST_URL).rstrip("/")
+        self.username = str(username or "").strip()
+        self.password = str(password or "")
+        self.transport = transport or OpenListTransport()
+        self.timeout = timeout
+
+    def load_token(self):
+        if not self.username or not self.password:
+            raise RuntimeError(
+                "OpenList media scan credentials missing; set OPENLIST_MEDIA_SCAN_USERNAME and OPENLIST_MEDIA_SCAN_PASSWORD"
+            )
+        response = self.transport.request(
+            "POST",
+            self.base_url + "/api/auth/login",
+            data={"username": self.username, "password": self.password},
+            timeout=self.timeout,
+        )
+        if response.get("code") != 200:
+            raise RuntimeError("OpenList login failed: %s" % (response.get("message") or response.get("code")))
+        token = extract_openlist_login_token(response)
+        if not token:
+            raise RuntimeError("OpenList login failed: token missing")
+        return token
+
+
 class OpenListTransport:
     def request(self, method, url, headers=None, data=None, timeout=None):
         body = None
@@ -52,6 +79,22 @@ class OpenListTransport:
         except (TimeoutError, urllib.error.URLError) as exc:
             raise RuntimeError("OpenList request failed: %s" % exc) from exc
         return json.loads(raw)
+
+
+def extract_openlist_login_token(response):
+    if not isinstance(response, dict):
+        return ""
+    data = response.get("data")
+    if isinstance(data, dict):
+        for key in ("token", "access_token"):
+            value = str(data.get(key) or "").strip()
+            if value:
+                return value
+    for key in ("token", "access_token"):
+        value = str(response.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 class OpenListClient:

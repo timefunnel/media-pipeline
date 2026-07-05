@@ -1,6 +1,7 @@
 import http.server
 import json
 import os
+import posixpath
 import re
 import socketserver
 import threading
@@ -8,6 +9,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider
 
 
 DEFAULT_SUBTITLE_PROXY_HOST = "127.0.0.1"
@@ -27,12 +30,36 @@ HOP_BY_HOP_HEADERS = {
 }
 
 WEBVTT_TIMESTAMP_RE = re.compile(r"(?P<time>\d{2}:\d{2}:\d{2})\.(?P<fraction>\d{1,2})(?=\s|$)")
+SRT_TIMESTAMP_RE = re.compile(r"(?P<time>\d{2}:\d{2}:\d{2}),(?P<fraction>\d{1,3})(?=\s|$)")
+ASS_EVENT_TIME_RE = re.compile(r"^(?P<hour>\d+):(?P<minute>\d{2}):(?P<second>\d{2})\.(?P<fraction>\d{1,2})$")
+ASS_OVERRIDE_RE = re.compile(r"\{[^}]*\}")
 SENSITIVE_QUERY_RE = re.compile(r"([?&](?:api_?key|access_token|token)=)[^&\s\"]+", re.IGNORECASE)
-EMBY_ITEM_ID_RE = re.compile(r"^/emby/(?:Users/[^/]+/)?Items/(?P<media_id>[^/?]+)(?:/PlaybackInfo)?/?$", re.IGNORECASE)
-EMBY_SUBTITLE_STREAM_RE = re.compile(
-    r"^/emby/Videos/(?P<media_id>[^/]+)/(?P<source_id>[^/]+)/Subtitles/(?P<stream_index>\d+)/Stream\.(?:vtt|srt|ass)$",
+EMBY_MEDIA_ID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+EMBY_ITEM_ID_RE = re.compile(
+    r"^/emby/(?:Users/[^/]+/)?Items/(?P<media_id>%s)(?:/PlaybackInfo)?/?$" % EMBY_MEDIA_ID_PATTERN,
     re.IGNORECASE,
 )
+EMBY_SUBTITLE_STREAM_RE = re.compile(
+    r"^/emby/Videos/(?P<media_id>[^/]+)/(?P<source_id>[^/]+)/Subtitles/(?P<stream_index>\d+)/Stream\.(?P<extension>vtt|srt|ass|ssa)$",
+    re.IGNORECASE,
+)
+SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
+VIDEO_EXTENSIONS = {
+    ".avi",
+    ".flv",
+    ".m2ts",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".rmvb",
+    ".ts",
+    ".vob",
+    ".webm",
+    ".wmv",
+}
 SUBTITLE_TRACK_BOOTSTRAP = """
 <script>
 (function () {
@@ -40,7 +67,7 @@ SUBTITLE_TRACK_BOOTSTRAP = """
   function timeToSeconds(value) {
     var parts = value.trim().split(":");
     if (parts.length !== 3) return 0;
-    var seconds = parts[2].split(".");
+    var seconds = parts[2].replace(",", ".").split(".");
     return Number(parts[0]) * 3600 + Number(parts[1]) * 60 + Number(seconds[0]) + Number(seconds[1] || 0) / 1000;
   }
   function cleanCueText(lines) {
@@ -236,6 +263,173 @@ def should_normalize_subtitle(content_type, body):
     return body.lstrip().startswith(b"WEBVTT")
 
 
+def subtitle_body_to_vtt(body, path="", content_type=""):
+    text = (body or b"").decode("utf-8-sig", "replace")
+    extension = subtitle_extension(path)
+    if should_normalize_subtitle(content_type, body or b""):
+        normalized = normalize_webvtt_timestamps(text)
+        return normalized.encode("utf-8"), "text/vtt; charset=utf-8"
+    if extension == ".srt":
+        converted = "WEBVTT\n\n" + SRT_TIMESTAMP_RE.sub(_pad_srt_fraction, text.replace("\r", ""))
+        return converted.encode("utf-8"), "text/vtt; charset=utf-8"
+    if extension in (".ass", ".ssa"):
+        converted = convert_ass_to_vtt(text)
+        if converted:
+            return converted.encode("utf-8"), "text/vtt; charset=utf-8"
+    return body or b"", content_type or "text/plain; charset=utf-8"
+
+
+def _pad_srt_fraction(match):
+    return "%s.%s" % (match.group("time"), match.group("fraction").ljust(3, "0")[:3])
+
+
+def convert_ass_to_vtt(text):
+    cues = []
+    format_fields = []
+    for raw_line in str(text or "").replace("\r", "").split("\n"):
+        line = raw_line.strip()
+        if line.lower().startswith("format:"):
+            format_fields = [field.strip().lower() for field in line.split(":", 1)[1].split(",")]
+            continue
+        if not line.lower().startswith("dialogue:"):
+            continue
+        payload = line.split(":", 1)[1].lstrip()
+        if format_fields:
+            parts = payload.split(",", max(0, len(format_fields) - 1))
+            values = {field: parts[index] for index, field in enumerate(format_fields) if index < len(parts)}
+            start = values.get("start", "")
+            end = values.get("end", "")
+            body = values.get("text", "")
+        else:
+            parts = payload.split(",", 9)
+            if len(parts) < 10:
+                continue
+            start, end, body = parts[1], parts[2], parts[9]
+        start_vtt = ass_time_to_vtt(start)
+        end_vtt = ass_time_to_vtt(end)
+        text_value = ASS_OVERRIDE_RE.sub("", body).replace("\\N", "\n").replace("\\n", "\n").strip()
+        if start_vtt and end_vtt and text_value:
+            cues.append("%s --> %s\n%s" % (start_vtt, end_vtt, text_value))
+    if not cues:
+        return ""
+    return "WEBVTT\n\n" + "\n\n".join(cues) + "\n"
+
+
+def ass_time_to_vtt(value):
+    match = ASS_EVENT_TIME_RE.match(str(value or "").strip())
+    if not match:
+        return ""
+    return "%02d:%s:%s.%s" % (
+        int(match.group("hour")),
+        match.group("minute"),
+        match.group("second"),
+        match.group("fraction").ljust(3, "0")[:3],
+    )
+
+
+def subtitle_extension(path):
+    return posixpath.splitext(str(path or "").split("?", 1)[0])[1].lower()
+
+
+def subtitle_delivery_extension(track):
+    extension = subtitle_extension((track or {}).get("path"))
+    if extension not in SUBTITLE_EXTENSIONS:
+        return ".vtt"
+    return extension
+
+
+def subtitle_track_codec(extension):
+    extension = str(extension or "").lower()
+    if extension == ".vtt":
+        return "webvtt"
+    if extension == ".srt":
+        return "srt"
+    if extension == ".ssa":
+        return "ssa"
+    if extension == ".ass":
+        return "ass"
+    return "webvtt"
+
+
+def subtitle_display_title(label, codec):
+    label = str(label or "Subtitle").strip() or "Subtitle"
+    codec_label = str(codec or "").upper() or "SUBTITLE"
+    if "external" in label.lower() or codec_label in label.upper():
+        return label
+    return "%s - %s - External" % (label, codec_label)
+
+
+def subtitle_content_type(path, fallback=""):
+    extension = subtitle_extension(path)
+    if extension == ".vtt":
+        return "text/vtt; charset=utf-8"
+    if extension == ".srt":
+        return "application/x-subrip; charset=utf-8"
+    if extension == ".ass":
+        return "text/x-ass; charset=utf-8"
+    if extension == ".ssa":
+        return "text/x-ssa; charset=utf-8"
+    return fallback or "text/plain; charset=utf-8"
+
+
+def cloud_path_to_openlist_path(path):
+    parsed = urllib.parse.urlparse(str(path or ""))
+    if parsed.scheme != "cloud" or parsed.netloc != "openlist":
+        return ""
+    return urllib.parse.unquote(parsed.path or "")
+
+
+def openlist_path_to_cloud_path(path):
+    path = str(path or "")
+    if not path.startswith("/"):
+        return ""
+    return "cloud://openlist" + path
+
+
+def openlist_item_is_dir(item):
+    if not isinstance(item, dict):
+        return False
+    value = item.get("is_dir")
+    if value is None:
+        value = item.get("isDir")
+    if value is not None:
+        return bool(value)
+    return str(item.get("type") or "").lower() in ("folder", "dir", "directory")
+
+
+def openlist_item_name(item):
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("name") or item.get("Name") or "").strip()
+
+
+def subtitle_matches_video(video_name, subtitle_name):
+    video_stem = posixpath.splitext(str(video_name or ""))[0].lower()
+    subtitle_stem = posixpath.splitext(str(subtitle_name or ""))[0].lower()
+    if not video_stem or not subtitle_stem:
+        return False
+    return subtitle_stem == video_stem or subtitle_stem.startswith(video_stem + ".")
+
+
+def subtitle_lang_label(name):
+    stem = posixpath.splitext(str(name or ""))[0]
+    token = stem.rsplit(".", 1)[-1].lower() if "." in stem else ""
+    labels = {
+        "sc": ("zh-Hans", "简体中文"),
+        "chs": ("zh-Hans", "简体中文"),
+        "zh-cn": ("zh-Hans", "简体中文"),
+        "tc": ("zh-Hant", "繁体中文"),
+        "cht": ("zh-Hant", "繁体中文"),
+        "zh-tw": ("zh-Hant", "繁体中文"),
+        "jp": ("ja", "日语"),
+        "jpn": ("ja", "日语"),
+        "ja": ("ja", "日语"),
+        "en": ("en", "English"),
+        "eng": ("en", "English"),
+    }
+    return labels.get(token, ("und", posixpath.basename(str(name or "")) or "Subtitle"))
+
+
 def redact_sensitive_query_values(text):
     return SENSITIVE_QUERY_RE.sub(r"\1REDACTED", text)
 
@@ -262,6 +456,7 @@ def parse_emby_subtitle_stream_path(path):
         "source_id": urllib.parse.unquote(match.group("source_id")),
         "stream_index": stream_index,
         "track_index": track_index if track_index is not None else max(0, stream_index - 1),
+        "extension": "." + str(match.group("extension") or "vtt").lower(),
     }
 
 
@@ -286,41 +481,191 @@ def inject_emby_subtitle_streams(payload, media_id, tracks):
         streams = source.get("MediaStreams")
         if not isinstance(streams, list):
             continue
-        if any(isinstance(stream, dict) and stream.get("Type") == "Subtitle" for stream in streams):
-            continue
         source_id = str(source.get("Id") or media_id)
+        if source_id != str(media_id):
+            continue
+        existing_delivery_urls = {
+            str(stream.get("DeliveryUrl") or "")
+            for stream in streams
+            if isinstance(stream, dict) and stream.get("Type") == "Subtitle"
+        }
         next_index = max([int(stream.get("Index") or 0) for stream in streams if isinstance(stream, dict)] + [-1]) + 1
+        first_added_index = None
         for track_index, track in enumerate(tracks):
             if not isinstance(track, dict):
                 continue
             label = str(track.get("label") or track.get("lang") or "Subtitle")
             language = str(track.get("lang") or "und")
+            extension = subtitle_delivery_extension(track)
+            codec = subtitle_track_codec(extension)
             stream_index = next_index + track_index
-            delivery_url = "/emby/Videos/%s/%s/Subtitles/%d/Stream.vtt?mp_track=%d" % (
+            path = str(track.get("path") or "")
+            delivery_url = "/emby/Videos/%s/%s/Subtitles/%d/Stream%s?mp_track=%d" % (
                 urllib.parse.quote(str(media_id), safe=""),
                 urllib.parse.quote(source_id, safe=""),
                 stream_index,
+                extension,
                 track_index,
             )
+            if delivery_url in existing_delivery_urls:
+                continue
             streams.append(
                 {
                     "Index": stream_index,
                     "Type": "Subtitle",
-                    "Codec": "webvtt",
+                    "Codec": codec,
                     "Language": language,
-                    "DisplayTitle": label,
+                    "DisplayTitle": subtitle_display_title(label, codec),
                     "Title": label,
                     "IsExternal": True,
+                    "IsExternalUrl": False,
+                    "IsInterlaced": False,
                     "IsForced": False,
-                    "IsDefault": track_index == 0,
+                    "IsDefault": first_added_index is None,
                     "IsTextSubtitleStream": True,
                     "SupportsExternalStream": True,
                     "DeliveryMethod": "External",
                     "DeliveryUrl": delivery_url,
+                    "Path": path,
+                    "Protocol": "File",
+                    "LocalizedDefault": "Default" if first_added_index is None else "",
+                    "LocalizedForced": "",
+                    "LocalizedExternal": "External",
                 }
             )
+            existing_delivery_urls.add(delivery_url)
+            if first_added_index is None:
+                first_added_index = stream_index
             changed = True
+        if first_added_index is not None and source.get("DefaultSubtitleStreamIndex") in (None, -1):
+            source["DefaultSubtitleStreamIndex"] = first_added_index
     return changed
+
+
+class OpenListSubtitleProvider:
+    def __init__(self, base_url=DEFAULT_OPENLIST_URL, username="", password="", timeout=30):
+        self.base_url = str(base_url or DEFAULT_OPENLIST_URL).rstrip("/")
+        self.username = str(username or "").strip()
+        self.password = str(password or "")
+        self.timeout = timeout
+        self._client = None
+        self._lock = threading.Lock()
+
+    def enabled(self):
+        return bool(self.username and self.password)
+
+    def tracks_for_media_path(self, media_path):
+        if not self.enabled():
+            return []
+        openlist_media_path = cloud_path_to_openlist_path(media_path)
+        if not openlist_media_path:
+            return []
+        media_name = posixpath.basename(openlist_media_path)
+        media_extension = subtitle_extension(media_name)
+        if media_extension not in VIDEO_EXTENSIONS:
+            return []
+        dir_path = posixpath.dirname(openlist_media_path) or "/"
+        tracks = []
+        for item in self._client_instance().list_all(dir_path, refresh=False):
+            if openlist_item_is_dir(item):
+                continue
+            name = openlist_item_name(item)
+            if subtitle_extension(name) not in SUBTITLE_EXTENSIONS:
+                continue
+            if not subtitle_matches_video(media_name, name):
+                continue
+            lang, label = subtitle_lang_label(name)
+            subtitle_path = posix_join(dir_path, name)
+            tracks.append(
+                {
+                    "lang": lang,
+                    "label": label,
+                    "path": openlist_path_to_cloud_path(subtitle_path),
+                    "source": "openlist",
+                }
+            )
+        return tracks
+
+    def read_subtitle(self, cloud_path, target_extension=""):
+        openlist_path = cloud_path_to_openlist_path(cloud_path)
+        if not openlist_path:
+            raise RuntimeError("OpenList subtitle path invalid")
+        response = self._client_instance().get_path(openlist_path)
+        raw_url = extract_openlist_raw_url(response)
+        if not raw_url:
+            raise RuntimeError("OpenList subtitle raw_url missing")
+        request = urllib.request.Request(raw_url, headers={"Accept-Encoding": "identity"}, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = response.read()
+                content_type = response.headers.get("Content-Type", "")
+        except (OSError, TimeoutError) as exc:
+            raise RuntimeError("OpenList subtitle read failed: %s" % exc) from exc
+        if str(target_extension or "").lower() == ".vtt":
+            return subtitle_body_to_vtt(body, openlist_path, content_type)
+        return body, subtitle_content_type(openlist_path, content_type)
+
+    def _client_instance(self):
+        if self._client is not None:
+            return self._client
+        with self._lock:
+            if self._client is None:
+                token = OpenListPasswordTokenProvider(
+                    self.base_url,
+                    self.username,
+                    self.password,
+                    timeout=self.timeout,
+                ).load_token()
+                self._client = OpenListClient(self.base_url, token, timeout=self.timeout)
+        return self._client
+
+
+def posix_join(parent, name):
+    return str(parent or "/").rstrip("/") + "/" + str(name or "").lstrip("/")
+
+
+def extract_openlist_raw_url(response):
+    data = response.get("data") if isinstance(response, dict) else None
+    candidates = [data, response]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("raw_url", "rawUrl", "url", "download_url", "downloadUrl"):
+            value = str(candidate.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def merge_subtitle_tracks(*track_lists):
+    merged = []
+    seen = set()
+    for tracks in track_lists:
+        for track in tracks or []:
+            if not isinstance(track, dict) or not track.get("path"):
+                continue
+            key = str(track.get("path"))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(track)
+    return merged
+
+
+def msg_media_path(payload):
+    candidates = [payload]
+    if isinstance(payload, dict):
+        for key in ("data", "media", "item"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                candidates.append(value)
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        value = str(candidate.get("path") or "").strip()
+        if value:
+            return value
+    return ""
 
 
 class MsgApiAuthenticator:
@@ -384,6 +729,7 @@ class MsgApiAuthenticator:
 class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
     upstream_base_url = DEFAULT_SUBTITLE_PROXY_UPSTREAM
     msg_api_auth = None
+    openlist_subtitle_provider = None
 
     def do_GET(self):
         self._proxy()
@@ -446,6 +792,9 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"subtitle path missing\n")
             return True
+        if tracks[track_index].get("source") == "openlist":
+            self._serve_openlist_subtitle_track(tracks[track_index], request_headers, stream_request["extension"])
+            return True
         query = urllib.parse.urlencode({"path": track_path})
         upstream_path = "/api/subtitles/%s?%s" % (urllib.parse.quote(stream_request["media_id"], safe=""), query)
         try:
@@ -459,24 +808,80 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         self._write_response(status, headers, body, request_headers=request_headers, request_path=self.path)
         return True
 
+    def _serve_openlist_subtitle_track(self, track, request_headers, target_extension):
+        if self.openlist_subtitle_provider is None:
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OpenList subtitle provider is not configured\n")
+            return
+        try:
+            body, content_type = self.openlist_subtitle_provider.read_subtitle(track.get("path"), target_extension=target_extension)
+        except RuntimeError as exc:
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(("OpenList subtitle stream error: %s\n" % exc).encode("utf-8"))
+            return
+        self._write_response(
+            200,
+            {"Content-Type": content_type},
+            body,
+            request_headers=request_headers,
+            request_path=self.path,
+        )
+
     def _fetch_msg_subtitle_tracks(self, media_id):
+        msg_tracks = []
         try:
             status, _headers, body = self._read_msg_api("/media/%s/subtitles" % urllib.parse.quote(str(media_id), safe=""))
         except RuntimeError as exc:
             print("subtitle proxy MSG subtitle list error: %s" % exc, flush=True)
+            status = 0
+            body = b""
+        if status and (status < 200 or status >= 300 or not body):
+            print("subtitle proxy MSG subtitle list HTTP %s for media %s" % (status, media_id), flush=True)
+        elif body:
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (TypeError, ValueError):
+                print("subtitle proxy MSG subtitle list invalid JSON for media %s" % media_id, flush=True)
+                payload = None
+            tracks = payload.get("tracks") if isinstance(payload, dict) else None
+            if isinstance(tracks, list):
+                msg_tracks = [track for track in tracks if isinstance(track, dict) and track.get("path")]
+        openlist_tracks = self._fetch_openlist_subtitle_tracks(media_id)
+        if openlist_tracks:
+            return openlist_tracks
+        return merge_subtitle_tracks(msg_tracks)
+
+    def _fetch_openlist_subtitle_tracks(self, media_id):
+        if self.openlist_subtitle_provider is None or not self.openlist_subtitle_provider.enabled():
+            return []
+        try:
+            status, _headers, body = self._read_msg_api("/media/%s" % urllib.parse.quote(str(media_id), safe=""))
+        except RuntimeError as exc:
+            print("subtitle proxy MSG media detail error: %s" % exc, flush=True)
             return []
         if status < 200 or status >= 300 or not body:
-            print("subtitle proxy MSG subtitle list HTTP %s for media %s" % (status, media_id), flush=True)
+            print("subtitle proxy MSG media detail HTTP %s for media %s" % (status, media_id), flush=True)
             return []
         try:
             payload = json.loads(body.decode("utf-8"))
         except (TypeError, ValueError):
-            print("subtitle proxy MSG subtitle list invalid JSON for media %s" % media_id, flush=True)
+            print("subtitle proxy MSG media detail invalid JSON for media %s" % media_id, flush=True)
             return []
-        tracks = payload.get("tracks") if isinstance(payload, dict) else None
-        if not isinstance(tracks, list):
+        media_path = msg_media_path(payload)
+        if not media_path:
             return []
-        return [track for track in tracks if isinstance(track, dict) and track.get("path")]
+        try:
+            tracks = self.openlist_subtitle_provider.tracks_for_media_path(media_path)
+        except RuntimeError as exc:
+            print("subtitle proxy OpenList subtitle discovery error: %s" % exc, flush=True)
+            return []
+        if tracks:
+            print("subtitle proxy OpenList subtitle tracks %s for media %s" % (len(tracks), media_id), flush=True)
+        return tracks
 
     def _read_msg_api(self, path, retry_auth=True):
         if self.msg_api_auth is None:
@@ -570,12 +975,20 @@ def run_subtitle_proxy(
     msg_api_base_url=None,
     msg_admin_user=None,
     msg_admin_password=None,
+    openlist_base_url=None,
+    openlist_username=None,
+    openlist_password=None,
 ):
     SubtitleProxyHandler.upstream_base_url = upstream
     SubtitleProxyHandler.msg_api_auth = MsgApiAuthenticator(
         msg_api_base_url or os.environ.get("MSG_BASE_URL") or DEFAULT_MSG_API_BASE_URL,
         msg_admin_user if msg_admin_user is not None else os.environ.get("MSG_ADMIN_USER", ""),
         msg_admin_password if msg_admin_password is not None else os.environ.get("MSG_ADMIN_PASSWORD", ""),
+    )
+    SubtitleProxyHandler.openlist_subtitle_provider = OpenListSubtitleProvider(
+        openlist_base_url or os.environ.get("OPENLIST_URL") or DEFAULT_OPENLIST_URL,
+        openlist_username if openlist_username is not None else os.environ.get("OPENLIST_MEDIA_SCAN_USERNAME", ""),
+        openlist_password if openlist_password is not None else os.environ.get("OPENLIST_MEDIA_SCAN_PASSWORD", ""),
     )
     server = ThreadingHTTPServer((host, port), SubtitleProxyHandler)
     print("subtitle proxy listening on %s:%s upstream=%s" % (host, port, upstream), flush=True)

@@ -29,7 +29,7 @@ from pipeline.mediastation import (
 )
 from pipeline.msgdb import DEFAULT_MSG_DATABASE_DSN, MediaStationDbClient, build_migration_target
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes, task_can_cancel
-from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListTokenProvider
+from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider
 from pipeline.openlist_tokens import OpenListTokenStore
 from pipeline.prowlarr import (
     DEFAULT_PROWLARR_CONFIG,
@@ -215,6 +215,8 @@ class BotConfig:
     openlist_pre_scan_clean_max_bytes: int = DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES
     openlist_adult_code_format_enabled: bool = True
     sync_recovery_interval_seconds: int = 60
+    openlist_scan_username: str = ""
+    openlist_scan_password: str = ""
 
     @classmethod
     def from_env(cls, env=None):
@@ -245,6 +247,8 @@ class BotConfig:
             search_limit=int(env.get("BOT_SEARCH_LIMIT", DEFAULT_SEARCH_LIMIT)),
             openlist_db=env.get("OPENLIST_DB", DEFAULT_OPENLIST_DB),
             openlist_url=env.get("OPENLIST_URL", DEFAULT_OPENLIST_URL),
+            openlist_scan_username=(env.get("OPENLIST_MEDIA_SCAN_USERNAME") or "").strip(),
+            openlist_scan_password=env.get("OPENLIST_MEDIA_SCAN_PASSWORD") or "",
             prowlarr_url=env.get("PROWLARR_URL", DEFAULT_PROWLARR_URL),
             prowlarr_config=env.get("PROWLARR_CONFIG", DEFAULT_PROWLARR_CONFIG),
             prowlarr_search_timeout_seconds=int(
@@ -928,7 +932,7 @@ class PipelineBotService:
         }
 
     def collect_openlist_dedupe_entries(self, refresh=True):
-        client = OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
+        client = self._build_openlist_scan_client()
         entries = []
         for category in CATEGORY_LABELS:
             path = category_to_openlist_path(category)
@@ -936,6 +940,14 @@ class PipelineBotService:
                 client.list_path(path, refresh=True)
             entries.extend(openlist_dedupe_entries(client, category, path))
         return unique_dedupe_entries(entries)
+
+    def _build_openlist_scan_client(self):
+        token = OpenListPasswordTokenProvider(
+            self.config.openlist_url,
+            self.config.openlist_scan_username,
+            self.config.openlist_scan_password,
+        ).load_token()
+        return OpenListClient(self.config.openlist_url, token)
 
     def sync_completed_task(self, category, title, task, progress_callback=None):
         out = dict(task or {})
@@ -1083,10 +1095,13 @@ class PipelineBotService:
             scrape_result = self._scrape_msg_media(get_msg_client(), category, media_id, title, progress, media)
             emit({"msg_scrape_status": "success", "msg_media_id": media_id, "msg_media_title": media_title, **scrape_result})
         extras_result = prefixed_task_fields(progress, "msg_extra_cleanup_")
-        if category == "movie" and int(clean_result.get("openlist_hidden_count") or 0) > 0:
+        movie_cleanup_touched_openlist = int(clean_result.get("openlist_hidden_count") or 0) > 0 or int(
+            clean_result.get("openlist_cleaned_count") or 0
+        ) > 0
+        if category == "movie" and movie_cleanup_touched_openlist:
             if not stage_is_complete(progress.get("msg_extra_cleanup_status")):
                 emit({"msg_extra_cleanup_status": "running", "msg_extra_cleanup_error": None})
-                extras_result = self._repair_msg_movie_extras(category, media_id)
+                extras_result = self._repair_msg_movie_extras(category, media_id, get_openlist_client())
                 if extras_result.get("msg_extra_cleanup_status") == "skipped":
                     apply_progress(extras_result)
                 else:
@@ -1153,17 +1168,25 @@ class PipelineBotService:
         client.scrape_media(media_id)
         return {"msg_scrape_mode": "smart", "msg_scrape_query": None}
 
-    def _repair_msg_movie_extras(self, category, media_id):
+    def _repair_msg_movie_extras(self, category, media_id, openlist_client=None):
         result = self._build_msg_db_client().repair_movie_extras(category, media_id=media_id)
         if not isinstance(result, dict):
             raise RuntimeError("MediaStationGo movie extra cleanup returned invalid response")
         status = result.get("status")
         if status not in ("success", "skipped"):
             raise RuntimeError("MediaStationGo movie extra cleanup returned invalid status: %s" % (status or "-"))
+        hide_patterns = [str(pattern) for pattern in result.get("openlist_hide_patterns") or [] if str(pattern or "").strip()]
+        hide_path = str(result.get("openlist_hide_path") or "").strip()
+        if hide_patterns:
+            if not hide_path:
+                raise RuntimeError("MediaStationGo movie extra cleanup returned hide patterns without path")
+            client = openlist_client or OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
+            client.upsert_meta_hide(hide_path, hide_patterns, h_sub=True)
         return {
             "msg_extra_cleanup_status": status,
             "msg_extra_cleanup_updated": int(result.get("updated") or 0),
             "msg_extra_cleanup_media_count": int(result.get("media_count") or 0),
+            "msg_extra_cleanup_hidden_count": len(hide_patterns),
             "msg_extra_cleanup_reason": result.get("reason"),
             "msg_extra_cleanup_error": None,
         }

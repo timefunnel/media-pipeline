@@ -32,7 +32,7 @@ from pipeline.mediastation import (
     reachable_image_url,
 )
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes, normalize_task, task_can_cancel, wait_for_task
-from pipeline.openlist import OpenListClient, OpenListTokenProvider
+from pipeline.openlist import OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider, extract_openlist_login_token
 from pipeline.openlist_tokens import OpenListTokenStore
 from pipeline.prowlarr import ProwlarrClient, ProwlarrConfig, torrent_bytes_to_magnet
 from pipeline.resource_selector import ResourceSelector
@@ -42,8 +42,10 @@ from pipeline.subtitle_proxy import (
     inject_subtitle_track_bootstrap,
     normalize_webvtt_timestamps,
     parse_emby_subtitle_stream_path,
+    parse_emby_item_media_id,
     redact_sensitive_query_values,
     should_normalize_subtitle,
+    subtitle_body_to_vtt,
 )
 
 
@@ -62,6 +64,8 @@ class BotConfigTest(unittest.TestCase):
                 "TG_BOT_TOKEN": "123:token",
                 "TG_ALLOWED_USER_IDS": "700656624",
                 "BOT_STATE_DB": "/bot/state.db",
+                "OPENLIST_MEDIA_SCAN_USERNAME": "media_scan",
+                "OPENLIST_MEDIA_SCAN_PASSWORD": "scan-secret",
             }
         )
 
@@ -69,6 +73,8 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.allowed_user_ids, {700656624})
         self.assertEqual(config.state_db_path, "/bot/state.db")
         self.assertEqual(config.telegram_timeout, 90)
+        self.assertEqual(config.openlist_scan_username, "media_scan")
+        self.assertEqual(config.openlist_scan_password, "scan-secret")
 
     def test_bot_config_enables_mediastation_when_credentials_exist(self):
         from pipeline.bot import BotConfig
@@ -203,6 +209,16 @@ class SubtitleProxyTest(unittest.TestCase):
         injected = inject_subtitle_track_bootstrap("<html><body></body></html>")
 
         self.assertIn("parts[1].trim().split", injected)
+        self.assertIn('replace(",", ".")', injected)
+
+    def test_subtitle_body_to_vtt_converts_srt_when_requested(self):
+        body = b"1\n00:00:01,2 --> 00:00:03,45\nhello\n"
+
+        converted, content_type = subtitle_body_to_vtt(body, path="subtitle.srt")
+
+        self.assertEqual(content_type, "text/vtt; charset=utf-8")
+        self.assertIn(b"WEBVTT", converted)
+        self.assertIn(b"00:00:01.200 --> 00:00:03.450", converted)
 
     def test_inject_subtitle_track_bootstrap_is_idempotent(self):
         html = inject_subtitle_track_bootstrap("<html><body></body></html>")
@@ -211,15 +227,15 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertEqual(injected.count("subtitleAutoEnabled"), html.count("subtitleAutoEnabled"))
 
-    def test_inject_emby_subtitle_streams_adds_external_vtt_tracks(self):
-        payload = {"MediaSources": [{"Id": "source-1", "MediaStreams": [{"Index": 0, "Type": "Video"}]}]}
+    def test_inject_emby_subtitle_streams_preserves_source_subtitle_format(self):
+        payload = {"MediaSources": [{"Id": "media-1", "MediaStreams": [{"Index": 0, "Type": "Video"}]}]}
 
         changed = inject_emby_subtitle_streams(
             payload,
             "media-1",
             [
                 {"lang": "tc", "label": "tc", "path": "cloud://subtitle.tc.ass"},
-                {"lang": "sc", "label": "sc", "path": "cloud://subtitle.sc.ass"},
+                {"lang": "sc", "label": "sc", "path": "cloud://subtitle.sc.srt"},
             ],
         )
 
@@ -227,18 +243,39 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual([stream["Type"] for stream in streams], ["Video", "Subtitle", "Subtitle"])
         self.assertEqual(streams[1]["Index"], 1)
-        self.assertEqual(streams[1]["Codec"], "webvtt")
+        self.assertEqual(streams[1]["Codec"], "ass")
+        self.assertEqual(streams[2]["Codec"], "srt")
         self.assertEqual(streams[1]["DeliveryMethod"], "External")
-        self.assertEqual(streams[1]["DeliveryUrl"], "/emby/Videos/media-1/source-1/Subtitles/1/Stream.vtt?mp_track=0")
-        self.assertEqual(streams[2]["DeliveryUrl"], "/emby/Videos/media-1/source-1/Subtitles/2/Stream.vtt?mp_track=1")
+        self.assertEqual(streams[1]["DisplayTitle"], "tc - ASS - External")
+        self.assertEqual(streams[1]["Path"], "cloud://subtitle.tc.ass")
+        self.assertEqual(payload["MediaSources"][0]["DefaultSubtitleStreamIndex"], 1)
+        self.assertEqual(streams[1]["DeliveryUrl"], "/emby/Videos/media-1/media-1/Subtitles/1/Stream.ass?mp_track=0")
+        self.assertEqual(streams[2]["DeliveryUrl"], "/emby/Videos/media-1/media-1/Subtitles/2/Stream.srt?mp_track=1")
 
-    def test_inject_emby_subtitle_streams_keeps_native_subtitles(self):
-        payload = {"MediaSources": [{"Id": "source-1", "MediaStreams": [{"Index": 0, "Type": "Video"}, {"Index": 1, "Type": "Subtitle"}]}]}
+    def test_inject_emby_subtitle_streams_appends_external_tracks_when_native_subtitles_exist(self):
+        payload = {"MediaSources": [{"Id": "media-1", "MediaStreams": [{"Index": 0, "Type": "Video"}, {"Index": 1, "Type": "Subtitle"}]}]}
 
         changed = inject_emby_subtitle_streams(payload, "media-1", [{"lang": "sc", "label": "sc", "path": "cloud://subtitle.sc.ass"}])
 
-        self.assertFalse(changed)
+        streams = payload["MediaSources"][0]["MediaStreams"]
+        self.assertTrue(changed)
+        self.assertEqual(len(streams), 3)
+        self.assertEqual(streams[2]["Index"], 2)
+        self.assertEqual(streams[2]["Codec"], "ass")
+
+    def test_inject_emby_subtitle_streams_only_updates_current_media_source(self):
+        payload = {
+            "MediaSources": [
+                {"Id": "media-1", "MediaStreams": [{"Index": 0, "Type": "Video"}]},
+                {"Id": "media-2", "MediaStreams": [{"Index": 0, "Type": "Video"}]},
+            ]
+        }
+
+        changed = inject_emby_subtitle_streams(payload, "media-1", [{"lang": "sc", "label": "sc", "path": "cloud://subtitle.sc.srt"}])
+
+        self.assertTrue(changed)
         self.assertEqual(len(payload["MediaSources"][0]["MediaStreams"]), 2)
+        self.assertEqual(len(payload["MediaSources"][1]["MediaStreams"]), 1)
 
     def test_parse_emby_subtitle_stream_path_reads_track_mapping(self):
         parsed = parse_emby_subtitle_stream_path("/emby/Videos/media-1/source-1/Subtitles/2/Stream.vtt?mp_track=1&api_key=secret")
@@ -247,6 +284,21 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertEqual(parsed["source_id"], "source-1")
         self.assertEqual(parsed["stream_index"], 2)
         self.assertEqual(parsed["track_index"], 1)
+        self.assertEqual(parsed["extension"], ".vtt")
+
+    def test_parse_emby_item_media_id_ignores_resume_collection(self):
+        media_id = parse_emby_item_media_id(
+            "/emby/Users/user-1/Items/Resume?Recursive=true&MediaTypes=Video&Limit=20"
+        )
+
+        self.assertEqual(media_id, "")
+
+    def test_parse_emby_item_media_id_accepts_uuid_items(self):
+        media_id = parse_emby_item_media_id(
+            "/emby/Users/user-1/Items/7303b838-dab8-4eb7-a8b6-4dc761f69c18/PlaybackInfo?api_key=secret"
+        )
+
+        self.assertEqual(media_id, "7303b838-dab8-4eb7-a8b6-4dc761f69c18")
 
 class CandidateStoreTest(unittest.TestCase):
     def test_candidate_store_persists_candidate_for_callback(self):
@@ -2763,6 +2815,27 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["openlist_cleaned_bytes"], 30 * 1024 * 1024 + 300 * 1024)
         self.assertEqual(task["msg_sync_status"], "success")
 
+    def test_repair_msg_movie_extras_writes_openlist_meta_hide(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_openlist = CleaningOpenList({})
+        with patch("pipeline.bot.MediaStationDbClient") as db_cls:
+            db_cls.return_value.repair_movie_extras.return_value = {
+                "status": "success",
+                "updated": 1,
+                "media_count": 2,
+                "openlist_hide_path": "/115/movie/Movie",
+                "openlist_hide_patterns": [r"^Extras$"],
+                "reason": "extras_deleted",
+            }
+            service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
+            result = service._repair_msg_movie_extras("movie", "media-1", fake_openlist)
+
+        self.assertEqual(fake_openlist.meta_hide_calls, [("/115/movie/Movie", [r"^Extras$"], True)])
+        self.assertEqual(result["msg_extra_cleanup_status"], "success")
+        self.assertEqual(result["msg_extra_cleanup_updated"], 1)
+        self.assertEqual(result["msg_extra_cleanup_hidden_count"], 1)
+
     def test_sync_completed_task_keeps_scanning_when_openlist_clean_target_is_missing(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
@@ -3491,10 +3564,18 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
 
-        with patch("pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()), patch(
+        with patch("pipeline.bot.OpenListPasswordTokenProvider", FakeOpenListPasswordTokenProvider), patch(
             "pipeline.bot.OpenListClient", return_value=fake_openlist
         ):
-            service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    openlist_scan_username="media_scan",
+                    openlist_scan_password="scan-secret",
+                )
+            )
             entries = service.collect_openlist_dedupe_entries(refresh=True)
 
         keys = {(entry["category"], entry["identity_type"], entry["identity_value"]) for entry in entries}
@@ -3534,10 +3615,18 @@ class PipelineBotServiceTest(unittest.TestCase):
             }
         )
 
-        with patch("pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()), patch(
+        with patch("pipeline.bot.OpenListPasswordTokenProvider", FakeOpenListPasswordTokenProvider), patch(
             "pipeline.bot.OpenListClient", return_value=fake_openlist
         ):
-            service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    openlist_scan_username="media_scan",
+                    openlist_scan_password="scan-secret",
+                )
+            )
             entries = service.collect_openlist_dedupe_entries(refresh=True)
 
         keys = {(entry["category"], entry["identity_type"], entry["identity_value"]) for entry in entries}
@@ -3552,6 +3641,66 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertNotIn(("movie", "normalized_title", "sample"), keys)
         self.assertNotIn(("movie", "normalized_title", "poster"), keys)
         self.assertNotIn(("adult", "normalized_title", "ssis4501080p"), keys)
+
+    def test_collect_openlist_dedupe_entries_requires_media_scan_credentials(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
+
+        with self.assertRaisesRegex(RuntimeError, "media scan credentials missing"):
+            service.collect_openlist_dedupe_entries(refresh=True)
+
+    def test_collect_openlist_dedupe_entries_uses_media_scan_view(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        movie_root = category_to_openlist_path("movie")
+        hidden_name = "Hidden Extra"
+        visible_name = "Visible Movie"
+        scan_openlist = CleaningOpenList(
+            {
+                movie_root: [{"name": visible_name, "is_dir": True, "size": 0}],
+                movie_root + "/" + visible_name: [{"name": "main.mkv", "is_dir": False, "size": 900 * 1024 * 1024}],
+                category_to_openlist_path("tv"): [],
+                category_to_openlist_path("anime"): [],
+                category_to_openlist_path("adult"): [],
+                category_to_openlist_path("other"): [],
+            }
+        )
+        admin_openlist = CleaningOpenList(
+            {
+                movie_root: [
+                    {"name": visible_name, "is_dir": True, "size": 0},
+                    {"name": hidden_name, "is_dir": True, "size": 0},
+                ],
+                movie_root + "/" + visible_name: [{"name": "main.mkv", "is_dir": False, "size": 900 * 1024 * 1024}],
+                movie_root + "/" + hidden_name: [{"name": "sample.mp4", "is_dir": False, "size": 20 * 1024 * 1024}],
+                category_to_openlist_path("tv"): [],
+                category_to_openlist_path("anime"): [],
+                category_to_openlist_path("adult"): [],
+                category_to_openlist_path("other"): [],
+            }
+        )
+
+        def build_client(_url, token):
+            return scan_openlist if token == "media-scan-token-value" else admin_openlist
+
+        with patch("pipeline.bot.OpenListPasswordTokenProvider", FakeOpenListPasswordTokenProvider), patch(
+            "pipeline.bot.OpenListClient", side_effect=build_client
+        ):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    openlist_scan_username="media_scan",
+                    openlist_scan_password="scan-secret",
+                )
+            )
+            entries = service.collect_openlist_dedupe_entries(refresh=True)
+
+        keys = {(entry["category"], entry["identity_type"], entry["identity_value"]) for entry in entries}
+        self.assertIn(("movie", "normalized_title", "visiblemovie"), keys)
+        self.assertNotIn(("movie", "normalized_title", "hiddenextra"), keys)
 
     def test_migrate_media_candidate_moves_openlist_then_updates_msg_db(self):
         from pipeline.bot import BotConfig, PipelineBotService
@@ -3986,6 +4135,28 @@ class OpenListTokenProviderTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "OpenList token missing"):
             provider.load_token()
+
+    def test_password_provider_logs_in_and_returns_user_token(self):
+        transport = FakeTransport({"code": 200, "message": "success", "data": {"token": "scan-token"}})
+        provider = OpenListPasswordTokenProvider("http://127.0.0.1:5244", "media_scan", "secret", transport=transport)
+
+        token = provider.load_token()
+
+        self.assertEqual(token, "scan-token")
+        self.assertEqual(transport.calls[0]["method"], "POST")
+        self.assertEqual(transport.calls[0]["url"], "http://127.0.0.1:5244/api/auth/login")
+        self.assertEqual(transport.calls[0]["data"], {"username": "media_scan", "password": "secret"})
+
+    def test_password_provider_rejects_missing_scan_credentials(self):
+        provider = OpenListPasswordTokenProvider("http://127.0.0.1:5244", "", "")
+
+        with self.assertRaisesRegex(RuntimeError, "OpenList media scan credentials missing"):
+            provider.load_token()
+
+    def test_extract_openlist_login_token_accepts_known_shapes(self):
+        self.assertEqual(extract_openlist_login_token({"data": {"token": "token-1"}}), "token-1")
+        self.assertEqual(extract_openlist_login_token({"data": {"access_token": "token-2"}}), "token-2")
+        self.assertEqual(extract_openlist_login_token({"token": "token-3"}), "token-3")
 
 
 class OpenListClientTest(unittest.TestCase):
@@ -5275,6 +5446,18 @@ class FakeOpenList:
 class FakeOpenListTokenProvider:
     def load_token(self):
         return "openlist-token-value"
+
+
+class FakeOpenListPasswordTokenProvider:
+    def __init__(self, base_url, username, password):
+        self.base_url = base_url
+        self.username = username
+        self.password = password
+
+    def load_token(self):
+        if not self.username or not self.password:
+            raise RuntimeError("OpenList media scan credentials missing")
+        return "media-scan-token-value"
 
 
 class RetryOpenList:
