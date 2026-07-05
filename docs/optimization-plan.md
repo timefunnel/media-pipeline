@@ -26,6 +26,8 @@ All implementation work must follow these rules:
 
 ### 1. Extract Dedupe Logic
 
+Status: completed.
+
 Goal:
 Move dedupe storage, identity normalization, duplicate lookup, and OpenList dedupe entry helpers out of `bot.py`.
 
