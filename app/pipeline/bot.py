@@ -40,6 +40,14 @@ from pipeline.prowlarr import (
     is_prowlarr_download_uri,
 )
 from pipeline.resource_selector import ResourceSelector
+from pipeline.search_stats import (
+    SearchResultList,
+    SearchStats,
+    attach_search_metadata,
+    exception_search_metadata,
+    format_search_stats,
+    search_result_metadata,
+)
 from pipeline.task_state import (
     STATUS_CANCELLED,
     STATUS_FAILED,
@@ -327,10 +335,12 @@ class CandidateStore:
                     category text not null,
                     query text not null,
                     candidate_ids_json text not null,
+                    metadata_json text not null default '{}',
                     created_at integer not null
                 )
                 """
             )
+            ensure_sqlite_column(conn, "search_sessions", "metadata_json", "text not null default '{}'")
             conn.execute(
                 """
                 create table if not exists migration_candidates (
@@ -405,16 +415,17 @@ class CandidateStore:
             "candidate": json.loads(row[4]),
         }
 
-    def save_search_session(self, user_id, chat_id, category, query, candidate_ids):
+    def save_search_session(self, user_id, chat_id, category, query, candidate_ids, metadata=None):
         payload = json.dumps([int(candidate_id) for candidate_id in candidate_ids], sort_keys=True)
+        metadata_payload = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True)
         conn = self._connect()
         try:
             cursor = conn.execute(
                 """
-                insert into search_sessions (user_id, chat_id, category, query, candidate_ids_json, created_at)
-                values (?, ?, ?, ?, ?, ?)
+                insert into search_sessions (user_id, chat_id, category, query, candidate_ids_json, metadata_json, created_at)
+                values (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (int(user_id), int(chat_id), category, query, payload, int(time.time())),
+                (int(user_id), int(chat_id), category, query, payload, metadata_payload, int(time.time())),
             )
             conn.commit()
             return cursor.lastrowid
@@ -425,7 +436,7 @@ class CandidateStore:
         conn = self._connect()
         try:
             row = conn.execute(
-                "select id, user_id, chat_id, category, query, candidate_ids_json from search_sessions where id = ?",
+                "select id, user_id, chat_id, category, query, candidate_ids_json, metadata_json from search_sessions where id = ?",
                 (int(session_id),),
             ).fetchone()
         finally:
@@ -439,6 +450,7 @@ class CandidateStore:
             "category": row[3],
             "query": row[4],
             "candidate_ids": json.loads(row[5]),
+            "metadata": json.loads(row[6] or "{}"),
         }
 
     def find_search_session_by_candidate(self, candidate_id):
@@ -447,7 +459,7 @@ class CandidateStore:
         try:
             rows = conn.execute(
                 """
-                select id, user_id, chat_id, category, query, candidate_ids_json
+                select id, user_id, chat_id, category, query, candidate_ids_json, metadata_json
                 from search_sessions
                 order by created_at desc, id desc
                 """
@@ -464,6 +476,7 @@ class CandidateStore:
                     "category": row[3],
                     "query": row[4],
                     "candidate_ids": candidate_ids,
+                    "metadata": json.loads(row[6] or "{}"),
                 }
         raise RuntimeError("search session not found for candidate: %s" % candidate_id)
 
@@ -824,6 +837,7 @@ class PipelineBotService:
 
     def search(self, query, category, limit=DEFAULT_SEARCH_LIMIT, profile=None):
         profile = profile or search_profile_for_query(category, query)
+        stats = SearchStats()
         api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
         prowlarr = ProwlarrClient(self.config.prowlarr_url, api_key, timeout=self.config.prowlarr_search_timeout_seconds)
         indexers = prowlarr.indexers()
@@ -836,8 +850,17 @@ class PipelineBotService:
             indexers=indexers,
             tags=tags,
             timeout_seconds=self.config.prowlarr_search_timeout_seconds,
+            stats=stats,
         )
-        return ResourceSelector(indexer_priorities=indexer_priority_map(indexers)).select_ranked_limited(candidates, query=query, limit=limit)
+        try:
+            ranked = ResourceSelector(indexer_priorities=indexer_priority_map(indexers)).select_ranked_limited(candidates, query=query, limit=limit)
+        except RuntimeError as exc:
+            attach_search_metadata(exc, stats.to_metadata(profile=profile, raw_count=len(candidates), selected_count=0))
+            raise
+        return SearchResultList(
+            ranked,
+            metadata=stats.to_metadata(profile=profile, raw_count=len(candidates), selected_count=len(ranked)),
+        )
 
     def search_adult(self, query, limit=DEFAULT_SEARCH_LIMIT):
         return self.search(query, "adult", limit=limit, profile=SEARCH_PROFILE_ADULT)
@@ -1571,7 +1594,7 @@ class TelegramBot:
                 candidates = self.service.search(query, category, limit=self.config.search_limit)
         except RuntimeError as exc:
             if "no acceptable resource" in str(exc):
-                self._send_empty_search_page(user_id, chat_id, category, query)
+                self._send_empty_search_page(user_id, chat_id, category, query, metadata=exception_search_metadata(exc))
                 return
             self.telegram.send_message(chat_id, "搜索失败：%s" % exc)
             return
@@ -1579,20 +1602,27 @@ class TelegramBot:
             self.telegram.send_message(chat_id, "搜索失败：%s" % exc)
             return
         if not candidates:
-            self._send_empty_search_page(user_id, chat_id, category, query)
+            self._send_empty_search_page(user_id, chat_id, category, query, metadata=search_result_metadata(candidates))
             return
 
         candidate_ids = []
         for candidate in candidates:
             candidate_id = self.store.save_candidate(user_id, chat_id, category, query, candidate)
             candidate_ids.append(candidate_id)
-        session_id = self.store.save_search_session(user_id, chat_id, category, query, candidate_ids)
+        session_id = self.store.save_search_session(
+            user_id,
+            chat_id,
+            category,
+            query,
+            candidate_ids,
+            metadata=search_result_metadata(candidates),
+        )
         text, reply_markup = self._render_search_page(session_id, page=0)
 
         self.telegram.send_message(chat_id, text, reply_markup=reply_markup)
 
-    def _send_empty_search_page(self, user_id, chat_id, category, query):
-        session_id = self.store.save_search_session(user_id, chat_id, category, query, [])
+    def _send_empty_search_page(self, user_id, chat_id, category, query, metadata=None):
+        session_id = self.store.save_search_session(user_id, chat_id, category, query, [], metadata=metadata)
         text, reply_markup = self._render_search_page(session_id, page=0)
         self.telegram.send_message(chat_id, text, reply_markup=reply_markup)
 
@@ -1730,7 +1760,16 @@ class TelegramBot:
                 candidates = self.service.search_adult(session["query"], limit=self.config.search_limit)
         except RuntimeError as exc:
             if "no acceptable resource" in str(exc):
-                self.telegram.send_message(session["chat_id"], "成人源未找到可用资源")
+                empty_session_id = self.store.save_search_session(
+                    user_id,
+                    session["chat_id"],
+                    "adult",
+                    session["query"],
+                    [],
+                    metadata=exception_search_metadata(exc),
+                )
+                text, reply_markup = self._render_search_page(empty_session_id, page=0)
+                self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
                 return
             self.telegram.send_message(session["chat_id"], "成人源补查失败：%s" % exc)
             return
@@ -1738,14 +1777,30 @@ class TelegramBot:
             self.telegram.send_message(session["chat_id"], "成人源补查失败：%s" % exc)
             return
         if not candidates:
-            self.telegram.send_message(session["chat_id"], "成人源未找到可用资源")
+            empty_session_id = self.store.save_search_session(
+                user_id,
+                session["chat_id"],
+                "adult",
+                session["query"],
+                [],
+                metadata=search_result_metadata(candidates),
+            )
+            text, reply_markup = self._render_search_page(empty_session_id, page=0)
+            self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
             return
 
         candidate_ids = []
         for candidate in candidates:
             candidate_id = self.store.save_candidate(user_id, session["chat_id"], "adult", session["query"], candidate)
             candidate_ids.append(candidate_id)
-        adult_session_id = self.store.save_search_session(user_id, session["chat_id"], "adult", session["query"], candidate_ids)
+        adult_session_id = self.store.save_search_session(
+            user_id,
+            session["chat_id"],
+            "adult",
+            session["query"],
+            candidate_ids,
+            metadata=search_result_metadata(candidates),
+        )
         text, reply_markup = self._render_search_page(adult_session_id, page=0)
         self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
 
@@ -1768,7 +1823,16 @@ class TelegramBot:
                 candidates = self.service.search_anime(session["query"], limit=self.config.search_limit)
         except RuntimeError as exc:
             if "no acceptable resource" in str(exc):
-                self.telegram.send_message(session["chat_id"], "动漫源未找到可用资源")
+                empty_session_id = self.store.save_search_session(
+                    user_id,
+                    session["chat_id"],
+                    "anime",
+                    session["query"],
+                    [],
+                    metadata=exception_search_metadata(exc),
+                )
+                text, reply_markup = self._render_search_page(empty_session_id, page=0)
+                self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
                 return
             self.telegram.send_message(session["chat_id"], "动漫源补查失败：%s" % exc)
             return
@@ -1776,14 +1840,30 @@ class TelegramBot:
             self.telegram.send_message(session["chat_id"], "动漫源补查失败：%s" % exc)
             return
         if not candidates:
-            self.telegram.send_message(session["chat_id"], "动漫源未找到可用资源")
+            empty_session_id = self.store.save_search_session(
+                user_id,
+                session["chat_id"],
+                "anime",
+                session["query"],
+                [],
+                metadata=search_result_metadata(candidates),
+            )
+            text, reply_markup = self._render_search_page(empty_session_id, page=0)
+            self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
             return
 
         candidate_ids = []
         for candidate in candidates:
             candidate_id = self.store.save_candidate(user_id, session["chat_id"], "anime", session["query"], candidate)
             candidate_ids.append(candidate_id)
-        anime_session_id = self.store.save_search_session(user_id, session["chat_id"], "anime", session["query"], candidate_ids)
+        anime_session_id = self.store.save_search_session(
+            user_id,
+            session["chat_id"],
+            "anime",
+            session["query"],
+            candidate_ids,
+            metadata=search_result_metadata(candidates),
+        )
         text, reply_markup = self._render_search_page(anime_session_id, page=0)
         self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
 
@@ -2304,6 +2384,7 @@ class TelegramBot:
             page_count,
             len(candidate_ids),
             title=title,
+            metadata=session.get("metadata"),
         ), search_page_reply_markup(
             session_id,
             candidates,
@@ -2715,12 +2796,18 @@ def safe_prowlarr_tags(prowlarr):
         return []
 
 
-def search_profile_indexer_results(prowlarr, query, profile, limit, indexers=None, tags=None, timeout_seconds=None):
+def search_profile_indexer_results(prowlarr, query, profile, limit, indexers=None, tags=None, timeout_seconds=None, stats=None):
     if indexers is None:
         indexers = prowlarr.indexers()
     selected = search_profile_indexers(indexers, tags or [], profile)
     categories = SEARCH_PROFILE_CATEGORIES.get(profile, SEARCH_PROFILE_CATEGORIES[SEARCH_PROFILE_GENERAL])
     if not selected:
+        if stats is not None:
+            return stats.measure(
+                "Prowlarr aggregate",
+                lambda: prowlarr.search(query, limit=limit, categories=categories),
+                phase="profile_aggregate",
+            )
         return prowlarr.search(query, limit=limit, categories=categories)
     return search_indexers_concurrently(
         prowlarr,
@@ -2729,6 +2816,7 @@ def search_profile_indexer_results(prowlarr, query, profile, limit, indexers=Non
         selected,
         categories=categories,
         timeout_seconds=timeout_seconds or DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS,
+        stats=stats,
     )
 
 
@@ -2790,7 +2878,7 @@ def indexer_priority_map(indexers):
     return priorities
 
 
-def search_indexers_concurrently(prowlarr, query, limit, indexers, categories=None, timeout_seconds=DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS):
+def search_indexers_concurrently(prowlarr, query, limit, indexers, categories=None, timeout_seconds=DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS, stats=None):
     results = []
     if not indexers:
         return results
@@ -2799,22 +2887,37 @@ def search_indexers_concurrently(prowlarr, query, limit, indexers, categories=No
     future_to_indexer = {
         executor.submit(prowlarr.search, query, limit, [indexer.get("id")], categories): indexer for indexer in indexers
     }
+    future_started = {future: time.monotonic() for future in future_to_indexer}
     done, pending = wait(future_to_indexer, timeout=timeout_seconds)
     for future in done:
         indexer = future_to_indexer[future]
+        source = indexer.get("name") or indexer.get("id")
+        duration = time.monotonic() - future_started[future]
         try:
-            results.extend(future.result())
+            found = future.result()
+            if stats is not None:
+                stats.record(source, result_count=len(found or []), duration_seconds=duration, phase="profile_indexer", indexer_id=indexer.get("id"))
+            results.extend(found)
         except Exception as error:
+            if stats is not None:
+                stats.record(source, status="failed", duration_seconds=duration, error=error, phase="profile_indexer", indexer_id=indexer.get("id"))
             print("profile indexer search failed: %s: %s" % (indexer.get("name") or indexer.get("id"), error), file=sys.stderr)
     for future in pending:
         indexer = future_to_indexer[future]
+        if stats is not None:
+            stats.record_timeout(
+                indexer.get("name") or indexer.get("id"),
+                phase="profile_indexer",
+                indexer_id=indexer.get("id"),
+                duration_seconds=time.monotonic() - future_started[future],
+            )
         print("profile indexer search timed out: %s" % (indexer.get("name") or indexer.get("id")), file=sys.stderr)
         future.cancel()
     executor.shutdown(wait=False, cancel_futures=True)
     return results
 
 
-def search_primary_indexer_results(prowlarr, query, limit, indexers=None):
+def search_primary_indexer_results(prowlarr, query, limit, indexers=None, stats=None):
     if indexers is None:
         indexers = prowlarr.indexers()
     primary_indexers = [
@@ -2831,13 +2934,19 @@ def search_primary_indexer_results(prowlarr, query, limit, indexers=None):
     if not indexer_ids:
         return []
     try:
+        if stats is not None:
+            return stats.measure(
+                "primary aggregate",
+                lambda: prowlarr.search(query, limit=limit, indexer_ids=indexer_ids),
+                phase="primary_aggregate",
+            )
         return prowlarr.search(query, limit=limit, indexer_ids=indexer_ids)
     except Exception as error:
         print("primary aggregate indexer search failed: %s" % error, file=sys.stderr)
-        return search_primary_indexers_individually(prowlarr, query, limit, primary_indexers, error)
+        return search_primary_indexers_individually(prowlarr, query, limit, primary_indexers, error, stats=stats)
 
 
-def search_primary_indexers_individually(prowlarr, query, limit, indexers, aggregate_error):
+def search_primary_indexers_individually(prowlarr, query, limit, indexers, aggregate_error, stats=None):
     results = []
     attempted = 0
     failures = []
@@ -2847,7 +2956,18 @@ def search_primary_indexers_individually(prowlarr, query, limit, indexers, aggre
             continue
         attempted += 1
         try:
-            results.extend(search_indexer_with_timeout(prowlarr, query, limit, indexer_id, timeout=DEFAULT_PRIMARY_INDEXER_TIMEOUT_SECONDS))
+            results.extend(
+                search_indexer_with_timeout(
+                    prowlarr,
+                    query,
+                    limit,
+                    indexer_id,
+                    timeout=DEFAULT_PRIMARY_INDEXER_TIMEOUT_SECONDS,
+                    stats=stats,
+                    source=indexer.get("name") or indexer_id,
+                    phase="primary_indexer",
+                )
+            )
         except Exception as error:
             failures.append((indexer.get("name") or indexer_id, error))
             print("primary indexer search failed: %s: %s" % (indexer.get("name") or indexer_id, error), file=sys.stderr)
@@ -2872,17 +2992,19 @@ def indexer_enabled(indexer):
     return (indexer or {}).get("enable", (indexer or {}).get("enabled", True)) is not False
 
 
-def search_sukebei_indexer_results(prowlarr, query, indexers=None):
+def search_sukebei_indexer_results(prowlarr, query, indexers=None, stats=None):
     return search_required_indexer_results(
         prowlarr,
         query,
         ResourceSelector.is_sukebei_item,
         DEFAULT_REQUIRED_INDEXER_SEARCH_LIMIT,
         indexers=indexers,
+        stats=stats,
+        phase="sukebei_indexer",
     )
 
 
-def search_anime_indexer_results(prowlarr, query, indexers=None):
+def search_anime_indexer_results(prowlarr, query, indexers=None, stats=None):
     return search_required_indexer_results(
         prowlarr,
         query,
@@ -2891,10 +3013,12 @@ def search_anime_indexer_results(prowlarr, query, indexers=None):
         indexers=indexers,
         optional=True,
         timeout=DEFAULT_OPTIONAL_INDEXER_TIMEOUT_SECONDS,
+        stats=stats,
+        phase="anime_indexer",
     )
 
 
-def search_required_indexer_results(prowlarr, query, predicate, limit, indexers=None, optional=False, timeout=None):
+def search_required_indexer_results(prowlarr, query, predicate, limit, indexers=None, optional=False, timeout=None, stats=None, phase="required_indexer"):
     results = []
     if indexers is None:
         indexers = prowlarr.indexers()
@@ -2907,7 +3031,18 @@ def search_required_indexer_results(prowlarr, query, predicate, limit, indexers=
         if indexer_id is None:
             continue
         try:
-            results.extend(search_indexer_with_timeout(prowlarr, query, limit, indexer_id, timeout=timeout))
+            results.extend(
+                search_indexer_with_timeout(
+                    prowlarr,
+                    query,
+                    limit,
+                    indexer_id,
+                    timeout=timeout,
+                    stats=stats,
+                    source=indexer.get("name") or indexer_id,
+                    phase=phase,
+                )
+            )
         except Exception as error:
             if not optional:
                 raise
@@ -2915,15 +3050,20 @@ def search_required_indexer_results(prowlarr, query, predicate, limit, indexers=
     return results
 
 
-def search_indexer_with_timeout(prowlarr, query, limit, indexer_id, timeout=None):
-    if timeout is None or not hasattr(prowlarr, "timeout"):
-        return prowlarr.search(query, limit=limit, indexer_ids=[indexer_id])
-    original_timeout = prowlarr.timeout
-    prowlarr.timeout = min(original_timeout, timeout)
-    try:
-        return prowlarr.search(query, limit=limit, indexer_ids=[indexer_id])
-    finally:
-        prowlarr.timeout = original_timeout
+def search_indexer_with_timeout(prowlarr, query, limit, indexer_id, timeout=None, stats=None, source=None, phase=None):
+    def run():
+        if timeout is None or not hasattr(prowlarr, "timeout"):
+            return prowlarr.search(query, limit=limit, indexer_ids=[indexer_id])
+        original_timeout = prowlarr.timeout
+        prowlarr.timeout = min(original_timeout, timeout)
+        try:
+            return prowlarr.search(query, limit=limit, indexer_ids=[indexer_id])
+        finally:
+            prowlarr.timeout = original_timeout
+
+    if stats is not None:
+        return stats.measure(source or indexer_id, run, phase=phase, indexer_id=indexer_id)
+    return run()
 
 
 def magnet_candidate_from_text(text):
@@ -2977,6 +3117,14 @@ def parse_bool(value, default=False):
     if value is None:
         return default
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def ensure_sqlite_column(conn, table, column, definition):
+    try:
+        conn.execute("alter table %s add column %s %s" % (table, column, definition))
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
 
 
 def normalize_content_profile(category, content_profile=None):
@@ -4247,8 +4395,11 @@ def access_token_invalid_text(text):
     return any(token in value for token in ("invalid", "无效", "失效", "过期", "expired"))
 
 
-def format_search_page_message(query, candidates, page, page_count, total, title="搜索结果"):
+def format_search_page_message(query, candidates, page, page_count, total, title="搜索结果", metadata=None):
     lines = ["%s：%s" % (title, query), "第 %s/%s 页，共 %s 条" % (page + 1, page_count, total)]
+    stats_line = format_search_stats(metadata)
+    if stats_line:
+        lines.append(stats_line)
     for _candidate_id, candidate in candidates:
         rank = candidate.get("rank")
         lines.append("%s. %s" % (rank, candidate.get("title")))

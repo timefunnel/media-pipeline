@@ -391,14 +391,24 @@ class CandidateStoreTest(unittest.TestCase):
             store = CandidateStore(str(Path(tmp) / "state.db"))
             first_id = store.save_candidate(700656624, 9001, "movie", "sintel", {"title": "Sintel 720p"})
             second_id = store.save_candidate(700656624, 9001, "movie", "sintel", {"title": "Sintel 1080p"})
-            session_id = store.save_search_session(700656624, 9001, "movie", "sintel", [first_id, second_id])
+            session_id = store.save_search_session(
+                700656624,
+                9001,
+                "movie",
+                "sintel",
+                [first_id, second_id],
+                metadata={"source_count": 2, "total_ms": 1234},
+            )
 
             session = store.load_search_session(session_id)
+            found = store.find_search_session_by_candidate(second_id)
 
         self.assertEqual(session["user_id"], 700656624)
         self.assertEqual(session["chat_id"], 9001)
         self.assertEqual(session["query"], "sintel")
         self.assertEqual(session["candidate_ids"], [first_id, second_id])
+        self.assertEqual(session["metadata"], {"source_count": 2, "total_ms": 1234})
+        self.assertEqual(found["metadata"], {"source_count": 2, "total_ms": 1234})
 
     def test_candidate_store_persists_migration_candidate(self):
         from pipeline.bot import CandidateStore
@@ -863,6 +873,34 @@ class TelegramBotTest(unittest.TestCase):
             self.assertIn("第 1/1 页，共 2 条", sent["text"])
             self.assertEqual(sent["reply_markup"]["inline_keyboard"][0][0]["text"], "#1 入库")
             self.assertRegex(sent["reply_markup"]["inline_keyboard"][0][0]["callback_data"], r"^choose:\d+$")
+
+    def test_message_search_shows_source_timing_summary(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+        from pipeline.search_stats import SearchResultList
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                search_results=SearchResultList(
+                    [{"title": "Sintel 720p", "download_uri": "magnet:?xt=urn:btih:AAA", "rank": 1, "seeders": 10}],
+                    metadata={
+                        "source_count": 2,
+                        "total_ms": 1234,
+                        "raw_count": 7,
+                        "selected_count": 1,
+                        "failed_count": 1,
+                    },
+                )
+            )
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "sintel"}})
+
+            session = store.find_search_session_by_candidate(1)
+
+        self.assertIn("搜索统计：来源2个，耗时1.2s，返回7条，展示1条，失败1个", telegram.messages[0]["text"])
+        self.assertEqual(session["metadata"]["source_count"], 2)
 
     def test_message_search_sends_typing_action_before_search(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -5492,6 +5530,34 @@ class CliSubmitSearchTest(unittest.TestCase):
             fake_prowlarr.search_calls,
             [("sintel", 100, (1, 2)), ("sintel", 100, (1,)), ("sintel", 100, (2,))],
         )
+
+    def test_primary_search_records_source_timing_stats(self):
+        from pipeline.bot import search_primary_indexer_results
+        from pipeline.search_stats import SearchStats
+
+        fake_prowlarr = FakeProwlarr(
+            [],
+            indexers=[
+                {"id": 1, "name": "Knaben", "enable": True},
+                {"id": 2, "name": "SlowIndexer", "enable": True},
+            ],
+            indexer_results={
+                (1,): [{"title": "Sintel 1080p", "indexer": "Knaben", "seeders": 20, "infoHash": "K1"}],
+            },
+            indexer_errors={
+                (1, 2): TimeoutError("timed out"),
+                (2,): TimeoutError("timed out"),
+            },
+        )
+        stats = SearchStats()
+
+        results = search_primary_indexer_results(fake_prowlarr, "sintel", 100, indexers=fake_prowlarr.indexers(), stats=stats)
+        metadata = stats.to_metadata(raw_count=len(results), selected_count=len(results))
+
+        self.assertEqual([item["infoHash"] for item in results], ["K1"])
+        self.assertEqual(metadata["failed_count"], 2)
+        self.assertEqual(metadata["success_count"], 1)
+        self.assertEqual([source["source"] for source in metadata["sources"]], ["primary aggregate", "Knaben", "SlowIndexer"])
 
     def test_submit_search_commit_uses_requested_rank(self):
         fake_prowlarr = FakeProwlarr(
