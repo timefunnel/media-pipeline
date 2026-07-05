@@ -332,7 +332,7 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertIsNone(folder["PrimaryImageItemId"])
-        self.assertTrue(folder["ImageTags"]["Primary"].startswith("mp-folder-v3-"))
+        self.assertRegex(folder["ImageTags"]["Primary"], r"^[0-9a-f]{32}$")
         self.assertEqual(folder["PrimaryImageAspectRatio"], 16 / 9)
 
     def test_iter_emby_items_accepts_virtual_folder_list(self):
@@ -362,7 +362,7 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(folder["PrimaryImageItemId"], "library-1")
-        self.assertTrue(folder["PrimaryImageTag"].startswith("mp-folder-v3-"))
+        self.assertRegex(folder["PrimaryImageTag"], r"^[0-9a-f]{32}$")
         self.assertNotIn("ImageTags", folder)
         self.assertNotIn("PrimaryImageAspectRatio", folder)
 
@@ -377,7 +377,7 @@ class SubtitleProxyTest(unittest.TestCase):
 
         def patch_payload(payload, request_headers, request_path):
             payload[0]["PrimaryImageItemId"] = "library-1"
-            payload[0]["PrimaryImageTag"] = "mp-folder-v3-test"
+            payload[0]["PrimaryImageTag"] = "0123456789abcdef0123456789abcdef"
             return True
 
         handler._patch_emby_collection_folder_covers = patch_payload
@@ -402,7 +402,7 @@ class SubtitleProxyTest(unittest.TestCase):
         )
 
         patched = json.loads(written.getvalue().decode("utf-8"))
-        self.assertEqual(patched[0]["PrimaryImageTag"], "mp-folder-v3-test")
+        self.assertEqual(patched[0]["PrimaryImageTag"], "0123456789abcdef0123456789abcdef")
         self.assertIn(("Cache-Control", "no-store"), sent_headers)
 
     def test_select_emby_folder_cover_items_limits_to_four_unique_items(self):
@@ -438,6 +438,18 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertEqual(emby_folder_cover_grid_dimensions("maxWidth=400&maxHeight=300"), (400, 225))
         self.assertEqual(emby_folder_cover_grid_dimensions("maxWidth=10"), (160, 90))
         self.assertEqual(emby_folder_cover_grid_dimensions(""), (640, 360))
+
+    def test_emby_folder_cover_response_headers_match_emby_image_shape(self):
+        headers = emby_folder_cover_response_headers("0123456789abcdef0123456789abcdef", now=0)
+
+        self.assertEqual(headers["Content-Type"], "image/png")
+        self.assertEqual(headers["Cache-Control"], "public, max-age=31536000")
+        self.assertEqual(headers["ETag"], '"0123456789abcdef0123456789abcdef"')
+        self.assertEqual(headers["Last-Modified"], "Thu, 01 Jan 1970 00:00:00 GMT")
+        self.assertIn("1971", headers["Expires"])
+        self.assertEqual(headers["Accept-Ranges"], "bytes")
+        self.assertEqual(headers["Cross-Origin-Resource-Policy"], "cross-origin")
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "*")
 
     def test_emby_image_proxy_path_replaces_tag_and_preserves_client_query(self):
         path = emby_image_proxy_path(

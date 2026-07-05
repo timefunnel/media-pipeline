@@ -50,6 +50,7 @@ from pipeline.subtitle_proxy import (
     parse_emby_subtitle_stream_path,
     parse_emby_item_media_id,
     build_emby_folder_cover_grid,
+    emby_folder_cover_response_headers,
     emby_folder_cover_grid_dimensions,
     patch_emby_collection_folder_item_cover,
     select_emby_folder_cover_items,

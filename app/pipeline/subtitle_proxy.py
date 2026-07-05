@@ -67,7 +67,7 @@ EMBY_FOLDER_COVER_ASPECT_RATIO = 16 / 9
 EMBY_FOLDER_COVER_DEFAULT_WIDTH = 640
 EMBY_FOLDER_COVER_MIN_WIDTH = 160
 EMBY_FOLDER_COVER_MAX_WIDTH = 1200
-EMBY_FOLDER_COVER_TAG_PREFIX = "mp-folder-v3"
+EMBY_FOLDER_COVER_TAG_LENGTH = 32
 SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
 VIDEO_EXTENSIONS = {
     ".avi",
@@ -757,8 +757,23 @@ def emby_folder_cover_grid_tag(folder_id, covers):
             ensure_ascii=True,
             separators=(",", ":"),
         ).encode("utf-8")
-    ).hexdigest()[:16]
-    return "%s-%s" % (EMBY_FOLDER_COVER_TAG_PREFIX, digest)
+    ).hexdigest()[:EMBY_FOLDER_COVER_TAG_LENGTH]
+    return digest
+
+
+def emby_folder_cover_response_headers(tag, now=None):
+    now = time.time() if now is None else now
+    expires_at = now + 31536000
+    return {
+        "Content-Type": "image/png",
+        "Cache-Control": "public, max-age=31536000",
+        "ETag": '"%s"' % tag,
+        "Last-Modified": http.server.BaseHTTPRequestHandler.date_time_string(None, now),
+        "Expires": http.server.BaseHTTPRequestHandler.date_time_string(None, expires_at),
+        "Accept-Ranges": "bytes",
+        "Cross-Origin-Resource-Policy": "cross-origin",
+        "Access-Control-Allow-Origin": "*",
+    }
 
 
 def emby_image_proxy_path(cover, original_query=""):
@@ -1199,11 +1214,7 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         if not body:
             return False
         tag = emby_folder_cover_grid_tag(image_request["item_id"], covers)
-        headers = {
-            "Content-Type": "image/png",
-            "Cache-Control": "public, max-age=31536000",
-            "ETag": '"%s"' % tag,
-        }
+        headers = emby_folder_cover_response_headers(tag)
         self._write_response(200, headers, body, request_headers=request_headers, request_path=self.path)
         return True
 
