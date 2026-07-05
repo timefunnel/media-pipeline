@@ -30,6 +30,7 @@ class StageDefinition:
 
 SYNC_STAGE_DEFINITIONS = (
     StageDefinition("openlist_adult_format_status", "openlist_adult_format_error"),
+    StageDefinition("openlist_trash_hide_status", "openlist_trash_hide_error"),
     StageDefinition("openlist_clean_status", "openlist_clean_error"),
     StageDefinition("openlist_adult_extra_hide_status", "openlist_adult_extra_hide_error"),
     StageDefinition("msg_scan_status"),

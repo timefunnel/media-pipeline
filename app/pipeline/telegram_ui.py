@@ -208,8 +208,9 @@ def format_task_status_message(title, task, category=None):
 def task_diagnostic_stage_values(task):
     out = []
     for key, label in (
-        ("openlist_clean_status", "OpenList隐藏"),
         ("openlist_adult_format_status", "番号格式化"),
+        ("openlist_trash_hide_status", "回收站隐藏"),
+        ("openlist_clean_status", "OpenList隐藏"),
         ("openlist_adult_extra_hide_status", "成人附加隐藏"),
         ("msg_scan_status", "MSG扫描"),
         ("msg_scrape_status", "MSG刮削"),
@@ -318,6 +319,18 @@ def append_task_lines(lines, task, category=None):
             if task.get("openlist_adult_format_error"):
                 lines.append("番号错误：%s" % task.get("openlist_adult_format_error"))
             lines.append("番号处理：请手动将目录重命名为“标准番号 - 原名称”，然后点击重试MSG同步")
+    if task.get("openlist_trash_hide_status") and task.get("openlist_trash_hide_status") != "skipped":
+        if task.get("openlist_trash_hide_status") == "success":
+            lines.append(
+                "回收站隐藏：已完成（隐藏 %s 个，跳过 %s 个）"
+                % (task.get("openlist_trash_hide_hidden_count") or 0, task.get("openlist_trash_hide_skipped_count") or 0)
+            )
+        elif task.get("openlist_trash_hide_status") == "running":
+            lines.append("回收站隐藏：进行中")
+        else:
+            lines.append("回收站隐藏：失败")
+            if task.get("openlist_trash_hide_error"):
+                lines.append("回收站隐藏错误：%s" % task.get("openlist_trash_hide_error"))
     if task.get("msg_scan_status"):
         if task.get("msg_scan_status") == "success":
             lines.append("MSG扫描：已完成")

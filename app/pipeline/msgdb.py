@@ -290,6 +290,30 @@ class MediaStationDbClient:
             "reason": "extras_hidden" if extra_ids else ("extras_already_hidden" if hide_patterns else "already_clean"),
         }
 
+    def list_deleted_openlist_media_for_hide(self, limit=100):
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                select
+                    m.id,
+                    m.library_id,
+                    m.library_root_id,
+                    m.path,
+                    m.deleted_at,
+                    l.type as library_type,
+                    r.path as root_path
+                from media m
+                left join libraries l on l.id = m.library_id
+                left join library_roots r on r.id = m.library_root_id
+                where m.deleted_at is not null
+                  and coalesce(m.path, '') like %s
+                order by m.deleted_at asc nulls last, m.updated_at asc nulls last
+                limit %s
+                """,
+                (MSG_CLOUD_PREFIX + "/%", max(1, int(limit))),
+            ).fetchall()
+        return [candidate for candidate in (deleted_openlist_media_hide_candidate(row) for row in rows) if candidate]
+
     def _connect(self):
         if self._connect_override is not None:
             return self._connect_override()
@@ -701,6 +725,48 @@ def movie_extra_hide_patterns(rows, source_openlist_path):
         seen.add(pattern)
         patterns.append(pattern)
     return patterns
+
+
+def deleted_openlist_media_hide_candidate(row):
+    media_id = str((row or {}).get("id") or "").strip()
+    media_path = cloud_path_to_openlist_path((row or {}).get("path"))
+    if not media_id or not media_path:
+        return None
+
+    category = library_id_to_category((row or {}).get("library_id"))
+    if category:
+        root_path = category_to_openlist_path(category)
+    else:
+        root_path = cloud_path_to_openlist_path((row or {}).get("root_path"))
+    if not root_path or not path_is_same_or_child(media_path, root_path) or media_path == root_path:
+        return None
+
+    if category in ("tv", "anime"):
+        target_path = media_path
+        target_kind = "file"
+    else:
+        try:
+            target_path, target_kind = media_work_item_path(media_path, root_path)
+        except ValueError:
+            return None
+
+    hide_path = posixpath.dirname(target_path.rstrip("/")) or "/"
+    hide_name = posixpath.basename(target_path.rstrip("/"))
+    if not hide_name:
+        return None
+
+    return {
+        "media_id": media_id,
+        "library_id": (row or {}).get("library_id"),
+        "library_root_id": (row or {}).get("library_root_id"),
+        "category": category,
+        "media_path": media_path,
+        "target_openlist_path": target_path,
+        "target_kind": target_kind,
+        "hide_path": normalize_openlist_path(hide_path),
+        "hide_pattern": "^%s$" % re.escape(hide_name),
+        "deleted_at": str((row or {}).get("deleted_at") or ""),
+    }
 
 
 def build_migration_target(candidate, target_category):

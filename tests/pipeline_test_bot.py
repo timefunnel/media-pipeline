@@ -107,6 +107,21 @@ class BotConfigTest(unittest.TestCase):
 
         self.assertEqual(config.sync_recovery_interval_seconds, 120)
 
+    def test_bot_config_reads_msg_trash_hide_sync_settings(self):
+        from pipeline.bot import BotConfig
+
+        config = BotConfig.from_env(
+            {
+                "TG_BOT_TOKEN": "123:token",
+                "TG_ALLOWED_USER_IDS": "700656624",
+                "MSG_TRASH_HIDE_SYNC_ENABLED": "1",
+                "MSG_TRASH_HIDE_SYNC_LIMIT": "25",
+            }
+        )
+
+        self.assertTrue(config.msg_trash_hide_sync_enabled)
+        self.assertEqual(config.msg_trash_hide_sync_limit, 25)
+
     def test_bot_config_reads_externalized_search_and_prowlarr_settings(self):
         from pipeline.bot import BotConfig
 
@@ -248,6 +263,26 @@ class CandidateStoreTest(unittest.TestCase):
         self.assertEqual(loaded["chat_id"], 9001)
         self.assertEqual(loaded["query"], "成龙历险记")
         self.assertEqual(loaded["candidate"]["source_openlist_path"], "/115/剧集/成龙历险记")
+
+    def test_candidate_store_tracks_processed_msg_trash_hide_items(self):
+        from pipeline.bot import CandidateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            self.assertEqual(store.processed_trash_hide_media_ids(["media-1"]), set())
+
+            store.save_trash_hide_result(
+                {
+                    "media_id": "media-1",
+                    "openlist_path": "/115/其他/Old",
+                    "hide_path": "/115/其他",
+                    "hide_pattern": r"^Old$",
+                    "status": "hidden",
+                    "reason": "meta_hide",
+                }
+            )
+
+            self.assertEqual(store.processed_trash_hide_media_ids(["media-1", "media-2"]), {"media-1"})
 
     def test_candidate_store_lists_running_msg_sync_tasks(self):
         from pipeline.bot import CandidateStore
@@ -2854,6 +2889,72 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["openlist_clean_status"], "success")
         self.assertEqual(task["openlist_cleaned_count"], 3)
         self.assertEqual(task["openlist_cleaned_bytes"], 30 * 1024 * 1024 + 300 * 1024)
+        self.assertEqual(task["msg_sync_status"], "success")
+
+    def test_sync_completed_task_hides_msg_trash_before_mediastation_scan(self):
+        from pipeline.bot import BotConfig, CandidateStore, PipelineBotService
+
+        events = []
+        fake_openlist = CleaningOpenList(
+            {
+                "/115/电影": [{"name": "Movie", "is_dir": True, "size": 0}],
+                "/115/其他": [{"name": "Old", "is_dir": True, "size": 0}],
+            },
+            events=events,
+        )
+        fake_msg = FakeMediaStationClient(
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "d150a96c-b467-4c60-82f1-207ae5949045", "title": "Movie"}]}},
+            events=events,
+        )
+
+        class FakeMsgDb:
+            def list_deleted_openlist_media_for_hide(self, limit=100):
+                return [
+                    {
+                        "media_id": "trash-1",
+                        "target_openlist_path": "/115/其他/Old",
+                        "hide_path": "/115/其他",
+                        "hide_pattern": "^Old$",
+                    },
+                    {
+                        "media_id": "trash-2",
+                        "target_openlist_path": "/115/其他/Gone",
+                        "hide_path": "/115/其他",
+                        "hide_pattern": "^Gone$",
+                    },
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp, patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
+        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist), patch("pipeline.bot.MediaStationDbClient", return_value=FakeMsgDb()):
+            state_db = str(Path(tmp) / "state.db")
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    state_db,
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    msg_sync_poll_seconds=0,
+                    msg_trash_hide_sync_enabled=True,
+                    openlist_pre_scan_clean_enabled=False,
+                )
+            )
+            task = service.sync_completed_task(
+                "movie",
+                "Movie",
+                {"info_hash": "ABC", "status_name": "success", "name": "Movie"},
+            )
+            processed = CandidateStore(state_db).processed_trash_hide_media_ids(["trash-1", "trash-2"])
+
+        self.assertEqual(fake_openlist.meta_hide_calls, [("/115/其他", ["^Old$"], True)])
+        self.assertEqual(fake_openlist.source_delete_calls, [])
+        self.assertLess(events.index(("meta_hide", "/115/其他", ("^Old$",), True)), events.index(("scan",)))
+        self.assertEqual(processed, {"trash-1", "trash-2"})
+        self.assertEqual(task["openlist_trash_hide_status"], "success")
+        self.assertEqual(task["openlist_trash_hide_hidden_count"], 1)
+        self.assertEqual(task["openlist_trash_hide_skipped_count"], 1)
         self.assertEqual(task["msg_sync_status"], "success")
 
     def test_repair_msg_movie_extras_writes_openlist_meta_hide(self):

@@ -307,6 +307,8 @@ class BotConfig:
     msg_enabled: bool = False
     msg_sync_poll_seconds: int = 60
     msg_sync_poll_interval_seconds: int = 5
+    msg_trash_hide_sync_enabled: bool = False
+    msg_trash_hide_sync_limit: int = 100
     openlist_pre_scan_clean_enabled: bool = True
     openlist_pre_scan_clean_max_bytes: int = DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES
     openlist_adult_code_format_enabled: bool = True
@@ -372,6 +374,8 @@ class BotConfig:
             msg_enabled=parse_bool(env.get("MSG_ENABLED"), bool(msg_admin_user and msg_admin_password)),
             msg_sync_poll_seconds=int(env.get("MSG_SYNC_POLL_SECONDS", "60")),
             msg_sync_poll_interval_seconds=int(env.get("MSG_SYNC_POLL_INTERVAL_SECONDS", "5")),
+            msg_trash_hide_sync_enabled=parse_bool(env.get("MSG_TRASH_HIDE_SYNC_ENABLED"), False),
+            msg_trash_hide_sync_limit=int(env.get("MSG_TRASH_HIDE_SYNC_LIMIT", "100")),
             openlist_pre_scan_clean_enabled=parse_bool(env.get("OPENLIST_PRE_SCAN_CLEAN_ENABLED"), True),
             openlist_pre_scan_clean_max_bytes=int(
                 env.get("OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES", str(DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES))
@@ -489,6 +493,20 @@ class CandidateStore:
                 """
                 create index if not exists idx_dedupe_index_lookup
                 on dedupe_index(category, identity_type, identity_value)
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists msg_trash_hide_index (
+                    media_id text primary key,
+                    openlist_path text not null,
+                    hide_path text,
+                    hide_pattern text,
+                    status text not null,
+                    reason text,
+                    created_at integer not null,
+                    updated_at integer not null
+                )
                 """
             )
             conn.commit()
@@ -836,6 +854,65 @@ class CandidateStore:
         finally:
             conn.close()
         return [dedupe_entry_from_row(row) for row in rows[: int(limit)]]
+
+    def processed_trash_hide_media_ids(self, media_ids):
+        normalized = [str(value or "").strip() for value in media_ids or [] if str(value or "").strip()]
+        if not normalized:
+            return set()
+        found = set()
+        conn = self._connect()
+        try:
+            for media_id in normalized:
+                row = conn.execute(
+                    "select media_id from msg_trash_hide_index where media_id = ?",
+                    (media_id,),
+                ).fetchone()
+                if row is not None:
+                    found.add(row[0])
+        finally:
+            conn.close()
+        return found
+
+    def save_trash_hide_result(self, result):
+        media_id = str((result or {}).get("media_id") or "").strip()
+        openlist_path = normalize_openlist_path((result or {}).get("openlist_path"))
+        status = str((result or {}).get("status") or "").strip()
+        if not media_id:
+            raise ValueError("trash hide media_id must not be empty")
+        if not openlist_path:
+            raise ValueError("trash hide openlist_path must not be empty")
+        if not status:
+            raise ValueError("trash hide status must not be empty")
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                insert into msg_trash_hide_index (
+                    media_id, openlist_path, hide_path, hide_pattern, status, reason, created_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                on conflict(media_id) do update set
+                    openlist_path = excluded.openlist_path,
+                    hide_path = excluded.hide_path,
+                    hide_pattern = excluded.hide_pattern,
+                    status = excluded.status,
+                    reason = excluded.reason,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    media_id,
+                    openlist_path,
+                    normalize_openlist_path((result or {}).get("hide_path")),
+                    str((result or {}).get("hide_pattern") or "").strip(),
+                    status,
+                    str((result or {}).get("reason") or "").strip(),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def list_msg_sync_running_tasks(self, limit=50):
         conn = self._connect()
@@ -1223,6 +1300,21 @@ class PipelineBotService:
             )
             apply_progress(format_result)
 
+        trash_hide_result = prefixed_task_fields(progress, "openlist_trash_hide_")
+        if self.config.msg_trash_hide_sync_enabled:
+            if not stage_is_complete(progress.get("openlist_trash_hide_status")):
+                emit({"openlist_trash_hide_status": "running", "openlist_trash_hide_error": None})
+                trash_hide_result = self._sync_msg_trash_to_openlist_hide(get_openlist_client())
+                if trash_hide_result.get("openlist_trash_hide_status") != "skipped":
+                    emit(trash_hide_result)
+                else:
+                    apply_progress(trash_hide_result)
+            else:
+                apply_progress(trash_hide_result)
+        else:
+            trash_hide_result = {"openlist_trash_hide_status": "skipped", "openlist_trash_hide_reason": "disabled"}
+            apply_progress(trash_hide_result)
+
         clean_result = prefixed_task_fields(progress, "openlist_clean_")
         if self.config.openlist_pre_scan_clean_enabled:
             if not stage_is_complete(progress.get("openlist_clean_status")):
@@ -1342,6 +1434,7 @@ class PipelineBotService:
             "msg_synced_at": int(time.time()),
             **clean_result,
             **format_result,
+            **trash_hide_result,
             **adult_extra_hide_result,
             **extras_result,
             **visibility_result,
@@ -1387,6 +1480,77 @@ class PipelineBotService:
             "msg_extra_cleanup_hidden_count": len(hide_patterns),
             "msg_extra_cleanup_reason": result.get("reason"),
             "msg_extra_cleanup_error": None,
+        }
+
+    def _sync_msg_trash_to_openlist_hide(self, openlist_client):
+        store = CandidateStore(self.config.state_db_path)
+        candidates = self._build_msg_db_client().list_deleted_openlist_media_for_hide(
+            limit=self.config.msg_trash_hide_sync_limit
+        )
+        processed = store.processed_trash_hide_media_ids([candidate["media_id"] for candidate in candidates])
+        pending = [candidate for candidate in candidates if candidate["media_id"] not in processed]
+        if not pending:
+            return {
+                "openlist_trash_hide_status": "skipped",
+                "openlist_trash_hide_reason": "no_pending",
+                "openlist_trash_hide_scanned_count": len(candidates),
+                "openlist_trash_hide_pending_count": 0,
+                "openlist_trash_hide_hidden_count": 0,
+                "openlist_trash_hide_skipped_count": 0,
+                "openlist_trash_hide_error": None,
+                "openlist_trash_hide_at": int(time.time()),
+            }
+
+        existing = []
+        missing = []
+        for candidate in pending:
+            if openlist_child_exists_for_hide(openlist_client, candidate["target_openlist_path"]):
+                existing.append(candidate)
+            else:
+                missing.append(candidate)
+
+        hide_groups = defaultdict(list)
+        for candidate in existing:
+            pattern = str(candidate.get("hide_pattern") or "").strip()
+            if pattern and pattern not in hide_groups[candidate["hide_path"]]:
+                hide_groups[candidate["hide_path"]].append(pattern)
+
+        for hide_path, patterns in sorted(hide_groups.items()):
+            openlist_client.upsert_meta_hide(hide_path, patterns, h_sub=True)
+
+        for candidate in existing:
+            store.save_trash_hide_result(
+                {
+                    "media_id": candidate["media_id"],
+                    "openlist_path": candidate["target_openlist_path"],
+                    "hide_path": candidate["hide_path"],
+                    "hide_pattern": candidate["hide_pattern"],
+                    "status": "hidden",
+                    "reason": "meta_hide",
+                }
+            )
+        for candidate in missing:
+            store.save_trash_hide_result(
+                {
+                    "media_id": candidate["media_id"],
+                    "openlist_path": candidate["target_openlist_path"],
+                    "hide_path": candidate["hide_path"],
+                    "hide_pattern": candidate["hide_pattern"],
+                    "status": "skipped",
+                    "reason": "target_missing",
+                }
+            )
+
+        return {
+            "openlist_trash_hide_status": "success",
+            "openlist_trash_hide_reason": "synced",
+            "openlist_trash_hide_scanned_count": len(candidates),
+            "openlist_trash_hide_pending_count": len(pending),
+            "openlist_trash_hide_hidden_count": len(existing),
+            "openlist_trash_hide_skipped_count": len(missing),
+            "openlist_trash_hide_meta_count": len(hide_groups),
+            "openlist_trash_hide_error": None,
+            "openlist_trash_hide_at": int(time.time()),
         }
 
     def _hide_openlist_adult_extra_videos_before_msg(self, client, category, queries, task):
@@ -3537,6 +3701,20 @@ def openlist_child_exists(client, path):
     return False
 
 
+def openlist_child_exists_for_hide(client, path):
+    try:
+        return openlist_child_exists(client, path)
+    except RuntimeError as exc:
+        if openlist_missing_error(exc):
+            return False
+        raise
+
+
+def openlist_missing_error(exc):
+    text = str(exc or "").lower()
+    return any(token in text for token in ("not found", "not exist", "不存在", "不存在或已删除", "已删除"))
+
+
 def parse_callback_data(value):
     action, sep, payload = (value or "").partition(":")
     if not sep:
@@ -3748,6 +3926,7 @@ def format_task_diagnostics_message(record):
 
     for key, label in (
         ("openlist_clean_error", "OpenList隐藏错误"),
+        ("openlist_trash_hide_error", "回收站隐藏错误"),
         ("openlist_adult_format_error", "番号格式化错误"),
         ("openlist_adult_extra_hide_error", "成人附加隐藏错误"),
         ("msg_error", "MSG错误"),
