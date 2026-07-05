@@ -293,7 +293,7 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertEqual(user_id, "user-1")
 
-    def test_patch_emby_collection_folder_item_cover_inherits_child_primary_image(self):
+    def test_patch_emby_collection_folder_item_cover_uses_self_grid_image(self):
         folder = {
             "Id": "library-1",
             "Name": "电影",
@@ -301,19 +301,53 @@ class SubtitleProxyTest(unittest.TestCase):
             "ImageTags": {},
             "PrimaryImageItemId": "library-1",
         }
-        cover = select_emby_folder_cover_item(
+        covers = select_emby_folder_cover_items(
             [
                 {"Id": "media-empty", "Name": "Empty", "ImageTags": {}},
                 {"Id": "media-1", "Name": "Sintel", "ImageTags": {"Primary": "media-1-tag"}, "PrimaryImageAspectRatio": 0.7},
+                {"Id": "media-2", "Name": "Tears", "ImageTags": {"Primary": "media-2-tag"}, "PrimaryImageAspectRatio": 0.7},
             ]
         )
 
-        changed = patch_emby_collection_folder_item_cover(folder, cover)
+        changed = patch_emby_collection_folder_item_cover(folder, covers)
 
         self.assertTrue(changed)
-        self.assertEqual(folder["PrimaryImageItemId"], "media-1")
-        self.assertEqual(folder["ImageTags"]["Primary"], "media-1-tag")
-        self.assertEqual(folder["PrimaryImageAspectRatio"], 0.7)
+        self.assertIsNone(folder["PrimaryImageItemId"])
+        self.assertTrue(folder["ImageTags"]["Primary"].startswith("mp-folder-"))
+        self.assertEqual(folder["PrimaryImageAspectRatio"], 16 / 9)
+
+    def test_select_emby_folder_cover_items_limits_to_four_unique_items(self):
+        covers = select_emby_folder_cover_items(
+            [
+                {"Id": "media-1", "ImageTags": {"Primary": "tag-1"}},
+                {"Id": "media-2", "ImageTags": {"Primary": "tag-2"}},
+                {"Id": "media-3", "ImageTags": {"Primary": "tag-3"}},
+                {"Id": "media-4", "ImageTags": {"Primary": "tag-4"}},
+                {"Id": "media-5", "ImageTags": {"Primary": "tag-5"}},
+            ]
+        )
+
+        self.assertEqual([cover["item_id"] for cover in covers], ["media-1", "media-2", "media-3", "media-4"])
+
+    def test_build_emby_folder_cover_grid_outputs_jpeg(self):
+        from PIL import Image
+
+        bodies = []
+        for color in ("red", "green", "blue", "yellow"):
+            image = Image.new("RGB", (24, 36), color)
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            bodies.append(buffer.getvalue())
+
+        body = build_emby_folder_cover_grid(bodies, dimensions=(400, 225))
+
+        self.assertTrue(body.startswith(b"\x89PNG"))
+        with Image.open(io.BytesIO(body)) as image:
+            self.assertEqual(image.size, (400, 225))
+
+    def test_emby_folder_cover_grid_dimensions_use_client_limit(self):
+        self.assertEqual(emby_folder_cover_grid_dimensions("maxWidth=400&maxHeight=300"), (400, 225))
+        self.assertEqual(emby_folder_cover_grid_dimensions("maxWidth=10"), (160, 90))
 
     def test_emby_image_proxy_path_replaces_tag_and_preserves_client_query(self):
         path = emby_image_proxy_path(

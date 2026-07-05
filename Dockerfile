@@ -5,7 +5,7 @@ ARG MEDIA_PIPELINE_REVISION=unknown
 
 WORKDIR /app
 COPY app/ /app/
-RUN pip install --no-cache-dir "psycopg[binary]>=3.2,<4"
+RUN pip install --no-cache-dir "psycopg[binary]>=3.2,<4" "Pillow>=10,<12"
 
 ENV PYTHONUNBUFFERED=1
 ENV MEDIA_PIPELINE_VERSION=${MEDIA_PIPELINE_VERSION}

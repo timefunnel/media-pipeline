@@ -1,5 +1,7 @@
 import base64
+import hashlib
 import http.server
+import io
 import json
 import os
 import posixpath
@@ -10,6 +12,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    Image = None
+    ImageOps = None
 
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider
 
@@ -52,6 +60,11 @@ EMBY_ITEM_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 EMBY_FOLDER_COVER_CACHE_TTL_SECONDS = 300
+EMBY_FOLDER_COVER_GRID_LIMIT = 4
+EMBY_FOLDER_COVER_ASPECT_RATIO = 16 / 9
+EMBY_FOLDER_COVER_DEFAULT_WIDTH = 600
+EMBY_FOLDER_COVER_MIN_WIDTH = 160
+EMBY_FOLDER_COVER_MAX_WIDTH = 1200
 SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
 VIDEO_EXTENSIONS = {
     ".avi",
@@ -636,13 +649,24 @@ def emby_item_needs_folder_cover(item):
 
 
 def select_emby_folder_cover_item(items, preferred_image_type="Primary"):
+    covers = select_emby_folder_cover_items(items, preferred_image_type=preferred_image_type, limit=1)
+    return covers[0] if covers else None
+
+
+def select_emby_folder_cover_items(items, preferred_image_type="Primary", limit=EMBY_FOLDER_COVER_GRID_LIMIT):
     preferred_image_type = image_type_value(preferred_image_type)
+    selected = []
+    selected_ids = set()
     for image_type in unique_values([preferred_image_type, "Primary", "Backdrop", "Thumb"]):
         for item in items or []:
             cover = emby_item_cover(item, image_type)
-            if cover:
-                return cover
-    return None
+            if not cover or cover["item_id"] in selected_ids:
+                continue
+            selected.append(cover)
+            selected_ids.add(cover["item_id"])
+            if len(selected) >= max(1, int_value(limit)):
+                return selected
+    return selected
 
 
 def emby_item_cover(item, image_type="Primary"):
@@ -676,15 +700,38 @@ def emby_item_cover(item, image_type="Primary"):
 
 
 def patch_emby_collection_folder_item_cover(item, cover):
-    if not emby_item_needs_folder_cover(item) or not cover:
+    covers = cover if isinstance(cover, list) else ([cover] if cover else [])
+    if not emby_item_needs_folder_cover(item) or not covers:
         return False
+    tag = emby_folder_cover_grid_tag(item.get("Id"), covers)
     image_tags = dict(item.get("ImageTags") if isinstance(item.get("ImageTags"), dict) else {})
-    image_tags["Primary"] = cover["tag"]
+    image_tags["Primary"] = tag
     item["ImageTags"] = image_tags
-    item["PrimaryImageItemId"] = cover["item_id"]
-    if cover.get("primary_image_aspect_ratio") is not None:
-        item["PrimaryImageAspectRatio"] = cover["primary_image_aspect_ratio"]
+    item["PrimaryImageItemId"] = None
+    item["PrimaryImageAspectRatio"] = EMBY_FOLDER_COVER_ASPECT_RATIO
     return True
+
+
+def emby_folder_cover_grid_tag(folder_id, covers):
+    digest = hashlib.sha1(
+        json.dumps(
+            [
+                str(folder_id or ""),
+                [
+                    [
+                        str(cover.get("item_id") or ""),
+                        str(cover.get("image_type") or ""),
+                        str(cover.get("tag") or ""),
+                    ]
+                    for cover in covers or []
+                    if isinstance(cover, dict)
+                ],
+            ],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return "mp-folder-%s" % digest
 
 
 def emby_image_proxy_path(cover, original_query=""):
@@ -699,6 +746,63 @@ def emby_image_proxy_path(cover, original_query=""):
         urllib.parse.quote(image_type_value(cover.get("image_type")), safe=""),
         urllib.parse.urlencode(query_items),
     )
+
+
+def emby_folder_cover_grid_dimensions(query=""):
+    max_width = 0
+    max_height = 0
+    for key, value in urllib.parse.parse_qsl(query or "", keep_blank_values=True):
+        normalized_key = key.lower()
+        if normalized_key in ("maxwidth", "width"):
+            parsed = int_value(value)
+            if parsed > 0:
+                max_width = parsed if not max_width else min(max_width, parsed)
+        elif normalized_key in ("maxheight", "height"):
+            parsed = int_value(value)
+            if parsed > 0:
+                max_height = parsed if not max_height else min(max_height, parsed)
+    width = max_width or EMBY_FOLDER_COVER_DEFAULT_WIDTH
+    if max_height:
+        width = min(width, int(max_height * EMBY_FOLDER_COVER_ASPECT_RATIO))
+    width = max(EMBY_FOLDER_COVER_MIN_WIDTH, min(EMBY_FOLDER_COVER_MAX_WIDTH, width))
+    height = max(1, int(round(width / EMBY_FOLDER_COVER_ASPECT_RATIO)))
+    return width, height
+
+
+def build_emby_folder_cover_grid(image_bodies, dimensions=None):
+    if Image is None or ImageOps is None:
+        raise RuntimeError("Pillow is required to build Emby folder cover grids")
+    decoded = []
+    for body in image_bodies or []:
+        if not body:
+            continue
+        try:
+            with Image.open(io.BytesIO(body)) as image:
+                decoded.append(image.convert("RGB"))
+        except (OSError, ValueError):
+            continue
+        if len(decoded) >= EMBY_FOLDER_COVER_GRID_LIMIT:
+            break
+    if not decoded:
+        return b""
+    if dimensions:
+        width, height = dimensions
+    else:
+        width, height = emby_folder_cover_grid_dimensions("")
+    width = max(EMBY_FOLDER_COVER_MIN_WIDTH, min(EMBY_FOLDER_COVER_MAX_WIDTH, int_value(width) or EMBY_FOLDER_COVER_DEFAULT_WIDTH))
+    height = max(1, int_value(height) or int(round(width / EMBY_FOLDER_COVER_ASPECT_RATIO)))
+    canvas = Image.new("RGB", (width, height), (18, 18, 18))
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    column_count = min(len(decoded), EMBY_FOLDER_COVER_GRID_LIMIT)
+    x = 0
+    for index, image in enumerate(decoded[:column_count]):
+        next_x = width if index == column_count - 1 else int(round(width * (index + 1) / column_count))
+        tile_size = (max(1, next_x - x), height)
+        canvas.paste(ImageOps.fit(image, tile_size, method=resample), (x, 0))
+        x = next_x
+    out = io.BytesIO()
+    canvas.save(out, format="PNG", optimize=True)
+    return out.getvalue()
 
 
 def unique_values(values):
@@ -992,6 +1096,7 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
     msg_api_auth = None
     openlist_subtitle_provider = None
     folder_cover_cache = {}
+    folder_image_cache = {}
     folder_id_cache = {}
     folder_cover_cache_lock = threading.Lock()
 
@@ -1048,20 +1153,29 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             return False
         if not self._is_emby_collection_folder_id(user_id, image_request["item_id"], request_headers, self.path):
             return False
-        cover = self._find_emby_folder_cover(
+        covers = self._find_emby_folder_covers(
             user_id,
             image_request["item_id"],
             request_headers,
             self.path,
             preferred_image_type=image_request["image_type"],
         )
-        if not cover:
+        if not covers:
             return False
-        upstream_path = emby_image_proxy_path(cover, image_request["query"])
-        status, headers, body = self._read_upstream(upstream_path, request_headers)
-        if status < 200 or status >= 300 or not body:
+        body = self._build_emby_folder_cover_image(
+            user_id,
+            image_request["item_id"],
+            covers,
+            request_headers,
+            image_request["query"],
+        )
+        if not body:
             return False
-        self._write_response(status, headers, body, request_headers=request_headers, request_path=upstream_path)
+        headers = {
+            "Content-Type": "image/png",
+            "Cache-Control": "public, max-age=%d" % EMBY_FOLDER_COVER_CACHE_TTL_SECONDS,
+        }
+        self._write_response(200, headers, body, request_headers=request_headers, request_path=self.path)
         return True
 
     def _serve_emby_subtitle_stream(self, request_headers):
@@ -1203,8 +1317,8 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             if not emby_item_needs_folder_cover(item):
                 continue
             self._remember_emby_collection_folder_id(user_id, item.get("Id"))
-            cover = self._find_emby_folder_cover(user_id, item.get("Id"), request_headers, request_path or "")
-            if patch_emby_collection_folder_item_cover(item, cover):
+            covers = self._find_emby_folder_covers(user_id, item.get("Id"), request_headers, request_path or "")
+            if patch_emby_collection_folder_item_cover(item, covers):
                 changed = True
         return changed
 
@@ -1260,26 +1374,62 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         return ids
 
     def _find_emby_folder_cover(self, user_id, folder_id, request_headers, request_path, preferred_image_type="Primary"):
+        covers = self._find_emby_folder_covers(user_id, folder_id, request_headers, request_path, preferred_image_type)
+        return covers[0] if covers else None
+
+    def _find_emby_folder_covers(self, user_id, folder_id, request_headers, request_path, preferred_image_type="Primary"):
         user_id = str(user_id or "").strip()
         folder_id = str(folder_id or "").strip()
         if not user_id or not folder_id:
-            return None
+            return []
         preferred_image_type = image_type_value(preferred_image_type)
         key = (user_id, folder_id, preferred_image_type)
         now = time.time()
         with self.folder_cover_cache_lock:
             cached = self.folder_cover_cache.get(key)
             if cached and cached.get("expires_at", 0) > now:
-                return cached.get("cover")
-        cover = self._fetch_emby_folder_cover(user_id, folder_id, request_headers, request_path, preferred_image_type)
+                return cached.get("covers") or []
+        covers = self._fetch_emby_folder_covers(user_id, folder_id, request_headers, request_path, preferred_image_type)
         with self.folder_cover_cache_lock:
             self.folder_cover_cache[key] = {
-                "cover": cover,
+                "covers": covers,
                 "expires_at": now + EMBY_FOLDER_COVER_CACHE_TTL_SECONDS,
             }
-        return cover
+        return covers
+
+    def _build_emby_folder_cover_image(self, user_id, folder_id, covers, request_headers, original_query):
+        dimensions = emby_folder_cover_grid_dimensions(original_query)
+        tag = emby_folder_cover_grid_tag(folder_id, covers)
+        key = (str(user_id), str(folder_id), tag, dimensions)
+        now = time.time()
+        with self.folder_cover_cache_lock:
+            cached = self.folder_image_cache.get(key)
+            if cached and cached.get("expires_at", 0) > now:
+                return cached.get("body") or b""
+        image_bodies = []
+        for cover in covers[:EMBY_FOLDER_COVER_GRID_LIMIT]:
+            upstream_path = emby_image_proxy_path(cover, original_query)
+            status, _headers, body = self._read_upstream(upstream_path, request_headers)
+            if status >= 200 and status < 300 and body:
+                image_bodies.append(body)
+        try:
+            body = build_emby_folder_cover_grid(image_bodies, dimensions=dimensions)
+        except RuntimeError as exc:
+            print("subtitle proxy Emby folder cover grid failed: %s" % exc, flush=True)
+            return b""
+        if body:
+            with self.folder_cover_cache_lock:
+                self.folder_image_cache[key] = {
+                    "body": body,
+                    "expires_at": now + EMBY_FOLDER_COVER_CACHE_TTL_SECONDS,
+                }
+        return body
 
     def _fetch_emby_folder_cover(self, user_id, folder_id, request_headers, request_path, preferred_image_type="Primary"):
+        covers = self._fetch_emby_folder_covers(user_id, folder_id, request_headers, request_path, preferred_image_type)
+        return covers[0] if covers else None
+
+    def _fetch_emby_folder_covers(self, user_id, folder_id, request_headers, request_path, preferred_image_type="Primary"):
         query_items = [
             ("ParentId", str(folder_id)),
             ("Limit", "30"),
@@ -1303,8 +1453,8 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             return None
         items = payload.get("Items") if isinstance(payload, dict) else None
         if not isinstance(items, list) or not items:
-            return None
-        return select_emby_folder_cover_item(items, preferred_image_type)
+            return []
+        return select_emby_folder_cover_items(items, preferred_image_type)
 
     def _read_msg_api(self, path, retry_auth=True):
         if self.msg_api_auth is None:
