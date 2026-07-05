@@ -3353,13 +3353,43 @@ def first_adult_code(values):
 
 
 def adult_code_prefix_matches(name, code):
-    return normalize_openlist_text(name).startswith(normalize_openlist_text(code))
+    raw_name = str(name or "").strip()
+    raw_code = str(code or "").strip()
+    if not raw_name or not raw_code:
+        return False
+    lowered_name = raw_name.casefold()
+    lowered_code = raw_code.casefold()
+    return lowered_name == lowered_code or lowered_name.startswith(lowered_code + " - ")
 
 
 def adult_code_formatted_name(code, old_name):
+    old_name = str(old_name or "").strip()
     if not old_name:
         return code
+    suffix = adult_code_name_suffix(old_name, code)
+    if suffix is not None:
+        if not suffix:
+            return code
+        return "%s - %s" % (code, suffix)
     return "%s - %s" % (code, old_name)
+
+
+def adult_code_name_suffix(name, code):
+    code_match = re.match(r"^([A-Za-z]{2,10})-(\d{3,5})$", str(code or ""))
+    if not code_match:
+        return None
+    prefix = re.escape(code_match.group(1))
+    number = re.escape(str(int(code_match.group(2))))
+    raw = str(name or "").strip()
+    match = re.match(r"(?i)^\s*%s[\s._-]*0*%s(?P<suffix>.*)$" % (prefix, number), raw)
+    if not match:
+        return None
+    suffix = match.group("suffix").strip()
+    if suffix.casefold() == "ch":
+        return ""
+    if suffix[:2].casefold() == "ch" and (len(suffix) == 2 or suffix[2] in " ._-"):
+        suffix = suffix[2:].lstrip(" ._-")
+    return suffix.strip(" ._-")
 
 
 def find_openlist_task_target(client, category_path, queries, task=None):

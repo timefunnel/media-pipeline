@@ -2991,6 +2991,15 @@ class PipelineBotServiceTest(unittest.TestCase):
             )
         )
 
+    def test_adult_code_formatting_strips_ch_noise_suffix(self):
+        from pipeline.bot import adult_code_formatted_name, adult_code_prefix_matches
+
+        self.assertFalse(adult_code_prefix_matches("ssis-152ch", "SSIS-152"))
+        self.assertTrue(adult_code_prefix_matches("SSIS-152", "SSIS-152"))
+        self.assertTrue(adult_code_prefix_matches("SSIS-152 - title", "SSIS-152"))
+        self.assertEqual(adult_code_formatted_name("SSIS-152", "ssis-152ch"), "SSIS-152")
+        self.assertEqual(adult_code_formatted_name("SSIS-152", "SSIS-152CH title"), "SSIS-152 - title")
+
     def test_sync_completed_adult_task_clears_format_running_when_format_is_skipped(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
