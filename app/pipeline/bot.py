@@ -105,6 +105,16 @@ HELP_TEXT = """直接发送关键词、番号或磁链即可。
 /version 查看当前版本
 
 搜索结果里选择资源后，再选择入电影、剧集、动漫、成人或其他库。"""
+BOT_COMMANDS = [
+    {"command": "start", "description": "打开使用说明"},
+    {"command": "help", "description": "查看功能和直接搜索说明"},
+    {"command": "tasks", "description": "查看最近任务、刷新进度或取消任务"},
+    {"command": "status", "description": "按 info_hash 查询任务进度"},
+    {"command": "migrate", "description": "迁移已入库媒体到其他库"},
+    {"command": "dedupe_refresh", "description": "刷新重复判断索引（需二次确认）"},
+    {"command": "version", "description": "查看当前版本"},
+]
+
 DEDUPE_REFRESH_WARNING_TEXT = """刷新已入库记录？
 
 这个操作会主动刷新 OpenList 目录并重建 Bot 的重复判断基线，可能增加网盘侧请求量，资源多时也会比较慢。
@@ -748,6 +758,9 @@ class TelegramApi:
 
     def send_chat_action(self, chat_id, action="typing"):
         return self._request("sendChatAction", {"chat_id": chat_id, "action": action})
+
+    def set_my_commands(self, commands):
+        return self._request("setMyCommands", {"commands": list(commands or [])})
 
     def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
         payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
@@ -2376,7 +2389,14 @@ class TelegramBot:
                 last_msg_recovery_at = now
             time.sleep(loop_interval)
 
+    def configure_bot_commands(self):
+        try:
+            self.telegram.set_my_commands(BOT_COMMANDS)
+        except Exception as exc:
+            print("telegram command setup failed: %s" % exc, flush=True)
+
     def run_forever(self):
+        self.configure_bot_commands()
         self.start_sync_recovery_thread()
         offset = None
         while True:

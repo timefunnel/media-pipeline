@@ -481,6 +481,46 @@ class TelegramBotTest(unittest.TestCase):
             ],
         )
 
+    def test_telegram_api_set_my_commands_uses_set_my_commands_endpoint(self):
+        from pipeline.bot import BOT_COMMANDS, TelegramApi
+
+        class FakeTelegramTransport:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, url, payload, timeout=None):
+                self.calls.append({"url": url, "payload": payload, "timeout": timeout})
+                return {"ok": True}
+
+        transport = FakeTelegramTransport()
+        api = TelegramApi("token", transport=transport, timeout=12)
+
+        api.set_my_commands(BOT_COMMANDS)
+
+        self.assertEqual(
+            transport.calls,
+            [
+                {
+                    "url": "https://api.telegram.org/bottoken/setMyCommands",
+                    "payload": {"commands": BOT_COMMANDS},
+                    "timeout": 12,
+                }
+            ],
+        )
+
+    def test_configure_bot_commands_sets_current_command_descriptions(self):
+        from pipeline.bot import BOT_COMMANDS, BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService()
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.configure_bot_commands()
+
+        self.assertEqual(telegram.commands, [BOT_COMMANDS])
+
     def test_telegram_transport_converts_http_error_body_to_runtime_error(self):
         import urllib.error
 
@@ -5407,6 +5447,7 @@ class FakeTelegram:
         self.edits = []
         self.deletes = []
         self.chat_actions = []
+        self.commands = []
         self.chat_action_error = chat_action_error
 
     def send_message(self, chat_id, text, reply_markup=None):
@@ -5417,6 +5458,10 @@ class FakeTelegram:
         if self.chat_action_error:
             raise self.chat_action_error
         self.chat_actions.append({"chat_id": chat_id, "action": action})
+
+    def set_my_commands(self, commands):
+        self.commands.append(list(commands or []))
+        return {"ok": True}
 
     def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
         self.edits.append({"chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": reply_markup})
