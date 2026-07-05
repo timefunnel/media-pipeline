@@ -333,6 +333,65 @@ class CategoryConfigTest(unittest.TestCase):
         self.assertEqual(other["provider"], "tmdb")
         self.assertEqual(other["media_type"], "movie")
 
+    def test_load_category_config_allows_env_overrides(self):
+        from pipeline.config import category_maps, load_category_config
+
+        config = load_category_config(
+            {
+                "MEDIA_PIPELINE_MOVIE_FOLDER_ID": "folder-override",
+                "MEDIA_PIPELINE_MOVIE_OPENLIST_PATH": "/115/电影新",
+                "MEDIA_PIPELINE_MOVIE_MSG_LIBRARY_ID": "library-override",
+                "MEDIA_PIPELINE_MOVIE_MSG_ROOT_ID": "root-override",
+                "MEDIA_PIPELINE_MOVIE_MSG_PROVIDER": "tmdb",
+                "MEDIA_PIPELINE_MOVIE_MSG_MEDIA_TYPE": "movie",
+            }
+        )
+        folder_ids, openlist_paths, msg_roots = category_maps(config)
+
+        self.assertEqual(folder_ids["movie"], "folder-override")
+        self.assertEqual(openlist_paths["movie"], "/115/电影新")
+        self.assertEqual(msg_roots["movie"]["library_id"], "library-override")
+        self.assertEqual(msg_roots["movie"]["root_id"], "root-override")
+        self.assertEqual(folder_ids["adult"], "3464134590896014943")
+
+    def test_load_category_config_allows_inline_json_overrides(self):
+        from pipeline.config import category_maps, load_category_config
+
+        payload = json.dumps(
+            {
+                "anime": {
+                    "folder_id": "anime-folder-json",
+                    "openlist_path": "/115/动画",
+                    "msg": {
+                        "library_id": "anime-library-json",
+                        "root_id": "anime-root-json",
+                        "provider": "tmdb",
+                        "media_type": "anime",
+                    },
+                }
+            },
+            ensure_ascii=False,
+        )
+
+        config = load_category_config({"MEDIA_PIPELINE_LIBRARY_CONFIG_JSON": payload})
+        folder_ids, openlist_paths, msg_roots = category_maps(config)
+
+        self.assertEqual(folder_ids["anime"], "anime-folder-json")
+        self.assertEqual(openlist_paths["anime"], "/115/动画")
+        self.assertEqual(msg_roots["anime"]["library_id"], "anime-library-json")
+        self.assertEqual(msg_roots["anime"]["root_id"], "anime-root-json")
+
+    def test_load_category_config_rejects_conflicting_external_sources(self):
+        from pipeline.config import load_category_config
+
+        with self.assertRaisesRegex(RuntimeError, "set either MEDIA_PIPELINE_LIBRARY_CONFIG"):
+            load_category_config(
+                {
+                    "MEDIA_PIPELINE_LIBRARY_CONFIG": "/tmp/library.json",
+                    "MEDIA_PIPELINE_LIBRARY_CONFIG_JSON": "{}",
+                }
+            )
+
     def test_rejects_unknown_category_without_fallback(self):
         with self.assertRaisesRegex(ValueError, "unsupported category"):
             category_to_folder_id("unknown")
