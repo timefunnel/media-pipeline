@@ -1399,7 +1399,10 @@ class TelegramBotTest(unittest.TestCase):
             self.assertEqual(service.submit_calls, [])
             self.assertEqual(telegram.answers, [{"callback_query_id": "cb1", "text": "发现重复作品"}])
             self.assertIn("重复入库拦截", telegram.edits[0]["text"])
+            self.assertIn("判定：强重复", telegram.edits[0]["text"])
             self.assertIn("相同info_hash", telegram.edits[0]["text"])
+            self.assertIn("命中规则：info_hash", telegram.edits[0]["text"])
+            self.assertIn("当前info_hash：BBB", telegram.edits[0]["text"])
             buttons = [button for row in telegram.edits[0]["reply_markup"]["inline_keyboard"] for button in row]
             self.assertEqual([button["text"] for button in buttons], ["查看已有任务"])
 
@@ -1483,6 +1486,8 @@ class TelegramBotTest(unittest.TestCase):
             self.assertEqual(service.submit_calls, [])
             self.assertEqual(service.duplicate_calls, [])
             self.assertIn("成人番号重复", telegram.edits[0]["text"])
+            self.assertIn("命中规则：成人番号", telegram.edits[0]["text"])
+            self.assertIn("命中值：SSIS-450", telegram.edits[0]["text"])
             self.assertIn("OpenList基线", telegram.edits[0]["text"])
             self.assertIn("/115/成人/SSIS-450 Existing", telegram.edits[0]["text"])
 
@@ -1506,6 +1511,8 @@ class TelegramBotTest(unittest.TestCase):
                     "source": "MediaStationGo",
                     "title": "Sintel",
                     "media_id": "media-1",
+                    "identity_type": "title_query",
+                    "identity_value": "sintel",
                 },
                 submit_response={"state": True, "tasks": [{"info_hash": "BBB", "state": True, "code": 0}]},
             )
@@ -1533,6 +1540,8 @@ class TelegramBotTest(unittest.TestCase):
             )
 
             self.assertIn("可能重复入库", telegram.edits[0]["text"])
+            self.assertIn("判定：弱重复", telegram.edits[0]["text"])
+            self.assertIn("命中规则：标题查询", telegram.edits[0]["text"])
             self.assertEqual(telegram.edits[0]["reply_markup"]["inline_keyboard"][-1][0]["text"], "仍然入库")
             self.assertEqual(service.submit_calls, [("movie", "magnet:?xt=urn:btih:BBB")])
             self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb2", "text": "已确认仍然入库"})
@@ -3287,6 +3296,96 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertNotIn("openlist_adult_format_status", task)
         self.assertEqual(task["msg_sync_status"], "success")
 
+    def test_sync_completed_task_prefers_msg_media_path_over_search_title_match(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        movie_root = category_to_openlist_path("movie")
+        target_path = movie_root + "/秋色之空"
+        fake_openlist = CleaningOpenList(
+            {
+                movie_root: [{"name": "秋色之空", "is_dir": True, "size": 0}],
+                target_path: [{"name": "01.mkv", "is_dir": False, "size": 900 * 1024 * 1024}],
+            }
+        )
+        fake_msg = FakeMediaStationClient(
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-wrong",
+                            "library_id": "d150a96c-b467-4c60-82f1-207ae5949045",
+                            "title": "秋色之空",
+                            "path": "cloud://openlist/115/动漫/成龙历险记/01.mp4",
+                        }
+                    ]
+                }
+            },
+            list_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-correct",
+                            "library_id": "d150a96c-b467-4c60-82f1-207ae5949045",
+                            "title": "秋色之空",
+                            "path": "cloud://openlist/115/电影/秋色之空/01.mkv",
+                            "size_bytes": 900 * 1024 * 1024,
+                        }
+                    ]
+                }
+            },
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
+        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    msg_sync_poll_seconds=0,
+                    openlist_pre_scan_clean_enabled=True,
+                )
+            )
+            task = service.sync_completed_task(
+                "movie",
+                "秋色之空",
+                {"info_hash": "ABC", "status_name": "success", "name": "秋色之空"},
+            )
+
+        self.assertEqual(task["msg_media_id"], "media-correct")
+        self.assertEqual(task["msg_match_mode"], "path")
+        self.assertEqual(task["msg_match_path"], "cloud://openlist/115/电影/秋色之空/01.mkv")
+        self.assertEqual(fake_msg.search_calls, [])
+
+    def test_find_media_by_openlist_paths_matches_encoded_child_path(self):
+        from pipeline.bot import find_media_by_openlist_paths
+
+        media = find_media_by_openlist_paths(
+            [
+                {
+                    "id": "wrong",
+                    "library_id": "library-1",
+                    "path": "cloud://openlist/115/电影/其他/01.mkv",
+                },
+                {
+                    "id": "right",
+                    "library_id": "library-1",
+                    "path": "cloud://openlist/115/%E7%94%B5%E5%BD%B1/Sintel/main.mkv",
+                    "size_bytes": 800 * 1024 * 1024,
+                },
+            ],
+            ["/115/电影/Sintel"],
+            library_id="library-1",
+        )
+
+        self.assertEqual(media["id"], "right")
+        self.assertEqual(media["_pipeline_match_mode"], "path")
+        self.assertEqual(media["_pipeline_match_path"], "cloud://openlist/115/电影/Sintel/main.mkv")
+
     def test_sync_completed_other_task_uses_other_root_without_adult_code_format(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
@@ -3478,6 +3577,8 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(duplicate["level"], "strong")
         self.assertEqual(duplicate["reason"], "mediastation_code")
         self.assertEqual(duplicate["media_id"], "media-1")
+        self.assertEqual(duplicate["identity_type"], "adult_code")
+        self.assertEqual(duplicate["identity_value"], "SSIS-450")
 
     def test_check_duplicate_marks_movie_title_match_as_weak(self):
         from pipeline.bot import BotConfig, PipelineBotService
@@ -3512,6 +3613,8 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(duplicate["level"], "weak")
         self.assertEqual(duplicate["reason"], "mediastation_title")
         self.assertEqual(duplicate["media_id"], "media-1")
+        self.assertEqual(duplicate["identity_type"], "title_query")
+        self.assertEqual(duplicate["identity_value"], "Sintel")
 
     def test_check_duplicate_does_not_use_generic_release_fragments(self):
         from pipeline.bot import BotConfig, PipelineBotService

@@ -25,9 +25,10 @@ from pipeline.mediastation import (
     extract_media_items,
     extract_scrape_matches,
     find_matching_media,
+    media_belongs_to_library,
     media_haystack,
 )
-from pipeline.msgdb import DEFAULT_MSG_DATABASE_DSN, MediaStationDbClient, build_migration_target
+from pipeline.msgdb import DEFAULT_MSG_DATABASE_DSN, MediaStationDbClient, build_migration_target, openlist_path_to_cloud_path
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes, task_can_cancel
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider
 from pipeline.openlist_tokens import OpenListTokenStore
@@ -922,13 +923,19 @@ class PipelineBotService:
         if media is None:
             return None
         media_codes = extract_codes(media_haystack(media))
+        matched_codes = sorted(codes.intersection(media_codes))
+        strong_code_match = category == "adult" and bool(matched_codes)
+        identity_value = matched_codes[0] if strong_code_match else (queries[0] if queries else "")
         return {
-            "level": "strong" if category == "adult" and codes and codes.intersection(media_codes) else "weak",
-            "reason": "mediastation_code" if category == "adult" and codes and codes.intersection(media_codes) else "mediastation_title",
+            "level": "strong" if strong_code_match else "weak",
+            "reason": "mediastation_code" if strong_code_match else "mediastation_title",
             "source": "MediaStationGo",
             "title": media_display_title(media),
+            "path": media_primary_path(media),
             "media_id": extract_media_id(media),
-            "can_force": not (category == "adult" and codes and codes.intersection(media_codes)),
+            "identity_type": "adult_code" if strong_code_match else "title_query",
+            "identity_value": identity_value,
+            "can_force": not strong_code_match,
         }
 
     def collect_openlist_dedupe_entries(self, refresh=True):
@@ -1073,6 +1080,7 @@ class PipelineBotService:
             else:
                 apply_progress(adult_extra_hide_result)
 
+        target_openlist_paths = msg_target_openlist_paths(category, progress)
         media_id = progress.get("msg_media_id")
         media_title = progress.get("msg_media_title")
         root = category_to_msg_library_root(category)
@@ -1083,12 +1091,20 @@ class PipelineBotService:
             client = get_msg_client()
             emit({"msg_scan_status": "running", "msg_error": None})
             client.scan_root(root["library_id"], root["root_id"])
-            media = self._wait_for_msg_media(client, root["library_id"], queries)
+            media = self._wait_for_msg_media(client, root["library_id"], queries, target_openlist_paths=target_openlist_paths)
             media_id = extract_media_id(media)
             if not media_id:
                 raise RuntimeError("MediaStationGo media id missing after scan")
             media_title = media_display_title(media)
-            emit({"msg_scan_status": "success", "msg_media_id": media_id, "msg_media_title": media_title})
+            emit(
+                {
+                    "msg_scan_status": "success",
+                    "msg_media_id": media_id,
+                    "msg_media_title": media_title,
+                    "msg_match_mode": media.get("_pipeline_match_mode") or "query",
+                    "msg_match_path": media.get("_pipeline_match_path"),
+                }
+            )
 
         if progress.get("msg_scrape_status") != "success":
             emit({"msg_scrape_status": "running", "msg_media_id": media_id, "msg_media_title": media_title})
@@ -1140,6 +1156,8 @@ class PipelineBotService:
             "msg_root_id": msg_root_id,
             "msg_media_id": media_id,
             "msg_media_title": media_title,
+            "msg_match_mode": progress.get("msg_match_mode"),
+            "msg_match_path": progress.get("msg_match_path"),
             "msg_error": None,
             "msg_synced_at": int(time.time()),
             **clean_result,
@@ -1235,25 +1253,35 @@ class PipelineBotService:
             "msg_artwork_repair_error": None,
         }
 
-    def _wait_for_msg_media(self, client, library_id, queries):
+    def _wait_for_msg_media(self, client, library_id, queries, target_openlist_paths=None):
         deadline = time.monotonic() + max(0, int(self.config.msg_sync_poll_seconds))
         interval = max(1, int(self.config.msg_sync_poll_interval_seconds))
         while True:
+            if target_openlist_paths:
+                items = extract_media_items(client.list_library_media(library_id, page=1, page_size=200, group_versions=0))
+                media = find_media_by_openlist_paths(items, target_openlist_paths, library_id=library_id)
+                if media:
+                    return media
+
             for query in queries:
                 items = extract_media_items(client.search_media(query, limit=20))
                 media = find_matching_media(items, queries, library_id=library_id)
                 if media:
+                    media["_pipeline_match_mode"] = "query"
                     return media
 
             items = extract_media_items(client.list_library_media(library_id, page=1, page_size=200, group_versions=0))
             media = find_matching_media(items, queries, library_id=library_id)
             if media:
+                media["_pipeline_match_mode"] = "query"
                 return media
 
             if time.monotonic() >= deadline:
                 break
             time.sleep(interval)
-        raise RuntimeError("MediaStationGo media not found after root scan: %s" % (queries[0] if queries else "-"))
+        target_hint = ", ".join(target_openlist_paths or [])
+        query_hint = queries[0] if queries else "-"
+        raise RuntimeError("MediaStationGo media not found after root scan: %s%s" % (query_hint, " path=%s" % target_hint if target_hint else ""))
 
     def _refresh_openlist_for_msg(self, category):
         path = category_to_openlist_path(category)
@@ -1312,6 +1340,137 @@ class PipelineBotService:
 
     def _build_msg_db_client(self):
         return MediaStationDbClient(self.config.msg_database_dsn)
+
+
+def msg_target_openlist_paths(category, task):
+    task = task or {}
+    paths = []
+    for key in (
+        "openlist_adult_format_new_path",
+        "openlist_adult_format_path",
+        "openlist_clean_target",
+        "openlist_adult_extra_hide_path",
+    ):
+        value = normalize_openlist_path(task.get(key))
+        if value:
+            paths.append(value)
+
+    root_path = normalize_openlist_path(category_to_openlist_path(category))
+    if root_path:
+        for name in task_openlist_target_names(task):
+            paths.append(posixpath.join(root_path.rstrip("/") or "/", name))
+    return unique_openlist_paths(paths)
+
+
+def task_openlist_target_names(task):
+    names = []
+    for key in ("name", "file_name", "filename"):
+        value = str((task or {}).get(key) or "").strip().replace("\\", "/")
+        if not value:
+            continue
+        name = posixpath.basename(value.rstrip("/"))
+        if name:
+            names.append(name)
+    return unique_nonempty_values(names)
+
+
+def unique_openlist_paths(paths):
+    seen = set()
+    out = []
+    for path in paths or []:
+        normalized = normalize_openlist_path(path)
+        key = normalized.casefold()
+        if normalized and key not in seen:
+            seen.add(key)
+            out.append(normalized)
+    return out
+
+
+def find_media_by_openlist_paths(items, openlist_paths, library_id=None):
+    targets = [normalize_msg_cloud_path(openlist_path_to_cloud_path(path)) for path in openlist_paths or []]
+    targets = [target for target in targets if target]
+    if not targets:
+        return None
+
+    best = None
+    best_score = 0
+    best_path = ""
+    for item in items or []:
+        if not media_belongs_to_library(item, library_id):
+            continue
+        for value in media_path_values(item):
+            media_path = normalize_msg_cloud_path(value)
+            for target in targets:
+                score = media_openlist_path_match_score(media_path, target, item)
+                if score > best_score:
+                    best = item
+                    best_score = score
+                    best_path = media_path
+    if best is not None:
+        best["_pipeline_match_mode"] = "path"
+        best["_pipeline_match_path"] = best_path
+    return best
+
+
+def media_openlist_path_match_score(media_path, target_path, item):
+    if not media_path or not target_path:
+        return 0
+    score = 0
+    if media_path == target_path:
+        score = 2000
+    elif media_path.startswith(target_path.rstrip("/") + "/"):
+        score = 1000
+    if score <= 0:
+        return 0
+    score += min(media_path.count("/"), 50)
+    score += min(media_item_size_bytes(item) // (100 * 1024 * 1024), 100)
+    return score
+
+
+def media_path_values(value):
+    paths = []
+    if isinstance(value, dict):
+        for key in ("path", "file_path", "source_path", "strm_url", "url"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                paths.append(item)
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                paths.extend(media_path_values(child))
+    elif isinstance(value, list):
+        for child in value:
+            paths.extend(media_path_values(child))
+    return unique_nonempty_values(paths)
+
+
+def media_primary_path(media):
+    paths = media_path_values(media)
+    return paths[0] if paths else ""
+
+
+def normalize_msg_cloud_path(value):
+    text = urllib.parse.unquote(str(value or "").strip()).replace("\\", "/").rstrip("/")
+    if not text:
+        return ""
+    if text.startswith("cloud://openlist"):
+        return text
+    if text.startswith("/"):
+        return openlist_path_to_cloud_path(text).rstrip("/")
+    return text
+
+
+def media_item_size_bytes(item):
+    if not isinstance(item, dict):
+        return 0
+    for key in ("size_bytes", "sizeBytes", "size", "file_size", "fileSize"):
+        value = item.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
 
 
 class TelegramBot:
@@ -2873,7 +3032,10 @@ def find_local_duplicate(records, category, candidate_record, candidate):
     if info_hash:
         for record in records:
             if str(record.get("info_hash") or "").lower() == info_hash.lower():
-                return duplicate_from_task("strong", "same_info_hash", "Bot状态库", record, can_force=False)
+                duplicate = duplicate_from_task("strong", "same_info_hash", "Bot状态库", record, can_force=False)
+                duplicate["identity_type"] = "info_hash"
+                duplicate["identity_value"] = info_hash
+                return duplicate
 
     if category == "adult":
         code = first_adult_code([candidate_record.get("query"), candidate.get("title"), candidate.get("download_uri")])
@@ -2884,6 +3046,8 @@ def find_local_duplicate(records, category, candidate_record, candidate):
                 if code in task_duplicate_codes(record):
                     duplicate = duplicate_from_task("strong", "adult_code", "Bot状态库", record, can_force=False)
                     duplicate["code"] = code
+                    duplicate["identity_type"] = "adult_code"
+                    duplicate["identity_value"] = code
                     return duplicate
     return None
 
@@ -2935,6 +3099,8 @@ def duplicate_from_dedupe_entry(identity, entry):
         "source": dedupe_source_label(entry.get("source")),
         "title": entry.get("title"),
         "path": entry.get("path"),
+        "identity_type": identity_type,
+        "identity_value": identity.get("identity_value"),
         "can_force": can_force,
     }
     if identity_type == "info_hash":
@@ -2951,6 +3117,7 @@ def duplicate_from_task(level, reason, source, record, can_force=False):
         "reason": reason,
         "source": source,
         "title": record.get("title") or task.get("name") or task.get("file_name") or task.get("info_hash"),
+        "path": task.get("openlist_adult_format_new_path") or task.get("openlist_adult_format_path") or task.get("openlist_clean_target"),
         "info_hash": task.get("info_hash") or record.get("info_hash"),
         "status_name": task.get("status_name"),
         "msg_sync_status": task.get("msg_sync_status"),
@@ -4089,7 +4256,17 @@ def format_duplicate_message(candidate, duplicate):
         lines = ["重复入库拦截：%s" % candidate.get("title")]
     else:
         lines = ["可能重复入库：%s" % candidate.get("title")]
+    lines.append("判定：%s" % duplicate_level_label(duplicate))
     lines.append("原因：%s" % duplicate_reason_label(duplicate))
+    if duplicate.get("identity_type"):
+        lines.append("命中规则：%s" % duplicate_identity_label(duplicate.get("identity_type")))
+    if duplicate.get("identity_value"):
+        lines.append("命中值：%s" % duplicate.get("identity_value"))
+    candidate_hash = candidate_info_hash(candidate)
+    if candidate_hash:
+        lines.append("当前info_hash：%s" % candidate_hash)
+    if candidate.get("indexer"):
+        lines.append("当前来源：%s" % candidate.get("indexer"))
     if duplicate.get("source"):
         lines.append("来源：%s" % duplicate.get("source"))
     if duplicate.get("title"):
@@ -4126,6 +4303,22 @@ def duplicate_reason_label(duplicate):
     if reason == "openlist_title":
         return "OpenList 标题相似"
     return reason or "重复作品"
+
+
+def duplicate_level_label(duplicate):
+    if duplicate.get("level") == "strong":
+        return "强重复（禁止重复提交）"
+    return "弱重复（可手动确认）"
+
+
+def duplicate_identity_label(identity_type):
+    labels = {
+        "info_hash": "info_hash",
+        "adult_code": "成人番号",
+        "normalized_title": "规范化标题",
+        "title_query": "标题查询",
+    }
+    return labels.get(identity_type, identity_type or "-")
 
 
 def duplicate_can_force(duplicate):
