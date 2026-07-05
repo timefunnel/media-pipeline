@@ -546,6 +546,41 @@ class CandidateStoreTest(unittest.TestCase):
         self.assertEqual(new_match[0]["path"], "/115/anime/Jackie")
 
 
+class TaskStateMachineTest(unittest.TestCase):
+    def test_task_state_machine_marks_first_running_stage_failed(self):
+        from pipeline.task_state import TASK_STATE
+
+        task = {
+            "openlist_clean_status": "success",
+            "msg_scan_status": "running",
+            "msg_scrape_status": "running",
+        }
+
+        stage = TASK_STATE.mark_running_sync_stage_failed(task, "scan failed")
+
+        self.assertEqual(stage, "msg_scan_status")
+        self.assertEqual(task["msg_scan_status"], "failed")
+        self.assertEqual(task["msg_scrape_status"], "running")
+
+    def test_task_state_machine_centralizes_offline_and_sync_checks(self):
+        from pipeline.task_state import TASK_STATE
+
+        self.assertTrue(TASK_STATE.is_offline_active({"status_name": "submitted"}))
+        self.assertTrue(TASK_STATE.is_offline_final({"status_name": "cancelled"}))
+        self.assertTrue(TASK_STATE.stage_is_complete("skipped"))
+        self.assertTrue(
+            TASK_STATE.can_retry_msg_sync(
+                {"info_hash": "ABC", "status_name": "success", "msg_sync_status": "failed", "msg_scrape_status": "running"}
+            )
+        )
+        self.assertFalse(
+            TASK_STATE.should_show_syncing_status(
+                {"status_name": "success", "msg_sync_status": "running"},
+                msg_enabled=True,
+            )
+        )
+
+
 class TelegramBotTest(unittest.TestCase):
     def test_telegram_api_send_chat_action_uses_send_chat_action_endpoint(self):
         from pipeline.bot import TelegramApi

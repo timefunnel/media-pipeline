@@ -40,6 +40,12 @@ from pipeline.prowlarr import (
     is_prowlarr_download_uri,
 )
 from pipeline.resource_selector import ResourceSelector
+from pipeline.task_state import (
+    STATUS_CANCELLED,
+    STATUS_FAILED,
+    STATUS_RUNNING,
+    TASK_STATE,
+)
 from pipeline.version import format_version_info
 
 
@@ -58,8 +64,6 @@ DEFAULT_TASK_LIST_PAGE_SIZE = 5
 DEFAULT_TASK_LIST_FETCH_LIMIT = 100
 DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES = 20 * 1024 * 1024
 ADULT_EXTRA_VIDEO_HIDE_MIN_BYTES = 200 * 1024 * 1024
-FINAL_TASK_STATUS_NAMES = {"success", "failed", "cancelled"}
-ACTIVE_115_STATUS_NAMES = {"submitted", "allocating", "downloading"}
 ACTIVE_115_FAST_POLL_WINDOW_SECONDS = 20
 ACTIVE_115_FAST_POLL_INTERVAL_SECONDS = 2
 ACTIVE_115_SLOW_AFTER_POLLS = 10
@@ -741,7 +745,7 @@ class CandidateStore:
         finally:
             conn.close()
         records = [task_record_from_row(row) for row in rows]
-        active = [record for record in records if (record["task"] or {}).get("status_name") in ACTIVE_115_STATUS_NAMES]
+        active = [record for record in records if TASK_STATE.is_offline_active(record["task"])]
         return active[: int(limit)]
 
 
@@ -2358,7 +2362,7 @@ class TelegramBot:
 
     def _retry_msg_sync_task(self, record, task, progress_callback=None):
         retry_task = dict(task or {})
-        retry_task["msg_sync_status"] = "running"
+        retry_task["msg_sync_status"] = STATUS_RUNNING
         retry_task["msg_error"] = None
         self.store.save_task(record["user_id"], record["chat_id"], record["category"], record["title"], retry_task)
         return self._sync_completed_task(record, retry_task, progress_callback=progress_callback)
@@ -2436,17 +2440,12 @@ class TelegramBot:
         if not self._should_show_syncing_status(task):
             return task
         out = dict(task or {})
-        out["msg_sync_status"] = "running"
+        out["msg_sync_status"] = STATUS_RUNNING
         out["msg_error"] = None
         return out
 
     def _should_show_syncing_status(self, task):
-        return bool(
-            self.config.msg_enabled
-            and (task or {}).get("status_name") == "success"
-            and not task_msg_synced(task)
-            and not task_sync_is_running(task)
-        )
+        return TASK_STATE.should_show_syncing_status(task, self.config.msg_enabled)
 
     def _delete_callback_message(self, chat_id, message_id):
         if chat_id is None or message_id is None:
@@ -3002,29 +3001,15 @@ def content_profile_to_category(content_profile):
 
 
 def task_msg_synced(task):
-    return (task or {}).get("msg_sync_status") == "success" and (task or {}).get("msg_scrape_status") == "success"
+    return TASK_STATE.msg_synced(task)
 
 
 def task_sync_is_running(task):
-    task = task or {}
-    return any(
-        task.get(key) == "running"
-        for key in (
-            "msg_sync_status",
-            "openlist_clean_status",
-            "openlist_adult_format_status",
-            "openlist_adult_extra_hide_status",
-            "msg_scan_status",
-            "msg_scrape_status",
-            "msg_extra_cleanup_status",
-            "msg_visibility_repair_status",
-            "msg_artwork_repair_status",
-        )
-    )
+    return TASK_STATE.sync_is_running(task)
 
 
 def stage_is_complete(status):
-    return status in ("success", "skipped")
+    return TASK_STATE.stage_is_complete(status)
 
 
 def prefixed_task_fields(task, prefix):
@@ -3032,38 +3017,11 @@ def prefixed_task_fields(task, prefix):
 
 
 def mark_current_sync_stage_failed(task, error):
-    if task.get("openlist_clean_status") == "running":
-        task["openlist_clean_status"] = "failed"
-        task["openlist_clean_error"] = error
-    elif task.get("openlist_adult_format_status") == "running":
-        task["openlist_adult_format_status"] = "failed"
-        task["openlist_adult_format_error"] = error
-    elif task.get("openlist_adult_extra_hide_status") == "running":
-        task["openlist_adult_extra_hide_status"] = "failed"
-        task["openlist_adult_extra_hide_error"] = error
-    elif task.get("msg_scan_status") == "running":
-        task["msg_scan_status"] = "failed"
-    elif task.get("msg_scrape_status") == "running":
-        task["msg_scrape_status"] = "failed"
-    elif task.get("msg_extra_cleanup_status") == "running":
-        task["msg_extra_cleanup_status"] = "failed"
-        task["msg_extra_cleanup_error"] = error
-    elif task.get("msg_visibility_repair_status") == "running":
-        task["msg_visibility_repair_status"] = "failed"
-        task["msg_visibility_repair_error"] = error
-    elif task.get("msg_artwork_repair_status") == "running":
-        task["msg_artwork_repair_status"] = "failed"
-        task["msg_artwork_repair_error"] = error
+    TASK_STATE.mark_running_sync_stage_failed(task, error)
 
 
 def task_can_retry_msg_sync(task):
-    task = task or {}
-    return bool(
-        task.get("info_hash")
-        and task.get("status_name") == "success"
-        and task.get("msg_sync_status") == "failed"
-        and not task_msg_synced(task)
-    )
+    return TASK_STATE.can_retry_msg_sync(task)
 
 
 def find_local_duplicate(records, category, candidate_record, candidate):
@@ -4899,7 +4857,7 @@ def callback_task_reply_markup(task):
 
 
 def task_is_final(task):
-    return (task or {}).get("status_name") in FINAL_TASK_STATUS_NAMES
+    return TASK_STATE.is_offline_final(task)
 
 
 def task_page_count(total):
@@ -4913,9 +4871,9 @@ def task_list_priority(record):
     status = task.get("status_name")
     if task_can_retry_msg_sync(task):
         return 0
-    if status not in FINAL_TASK_STATUS_NAMES:
+    if not TASK_STATE.is_offline_final(task):
         return 1
-    if status in {"failed", "cancelled"}:
+    if status in {STATUS_FAILED, STATUS_CANCELLED}:
         return 2
     return 3
 
