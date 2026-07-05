@@ -509,6 +509,18 @@ class CandidateStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                create table if not exists candidate_submissions (
+                    candidate_id integer primary key,
+                    status text not null,
+                    info_hash text,
+                    error text,
+                    created_at integer not null,
+                    updated_at integer not null
+                )
+                """
+            )
             conn.commit()
         finally:
             conn.close()
@@ -547,6 +559,51 @@ class CandidateStore:
             "query": row[3],
             "candidate": json.loads(row[4]),
         }
+
+    def claim_candidate_submission(self, candidate_id):
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """
+                insert or ignore into candidate_submissions (
+                    candidate_id, status, info_hash, error, created_at, updated_at
+                ) values (?, 'running', null, null, ?, ?)
+                """,
+                (int(candidate_id), now, now),
+            )
+            conn.commit()
+            if cursor.rowcount == 1:
+                return {"claimed": True, "status": "running", "candidate_id": int(candidate_id)}
+            row = conn.execute(
+                """
+                select candidate_id, status, info_hash, error, created_at, updated_at
+                from candidate_submissions
+                where candidate_id = ?
+                """,
+                (int(candidate_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            raise RuntimeError("candidate submission claim failed: %s" % candidate_id)
+        return candidate_submission_from_row(row, claimed=False)
+
+    def finish_candidate_submission(self, candidate_id, status, info_hash=None, error=None):
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                update candidate_submissions
+                set status = ?, info_hash = ?, error = ?, updated_at = ?
+                where candidate_id = ?
+                """,
+                (status, info_hash, error, now, int(candidate_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def save_search_session(self, user_id, chat_id, category, query, candidate_ids, metadata=None):
         payload = json.dumps([int(candidate_id) for candidate_id in candidate_ids], sort_keys=True)
@@ -2297,8 +2354,16 @@ class TelegramBot:
                     )
                     return
 
-            result = self.service.submit(category, candidate["download_uri"])
+            submission = self.store.claim_candidate_submission(candidate_id)
+            if not submission.get("claimed"):
+                return
+            try:
+                result = self.service.submit(category, candidate["download_uri"])
+            except Exception as exc:
+                self.store.finish_candidate_submission(candidate_id, "failed", error=str(exc))
+                raise
         self._save_tasks_from_submit(record, candidate, result, category, content_profile=content_profile)
+        self.store.finish_candidate_submission(candidate_id, "submitted", info_hash=first_submit_task_info_hash(result))
         if answer and not callback_answered:
             self.telegram.answer_callback_query(callback_id, "已提交 115 离线")
         self._delete_callback_message(chat_id, message_id)
@@ -3787,6 +3852,18 @@ def task_record_from_row(row):
     }
 
 
+def candidate_submission_from_row(row, claimed=False):
+    return {
+        "candidate_id": row[0],
+        "status": row[1],
+        "info_hash": row[2],
+        "error": row[3],
+        "created_at": row[4],
+        "updated_at": row[5],
+        "claimed": bool(claimed),
+    }
+
+
 def task_poll_count(task):
     try:
         return int((task or {}).get("poll_count") or 0)
@@ -3913,6 +3990,14 @@ def submit_response_should_track(result):
         return True
     text = " ".join(str((result or {}).get(key) or "") for key in ("code", "message"))
     return "已存在" in text or "已添加" in text
+
+
+def first_submit_task_info_hash(result):
+    for task in (result or {}).get("tasks") or []:
+        value = str((task or {}).get("info_hash") or "").strip()
+        if value:
+            return value
+    return None
 
 
 def access_token_invalid_response(response):

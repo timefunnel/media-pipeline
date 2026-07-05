@@ -193,6 +193,25 @@ class CandidateStoreTest(unittest.TestCase):
         self.assertEqual(loaded["query"], "sintel")
         self.assertEqual(loaded["candidate"]["download_uri"], "magnet:?xt=urn:btih:ABC")
 
+    def test_candidate_store_claims_submission_once(self):
+        from pipeline.bot import CandidateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            candidate_id = store.save_candidate(700656624, 9001, "movie", "sintel", {"title": "Sintel"})
+
+            first = store.claim_candidate_submission(candidate_id)
+            second = store.claim_candidate_submission(candidate_id)
+            store.finish_candidate_submission(candidate_id, "submitted", info_hash="ABC")
+            third = store.claim_candidate_submission(candidate_id)
+
+        self.assertTrue(first["claimed"])
+        self.assertFalse(second["claimed"])
+        self.assertEqual(second["status"], "running")
+        self.assertFalse(third["claimed"])
+        self.assertEqual(third["status"], "submitted")
+        self.assertEqual(third["info_hash"], "ABC")
+
     def test_candidate_store_persists_recent_offline_tasks(self):
         from pipeline.bot import CandidateStore
 
@@ -1296,6 +1315,37 @@ class TelegramBotTest(unittest.TestCase):
             self.assertEqual(store.load_task("BBB")["task"]["status_name"], "submitted")
             self.assertEqual(store.load_task("BBB")["task"]["telegram_status_message_id"], 1001)
             self.assertEqual(store.load_task("BBB")["category"], "adult")
+
+    def test_callback_submit_claims_candidate_before_115_submit(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            candidate_id = store.save_candidate(
+                user_id=700656624,
+                chat_id=9001,
+                category="adult",
+                query="cawd-773",
+                candidate={"title": "CAWD-773", "download_uri": "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233", "rank": 1},
+            )
+            telegram = FakeTelegram()
+            service = FakeBotService(submit_response={"state": True, "tasks": []})
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+            update = {
+                "callback_query": {
+                    "id": "cb1",
+                    "from": {"id": 700656624},
+                    "message": {"chat": {"id": 9001}, "message_id": 502},
+                    "data": "submit:adult:%s" % candidate_id,
+                }
+            }
+
+            bot.handle_update(update)
+            update["callback_query"]["id"] = "cb2"
+            bot.handle_update(update)
+
+            self.assertEqual(service.submit_calls, [("adult", "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233")])
+            self.assertEqual([item["text"] for item in telegram.answers], ["正在处理入库", "正在处理入库"])
 
     def test_callback_submit_blocks_same_info_hash_duplicate_without_submitting(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
