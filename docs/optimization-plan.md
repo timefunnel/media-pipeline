@@ -61,6 +61,8 @@ Validation:
 
 ### 3. Extract Telegram UI Formatting
 
+Status: completed.
+
 Goal:
 Move reply markup builders and message formatting functions into a UI module.
 
