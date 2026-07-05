@@ -335,6 +335,76 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertTrue(folder["ImageTags"]["Primary"].startswith("mp-folder-v2-"))
         self.assertEqual(folder["PrimaryImageAspectRatio"], 16 / 9)
 
+    def test_iter_emby_items_accepts_virtual_folder_list(self):
+        items = list(
+            iter_emby_items(
+                [
+                    {"Id": "library-1", "CollectionType": "movies"},
+                    {"Id": "library-2", "CollectionType": "tvshows"},
+                ]
+            )
+        )
+
+        self.assertEqual([item["Id"] for item in items], ["library-1", "library-2"])
+
+    def test_patch_emby_collection_folder_item_cover_matches_virtual_folder_shape(self):
+        folder = {
+            "Id": "library-1",
+            "ItemId": "library-1",
+            "Name": "Movies",
+            "CollectionType": "movies",
+            "Locations": ["cloud://openlist/115%2FMovies"],
+            "PrimaryImageItemId": "library-1",
+        }
+        covers = [{"item_id": "media-1", "image_type": "Primary", "tag": "media-1-tag"}]
+
+        changed = patch_emby_collection_folder_item_cover(folder, covers)
+
+        self.assertTrue(changed)
+        self.assertEqual(folder["PrimaryImageItemId"], "library-1")
+        self.assertTrue(folder["PrimaryImageTag"].startswith("mp-folder-v2-"))
+        self.assertNotIn("ImageTags", folder)
+        self.assertNotIn("PrimaryImageAspectRatio", folder)
+
+    def test_write_response_patches_json_list_payload(self):
+        handler = object.__new__(SubtitleProxyHandler)
+        written = io.BytesIO()
+        sent_headers = []
+        handler.wfile = written
+        handler.send_response = lambda status: sent_headers.append(("status", status))
+        handler.send_header = lambda key, value: sent_headers.append((key, value))
+        handler.end_headers = lambda: sent_headers.append(("end", None))
+
+        def patch_payload(payload, request_headers, request_path):
+            payload[0]["PrimaryImageItemId"] = "library-1"
+            payload[0]["PrimaryImageTag"] = "mp-folder-v2-test"
+            return True
+
+        handler._patch_emby_collection_folder_covers = patch_payload
+        body = json.dumps(
+            [
+                {
+                    "Id": "library-1",
+                    "ItemId": "library-1",
+                    "CollectionType": "movies",
+                    "Locations": ["cloud://openlist/115%2FMovies"],
+                    "PrimaryImageItemId": "library-1",
+                }
+            ]
+        ).encode("utf-8")
+
+        handler._write_response(
+            200,
+            {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "public"},
+            body,
+            request_headers={"X-Emby-Token": "token"},
+            request_path="/Library/VirtualFolders",
+        )
+
+        patched = json.loads(written.getvalue().decode("utf-8"))
+        self.assertEqual(patched[0]["PrimaryImageTag"], "mp-folder-v2-test")
+        self.assertIn(("Cache-Control", "no-store"), sent_headers)
+
     def test_select_emby_folder_cover_items_limits_to_four_unique_items(self):
         covers = select_emby_folder_cover_items(
             [

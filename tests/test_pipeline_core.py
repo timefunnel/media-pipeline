@@ -39,8 +39,10 @@ from pipeline.prowlarr import ProwlarrClient, ProwlarrConfig, torrent_bytes_to_m
 from pipeline.resource_selector import ResourceSelector
 from pipeline.subtitle_proxy import (
     MsgApiAuthenticator,
+    SubtitleProxyHandler,
     inject_emby_subtitle_streams,
     inject_subtitle_track_bootstrap,
+    iter_emby_items,
     normalize_webvtt_timestamps,
     patch_emby_playback_info_runtime,
     patch_emby_resume_runtime_fields,

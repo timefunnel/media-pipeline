@@ -636,19 +636,39 @@ def iter_emby_items(payload):
             for item in items:
                 if isinstance(item, dict):
                     yield item
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                yield item
 
 
 def emby_item_is_collection_folder(item):
-    return isinstance(item, dict) and str(item.get("Type") or item.get("type") or "").lower() == "collectionfolder"
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("Type") or item.get("type") or "").lower() == "collectionfolder":
+        return True
+    return emby_item_is_virtual_folder(item)
+
+
+def emby_item_is_virtual_folder(item):
+    return isinstance(item, dict) and bool(item.get("CollectionType") and item.get("ItemId") and item.get("Locations") is not None)
+
+
+def emby_collection_folder_id(item):
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("Id") or item.get("ItemId") or "").strip()
 
 
 def emby_item_needs_folder_cover(item):
     if not emby_item_is_collection_folder(item):
         return False
+    if emby_item_is_virtual_folder(item):
+        return bool(emby_collection_folder_id(item) and not item.get("PrimaryImageTag"))
     image_tags = item.get("ImageTags")
     if isinstance(image_tags, dict) and image_tags.get("Primary"):
         return False
-    return bool(item.get("Id"))
+    return bool(emby_collection_folder_id(item))
 
 
 def select_emby_folder_cover_item(items, preferred_image_type="Primary"):
@@ -706,7 +726,11 @@ def patch_emby_collection_folder_item_cover(item, cover):
     covers = cover if isinstance(cover, list) else ([cover] if cover else [])
     if not emby_item_needs_folder_cover(item) or not covers:
         return False
-    tag = emby_folder_cover_grid_tag(item.get("Id"), covers)
+    tag = emby_folder_cover_grid_tag(emby_collection_folder_id(item), covers)
+    if emby_item_is_virtual_folder(item):
+        item["PrimaryImageItemId"] = emby_collection_folder_id(item)
+        item["PrimaryImageTag"] = tag
+        return True
     image_tags = dict(item.get("ImageTags") if isinstance(item.get("ImageTags"), dict) else {})
     image_tags["Primary"] = tag
     item["ImageTags"] = image_tags
@@ -1321,8 +1345,9 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         for item in iter_emby_items(payload):
             if not emby_item_needs_folder_cover(item):
                 continue
-            self._remember_emby_collection_folder_id(user_id, item.get("Id"))
-            covers = self._find_emby_folder_covers(user_id, item.get("Id"), request_headers, request_path or "")
+            folder_id = emby_collection_folder_id(item)
+            self._remember_emby_collection_folder_id(user_id, folder_id)
+            covers = self._find_emby_folder_covers(user_id, folder_id, request_headers, request_path or "")
             if patch_emby_collection_folder_item_cover(item, covers):
                 changed = True
         return changed
@@ -1507,12 +1532,12 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                 payload = json.loads(body.decode("utf-8"))
             except (TypeError, ValueError):
                 payload = None
-            if isinstance(payload, dict):
-                if patch_emby_resume_runtime_fields(payload):
+            if isinstance(payload, (dict, list)):
+                if isinstance(payload, dict) and patch_emby_resume_runtime_fields(payload):
                     no_store = True
                 if self._patch_emby_collection_folder_covers(payload, request_headers, request_path or ""):
                     no_store = True
-                if media_id:
+                if isinstance(payload, dict) and media_id:
                     runtime_ticks = self._fetch_emby_resume_runtime_ticks(media_id, request_headers, request_path or "")
                     if patch_emby_playback_info_runtime(payload, runtime_ticks, media_id=media_id):
                         no_store = True
