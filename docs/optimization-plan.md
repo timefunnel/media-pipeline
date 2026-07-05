@@ -45,6 +45,8 @@ Validation:
 
 ### 2. Extract Migration Flow Helpers
 
+Status: completed.
+
 Goal:
 Separate media migration orchestration and formatting helpers from Telegram callback handling.
 
