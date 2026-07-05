@@ -76,6 +76,8 @@ Validation:
 
 ### 4. Tighten Task State Usage
 
+Status: completed.
+
 Goal:
 Make task button visibility, retry eligibility, cancellation eligibility, and syncing display depend on `TASK_STATE`.
 

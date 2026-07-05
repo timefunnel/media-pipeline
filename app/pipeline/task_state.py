@@ -60,6 +60,13 @@ class TaskStateMachine:
     def is_offline_success(self, task):
         return self.status_name(task) == STATUS_SUCCESS
 
+    def can_refresh_offline_status(self, task):
+        task = task or {}
+        return bool(task.get("info_hash") and not self.is_offline_final(task))
+
+    def can_cancel_offline_task(self, task):
+        return self.is_offline_active(task)
+
     def status_name(self, task):
         return (task or {}).get("status_name")
 
@@ -100,6 +107,16 @@ class TaskStateMachine:
             and not self.msg_synced(task)
             and not self.sync_is_running(task)
         )
+
+    def task_list_priority(self, task):
+        task = task or {}
+        if self.can_retry_msg_sync(task):
+            return 0
+        if not self.is_offline_final(task):
+            return 1
+        if self.status_name(task) in {STATUS_FAILED, STATUS_CANCELLED}:
+            return 2
+        return 3
 
 
 TASK_STATE = TaskStateMachine()

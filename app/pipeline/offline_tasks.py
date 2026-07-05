@@ -81,7 +81,7 @@ def wait_for_task(client, info_hash, timeout_seconds=600, interval_seconds=15, m
 
 
 def task_can_cancel(task):
-    return task is not None and TASK_STATE.is_offline_active(task)
+    return task is not None and TASK_STATE.can_cancel_offline_task(task)
 
 
 def cancel_task_if_active(client, info_hash, max_pages=10):

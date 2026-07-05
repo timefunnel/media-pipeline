@@ -105,7 +105,7 @@ from pipeline.mediastation import (
     media_haystack,
 )
 from pipeline.msgdb import DEFAULT_MSG_DATABASE_DSN, MediaStationDbClient, build_migration_target, openlist_path_to_cloud_path
-from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes, task_can_cancel
+from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider
 from pipeline.openlist_tokens import OpenListTokenStore
 from pipeline.prowlarr import (
@@ -845,7 +845,7 @@ class CandidateStore:
         return [
             record
             for record in records
-            if (record["task"] or {}).get("status_name") == "success"
+            if TASK_STATE.is_offline_success(record["task"])
             and task_sync_is_running(record["task"])
             and not task_msg_synced(record["task"])
         ]
@@ -1101,7 +1101,7 @@ class PipelineBotService:
 
     def sync_completed_task(self, category, title, task, progress_callback=None):
         out = dict(task or {})
-        if out.get("status_name") != "success":
+        if not TASK_STATE.is_offline_success(out):
             return out
         if task_msg_synced(out):
             return out
@@ -2127,7 +2127,7 @@ class TelegramBot:
         if record is None:
             return
         record = self._remember_status_message_id(record, message_id)
-        if task_is_final(record["task"]) and (record["task"] or {}).get("status_name") != "success":
+        if task_is_final(record["task"]) and not TASK_STATE.is_offline_success(record["task"]):
             self.telegram.answer_callback_query(callback_id, "任务已结束")
             self._update_callback_message(
                 chat_id,
@@ -2758,7 +2758,7 @@ class TelegramBot:
         task.setdefault("info_hash", record["info_hash"])
         if result.get("cancelled"):
             mark_task_auto_cancelled(task, now)
-        if task.get("status_name") == "success":
+        if TASK_STATE.is_offline_success(task):
             task = self._sync_completed_task_with_store_progress(record, task)
         self.store.save_task(record["user_id"], record["chat_id"], record["category"], record["title"], task)
         if result.get("cancelled"):

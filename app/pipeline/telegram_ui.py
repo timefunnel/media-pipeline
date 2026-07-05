@@ -2,10 +2,9 @@ from collections import defaultdict
 
 from pipeline.dedupe import candidate_info_hash
 from pipeline.migration import format_size
-from pipeline.offline_tasks import task_can_cancel
 from pipeline.prowlarr import is_prowlarr_download_uri
 from pipeline.search_stats import format_search_stats
-from pipeline.task_state import STATUS_CANCELLED, STATUS_FAILED, TASK_STATE
+from pipeline.task_state import TASK_STATE
 
 
 SEARCH_PAGE_SIZE = 5
@@ -459,10 +458,10 @@ def task_reply_markup(task):
     info_hash = (task or {}).get("info_hash")
     if task_can_retry_msg_sync(task):
         return {"inline_keyboard": [[{"text": "重试MSG同步", "callback_data": "retry_msg:%s" % info_hash}]]}
-    if not info_hash or task_is_final(task):
+    if not TASK_STATE.can_refresh_offline_status(task):
         return None
     row = [{"text": "刷新进度", "callback_data": "status:%s" % info_hash}]
-    if task_can_cancel(task):
+    if TASK_STATE.can_cancel_offline_task(task):
         row.append({"text": "取消任务", "callback_data": "cancel:%s" % info_hash})
     return {"inline_keyboard": [row]}
 
@@ -484,14 +483,7 @@ def task_page_count(total, page_size=DEFAULT_TASK_LIST_PAGE_SIZE):
 
 def task_list_priority(record):
     task = (record or {}).get("task") or {}
-    status = task.get("status_name")
-    if task_can_retry_msg_sync(task):
-        return 0
-    if not TASK_STATE.is_offline_final(task):
-        return 1
-    if status in {STATUS_FAILED, STATUS_CANCELLED}:
-        return 2
-    return 3
+    return TASK_STATE.task_list_priority(task)
 
 def task_list_reply_markup(records, page=0, page_count=1, page_size=DEFAULT_TASK_LIST_PAGE_SIZE):
     rows = []
@@ -502,10 +494,10 @@ def task_list_reply_markup(records, page=0, page_count=1, page_size=DEFAULT_TASK
         if task_can_retry_msg_sync(task):
             rows.append([{"text": "重试MSG %s" % display_index, "callback_data": "retry_msg:%s" % info_hash}])
             continue
-        if task_is_final(task):
+        if not TASK_STATE.can_refresh_offline_status(task):
             continue
         row = [{"text": "刷新 %s" % display_index, "callback_data": "status:%s" % info_hash}]
-        if task_can_cancel(task):
+        if TASK_STATE.can_cancel_offline_task(task):
             row.append({"text": "取消 %s" % display_index, "callback_data": "cancel:%s" % info_hash})
         rows.append(row)
     nav = []

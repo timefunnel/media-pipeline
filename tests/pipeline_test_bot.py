@@ -374,12 +374,23 @@ class TaskStateMachineTest(unittest.TestCase):
 
         self.assertTrue(TASK_STATE.is_offline_active({"status_name": "submitted"}))
         self.assertTrue(TASK_STATE.is_offline_final({"status_name": "cancelled"}))
+        self.assertTrue(TASK_STATE.can_refresh_offline_status({"info_hash": "ABC", "status_name": "downloading"}))
+        self.assertFalse(TASK_STATE.can_refresh_offline_status({"info_hash": "ABC", "status_name": "cancelled"}))
+        self.assertTrue(TASK_STATE.can_cancel_offline_task({"status_name": "downloading"}))
+        self.assertFalse(TASK_STATE.can_cancel_offline_task({"status_name": "success"}))
         self.assertTrue(TASK_STATE.stage_is_complete("skipped"))
         self.assertTrue(
             TASK_STATE.can_retry_msg_sync(
                 {"info_hash": "ABC", "status_name": "success", "msg_sync_status": "failed", "msg_scrape_status": "running"}
             )
         )
+        self.assertEqual(
+            TASK_STATE.task_list_priority({"info_hash": "ABC", "status_name": "success", "msg_sync_status": "failed"}),
+            0,
+        )
+        self.assertEqual(TASK_STATE.task_list_priority({"info_hash": "ABC", "status_name": "downloading"}), 1)
+        self.assertEqual(TASK_STATE.task_list_priority({"info_hash": "ABC", "status_name": "cancelled"}), 2)
+        self.assertEqual(TASK_STATE.task_list_priority({"info_hash": "ABC", "status_name": "success"}), 3)
         self.assertFalse(
             TASK_STATE.should_show_syncing_status(
                 {"status_name": "success", "msg_sync_status": "running"},
