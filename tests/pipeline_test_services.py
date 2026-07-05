@@ -278,6 +278,51 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertEqual(media_id, "7303b838-dab8-4eb7-a8b6-4dc761f69c18")
 
+    def test_parse_emby_item_image_request_accepts_primary_image_path(self):
+        parsed = parse_emby_item_image_request("/emby/Items/library-1/Images/Primary?tag=old&maxWidth=400")
+
+        self.assertEqual(parsed["item_id"], "library-1")
+        self.assertEqual(parsed["image_type"], "Primary")
+        self.assertEqual(parsed["query"], "tag=old&maxWidth=400")
+
+    def test_emby_request_user_id_from_auth_reads_jwt_query_token(self):
+        payload = base64.urlsafe_b64encode(json.dumps({"uid": "user-1"}).encode("utf-8")).decode("ascii").rstrip("=")
+        token = "header.%s.signature" % payload
+
+        user_id = emby_request_user_id_from_auth("/emby/Items/library-1/Images/Primary?api_key=%s" % token, {})
+
+        self.assertEqual(user_id, "user-1")
+
+    def test_patch_emby_collection_folder_item_cover_inherits_child_primary_image(self):
+        folder = {
+            "Id": "library-1",
+            "Name": "电影",
+            "Type": "CollectionFolder",
+            "ImageTags": {},
+            "PrimaryImageItemId": "library-1",
+        }
+        cover = select_emby_folder_cover_item(
+            [
+                {"Id": "media-empty", "Name": "Empty", "ImageTags": {}},
+                {"Id": "media-1", "Name": "Sintel", "ImageTags": {"Primary": "media-1-tag"}, "PrimaryImageAspectRatio": 0.7},
+            ]
+        )
+
+        changed = patch_emby_collection_folder_item_cover(folder, cover)
+
+        self.assertTrue(changed)
+        self.assertEqual(folder["PrimaryImageItemId"], "media-1")
+        self.assertEqual(folder["ImageTags"]["Primary"], "media-1-tag")
+        self.assertEqual(folder["PrimaryImageAspectRatio"], 0.7)
+
+    def test_emby_image_proxy_path_replaces_tag_and_preserves_client_query(self):
+        path = emby_image_proxy_path(
+            {"item_id": "media-1", "image_type": "Primary", "tag": "new-tag"},
+            "tag=old-tag&maxWidth=400&api_key=secret",
+        )
+
+        self.assertEqual(path, "/emby/Items/media-1/Images/Primary?maxWidth=400&api_key=secret&tag=new-tag")
+
 
 class CategoryConfigTest(unittest.TestCase):
     def test_msgdb_groups_episode_rows_into_one_migration_candidate(self):

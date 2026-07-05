@@ -1,3 +1,4 @@
+import base64
 import json
 import hashlib
 import io
@@ -43,8 +44,13 @@ from pipeline.subtitle_proxy import (
     normalize_webvtt_timestamps,
     patch_emby_playback_info_runtime,
     patch_emby_resume_runtime_fields,
+    parse_emby_item_image_request,
     parse_emby_subtitle_stream_path,
     parse_emby_item_media_id,
+    patch_emby_collection_folder_item_cover,
+    select_emby_folder_cover_item,
+    emby_image_proxy_path,
+    emby_request_user_id_from_auth,
     redact_sensitive_query_values,
     should_normalize_subtitle,
     subtitle_body_to_vtt,

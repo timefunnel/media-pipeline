@@ -1,3 +1,4 @@
+import base64
 import http.server
 import json
 import os
@@ -46,6 +47,11 @@ EMBY_SUBTITLE_STREAM_RE = re.compile(
     r"^/emby/Videos/(?P<media_id>[^/]+)/(?P<source_id>[^/]+)/Subtitles/(?P<stream_index>\d+)/Stream\.(?P<extension>vtt|srt|ass|ssa)$",
     re.IGNORECASE,
 )
+EMBY_ITEM_IMAGE_RE = re.compile(
+    r"^/emby/Items/(?P<item_id>[^/]+)/Images/(?P<image_type>Primary|Backdrop|Thumb)(?:/\d+)?/?$",
+    re.IGNORECASE,
+)
+EMBY_FOLDER_COVER_CACHE_TTL_SECONDS = 300
 SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
 VIDEO_EXTENSIONS = {
     ".avi",
@@ -471,6 +477,27 @@ def parse_emby_item_media_id(path):
     return urllib.parse.unquote(match.group("media_id"))
 
 
+def parse_emby_item_image_request(path):
+    parsed = urllib.parse.urlparse(path)
+    match = EMBY_ITEM_IMAGE_RE.match(parsed.path)
+    if not match:
+        return None
+    return {
+        "item_id": urllib.parse.unquote(match.group("item_id")),
+        "image_type": image_type_value(match.group("image_type")),
+        "query": parsed.query,
+    }
+
+
+def image_type_value(value):
+    normalized = str(value or "Primary").strip().lower()
+    if normalized == "backdrop":
+        return "Backdrop"
+    if normalized == "thumb":
+        return "Thumb"
+    return "Primary"
+
+
 def inject_emby_subtitle_streams(payload, media_id, tracks):
     if not isinstance(payload, dict) or not media_id or not tracks:
         return False
@@ -550,6 +577,139 @@ def inject_emby_subtitle_streams(payload, media_id, tracks):
         if first_added_index is not None and source.get("DefaultSubtitleStreamIndex") in (None, -1):
             source["DefaultSubtitleStreamIndex"] = first_added_index
     return changed
+
+
+def emby_auth_token(path="", headers=None):
+    parsed = urllib.parse.urlparse(path or "")
+    query = urllib.parse.parse_qs(parsed.query)
+    for key in ("X-Emby-Token", "api_key", "ApiKey", "access_token"):
+        values = query.get(key) or []
+        if values and values[0]:
+            return str(values[0])
+    for key, value in (headers or {}).items():
+        if key.lower() in ("x-emby-token", "x-mediabrowser-token"):
+            return str(value or "")
+        if key.lower() == "authorization":
+            prefix, _, token = str(value or "").partition(" ")
+            if prefix.lower() == "bearer" and token:
+                return token
+    return ""
+
+
+def emby_user_id_from_token(token):
+    parts = str(token or "").split(".")
+    if len(parts) < 2:
+        return ""
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
+    except (TypeError, ValueError, OSError):
+        return ""
+    return str(data.get("uid") or data.get("sub") or "").strip()
+
+
+def emby_request_user_id_from_auth(path="", headers=None):
+    return emby_request_user_id(path) or emby_user_id_from_token(emby_auth_token(path, headers))
+
+
+def iter_emby_items(payload):
+    if isinstance(payload, dict):
+        yield payload
+        items = payload.get("Items") or payload.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    yield item
+
+
+def emby_item_is_collection_folder(item):
+    return isinstance(item, dict) and str(item.get("Type") or item.get("type") or "").lower() == "collectionfolder"
+
+
+def emby_item_needs_folder_cover(item):
+    if not emby_item_is_collection_folder(item):
+        return False
+    image_tags = item.get("ImageTags")
+    if isinstance(image_tags, dict) and image_tags.get("Primary"):
+        return False
+    return bool(item.get("Id"))
+
+
+def select_emby_folder_cover_item(items, preferred_image_type="Primary"):
+    preferred_image_type = image_type_value(preferred_image_type)
+    for image_type in unique_values([preferred_image_type, "Primary", "Backdrop", "Thumb"]):
+        for item in items or []:
+            cover = emby_item_cover(item, image_type)
+            if cover:
+                return cover
+    return None
+
+
+def emby_item_cover(item, image_type="Primary"):
+    if not isinstance(item, dict):
+        return None
+    item_id = str(item.get("Id") or item.get("id") or "").strip()
+    if not item_id:
+        return None
+    image_type = image_type_value(image_type)
+    image_tags = item.get("ImageTags")
+    image_tags = image_tags if isinstance(image_tags, dict) else {}
+    if image_type == "Primary":
+        tag = image_tags.get("Primary")
+    elif image_type == "Backdrop":
+        tags = item.get("BackdropImageTags")
+        tag = tags[0] if isinstance(tags, list) and tags else image_tags.get("Backdrop")
+    else:
+        tag = image_tags.get("Thumb")
+    if not tag and image_type != "Primary":
+        return emby_item_cover(item, "Primary")
+    if not tag:
+        return None
+    cover = {
+        "item_id": item_id,
+        "image_type": image_type,
+        "tag": str(tag),
+    }
+    if item.get("PrimaryImageAspectRatio") is not None:
+        cover["primary_image_aspect_ratio"] = item.get("PrimaryImageAspectRatio")
+    return cover
+
+
+def patch_emby_collection_folder_item_cover(item, cover):
+    if not emby_item_needs_folder_cover(item) or not cover:
+        return False
+    image_tags = dict(item.get("ImageTags") if isinstance(item.get("ImageTags"), dict) else {})
+    image_tags["Primary"] = cover["tag"]
+    item["ImageTags"] = image_tags
+    item["PrimaryImageItemId"] = cover["item_id"]
+    if cover.get("primary_image_aspect_ratio") is not None:
+        item["PrimaryImageAspectRatio"] = cover["primary_image_aspect_ratio"]
+    return True
+
+
+def emby_image_proxy_path(cover, original_query=""):
+    query_items = []
+    for key, value in urllib.parse.parse_qsl(original_query or "", keep_blank_values=True):
+        if key.lower() == "tag":
+            continue
+        query_items.append((key, value))
+    query_items.append(("tag", cover["tag"]))
+    return "/emby/Items/%s/Images/%s?%s" % (
+        urllib.parse.quote(str(cover["item_id"]), safe=""),
+        urllib.parse.quote(image_type_value(cover.get("image_type")), safe=""),
+        urllib.parse.urlencode(query_items),
+    )
+
+
+def unique_values(values):
+    seen = set()
+    out = []
+    for value in values or []:
+        normalized = str(value or "")
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+    return out
 
 
 class OpenListSubtitleProvider:
@@ -831,6 +991,9 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
     upstream_base_url = DEFAULT_SUBTITLE_PROXY_UPSTREAM
     msg_api_auth = None
     openlist_subtitle_provider = None
+    folder_cover_cache = {}
+    folder_id_cache = {}
+    folder_cover_cache_lock = threading.Lock()
 
     def do_GET(self):
         self._proxy()
@@ -855,6 +1018,8 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             for key, value in self.headers.items()
             if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() not in ("host", "content-length")
         }
+        if method == "GET" and not head_only and self._serve_emby_folder_image(headers):
+            return
         if method == "GET" and not head_only and self._serve_emby_subtitle_stream(headers):
             return
         upstream_url = urllib.parse.urljoin(self.upstream_base_url.rstrip("/") + "/", self.path.lstrip("/"))
@@ -873,6 +1038,31 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             if not head_only:
                 self.wfile.write(("subtitle proxy upstream error: %s\n" % exc).encode("utf-8"))
+
+    def _serve_emby_folder_image(self, request_headers):
+        image_request = parse_emby_item_image_request(self.path)
+        if not image_request:
+            return False
+        user_id = emby_request_user_id_from_auth(self.path, request_headers)
+        if not user_id:
+            return False
+        if not self._is_emby_collection_folder_id(user_id, image_request["item_id"], request_headers, self.path):
+            return False
+        cover = self._find_emby_folder_cover(
+            user_id,
+            image_request["item_id"],
+            request_headers,
+            self.path,
+            preferred_image_type=image_request["image_type"],
+        )
+        if not cover:
+            return False
+        upstream_path = emby_image_proxy_path(cover, image_request["query"])
+        status, headers, body = self._read_upstream(upstream_path, request_headers)
+        if status < 200 or status >= 300 or not body:
+            return False
+        self._write_response(status, headers, body, request_headers=request_headers, request_path=upstream_path)
+        return True
 
     def _serve_emby_subtitle_stream(self, request_headers):
         stream_request = parse_emby_subtitle_stream_path(self.path)
@@ -1004,6 +1194,118 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         patch_emby_media_item_runtime(payload)
         return int_value(payload.get("RunTimeTicks"))
 
+    def _patch_emby_collection_folder_covers(self, payload, request_headers, request_path):
+        user_id = emby_request_user_id_from_auth(request_path or "", request_headers)
+        if not user_id:
+            return False
+        changed = False
+        for item in iter_emby_items(payload):
+            if not emby_item_needs_folder_cover(item):
+                continue
+            self._remember_emby_collection_folder_id(user_id, item.get("Id"))
+            cover = self._find_emby_folder_cover(user_id, item.get("Id"), request_headers, request_path or "")
+            if patch_emby_collection_folder_item_cover(item, cover):
+                changed = True
+        return changed
+
+    def _remember_emby_collection_folder_id(self, user_id, folder_id):
+        user_id = str(user_id or "").strip()
+        folder_id = str(folder_id or "").strip()
+        if not user_id or not folder_id:
+            return
+        now = time.time()
+        with self.folder_cover_cache_lock:
+            cached = self.folder_id_cache.get(user_id)
+            if not cached or cached.get("expires_at", 0) <= now:
+                cached = {"ids": set(), "expires_at": now + EMBY_FOLDER_COVER_CACHE_TTL_SECONDS}
+                self.folder_id_cache[user_id] = cached
+            cached["ids"].add(folder_id)
+
+    def _is_emby_collection_folder_id(self, user_id, item_id, request_headers, request_path):
+        user_id = str(user_id or "").strip()
+        item_id = str(item_id or "").strip()
+        if not user_id or not item_id:
+            return False
+        now = time.time()
+        with self.folder_cover_cache_lock:
+            cached = self.folder_id_cache.get(user_id)
+            if cached and cached.get("expires_at", 0) > now:
+                return item_id in cached.get("ids", set())
+        folder_ids = self._fetch_emby_collection_folder_ids(user_id, request_headers, request_path)
+        with self.folder_cover_cache_lock:
+            self.folder_id_cache[user_id] = {
+                "ids": set(folder_ids),
+                "expires_at": now + EMBY_FOLDER_COVER_CACHE_TTL_SECONDS,
+            }
+        return item_id in folder_ids
+
+    def _fetch_emby_collection_folder_ids(self, user_id, request_headers, request_path):
+        query_items = []
+        token = emby_auth_token(request_path, request_headers)
+        if token:
+            query_items.append(("api_key", token))
+        suffix = "?" + urllib.parse.urlencode(query_items) if query_items else ""
+        path = "/emby/Users/%s/Views%s" % (urllib.parse.quote(str(user_id), safe=""), suffix)
+        status, _headers, body = self._read_upstream(path, request_headers)
+        if status < 200 or status >= 300 or not body:
+            return set()
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (TypeError, ValueError):
+            return set()
+        ids = set()
+        for item in iter_emby_items(payload):
+            if emby_item_is_collection_folder(item) and item.get("Id"):
+                ids.add(str(item.get("Id")))
+        return ids
+
+    def _find_emby_folder_cover(self, user_id, folder_id, request_headers, request_path, preferred_image_type="Primary"):
+        user_id = str(user_id or "").strip()
+        folder_id = str(folder_id or "").strip()
+        if not user_id or not folder_id:
+            return None
+        preferred_image_type = image_type_value(preferred_image_type)
+        key = (user_id, folder_id, preferred_image_type)
+        now = time.time()
+        with self.folder_cover_cache_lock:
+            cached = self.folder_cover_cache.get(key)
+            if cached and cached.get("expires_at", 0) > now:
+                return cached.get("cover")
+        cover = self._fetch_emby_folder_cover(user_id, folder_id, request_headers, request_path, preferred_image_type)
+        with self.folder_cover_cache_lock:
+            self.folder_cover_cache[key] = {
+                "cover": cover,
+                "expires_at": now + EMBY_FOLDER_COVER_CACHE_TTL_SECONDS,
+            }
+        return cover
+
+    def _fetch_emby_folder_cover(self, user_id, folder_id, request_headers, request_path, preferred_image_type="Primary"):
+        query_items = [
+            ("ParentId", str(folder_id)),
+            ("Limit", "30"),
+            ("Fields", "PrimaryImageAspectRatio"),
+            ("ImageTypeLimit", "1"),
+            ("EnableImageTypes", "Primary,Backdrop,Thumb"),
+        ]
+        token = emby_auth_token(request_path, request_headers)
+        if token:
+            query_items.append(("api_key", token))
+        path = "/emby/Users/%s/Items?%s" % (
+            urllib.parse.quote(str(user_id), safe=""),
+            urllib.parse.urlencode(query_items),
+        )
+        status, _headers, body = self._read_upstream(path, request_headers)
+        if status < 200 or status >= 300 or not body:
+            return None
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (TypeError, ValueError):
+            return None
+        items = payload.get("Items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or not items:
+            return None
+        return select_emby_folder_cover_item(items, preferred_image_type)
+
     def _read_msg_api(self, path, retry_auth=True):
         if self.msg_api_auth is None:
             raise RuntimeError("subtitle proxy MSG auth is not configured")
@@ -1052,6 +1354,8 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                 payload = None
             if isinstance(payload, dict):
                 if patch_emby_resume_runtime_fields(payload):
+                    no_store = True
+                if self._patch_emby_collection_folder_covers(payload, request_headers, request_path or ""):
                     no_store = True
                 if media_id:
                     runtime_ticks = self._fetch_emby_resume_runtime_ticks(media_id, request_headers, request_path or "")
