@@ -26,6 +26,7 @@ ANIME_QUERY_HINT_PATTERN = re.compile(
 SEARCH_PROFILE_GENERAL = "general"
 SEARCH_PROFILE_ADULT = "adult"
 SEARCH_PROFILE_ANIME = "anime"
+SEARCH_PROFILES = (SEARCH_PROFILE_GENERAL, SEARCH_PROFILE_ADULT, SEARCH_PROFILE_ANIME)
 SEARCH_PROFILE_CATEGORIES = {
     SEARCH_PROFILE_GENERAL: (2000, 5000),
     SEARCH_PROFILE_ADULT: (6000,),
@@ -434,6 +435,21 @@ def parse_csv_strings(value, default):
     return tuple(item.strip() for item in str(value).split(",") if item.strip())
 
 
+def parse_int(value, default):
+    if value is None or str(value).strip() == "":
+        return int(default)
+    return int(value)
+
+
+def search_profile_value(values_by_profile, profile, default):
+    values_by_profile = values_by_profile or {}
+    if profile in values_by_profile:
+        return values_by_profile[profile]
+    if SEARCH_PROFILE_GENERAL in values_by_profile:
+        return values_by_profile[SEARCH_PROFILE_GENERAL]
+    return default
+
+
 def search_profile_categories_from_env(env):
     return {
         SEARCH_PROFILE_GENERAL: parse_csv_ints(
@@ -467,5 +483,31 @@ def search_profile_tag_labels_from_env(env):
         ),
     }
 
+
+def search_profile_upstream_limits_from_env(env):
+    default_limit = parse_int(env.get("PROWLARR_UPSTREAM_SEARCH_LIMIT"), DEFAULT_UPSTREAM_SEARCH_LIMIT)
+    return {
+        SEARCH_PROFILE_GENERAL: parse_int(env.get("PROWLARR_PROFILE_GENERAL_UPSTREAM_LIMIT"), default_limit),
+        SEARCH_PROFILE_ADULT: parse_int(env.get("PROWLARR_PROFILE_ADULT_UPSTREAM_LIMIT"), default_limit),
+        SEARCH_PROFILE_ANIME: parse_int(env.get("PROWLARR_PROFILE_ANIME_UPSTREAM_LIMIT"), default_limit),
+    }
+
+
+def search_profile_timeout_seconds_from_env(env):
+    default_timeout = parse_int(env.get("PROWLARR_SEARCH_TIMEOUT_SECONDS"), DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS)
+    return {
+        SEARCH_PROFILE_GENERAL: parse_int(env.get("PROWLARR_PROFILE_GENERAL_TIMEOUT_SECONDS"), default_timeout),
+        SEARCH_PROFILE_ADULT: parse_int(env.get("PROWLARR_PROFILE_ADULT_TIMEOUT_SECONDS"), default_timeout),
+        SEARCH_PROFILE_ANIME: parse_int(env.get("PROWLARR_PROFILE_ANIME_TIMEOUT_SECONDS"), default_timeout),
+    }
+
+
+def search_profile_max_workers_from_env(env):
+    default_workers = parse_int(env.get("PROWLARR_MAX_WORKERS"), DEFAULT_PROWLARR_MAX_WORKERS)
+    return {
+        SEARCH_PROFILE_GENERAL: parse_int(env.get("PROWLARR_PROFILE_GENERAL_MAX_WORKERS"), default_workers),
+        SEARCH_PROFILE_ADULT: parse_int(env.get("PROWLARR_PROFILE_ADULT_MAX_WORKERS"), default_workers),
+        SEARCH_PROFILE_ANIME: parse_int(env.get("PROWLARR_PROFILE_ANIME_MAX_WORKERS"), default_workers),
+    }
 
 

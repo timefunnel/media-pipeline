@@ -119,6 +119,15 @@ class BotConfigTest(unittest.TestCase):
                 "BOT_TASK_LIST_FETCH_LIMIT": "77",
                 "PROWLARR_UPSTREAM_SEARCH_LIMIT": "150",
                 "PROWLARR_MAX_WORKERS": "3",
+                "PROWLARR_PROFILE_GENERAL_UPSTREAM_LIMIT": "120",
+                "PROWLARR_PROFILE_ADULT_UPSTREAM_LIMIT": "200",
+                "PROWLARR_PROFILE_ANIME_UPSTREAM_LIMIT": "80",
+                "PROWLARR_PROFILE_GENERAL_TIMEOUT_SECONDS": "3",
+                "PROWLARR_PROFILE_ADULT_TIMEOUT_SECONDS": "5",
+                "PROWLARR_PROFILE_ANIME_TIMEOUT_SECONDS": "2",
+                "PROWLARR_PROFILE_GENERAL_MAX_WORKERS": "4",
+                "PROWLARR_PROFILE_ADULT_MAX_WORKERS": "6",
+                "PROWLARR_PROFILE_ANIME_MAX_WORKERS": "2",
                 "PROWLARR_PROFILE_GENERAL_CATEGORIES": "1000,2000",
                 "PROWLARR_PROFILE_ADULT_CATEGORIES": "6000",
                 "PROWLARR_PROFILE_ANIME_CATEGORIES": "5070,5080",
@@ -133,6 +142,15 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.task_list_fetch_limit, 77)
         self.assertEqual(config.prowlarr_upstream_search_limit, 150)
         self.assertEqual(config.prowlarr_max_workers, 3)
+        self.assertEqual(config.search_profile_upstream_limits["general"], 120)
+        self.assertEqual(config.search_profile_upstream_limits["adult"], 200)
+        self.assertEqual(config.search_profile_upstream_limits["anime"], 80)
+        self.assertEqual(config.search_profile_timeout_seconds["general"], 3)
+        self.assertEqual(config.search_profile_timeout_seconds["adult"], 5)
+        self.assertEqual(config.search_profile_timeout_seconds["anime"], 2)
+        self.assertEqual(config.search_profile_max_workers["general"], 4)
+        self.assertEqual(config.search_profile_max_workers["adult"], 6)
+        self.assertEqual(config.search_profile_max_workers["anime"], 2)
         self.assertEqual(config.search_profile_categories["general"], (1000, 2000))
         self.assertEqual(config.search_profile_categories["anime"], (5070, 5080))
         self.assertEqual(config.search_profile_tag_labels["adult"], ("adult", "sukebei"))

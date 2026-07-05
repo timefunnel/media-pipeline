@@ -146,7 +146,11 @@ from pipeline.search import (
     search_profile_categories_from_env,
     search_profile_for_query,
     search_profile_indexer_results,
+    search_profile_max_workers_from_env,
     search_profile_tag_labels_from_env,
+    search_profile_timeout_seconds_from_env,
+    search_profile_upstream_limits_from_env,
+    search_profile_value,
     search_primary_indexer_results,
     search_sukebei_indexer_results,
     should_search_anime,
@@ -320,6 +324,9 @@ class BotConfig:
     prowlarr_max_workers: int = DEFAULT_PROWLARR_MAX_WORKERS
     search_profile_categories: dict = None
     search_profile_tag_labels: dict = None
+    search_profile_upstream_limits: dict = None
+    search_profile_timeout_seconds: dict = None
+    search_profile_max_workers: dict = None
 
     @classmethod
     def from_env(cls, env=None):
@@ -388,6 +395,9 @@ class BotConfig:
             prowlarr_max_workers=int(env.get("PROWLARR_MAX_WORKERS", str(DEFAULT_PROWLARR_MAX_WORKERS))),
             search_profile_categories=search_profile_categories_from_env(env),
             search_profile_tag_labels=search_profile_tag_labels_from_env(env),
+            search_profile_upstream_limits=search_profile_upstream_limits_from_env(env),
+            search_profile_timeout_seconds=search_profile_timeout_seconds_from_env(env),
+            search_profile_max_workers=search_profile_max_workers_from_env(env),
         )
 
 
@@ -947,27 +957,54 @@ class PipelineBotService:
         prowlarr = ProwlarrClient(self.config.prowlarr_url, api_key, timeout=self.config.prowlarr_search_timeout_seconds)
         indexers = prowlarr.indexers()
         tags = safe_prowlarr_tags(prowlarr)
+        categories_by_profile = self.config.search_profile_categories or SEARCH_PROFILE_CATEGORIES
+        tag_labels_by_profile = self.config.search_profile_tag_labels or SEARCH_PROFILE_TAG_LABELS
+        upstream_limit = search_profile_value(
+            self.config.search_profile_upstream_limits,
+            profile,
+            self.config.prowlarr_upstream_search_limit,
+        )
+        timeout_seconds = search_profile_value(
+            self.config.search_profile_timeout_seconds,
+            profile,
+            self.config.prowlarr_search_timeout_seconds,
+        )
+        max_workers = search_profile_value(
+            self.config.search_profile_max_workers,
+            profile,
+            self.config.prowlarr_max_workers,
+        )
+        search_settings = {
+            "upstream_limit": int(upstream_limit),
+            "timeout_seconds": int(timeout_seconds),
+            "max_workers": int(max_workers),
+            "categories": list(categories_by_profile.get(profile, ())),
+            "tag_labels": list(tag_labels_by_profile.get(profile, ())),
+        }
         candidates = search_profile_indexer_results(
             prowlarr,
             query,
             profile,
-            max(int(limit), int(self.config.prowlarr_upstream_search_limit)),
+            max(int(limit), int(upstream_limit)),
             indexers=indexers,
             tags=tags,
-            timeout_seconds=self.config.prowlarr_search_timeout_seconds,
+            timeout_seconds=timeout_seconds,
             stats=stats,
-            categories_by_profile=self.config.search_profile_categories,
-            tag_labels_by_profile=self.config.search_profile_tag_labels,
-            max_workers=self.config.prowlarr_max_workers,
+            categories_by_profile=categories_by_profile,
+            tag_labels_by_profile=tag_labels_by_profile,
+            max_workers=max_workers,
         )
         try:
             ranked = ResourceSelector(indexer_priorities=indexer_priority_map(indexers)).select_ranked_limited(candidates, query=query, limit=limit)
         except RuntimeError as exc:
-            attach_search_metadata(exc, stats.to_metadata(profile=profile, raw_count=len(candidates), selected_count=0))
+            attach_search_metadata(
+                exc,
+                stats.to_metadata(profile=profile, raw_count=len(candidates), selected_count=0, settings=search_settings),
+            )
             raise
         return SearchResultList(
             ranked,
-            metadata=stats.to_metadata(profile=profile, raw_count=len(candidates), selected_count=len(ranked)),
+            metadata=stats.to_metadata(profile=profile, raw_count=len(candidates), selected_count=len(ranked), settings=search_settings),
         )
 
     def search_adult(self, query, limit=DEFAULT_SEARCH_LIMIT):

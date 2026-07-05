@@ -54,13 +54,13 @@ class SearchStats:
     def record_timeout(self, source, phase=None, indexer_id=None, duration_seconds=0):
         self.record(source, status="timeout", duration_seconds=duration_seconds, phase=phase, indexer_id=indexer_id)
 
-    def to_metadata(self, profile=None, raw_count=0, selected_count=0):
+    def to_metadata(self, profile=None, raw_count=0, selected_count=0, settings=None):
         total_ms = int(round((self.clock() - self.started_at) * 1000))
         success_count = sum(1 for source in self.sources if source.get("status") == "success")
         failed_count = sum(1 for source in self.sources if source.get("status") == "failed")
         timeout_count = sum(1 for source in self.sources if source.get("status") == "timeout")
         result_count = sum(int(source.get("result_count") or 0) for source in self.sources)
-        return {
+        metadata = {
             "profile": profile or "",
             "total_ms": total_ms,
             "source_count": len(self.sources),
@@ -71,6 +71,9 @@ class SearchStats:
             "selected_count": int(selected_count or 0),
             "sources": list(self.sources),
         }
+        if settings:
+            metadata["settings"] = dict(settings)
+        return metadata
 
 
 def search_result_metadata(results):

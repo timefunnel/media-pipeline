@@ -107,6 +107,8 @@ Validation:
 
 ### 6. Data-Driven Search Tuning
 
+Status: completed.
+
 Goal:
 Use recorded search source stats to tune Prowlarr indexer priority, timeout, concurrency, and category/tag boundaries.
 

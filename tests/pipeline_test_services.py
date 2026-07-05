@@ -1640,6 +1640,114 @@ class CliSubmitSearchTest(unittest.TestCase):
         self.assertEqual([item["indexer"] for item in results], ["BookOnly"])
         self.assertEqual(fake_prowlarr.search_calls, [("sintel", 100, (2,), (7000,))])
 
+    def test_profile_search_records_partial_failure_without_dropping_successes(self):
+        from pipeline.bot import SEARCH_PROFILE_GENERAL, search_profile_indexer_results
+        from pipeline.search_stats import SearchStats
+
+        fake_prowlarr = FakeProwlarr(
+            [],
+            indexers=[
+                {"id": 1, "name": "FastIndexer", "enable": True, "capabilities": {"categories": [{"id": 2000}]}},
+                {"id": 2, "name": "BrokenIndexer", "enable": True, "capabilities": {"categories": [{"id": 2000}]}},
+            ],
+            indexer_results={(1,): [{"title": "Sintel 1080p", "indexer": "FastIndexer", "seeders": 2, "infoHash": "F1"}]},
+            indexer_errors={(2,): RuntimeError("upstream failed")},
+        )
+        stats = SearchStats()
+
+        results = search_profile_indexer_results(
+            fake_prowlarr,
+            "sintel",
+            SEARCH_PROFILE_GENERAL,
+            100,
+            indexers=fake_prowlarr.indexers(),
+            stats=stats,
+            max_workers=2,
+        )
+        metadata = stats.to_metadata(raw_count=len(results), selected_count=len(results))
+
+        self.assertEqual([item["infoHash"] for item in results], ["F1"])
+        self.assertEqual(metadata["success_count"], 1)
+        self.assertEqual(metadata["failed_count"], 1)
+        self.assertEqual({source["source"] for source in metadata["sources"]}, {"FastIndexer", "BrokenIndexer"})
+
+    def test_profile_search_records_timeout_without_waiting_for_slow_source(self):
+        import time
+
+        from pipeline.bot import SEARCH_PROFILE_GENERAL, search_profile_indexer_results
+        from pipeline.search_stats import SearchStats
+
+        class SlowProwlarr(FakeProwlarr):
+            def search(self, query, limit=20, indexer_ids=None, categories=None):
+                if tuple(indexer_ids or []) == (2,):
+                    time.sleep(0.05)
+                return super().search(query, limit=limit, indexer_ids=indexer_ids, categories=categories)
+
+        fake_prowlarr = SlowProwlarr(
+            [],
+            indexers=[
+                {"id": 1, "name": "FastIndexer", "enable": True, "capabilities": {"categories": [{"id": 2000}]}},
+                {"id": 2, "name": "SlowIndexer", "enable": True, "capabilities": {"categories": [{"id": 2000}]}},
+            ],
+            indexer_results={
+                (1,): [{"title": "Sintel 1080p", "indexer": "FastIndexer", "seeders": 2, "infoHash": "F1"}],
+                (2,): [{"title": "Sintel 720p", "indexer": "SlowIndexer", "seeders": 2, "infoHash": "S1"}],
+            },
+        )
+        stats = SearchStats()
+
+        results = search_profile_indexer_results(
+            fake_prowlarr,
+            "sintel",
+            SEARCH_PROFILE_GENERAL,
+            100,
+            indexers=fake_prowlarr.indexers(),
+            timeout_seconds=0.01,
+            stats=stats,
+            max_workers=2,
+        )
+        metadata = stats.to_metadata(raw_count=len(results), selected_count=len(results))
+
+        self.assertEqual([item["infoHash"] for item in results], ["F1"])
+        self.assertEqual(metadata["success_count"], 1)
+        self.assertEqual(metadata["timeout_count"], 1)
+        self.assertEqual({source["source"] for source in metadata["sources"]}, {"FastIndexer", "SlowIndexer"})
+
+    def test_bot_search_uses_profile_specific_tuning_settings(self):
+        from pipeline.bot import BotConfig, PipelineBotService, SEARCH_PROFILE_ADULT
+        from pipeline.search_stats import search_result_metadata
+
+        fake_prowlarr = FakeProwlarr(
+            [],
+            indexers=[
+                {"id": 8, "name": "sukebei.nyaa.si", "enable": True, "capabilities": {"categories": [{"id": 6000}]}},
+            ],
+            indexer_results={
+                (8,): [{"title": "MIDE-882 1080p", "indexer": "sukebei.nyaa.si", "seeders": 0, "infoHash": "S1"}],
+            },
+        )
+
+        with patch("pipeline.bot.ProwlarrConfig") as config_cls, patch("pipeline.bot.ProwlarrClient", return_value=fake_prowlarr):
+            config_cls.return_value.load_api_key.return_value = "prowlarr-key"
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    search_profile_upstream_limits={SEARCH_PROFILE_ADULT: 42},
+                    search_profile_timeout_seconds={SEARCH_PROFILE_ADULT: 2},
+                    search_profile_max_workers={SEARCH_PROFILE_ADULT: 1},
+                )
+            )
+            results = service.search_adult("MIDE-882", limit=5)
+
+        metadata = search_result_metadata(results)
+        self.assertEqual([item["infoHash"] for item in results], ["S1"])
+        self.assertEqual(fake_prowlarr.search_calls, [("MIDE-882", 42, (8,), (6000,))])
+        self.assertEqual(metadata["settings"]["upstream_limit"], 42)
+        self.assertEqual(metadata["settings"]["timeout_seconds"], 2)
+        self.assertEqual(metadata["settings"]["max_workers"], 1)
+
     def test_primary_search_falls_back_to_single_indexers_when_aggregate_times_out(self):
         from pipeline.bot import search_primary_indexer_results
 
