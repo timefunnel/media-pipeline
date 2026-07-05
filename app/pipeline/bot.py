@@ -65,6 +65,7 @@ DEFAULT_REQUIRED_INDEXER_SEARCH_LIMIT = 1000
 DEFAULT_ANIME_INDEXER_SEARCH_LIMIT = 100
 DEFAULT_PRIMARY_INDEXER_TIMEOUT_SECONDS = 12
 DEFAULT_OPTIONAL_INDEXER_TIMEOUT_SECONDS = 12
+DEFAULT_PROWLARR_MAX_WORKERS = 8
 DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS = 4
 SEARCH_PAGE_SIZE = 5
 DEFAULT_TASK_LIST_LIMIT = 10
@@ -232,6 +233,17 @@ class BotConfig:
     sync_recovery_interval_seconds: int = 60
     openlist_scan_username: str = ""
     openlist_scan_password: str = ""
+    search_page_size: int = SEARCH_PAGE_SIZE
+    task_list_page_size: int = DEFAULT_TASK_LIST_PAGE_SIZE
+    task_list_fetch_limit: int = DEFAULT_TASK_LIST_FETCH_LIMIT
+    prowlarr_upstream_search_limit: int = DEFAULT_UPSTREAM_SEARCH_LIMIT
+    prowlarr_required_indexer_search_limit: int = DEFAULT_REQUIRED_INDEXER_SEARCH_LIMIT
+    prowlarr_anime_indexer_search_limit: int = DEFAULT_ANIME_INDEXER_SEARCH_LIMIT
+    prowlarr_primary_indexer_timeout_seconds: int = DEFAULT_PRIMARY_INDEXER_TIMEOUT_SECONDS
+    prowlarr_optional_indexer_timeout_seconds: int = DEFAULT_OPTIONAL_INDEXER_TIMEOUT_SECONDS
+    prowlarr_max_workers: int = DEFAULT_PROWLARR_MAX_WORKERS
+    search_profile_categories: dict = None
+    search_profile_tag_labels: dict = None
 
     @classmethod
     def from_env(cls, env=None):
@@ -283,6 +295,23 @@ class BotConfig:
             ),
             openlist_adult_code_format_enabled=parse_bool(env.get("OPENLIST_ADULT_CODE_FORMAT_ENABLED"), True),
             sync_recovery_interval_seconds=int(env.get("BOT_SYNC_RECOVERY_INTERVAL_SECONDS", "60")),
+            search_page_size=int(env.get("BOT_SEARCH_PAGE_SIZE", str(SEARCH_PAGE_SIZE))),
+            task_list_page_size=int(env.get("BOT_TASK_LIST_PAGE_SIZE", str(DEFAULT_TASK_LIST_PAGE_SIZE))),
+            task_list_fetch_limit=int(env.get("BOT_TASK_LIST_FETCH_LIMIT", str(DEFAULT_TASK_LIST_FETCH_LIMIT))),
+            prowlarr_upstream_search_limit=int(env.get("PROWLARR_UPSTREAM_SEARCH_LIMIT", str(DEFAULT_UPSTREAM_SEARCH_LIMIT))),
+            prowlarr_required_indexer_search_limit=int(
+                env.get("PROWLARR_REQUIRED_INDEXER_SEARCH_LIMIT", str(DEFAULT_REQUIRED_INDEXER_SEARCH_LIMIT))
+            ),
+            prowlarr_anime_indexer_search_limit=int(env.get("PROWLARR_ANIME_INDEXER_SEARCH_LIMIT", str(DEFAULT_ANIME_INDEXER_SEARCH_LIMIT))),
+            prowlarr_primary_indexer_timeout_seconds=int(
+                env.get("PROWLARR_PRIMARY_INDEXER_TIMEOUT_SECONDS", str(DEFAULT_PRIMARY_INDEXER_TIMEOUT_SECONDS))
+            ),
+            prowlarr_optional_indexer_timeout_seconds=int(
+                env.get("PROWLARR_OPTIONAL_INDEXER_TIMEOUT_SECONDS", str(DEFAULT_OPTIONAL_INDEXER_TIMEOUT_SECONDS))
+            ),
+            prowlarr_max_workers=int(env.get("PROWLARR_MAX_WORKERS", str(DEFAULT_PROWLARR_MAX_WORKERS))),
+            search_profile_categories=search_profile_categories_from_env(env),
+            search_profile_tag_labels=search_profile_tag_labels_from_env(env),
         )
 
 
@@ -846,11 +875,14 @@ class PipelineBotService:
             prowlarr,
             query,
             profile,
-            max(int(limit), DEFAULT_UPSTREAM_SEARCH_LIMIT),
+            max(int(limit), int(self.config.prowlarr_upstream_search_limit)),
             indexers=indexers,
             tags=tags,
             timeout_seconds=self.config.prowlarr_search_timeout_seconds,
             stats=stats,
+            categories_by_profile=self.config.search_profile_categories,
+            tag_labels_by_profile=self.config.search_profile_tag_labels,
+            max_workers=self.config.prowlarr_max_workers,
         )
         try:
             ranked = ResourceSelector(indexer_priorities=indexer_priority_map(indexers)).select_ranked_limited(candidates, query=query, limit=limit)
@@ -1718,7 +1750,7 @@ class TelegramBot:
             return
 
         text, reply_markup = self._render_search_page(session_id, page)
-        page_count = search_page_count(len(session["candidate_ids"]))
+        page_count = search_page_count(len(session["candidate_ids"]), page_size=self.config.search_page_size)
         safe_page = normalize_page(page, page_count)
         self.telegram.answer_callback_query(callback_id, "第 %s/%s 页" % (safe_page + 1, page_count))
         self._update_callback_message(
@@ -1913,7 +1945,7 @@ class TelegramBot:
             return
 
         candidate_ids = [int(value) for value in session["candidate_ids"]]
-        page = candidate_ids.index(int(candidate_id)) // SEARCH_PAGE_SIZE
+        page = candidate_ids.index(int(candidate_id)) // self.config.search_page_size
         text, reply_markup = self._render_search_page(session["id"], page)
         self.telegram.answer_callback_query(callback_id, "返回结果")
         self._update_callback_message(
@@ -2297,8 +2329,8 @@ class TelegramBot:
             return
         self.telegram.send_message(
             chat_id,
-            format_task_list_message(records, page=page, page_count=page_count, total=total),
-            reply_markup=task_list_reply_markup(records, page=page, page_count=page_count),
+            format_task_list_message(records, page=page, page_count=page_count, total=total, page_size=self.config.task_list_page_size),
+            reply_markup=task_list_reply_markup(records, page=page, page_count=page_count, page_size=self.config.task_list_page_size),
         )
 
     def _handle_task_page_callback(self, user_id, chat_id, message_id, callback_id, page):
@@ -2311,17 +2343,17 @@ class TelegramBot:
         self._update_callback_message(
             chat_id,
             message_id,
-            format_task_list_message(records, page=page, page_count=page_count, total=total),
-            reply_markup=task_list_reply_markup(records, page=page, page_count=page_count),
+            format_task_list_message(records, page=page, page_count=page_count, total=total, page_size=self.config.task_list_page_size),
+            reply_markup=task_list_reply_markup(records, page=page, page_count=page_count, page_size=self.config.task_list_page_size),
         )
 
     def _task_list_page(self, user_id, page=0):
-        records = prioritized_task_records(self.store.list_tasks(user_id, limit=DEFAULT_TASK_LIST_FETCH_LIMIT))
+        records = prioritized_task_records(self.store.list_tasks(user_id, limit=self.config.task_list_fetch_limit))
         total = len(records)
-        page_count = task_page_count(total)
+        page_count = task_page_count(total, page_size=self.config.task_list_page_size)
         page = normalize_page(page, page_count)
-        start = page * DEFAULT_TASK_LIST_PAGE_SIZE
-        return records[start : start + DEFAULT_TASK_LIST_PAGE_SIZE], page, page_count, total
+        start = page * self.config.task_list_page_size
+        return records[start : start + self.config.task_list_page_size], page, page_count, total
 
     def _handle_dedupe_refresh_command(self, chat_id):
         self.telegram.send_message(chat_id, DEDUPE_REFRESH_WARNING_TEXT, reply_markup=dedupe_refresh_confirm_reply_markup())
@@ -2360,10 +2392,10 @@ class TelegramBot:
     def _render_search_page(self, session_id, page):
         session = self.store.load_search_session(session_id)
         candidate_ids = session["candidate_ids"]
-        page_count = search_page_count(len(candidate_ids))
+        page_count = search_page_count(len(candidate_ids), page_size=self.config.search_page_size)
         page = normalize_page(page, page_count)
-        start = page * SEARCH_PAGE_SIZE
-        page_candidate_ids = candidate_ids[start : start + SEARCH_PAGE_SIZE]
+        start = page * self.config.search_page_size
+        page_candidate_ids = candidate_ids[start : start + self.config.search_page_size]
         candidates = []
         for candidate_id in page_candidate_ids:
             record = self.store.load_candidate(candidate_id)
@@ -2796,11 +2828,29 @@ def safe_prowlarr_tags(prowlarr):
         return []
 
 
-def search_profile_indexer_results(prowlarr, query, profile, limit, indexers=None, tags=None, timeout_seconds=None, stats=None):
+def search_profile_indexer_results(
+    prowlarr,
+    query,
+    profile,
+    limit,
+    indexers=None,
+    tags=None,
+    timeout_seconds=None,
+    stats=None,
+    categories_by_profile=None,
+    tag_labels_by_profile=None,
+    max_workers=DEFAULT_PROWLARR_MAX_WORKERS,
+):
     if indexers is None:
         indexers = prowlarr.indexers()
-    selected = search_profile_indexers(indexers, tags or [], profile)
-    categories = SEARCH_PROFILE_CATEGORIES.get(profile, SEARCH_PROFILE_CATEGORIES[SEARCH_PROFILE_GENERAL])
+    selected = search_profile_indexers(
+        indexers,
+        tags or [],
+        profile,
+        categories_by_profile=categories_by_profile,
+        tag_labels_by_profile=tag_labels_by_profile,
+    )
+    categories = search_profile_categories(profile, categories_by_profile)
     if not selected:
         if stats is not None:
             return stats.measure(
@@ -2817,22 +2867,31 @@ def search_profile_indexer_results(prowlarr, query, profile, limit, indexers=Non
         categories=categories,
         timeout_seconds=timeout_seconds or DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS,
         stats=stats,
+        max_workers=max_workers,
     )
 
 
-def search_profile_indexers(indexers, tags, profile):
+def search_profile_indexers(indexers, tags, profile, categories_by_profile=None, tag_labels_by_profile=None):
     enabled = [indexer for indexer in indexers if indexer_enabled(indexer) and indexer.get("id") is not None]
-    tag_ids = search_profile_tag_ids(tags, profile)
+    tag_ids = search_profile_tag_ids(tags, profile, tag_labels_by_profile=tag_labels_by_profile)
     if tag_ids:
         tagged = [indexer for indexer in enabled if tag_ids.intersection(set(indexer.get("tags") or []))]
         if tagged:
             return tagged
-    categories = SEARCH_PROFILE_CATEGORIES.get(profile, ())
+    categories = search_profile_categories(profile, categories_by_profile, default=())
     return [indexer for indexer in enabled if indexer_supports_any_category(indexer, categories)]
 
 
-def search_profile_tag_ids(tags, profile):
-    labels = {label.casefold() for label in SEARCH_PROFILE_TAG_LABELS.get(profile, ())}
+def search_profile_categories(profile, categories_by_profile=None, default=None):
+    categories_by_profile = categories_by_profile or SEARCH_PROFILE_CATEGORIES
+    if default is None:
+        default = categories_by_profile.get(SEARCH_PROFILE_GENERAL, SEARCH_PROFILE_CATEGORIES[SEARCH_PROFILE_GENERAL])
+    return tuple(categories_by_profile.get(profile, default))
+
+
+def search_profile_tag_ids(tags, profile, tag_labels_by_profile=None):
+    tag_labels_by_profile = tag_labels_by_profile or SEARCH_PROFILE_TAG_LABELS
+    labels = {label.casefold() for label in tag_labels_by_profile.get(profile, ())}
     ids = set()
     for tag in tags or []:
         label = str(tag.get("label") or tag.get("name") or "").casefold()
@@ -2878,11 +2937,20 @@ def indexer_priority_map(indexers):
     return priorities
 
 
-def search_indexers_concurrently(prowlarr, query, limit, indexers, categories=None, timeout_seconds=DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS, stats=None):
+def search_indexers_concurrently(
+    prowlarr,
+    query,
+    limit,
+    indexers,
+    categories=None,
+    timeout_seconds=DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS,
+    stats=None,
+    max_workers=DEFAULT_PROWLARR_MAX_WORKERS,
+):
     results = []
     if not indexers:
         return results
-    max_workers = max(1, min(8, len(indexers)))
+    max_workers = max(1, min(int(max_workers), len(indexers)))
     executor = ThreadPoolExecutor(max_workers=max_workers)
     future_to_indexer = {
         executor.submit(prowlarr.search, query, limit, [indexer.get("id")], categories): indexer for indexer in indexers
@@ -3117,6 +3185,57 @@ def parse_bool(value, default=False):
     if value is None:
         return default
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_csv_ints(value, default):
+    if value is None or str(value).strip() == "":
+        return tuple(default)
+    out = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if item:
+            out.append(int(item))
+    return tuple(out)
+
+
+def parse_csv_strings(value, default):
+    if value is None or str(value).strip() == "":
+        return tuple(default)
+    return tuple(item.strip() for item in str(value).split(",") if item.strip())
+
+
+def search_profile_categories_from_env(env):
+    return {
+        SEARCH_PROFILE_GENERAL: parse_csv_ints(
+            env.get("PROWLARR_PROFILE_GENERAL_CATEGORIES"),
+            SEARCH_PROFILE_CATEGORIES[SEARCH_PROFILE_GENERAL],
+        ),
+        SEARCH_PROFILE_ADULT: parse_csv_ints(
+            env.get("PROWLARR_PROFILE_ADULT_CATEGORIES"),
+            SEARCH_PROFILE_CATEGORIES[SEARCH_PROFILE_ADULT],
+        ),
+        SEARCH_PROFILE_ANIME: parse_csv_ints(
+            env.get("PROWLARR_PROFILE_ANIME_CATEGORIES"),
+            SEARCH_PROFILE_CATEGORIES[SEARCH_PROFILE_ANIME],
+        ),
+    }
+
+
+def search_profile_tag_labels_from_env(env):
+    return {
+        SEARCH_PROFILE_GENERAL: parse_csv_strings(
+            env.get("PROWLARR_PROFILE_GENERAL_TAG_LABELS"),
+            SEARCH_PROFILE_TAG_LABELS[SEARCH_PROFILE_GENERAL],
+        ),
+        SEARCH_PROFILE_ADULT: parse_csv_strings(
+            env.get("PROWLARR_PROFILE_ADULT_TAG_LABELS"),
+            SEARCH_PROFILE_TAG_LABELS[SEARCH_PROFILE_ADULT],
+        ),
+        SEARCH_PROFILE_ANIME: parse_csv_strings(
+            env.get("PROWLARR_PROFILE_ANIME_TAG_LABELS"),
+            SEARCH_PROFILE_TAG_LABELS[SEARCH_PROFILE_ANIME],
+        ),
+    }
 
 
 def ensure_sqlite_column(conn, table, column, definition):
@@ -4339,10 +4458,10 @@ def msg_match_mode_label(value):
     }.get(value, value or "-")
 
 
-def search_page_count(total):
+def search_page_count(total, page_size=SEARCH_PAGE_SIZE):
     if total <= 0:
         return 1
-    return (total + SEARCH_PAGE_SIZE - 1) // SEARCH_PAGE_SIZE
+    return (total + int(page_size) - 1) // int(page_size)
 
 
 def normalize_page(page, page_count):
@@ -4736,11 +4855,11 @@ def format_migration_result_message(candidate, result):
     return "\n".join(lines)
 
 
-def format_task_list_message(records, page=0, page_count=1, total=None):
+def format_task_list_message(records, page=0, page_count=1, total=None, page_size=DEFAULT_TASK_LIST_PAGE_SIZE):
     if total is None:
         total = len(records)
     lines = ["最近任务：第 %s/%s 页，共 %s 条" % (page + 1, page_count, total)]
-    start_index = page * DEFAULT_TASK_LIST_PAGE_SIZE + 1
+    start_index = page * int(page_size) + 1
     for idx, record in enumerate(records, 1):
         task = record["task"]
         title = record["title"] or task.get("name") or task.get("info_hash")
@@ -5011,10 +5130,10 @@ def task_is_final(task):
     return TASK_STATE.is_offline_final(task)
 
 
-def task_page_count(total):
+def task_page_count(total, page_size=DEFAULT_TASK_LIST_PAGE_SIZE):
     if total <= 0:
         return 1
-    return (total + DEFAULT_TASK_LIST_PAGE_SIZE - 1) // DEFAULT_TASK_LIST_PAGE_SIZE
+    return (total + int(page_size) - 1) // int(page_size)
 
 
 def task_list_priority(record):
@@ -5040,12 +5159,12 @@ def prioritized_task_records(records):
     return sorted(records or [], key=sort_key)
 
 
-def task_list_reply_markup(records, page=0, page_count=1):
+def task_list_reply_markup(records, page=0, page_count=1, page_size=DEFAULT_TASK_LIST_PAGE_SIZE):
     rows = []
     for idx, record in enumerate(records, 1):
         task = record["task"]
         info_hash = task.get("info_hash") or record["info_hash"]
-        display_index = page * DEFAULT_TASK_LIST_PAGE_SIZE + idx
+        display_index = page * int(page_size) + idx
         if task_can_retry_msg_sync(task):
             rows.append([{"text": "重试MSG %s" % display_index, "callback_data": "retry_msg:%s" % info_hash}])
             continue

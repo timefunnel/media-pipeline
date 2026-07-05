@@ -157,6 +157,36 @@ class BotConfigTest(unittest.TestCase):
 
         self.assertEqual(config.sync_recovery_interval_seconds, 120)
 
+    def test_bot_config_reads_externalized_search_and_prowlarr_settings(self):
+        from pipeline.bot import BotConfig
+
+        config = BotConfig.from_env(
+            {
+                "TG_BOT_TOKEN": "123:token",
+                "TG_ALLOWED_USER_IDS": "700656624",
+                "BOT_SEARCH_PAGE_SIZE": "10",
+                "BOT_TASK_LIST_PAGE_SIZE": "7",
+                "BOT_TASK_LIST_FETCH_LIMIT": "77",
+                "PROWLARR_UPSTREAM_SEARCH_LIMIT": "150",
+                "PROWLARR_MAX_WORKERS": "3",
+                "PROWLARR_PROFILE_GENERAL_CATEGORIES": "1000,2000",
+                "PROWLARR_PROFILE_ADULT_CATEGORIES": "6000",
+                "PROWLARR_PROFILE_ANIME_CATEGORIES": "5070,5080",
+                "PROWLARR_PROFILE_GENERAL_TAG_LABELS": "general,public",
+                "PROWLARR_PROFILE_ADULT_TAG_LABELS": "adult,sukebei",
+                "PROWLARR_PROFILE_ANIME_TAG_LABELS": "anime,nyaa",
+            }
+        )
+
+        self.assertEqual(config.search_page_size, 10)
+        self.assertEqual(config.task_list_page_size, 7)
+        self.assertEqual(config.task_list_fetch_limit, 77)
+        self.assertEqual(config.prowlarr_upstream_search_limit, 150)
+        self.assertEqual(config.prowlarr_max_workers, 3)
+        self.assertEqual(config.search_profile_categories["general"], (1000, 2000))
+        self.assertEqual(config.search_profile_categories["anime"], (5070, 5080))
+        self.assertEqual(config.search_profile_tag_labels["adult"], ("adult", "sukebei"))
+
 
 class SubtitleProxyTest(unittest.TestCase):
     def test_normalize_webvtt_timestamps_pads_centiseconds(self):
@@ -5504,6 +5534,43 @@ class CliSubmitSearchTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([item["indexer"] for item in payload["results"]], ["Knaben"])
         self.assertEqual(fake_prowlarr.search_calls, [("ATFB-309", 100, (1,))])
+
+    def test_profile_search_uses_externalized_categories(self):
+        from pipeline.bot import SEARCH_PROFILE_GENERAL, search_profile_indexer_results
+
+        fake_prowlarr = FakeProwlarr(
+            [],
+            indexers=[
+                {
+                    "id": 1,
+                    "name": "MovieOnly",
+                    "enable": True,
+                    "capabilities": {"categories": [{"id": 2000}]},
+                },
+                {
+                    "id": 2,
+                    "name": "BookOnly",
+                    "enable": True,
+                    "capabilities": {"categories": [{"id": 7000}]},
+                },
+            ],
+            indexer_results={
+                (2,): [{"title": "Sintel Book", "indexer": "BookOnly", "seeders": 1, "infoHash": "B1"}],
+            },
+        )
+
+        results = search_profile_indexer_results(
+            fake_prowlarr,
+            "sintel",
+            SEARCH_PROFILE_GENERAL,
+            100,
+            indexers=fake_prowlarr.indexers(),
+            categories_by_profile={SEARCH_PROFILE_GENERAL: (7000,)},
+            max_workers=1,
+        )
+
+        self.assertEqual([item["indexer"] for item in results], ["BookOnly"])
+        self.assertEqual(fake_prowlarr.search_calls, [("sintel", 100, (2,), (7000,))])
 
     def test_primary_search_falls_back_to_single_indexers_when_aggregate_times_out(self):
         from pipeline.bot import search_primary_indexer_results
