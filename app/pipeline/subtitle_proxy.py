@@ -64,9 +64,10 @@ EMBY_ITEM_IMAGE_RE = re.compile(
 EMBY_FOLDER_COVER_CACHE_TTL_SECONDS = 300
 EMBY_FOLDER_COVER_GRID_LIMIT = 4
 EMBY_FOLDER_COVER_ASPECT_RATIO = 16 / 9
-EMBY_FOLDER_COVER_DEFAULT_WIDTH = 600
+EMBY_FOLDER_COVER_DEFAULT_WIDTH = 640
 EMBY_FOLDER_COVER_MIN_WIDTH = 160
 EMBY_FOLDER_COVER_MAX_WIDTH = 1200
+EMBY_FOLDER_COVER_TAG_PREFIX = "mp-folder-v2"
 SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
 VIDEO_EXTENSIONS = {
     ".avi",
@@ -733,7 +734,7 @@ def emby_folder_cover_grid_tag(folder_id, covers):
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()[:16]
-    return "mp-folder-%s" % digest
+    return "%s-%s" % (EMBY_FOLDER_COVER_TAG_PREFIX, digest)
 
 
 def emby_image_proxy_path(cover, original_query=""):
@@ -780,7 +781,7 @@ def build_emby_folder_cover_grid(image_bodies, dimensions=None):
             continue
         try:
             with Image.open(io.BytesIO(body)) as image:
-                decoded.append(image.convert("RGB"))
+                decoded.append(image.convert("RGBA"))
         except (OSError, ValueError):
             continue
         if len(decoded) >= EMBY_FOLDER_COVER_GRID_LIMIT:
@@ -793,7 +794,7 @@ def build_emby_folder_cover_grid(image_bodies, dimensions=None):
         width, height = emby_folder_cover_grid_dimensions("")
     width = max(EMBY_FOLDER_COVER_MIN_WIDTH, min(EMBY_FOLDER_COVER_MAX_WIDTH, int_value(width) or EMBY_FOLDER_COVER_DEFAULT_WIDTH))
     height = max(1, int_value(height) or int(round(width / EMBY_FOLDER_COVER_ASPECT_RATIO)))
-    canvas = Image.new("RGB", (width, height), (18, 18, 18))
+    canvas = Image.new("RGBA", (width, height), (18, 18, 18, 255))
     resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
     column_count = min(len(decoded), EMBY_FOLDER_COVER_GRID_LIMIT)
     x = 0
@@ -1173,9 +1174,11 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         )
         if not body:
             return False
+        tag = emby_folder_cover_grid_tag(image_request["item_id"], covers)
         headers = {
             "Content-Type": "image/png",
-            "Cache-Control": "public, max-age=%d" % EMBY_FOLDER_COVER_CACHE_TTL_SECONDS,
+            "Cache-Control": "public, max-age=31536000",
+            "ETag": '"%s"' % tag,
         }
         self._write_response(200, headers, body, request_headers=request_headers, request_path=self.path)
         return True

@@ -332,7 +332,7 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertIsNone(folder["PrimaryImageItemId"])
-        self.assertTrue(folder["ImageTags"]["Primary"].startswith("mp-folder-"))
+        self.assertTrue(folder["ImageTags"]["Primary"].startswith("mp-folder-v2-"))
         self.assertEqual(folder["PrimaryImageAspectRatio"], 16 / 9)
 
     def test_select_emby_folder_cover_items_limits_to_four_unique_items(self):
@@ -367,6 +367,7 @@ class SubtitleProxyTest(unittest.TestCase):
     def test_emby_folder_cover_grid_dimensions_use_client_limit(self):
         self.assertEqual(emby_folder_cover_grid_dimensions("maxWidth=400&maxHeight=300"), (400, 225))
         self.assertEqual(emby_folder_cover_grid_dimensions("maxWidth=10"), (160, 90))
+        self.assertEqual(emby_folder_cover_grid_dimensions(""), (640, 360))
 
     def test_emby_image_proxy_path_replaces_tag_and_preserves_client_query(self):
         path = emby_image_proxy_path(
