@@ -684,6 +684,7 @@ class TelegramBotTest(unittest.TestCase):
         self.assertEqual(service.search_calls, [])
         self.assertIn("直接发送关键词、番号或磁链即可", telegram.messages[0]["text"])
         self.assertIn("/tasks 查看最近任务", telegram.messages[0]["text"])
+        self.assertIn("/diag <info_hash|media_id>", telegram.messages[0]["text"])
         self.assertIn("/migrate <关键词>", telegram.messages[0]["text"])
 
     def test_migrate_command_searches_msg_and_prompts_candidates(self):
@@ -2002,6 +2003,24 @@ class TelegramBotTest(unittest.TestCase):
         self.assertNotIn("番号格式化", movie_text)
         self.assertIn("番号格式化：已完成（MIDA-304）", adult_text)
 
+    def test_status_message_shows_msg_match_diagnostics(self):
+        from pipeline.bot import format_task_status_message
+
+        task = {
+            "info_hash": "ABC",
+            "status_name": "success",
+            "msg_sync_status": "success",
+            "msg_scrape_status": "success",
+            "msg_media_id": "media-1",
+            "msg_match_mode": "path",
+            "msg_match_path": "cloud://openlist/115/电影/Sintel/main.mkv",
+        }
+
+        text = format_task_status_message("Sintel", task, category="movie")
+
+        self.assertIn("MSG匹配：路径命中", text)
+        self.assertIn("MSG路径：cloud://openlist/115/电影/Sintel/main.mkv", text)
+
     def test_failed_msg_sync_task_shows_retry_button_and_retries_from_callback(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot, task_reply_markup
 
@@ -2482,6 +2501,75 @@ class TelegramBotTest(unittest.TestCase):
             self.assertIn("Cancelled", telegram.messages[0]["text"])
             self.assertIn("Success", telegram.messages[0]["text"])
             self.assertIsNone(telegram.messages[0]["reply_markup"])
+
+    def test_diag_command_shows_local_task_diagnostics_without_querying_115(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            store.save_task(
+                700656624,
+                9001,
+                "movie",
+                "Sintel",
+                {
+                    "info_hash": "ABC",
+                    "status_name": "success",
+                    "percent_done": 100,
+                    "name": "Sintel",
+                    "msg_sync_status": "success",
+                    "msg_scan_status": "success",
+                    "msg_scrape_status": "success",
+                    "msg_media_id": "media-1",
+                    "msg_match_mode": "path",
+                    "msg_match_path": "cloud://openlist/115/电影/Sintel/main.mkv",
+                    "openlist_clean_target": "/115/电影/Sintel",
+                },
+            )
+            telegram = FakeTelegram()
+            service = FakeBotService()
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/diag ABC"}})
+
+            self.assertEqual(service.status_calls, [])
+            self.assertEqual(service.msg_diag_calls, [])
+            text = telegram.messages[0]["text"]
+            self.assertIn("任务诊断：Sintel", text)
+            self.assertIn("MSG匹配：路径命中", text)
+            self.assertIn("MSG路径：cloud://openlist/115/电影/Sintel/main.mkv", text)
+            self.assertIn("目标路径候选：", text)
+            self.assertIn("/115/电影/Sintel", text)
+
+    def test_diag_command_falls_back_to_msg_media_diagnostics(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                msg_diag_response={
+                    "id": "media-1",
+                    "title": "Sintel",
+                    "library_id": "library-1",
+                    "library_root_id": "root-1",
+                    "path": "cloud://openlist/115/电影/Sintel/main.mkv",
+                    "size_bytes": 800 * 1024 * 1024,
+                    "duration_sec": 3823,
+                }
+            )
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path, msg_enabled=True), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/diag media-1"}})
+
+            self.assertEqual(service.msg_diag_calls, ["media-1"])
+            text = telegram.messages[0]["text"]
+            self.assertIn("MSG媒体诊断：media-1", text)
+            self.assertIn("标题：Sintel", text)
+            self.assertIn("library_id：library-1", text)
+            self.assertIn("root_id：root-1", text)
+            self.assertIn("路径：cloud://openlist/115/电影/Sintel/main.mkv", text)
+            self.assertIn("时长：3823秒", text)
 
     def test_unauthorized_user_is_rejected_before_search(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -5817,6 +5905,7 @@ class FakeBotService:
         statuses_response=None,
         migration_candidates=None,
         migration_response=None,
+        msg_diag_response=None,
     ):
         self.search_results = search_results or []
         self.adult_search_results = adult_search_results or []
@@ -5855,6 +5944,8 @@ class FakeBotService:
         }
         self.migration_search_calls = []
         self.migration_calls = []
+        self.msg_diag_response = msg_diag_response or {}
+        self.msg_diag_calls = []
 
     def search(self, query, category, limit=5):
         self.search_calls.append((query, category, limit))
@@ -5909,6 +6000,12 @@ class FakeBotService:
     def migrate_media_candidate(self, candidate, target_category):
         self.migration_calls.append((candidate.get("source_openlist_path"), target_category))
         return dict(self.migration_response)
+
+    def msg_media_diagnostics(self, media_id):
+        self.msg_diag_calls.append(media_id)
+        if self.search_error:
+            raise self.search_error
+        return dict(self.msg_diag_response)
 
     def sync_completed_task(self, category, title, task, progress_callback=None):
         self.sync_calls.append((category, title, (task or {}).get("info_hash")))

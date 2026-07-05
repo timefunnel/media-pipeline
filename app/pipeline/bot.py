@@ -101,6 +101,7 @@ HELP_TEXT = """直接发送关键词、番号或磁链即可。
 常用入口：
 /tasks 查看最近任务
 /status <info_hash> 查询任务状态
+/diag <info_hash|media_id> 查看任务或MSG媒体诊断
 /migrate <关键词> 迁移已有媒体到其他库
 /dedupe_refresh 刷新已入库记录（需二次确认）
 /version 查看当前版本
@@ -111,6 +112,7 @@ BOT_COMMANDS = [
     {"command": "help", "description": "查看功能和直接搜索说明"},
     {"command": "tasks", "description": "查看最近任务、刷新进度或取消任务"},
     {"command": "status", "description": "按 info_hash 查询任务进度"},
+    {"command": "diag", "description": "查看任务或MSG媒体诊断"},
     {"command": "migrate", "description": "迁移已入库媒体到其他库"},
     {"command": "dedupe_refresh", "description": "刷新重复判断索引（需二次确认）"},
     {"command": "version", "description": "查看当前版本"},
@@ -842,6 +844,12 @@ class PipelineBotService:
     def search_migration_candidates(self, query, limit=20):
         return self._build_msg_db_client().search_migration_candidates(query, limit=limit)
 
+    def msg_media_diagnostics(self, media_id):
+        media_id = str(media_id or "").strip()
+        if not media_id:
+            raise ValueError("MediaStationGo media id missing")
+        return self._build_msg_client().get_media(media_id)
+
     def submit(self, category, download_uri):
         download_uri = self._resolve_download_uri(download_uri)
         result = summarize_submit(
@@ -1513,6 +1521,10 @@ class TelegramBot:
             with self._typing_action(chat_id):
                 self._handle_status_command(chat_id, user_id, argument)
             return
+        if command == "/diag":
+            with self._typing_action(chat_id):
+                self._handle_diag_command(chat_id, user_id, argument)
+            return
         if command == "/migrate":
             with self._typing_action(chat_id):
                 self._handle_migrate_command(chat_id, user_id, argument)
@@ -2166,6 +2178,32 @@ class TelegramBot:
         task = self._sync_completed_task(record, task)
         self.store.save_task(user_id, record["chat_id"], record["category"], record["title"], task)
         self.telegram.send_message(chat_id, format_task_status_message(record["title"], task, category=record["category"]), reply_markup=task_reply_markup(task))
+
+    def _handle_diag_command(self, chat_id, user_id, argument):
+        target = str(argument or "").strip()
+        if not target:
+            self.telegram.send_message(chat_id, "请输入 info_hash 或 MSG媒体ID")
+            return
+        try:
+            record = self.store.load_task(target)
+        except RuntimeError:
+            record = None
+        if record is not None:
+            if record["user_id"] != user_id:
+                self.telegram.send_message(chat_id, "无权查看该任务")
+                return
+            self.telegram.send_message(chat_id, format_task_diagnostics_message(record))
+            return
+
+        if not self.config.msg_enabled:
+            self.telegram.send_message(chat_id, "未找到任务记录，且MSG诊断未启用")
+            return
+        try:
+            media = self.service.msg_media_diagnostics(target)
+        except (RuntimeError, ValueError) as exc:
+            self.telegram.send_message(chat_id, "诊断失败：%s" % exc)
+            return
+        self.telegram.send_message(chat_id, format_msg_media_diagnostics_message(target, media))
 
     def _send_task_list(self, chat_id, user_id):
         records, page, page_count, total = self._task_list_page(user_id, page=0)
@@ -4174,6 +4212,13 @@ def msg_sync_status_label(value):
     }.get(value, value or "-")
 
 
+def msg_match_mode_label(value):
+    return {
+        "path": "路径命中",
+        "query": "标题/番号命中",
+    }.get(value, value or "-")
+
+
 def search_page_count(total):
     if total <= 0:
         return 1
@@ -4370,6 +4415,123 @@ def format_task_status_message(title, task, category=None):
     return "\n".join(lines)
 
 
+def format_task_diagnostics_message(record):
+    task = (record or {}).get("task") or {}
+    category = (record or {}).get("category")
+    lines = ["任务诊断：%s" % ((record or {}).get("title") or task.get("name") or task.get("info_hash") or "-")]
+    lines.append("库：%s" % CATEGORY_LABELS.get(category, category or "-"))
+    append_task_lines(lines, task, category=category)
+
+    target_paths = msg_target_openlist_paths(category, task) if category else []
+    if target_paths:
+        lines.append("目标路径候选：")
+        for path in target_paths[:5]:
+            lines.append("- %s" % path)
+
+    stage_values = task_diagnostic_stage_values(task)
+    if stage_values:
+        lines.append("阶段：")
+        for label, value in stage_values:
+            lines.append("- %s：%s" % (label, msg_sync_status_label(value)))
+
+    for key, label in (
+        ("openlist_clean_error", "OpenList清理错误"),
+        ("openlist_adult_format_error", "番号格式化错误"),
+        ("openlist_adult_extra_hide_error", "成人附加隐藏错误"),
+        ("msg_error", "MSG错误"),
+        ("msg_extra_cleanup_error", "特典清理错误"),
+        ("msg_visibility_repair_error", "可见性修复错误"),
+        ("msg_artwork_repair_error", "图片修复错误"),
+    ):
+        if task.get(key):
+            lines.append("%s：%s" % (label, task.get(key)))
+    return "\n".join(lines)
+
+
+def task_diagnostic_stage_values(task):
+    out = []
+    for key, label in (
+        ("openlist_clean_status", "OpenList清理"),
+        ("openlist_adult_format_status", "番号格式化"),
+        ("openlist_adult_extra_hide_status", "成人附加隐藏"),
+        ("msg_scan_status", "MSG扫描"),
+        ("msg_scrape_status", "MSG刮削"),
+        ("msg_extra_cleanup_status", "特典清理"),
+        ("msg_visibility_repair_status", "可见性修复"),
+        ("msg_artwork_repair_status", "图片修复"),
+    ):
+        value = (task or {}).get(key)
+        if value:
+            out.append((label, value))
+    return out
+
+
+def format_msg_media_diagnostics_message(media_id, media):
+    lines = ["MSG媒体诊断：%s" % media_id]
+    if not isinstance(media, dict):
+        lines.append("返回：非对象")
+        return "\n".join(lines)
+
+    actual_id = extract_media_id(media)
+    if actual_id and actual_id != str(media_id):
+        lines.append("实际ID：%s" % actual_id)
+    title = media_display_title(media)
+    if title:
+        lines.append("标题：%s" % title)
+    library_id = media_first_value(media, ("library_id", "libraryId"))
+    if library_id:
+        lines.append("library_id：%s" % library_id)
+    root_id = media_first_value(media, ("library_root_id", "libraryRootId", "root_id", "rootId"))
+    if root_id:
+        lines.append("root_id：%s" % root_id)
+    path = media_primary_path(media)
+    if path:
+        lines.append("路径：%s" % path)
+    relative_path = media_first_value(media, ("relative_path", "relativePath"))
+    if relative_path:
+        lines.append("relative_path：%s" % relative_path)
+
+    size = media_item_size_bytes(media)
+    if size > 0:
+        lines.append("大小：%s" % format_size(size))
+    duration = media_first_int(media, ("duration_sec", "durationSec", "duration", "runtime_sec", "runtimeSec"))
+    if duration is not None:
+        lines.append("时长：%s秒" % duration)
+    provider = media_first_value(media, ("provider", "metadata_provider", "metadataProvider"))
+    if provider:
+        lines.append("刮削源：%s" % provider)
+    return "\n".join(lines)
+
+
+def media_first_value(value, keys):
+    if isinstance(value, dict):
+        for key in keys:
+            item = value.get(key)
+            if item not in (None, ""):
+                return item
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                item = media_first_value(child, keys)
+                if item not in (None, ""):
+                    return item
+    elif isinstance(value, list):
+        for child in value:
+            item = media_first_value(child, keys)
+            if item not in (None, ""):
+                return item
+    return None
+
+
+def media_first_int(value, keys):
+    item = media_first_value(value, keys)
+    if item in (None, ""):
+        return None
+    try:
+        return int(item)
+    except (TypeError, ValueError):
+        return None
+
+
 def format_cancel_result_message(title, result, category=None):
     task = result.get("task") or {}
     if result.get("cancelled"):
@@ -4495,6 +4657,10 @@ def append_task_lines(lines, task, category=None):
             lines.append("MSG同步：已完成")
             if task.get("msg_media_id"):
                 lines.append("MSG媒体ID：%s" % task.get("msg_media_id"))
+            if task.get("msg_match_mode"):
+                lines.append("MSG匹配：%s" % msg_match_mode_label(task.get("msg_match_mode")))
+            if task.get("msg_match_path"):
+                lines.append("MSG路径：%s" % task.get("msg_match_path"))
         elif task.get("msg_sync_status") == "running":
             lines.append("MSG同步：进行中")
         else:
