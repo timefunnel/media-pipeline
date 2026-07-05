@@ -278,8 +278,22 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertEqual(media_id, "7303b838-dab8-4eb7-a8b6-4dc761f69c18")
 
+    def test_parse_emby_item_media_id_accepts_bare_emby_paths(self):
+        media_id = parse_emby_item_media_id(
+            "/Users/user-1/Items/7303b838-dab8-4eb7-a8b6-4dc761f69c18/PlaybackInfo?api_key=secret"
+        )
+
+        self.assertEqual(media_id, "7303b838-dab8-4eb7-a8b6-4dc761f69c18")
+
     def test_parse_emby_item_image_request_accepts_primary_image_path(self):
         parsed = parse_emby_item_image_request("/emby/Items/library-1/Images/Primary?tag=old&maxWidth=400")
+
+        self.assertEqual(parsed["item_id"], "library-1")
+        self.assertEqual(parsed["image_type"], "Primary")
+        self.assertEqual(parsed["query"], "tag=old&maxWidth=400")
+
+    def test_parse_emby_item_image_request_accepts_bare_primary_image_path(self):
+        parsed = parse_emby_item_image_request("/Items/library-1/Images/Primary?tag=old&maxWidth=400")
 
         self.assertEqual(parsed["item_id"], "library-1")
         self.assertEqual(parsed["image_type"], "Primary")
@@ -290,6 +304,11 @@ class SubtitleProxyTest(unittest.TestCase):
         token = "header.%s.signature" % payload
 
         user_id = emby_request_user_id_from_auth("/emby/Items/library-1/Images/Primary?api_key=%s" % token, {})
+
+        self.assertEqual(user_id, "user-1")
+
+    def test_emby_request_user_id_from_auth_reads_bare_user_path(self):
+        user_id = emby_request_user_id_from_auth("/Users/user-1/Views?IncludeExternalContent=false", {})
 
         self.assertEqual(user_id, "user-1")
 

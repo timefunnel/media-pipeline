@@ -47,16 +47,18 @@ ASS_EVENT_TIME_RE = re.compile(r"^(?P<hour>\d+):(?P<minute>\d{2}):(?P<second>\d{
 ASS_OVERRIDE_RE = re.compile(r"\{[^}]*\}")
 SENSITIVE_QUERY_RE = re.compile(r"([?&](?:api_?key|access_token|token)=)[^&\s\"]+", re.IGNORECASE)
 EMBY_MEDIA_ID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+EMBY_PATH_PREFIX_PATTERN = r"(?:/emby)?"
 EMBY_ITEM_ID_RE = re.compile(
-    r"^/emby/(?:Users/[^/]+/)?Items/(?P<media_id>%s)(?:/PlaybackInfo)?/?$" % EMBY_MEDIA_ID_PATTERN,
+    r"^%s/(?:Users/[^/]+/)?Items/(?P<media_id>%s)(?:/PlaybackInfo)?/?$" % (EMBY_PATH_PREFIX_PATTERN, EMBY_MEDIA_ID_PATTERN),
     re.IGNORECASE,
 )
 EMBY_SUBTITLE_STREAM_RE = re.compile(
-    r"^/emby/Videos/(?P<media_id>[^/]+)/(?P<source_id>[^/]+)/Subtitles/(?P<stream_index>\d+)/Stream\.(?P<extension>vtt|srt|ass|ssa)$",
+    r"^%s/Videos/(?P<media_id>[^/]+)/(?P<source_id>[^/]+)/Subtitles/(?P<stream_index>\d+)/Stream\.(?P<extension>vtt|srt|ass|ssa)$"
+    % EMBY_PATH_PREFIX_PATTERN,
     re.IGNORECASE,
 )
 EMBY_ITEM_IMAGE_RE = re.compile(
-    r"^/emby/Items/(?P<item_id>[^/]+)/Images/(?P<image_type>Primary|Backdrop|Thumb)(?:/\d+)?/?$",
+    r"^%s/Items/(?P<item_id>[^/]+)/Images/(?P<image_type>Primary|Backdrop|Thumb)(?:/\d+)?/?$" % EMBY_PATH_PREFIX_PATTERN,
     re.IGNORECASE,
 )
 EMBY_FOLDER_COVER_CACHE_TTL_SECONDS = 300
@@ -1025,7 +1027,7 @@ def patch_emby_playback_info_runtime(payload, runtime_ticks, media_id=""):
 
 def emby_request_user_id(path):
     parsed = urllib.parse.urlparse(path)
-    match = re.match(r"^/emby/Users/(?P<user_id>[^/]+)/", parsed.path, re.IGNORECASE)
+    match = re.match(r"^(?:/emby)?/Users/(?P<user_id>[^/]+)/", parsed.path, re.IGNORECASE)
     if match:
         return urllib.parse.unquote(match.group("user_id"))
     query = urllib.parse.parse_qs(parsed.query)
