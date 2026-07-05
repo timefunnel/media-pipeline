@@ -41,6 +41,8 @@ from pipeline.subtitle_proxy import (
     inject_emby_subtitle_streams,
     inject_subtitle_track_bootstrap,
     normalize_webvtt_timestamps,
+    patch_emby_playback_info_runtime,
+    patch_emby_resume_runtime_fields,
     parse_emby_subtitle_stream_path,
     parse_emby_item_media_id,
     redact_sensitive_query_values,
@@ -219,6 +221,45 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertEqual(content_type, "text/vtt; charset=utf-8")
         self.assertIn(b"WEBVTT", converted)
         self.assertIn(b"00:00:01.200 --> 00:00:03.450", converted)
+
+    def test_patch_emby_resume_runtime_fields_adds_synthetic_duration(self):
+        payload = {
+            "Items": [
+                {
+                    "Id": "media-1",
+                    "RunTimeTicks": 0,
+                    "UserData": {
+                        "PlaybackPositionTicks": 52_620_0000,
+                        "PlayedPercentage": 0,
+                    },
+                }
+            ]
+        }
+
+        changed = patch_emby_resume_runtime_fields(payload)
+
+        item = payload["Items"][0]
+        self.assertTrue(changed)
+        self.assertGreater(item["RunTimeTicks"], item["UserData"]["PlaybackPositionTicks"])
+        self.assertGreater(item["UserData"]["PlayedPercentage"], 0)
+
+    def test_patch_emby_playback_info_runtime_updates_media_sources(self):
+        payload = {"MediaSources": [{"Id": "media-1", "RunTimeTicks": 0}, {"Id": "media-2", "RunTimeTicks": 10}]}
+
+        changed = patch_emby_playback_info_runtime(payload, 600_000_0000, media_id="media-1")
+
+        self.assertTrue(changed)
+        self.assertEqual(payload["MediaSources"][0]["RunTimeTicks"], 600_000_0000)
+        self.assertEqual(payload["MediaSources"][1]["RunTimeTicks"], 10)
+
+    def test_patch_emby_playback_info_runtime_skips_other_media_sources(self):
+        payload = {"MediaSources": [{"Id": "media-1", "RunTimeTicks": 0}, {"Id": "media-2", "RunTimeTicks": 0}]}
+
+        changed = patch_emby_playback_info_runtime(payload, 600_000_0000, media_id="media-1")
+
+        self.assertTrue(changed)
+        self.assertEqual(payload["MediaSources"][0]["RunTimeTicks"], 600_000_0000)
+        self.assertEqual(payload["MediaSources"][1]["RunTimeTicks"], 0)
 
     def test_inject_subtitle_track_bootstrap_is_idempotent(self):
         html = inject_subtitle_track_bootstrap("<html><body></body></html>")

@@ -17,6 +17,9 @@ DEFAULT_SUBTITLE_PROXY_HOST = "127.0.0.1"
 DEFAULT_SUBTITLE_PROXY_PORT = 18081
 DEFAULT_SUBTITLE_PROXY_UPSTREAM = "http://127.0.0.1:18080"
 DEFAULT_MSG_API_BASE_URL = "http://127.0.0.1:18080/api"
+EMBY_TICKS_PER_SECOND = 10_000_000
+MIN_SYNTHETIC_RUNTIME_TICKS = 10 * 60 * EMBY_TICKS_PER_SECOND
+SYNTHETIC_RUNTIME_PADDING_TICKS = 60 * 60 * EMBY_TICKS_PER_SECOND
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -668,6 +671,97 @@ def msg_media_path(payload):
     return ""
 
 
+def int_value(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def synthetic_runtime_ticks(position_ticks):
+    position_ticks = max(0, int_value(position_ticks))
+    if position_ticks <= 0:
+        return 0
+    return max(
+        MIN_SYNTHETIC_RUNTIME_TICKS,
+        position_ticks * 2,
+        position_ticks + SYNTHETIC_RUNTIME_PADDING_TICKS,
+    )
+
+
+def patch_emby_resume_runtime_fields(payload):
+    changed = False
+    if isinstance(payload, dict):
+        changed = patch_emby_media_item_runtime(payload) or changed
+        items = payload.get("Items") or payload.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if patch_emby_media_item_runtime(item):
+                    changed = True
+    return changed
+
+
+def patch_emby_media_item_runtime(item):
+    if not isinstance(item, dict):
+        return False
+    user_data = item.get("UserData")
+    if not isinstance(user_data, dict):
+        return False
+    position_ticks = int_value(user_data.get("PlaybackPositionTicks"))
+    if position_ticks <= 0:
+        return False
+
+    changed = False
+    runtime_ticks = int_value(item.get("RunTimeTicks"))
+    if runtime_ticks <= 0:
+        runtime_ticks = synthetic_runtime_ticks(position_ticks)
+        item["RunTimeTicks"] = runtime_ticks
+        changed = True
+    if runtime_ticks > 0:
+        percentage = min(99.0, max(0.0, position_ticks * 100.0 / runtime_ticks))
+        current_percentage = user_data.get("PlayedPercentage")
+        if current_percentage in (None, 0, 0.0):
+            user_data["PlayedPercentage"] = percentage
+            changed = True
+
+    media_sources = item.get("MediaSources")
+    if isinstance(media_sources, list):
+        for source in media_sources:
+            if isinstance(source, dict) and int_value(source.get("RunTimeTicks")) <= 0 and runtime_ticks > 0:
+                source["RunTimeTicks"] = runtime_ticks
+                changed = True
+    return changed
+
+
+def patch_emby_playback_info_runtime(payload, runtime_ticks, media_id=""):
+    runtime_ticks = int_value(runtime_ticks)
+    if runtime_ticks <= 0 or not isinstance(payload, dict):
+        return False
+    media_id = str(media_id or "")
+    changed = False
+    media_sources = payload.get("MediaSources")
+    if isinstance(media_sources, list):
+        for source in media_sources:
+            if not isinstance(source, dict):
+                continue
+            if media_id and str(source.get("Id") or "") != media_id:
+                continue
+            if int_value(source.get("RunTimeTicks")) <= 0:
+                source["RunTimeTicks"] = runtime_ticks
+                changed = True
+    return changed
+
+
+def emby_request_user_id(path):
+    parsed = urllib.parse.urlparse(path)
+    match = re.match(r"^/emby/Users/(?P<user_id>[^/]+)/", parsed.path, re.IGNORECASE)
+    if match:
+        return urllib.parse.unquote(match.group("user_id"))
+    query = urllib.parse.parse_qs(parsed.query)
+    values = query.get("UserId") or query.get("userId") or query.get("user_id") or []
+    return str(values[0]) if values else ""
+
+
 class MsgApiAuthenticator:
     def __init__(self, base_url=DEFAULT_MSG_API_BASE_URL, username="", password=""):
         self.base_url = str(base_url or DEFAULT_MSG_API_BASE_URL).rstrip("/")
@@ -883,6 +977,26 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             print("subtitle proxy OpenList subtitle tracks %s for media %s" % (len(tracks), media_id), flush=True)
         return tracks
 
+    def _fetch_emby_resume_runtime_ticks(self, media_id, request_headers, request_path):
+        user_id = emby_request_user_id(request_path or "")
+        if not user_id:
+            return 0
+        status, _headers, body = self._read_upstream(
+            "/emby/Users/%s/Items/%s" % (
+                urllib.parse.quote(str(user_id), safe=""),
+                urllib.parse.quote(str(media_id), safe=""),
+            ),
+            request_headers,
+        )
+        if status < 200 or status >= 300 or not body:
+            return 0
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (TypeError, ValueError):
+            return 0
+        patch_emby_media_item_runtime(payload)
+        return int_value(payload.get("RunTimeTicks"))
+
     def _read_msg_api(self, path, retry_auth=True):
         if self.msg_api_auth is None:
             raise RuntimeError("subtitle proxy MSG auth is not configured")
@@ -925,17 +1039,23 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             content_type = "text/vtt; charset=utf-8"
         elif not head_only and body and "application/json" in (content_type or "").lower():
             media_id = parse_emby_item_media_id(request_path or "")
-            if media_id:
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except (TypeError, ValueError):
-                    payload = None
-                if isinstance(payload, dict):
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                if patch_emby_resume_runtime_fields(payload):
+                    no_store = True
+                if media_id:
+                    runtime_ticks = self._fetch_emby_resume_runtime_ticks(media_id, request_headers, request_path or "")
+                    if patch_emby_playback_info_runtime(payload, runtime_ticks, media_id=media_id):
+                        no_store = True
                     tracks = self._fetch_msg_subtitle_tracks(media_id)
                     if inject_emby_subtitle_streams(payload, media_id, tracks):
-                        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                        content_type = "application/json; charset=utf-8"
                         no_store = True
+                if no_store:
+                    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
         elif not head_only and body and "text/html" in (content_type or "").lower():
             body = inject_subtitle_track_bootstrap(body.decode("utf-8", "replace")).encode("utf-8")
             no_store = True
