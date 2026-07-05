@@ -123,6 +123,8 @@ Validation:
 
 ### 7. Emby Compatibility Regression Coverage
 
+Status: completed.
+
 Goal:
 Add targeted regression coverage for subtitle injection and playback progress behavior used by Infuse/Vidhub.
 

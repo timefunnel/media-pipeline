@@ -492,6 +492,11 @@ def inject_emby_subtitle_streams(payload, media_id, tracks):
             for stream in streams
             if isinstance(stream, dict) and stream.get("Type") == "Subtitle"
         }
+        existing_paths = {
+            str(stream.get("Path") or "")
+            for stream in streams
+            if isinstance(stream, dict) and stream.get("Type") == "Subtitle" and stream.get("Path")
+        }
         next_index = max([int(stream.get("Index") or 0) for stream in streams if isinstance(stream, dict)] + [-1]) + 1
         first_added_index = None
         for track_index, track in enumerate(tracks):
@@ -510,7 +515,7 @@ def inject_emby_subtitle_streams(payload, media_id, tracks):
                 extension,
                 track_index,
             )
-            if delivery_url in existing_delivery_urls:
+            if delivery_url in existing_delivery_urls or (path and path in existing_paths):
                 continue
             streams.append(
                 {
@@ -537,6 +542,8 @@ def inject_emby_subtitle_streams(payload, media_id, tracks):
                 }
             )
             existing_delivery_urls.add(delivery_url)
+            if path:
+                existing_paths.add(path)
             if first_added_index is None:
                 first_added_index = stream_index
             changed = True

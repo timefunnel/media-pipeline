@@ -65,6 +65,23 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertIn(b"WEBVTT", converted)
         self.assertIn(b"00:00:01.200 --> 00:00:03.450", converted)
 
+    def test_subtitle_body_to_vtt_converts_ass_for_emby_vtt_delivery(self):
+        body = (
+            "[Script Info]\n"
+            "[Events]\n"
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:01.20,0:00:03.45,Default,,0,0,0,,{\\an8}第一行\\N第二行\n"
+        ).encode("utf-8")
+
+        converted, content_type = subtitle_body_to_vtt(body, path="subtitle.ass")
+
+        text = converted.decode("utf-8")
+        self.assertEqual(content_type, "text/vtt; charset=utf-8")
+        self.assertIn("WEBVTT", text)
+        self.assertIn("00:00:01.200 --> 00:00:03.450", text)
+        self.assertIn("第一行\n第二行", text)
+        self.assertNotIn("{\\an8}", text)
+
     def test_patch_emby_resume_runtime_fields_adds_synthetic_duration(self):
         payload = {
             "Items": [
@@ -85,6 +102,29 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertGreater(item["RunTimeTicks"], item["UserData"]["PlaybackPositionTicks"])
         self.assertGreater(item["UserData"]["PlayedPercentage"], 0)
+
+    def test_resume_runtime_patch_provides_ticks_for_playback_info_patch(self):
+        resume_payload = {
+            "Items": [
+                {
+                    "Id": "media-1",
+                    "RunTimeTicks": 0,
+                    "UserData": {"PlaybackPositionTicks": 60_000_0000, "PlayedPercentage": 0},
+                    "MediaSources": [{"Id": "media-1", "RunTimeTicks": 0}],
+                }
+            ]
+        }
+
+        resume_changed = patch_emby_resume_runtime_fields(resume_payload)
+        runtime_ticks = resume_payload["Items"][0]["RunTimeTicks"]
+        playback_payload = {"MediaSources": [{"Id": "media-1", "RunTimeTicks": 0}]}
+        playback_changed = patch_emby_playback_info_runtime(playback_payload, runtime_ticks, media_id="media-1")
+
+        self.assertTrue(resume_changed)
+        self.assertGreater(runtime_ticks, 60_000_0000)
+        self.assertEqual(resume_payload["Items"][0]["MediaSources"][0]["RunTimeTicks"], runtime_ticks)
+        self.assertTrue(playback_changed)
+        self.assertEqual(playback_payload["MediaSources"][0]["RunTimeTicks"], runtime_ticks)
 
     def test_patch_emby_playback_info_runtime_updates_media_sources(self):
         payload = {"MediaSources": [{"Id": "media-1", "RunTimeTicks": 0}, {"Id": "media-2", "RunTimeTicks": 10}]}
@@ -147,6 +187,19 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertEqual(streams[2]["Index"], 2)
         self.assertEqual(streams[2]["Codec"], "ass")
 
+    def test_inject_emby_subtitle_streams_is_idempotent_by_track_path(self):
+        payload = {"MediaSources": [{"Id": "media-1", "MediaStreams": [{"Index": 0, "Type": "Video"}]}]}
+        tracks = [{"lang": "sc", "label": "sc", "path": "cloud://subtitle.sc.ass"}]
+
+        first_changed = inject_emby_subtitle_streams(payload, "media-1", tracks)
+        second_changed = inject_emby_subtitle_streams(payload, "media-1", tracks)
+
+        streams = payload["MediaSources"][0]["MediaStreams"]
+        self.assertTrue(first_changed)
+        self.assertFalse(second_changed)
+        self.assertEqual([stream["Type"] for stream in streams], ["Video", "Subtitle"])
+        self.assertEqual(streams[1]["Path"], "cloud://subtitle.sc.ass")
+
     def test_inject_emby_subtitle_streams_only_updates_current_media_source(self):
         payload = {
             "MediaSources": [
@@ -160,6 +213,47 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(len(payload["MediaSources"][0]["MediaStreams"]), 2)
         self.assertEqual(len(payload["MediaSources"][1]["MediaStreams"]), 1)
+
+    def test_openlist_subtitle_provider_discovers_matching_external_subtitles(self):
+        from pipeline.subtitle_proxy import OpenListSubtitleProvider
+
+        class FakeOpenListClient:
+            def list_all(self, path, refresh=False):
+                self.path = path
+                self.refresh = refresh
+                return [
+                    {"name": "01.sc.ass", "is_dir": False},
+                    {"name": "01.tc.srt", "is_dir": False},
+                    {"name": "02.sc.ass", "is_dir": False},
+                    {"name": "01.jpg", "is_dir": False},
+                    {"name": "Subs", "is_dir": True},
+                ]
+
+        fake_client = FakeOpenListClient()
+        provider = OpenListSubtitleProvider("http://127.0.0.1:5244", "media_scan", "secret")
+        provider._client = fake_client
+
+        tracks = provider.tracks_for_media_path("cloud://openlist/115/动漫/秋色之空/01.mkv")
+
+        self.assertEqual(fake_client.path, "/115/动漫/秋色之空")
+        self.assertFalse(fake_client.refresh)
+        self.assertEqual(
+            tracks,
+            [
+                {
+                    "lang": "zh-Hans",
+                    "label": "简体中文",
+                    "path": "cloud://openlist/115/动漫/秋色之空/01.sc.ass",
+                    "source": "openlist",
+                },
+                {
+                    "lang": "zh-Hant",
+                    "label": "繁体中文",
+                    "path": "cloud://openlist/115/动漫/秋色之空/01.tc.srt",
+                    "source": "openlist",
+                },
+            ],
+        )
 
     def test_parse_emby_subtitle_stream_path_reads_track_mapping(self):
         parsed = parse_emby_subtitle_stream_path("/emby/Videos/media-1/source-1/Subtitles/2/Stream.vtt?mp_track=1&api_key=secret")
