@@ -332,7 +332,7 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertIsNone(folder["PrimaryImageItemId"])
-        self.assertTrue(folder["ImageTags"]["Primary"].startswith("mp-folder-v2-"))
+        self.assertTrue(folder["ImageTags"]["Primary"].startswith("mp-folder-v3-"))
         self.assertEqual(folder["PrimaryImageAspectRatio"], 16 / 9)
 
     def test_iter_emby_items_accepts_virtual_folder_list(self):
@@ -362,7 +362,7 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(folder["PrimaryImageItemId"], "library-1")
-        self.assertTrue(folder["PrimaryImageTag"].startswith("mp-folder-v2-"))
+        self.assertTrue(folder["PrimaryImageTag"].startswith("mp-folder-v3-"))
         self.assertNotIn("ImageTags", folder)
         self.assertNotIn("PrimaryImageAspectRatio", folder)
 
@@ -377,7 +377,7 @@ class SubtitleProxyTest(unittest.TestCase):
 
         def patch_payload(payload, request_headers, request_path):
             payload[0]["PrimaryImageItemId"] = "library-1"
-            payload[0]["PrimaryImageTag"] = "mp-folder-v2-test"
+            payload[0]["PrimaryImageTag"] = "mp-folder-v3-test"
             return True
 
         handler._patch_emby_collection_folder_covers = patch_payload
@@ -402,7 +402,7 @@ class SubtitleProxyTest(unittest.TestCase):
         )
 
         patched = json.loads(written.getvalue().decode("utf-8"))
-        self.assertEqual(patched[0]["PrimaryImageTag"], "mp-folder-v2-test")
+        self.assertEqual(patched[0]["PrimaryImageTag"], "mp-folder-v3-test")
         self.assertIn(("Cache-Control", "no-store"), sent_headers)
 
     def test_select_emby_folder_cover_items_limits_to_four_unique_items(self):
