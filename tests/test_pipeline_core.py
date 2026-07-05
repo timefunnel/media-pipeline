@@ -2964,6 +2964,62 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["msg_artwork_repair_fields"], "poster_url")
         self.assertEqual(task["msg_sync_status"], "success")
 
+    def test_sync_completed_adult_task_hides_secondary_videos_after_format(self):
+        import posixpath
+
+        from pipeline.bot import BotConfig, PipelineBotService
+        from pipeline.config import category_to_openlist_path
+
+        events = []
+        adult_root = category_to_openlist_path("adult")
+        old_path = posixpath.join(adult_root, "ssis-218ch")
+        new_path = posixpath.join(adult_root, "SSIS-218")
+        fake_openlist = CleaningOpenList(
+            {
+                adult_root: [{"name": "ssis-218ch", "is_dir": True, "size": 0}],
+                old_path: [
+                    {"name": "ssis-218ch.mp4", "is_dir": False, "size": 5 * 1024 * 1024 * 1024},
+                    {"name": "side.mp4", "is_dir": False, "size": 150 * 1024 * 1024},
+                ],
+            },
+            events=events,
+        )
+        fake_msg = FakeMediaStationClient(
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "26768071-73bb-4b5c-85f3-ad0dd84f9fd9", "title": "SSIS-218"}]}},
+            events=events,
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
+        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    msg_sync_poll_seconds=0,
+                    openlist_pre_scan_clean_enabled=True,
+                    openlist_adult_code_format_enabled=True,
+                )
+            )
+            task = service.sync_completed_task(
+                "adult",
+                "ssis-218ch",
+                {"info_hash": "ABC", "status_name": "success", "name": "ssis-218ch"},
+            )
+
+        self.assertEqual(fake_openlist.remove_calls, [])
+        self.assertEqual(fake_openlist.rename_calls, [(old_path, "SSIS-218")])
+        self.assertEqual(fake_openlist.meta_hide_calls, [(new_path, [r"^side\.mp4$"], True)])
+        self.assertLess(events.index(("rename", old_path, "SSIS-218")), events.index(("meta_hide", new_path, (r"^side\.mp4$",), True)))
+        self.assertLess(events.index(("meta_hide", new_path, (r"^side\.mp4$",), True)), events.index(("scan",)))
+        self.assertEqual(task["openlist_adult_extra_hide_status"], "success")
+        self.assertEqual(task["openlist_adult_extra_hidden_count"], 1)
+        self.assertEqual(task["msg_sync_status"], "success")
+
     def test_first_adult_code_recognizes_standard_and_fc2_codes_only(self):
         from pipeline.bot import first_adult_code
 
@@ -5215,6 +5271,21 @@ class CleaningOpenList:
     def rename_path(self, path, name):
         self.rename_calls.append((path, name))
         self.events.append(("rename", path, name))
+        parent = str(path).rstrip("/").rsplit("/", 1)[0] or "/"
+        new_path = parent.rstrip("/") + "/" + str(name)
+        if parent in self.tree:
+            for item in self.tree[parent]:
+                if str(item.get("name") or "") == str(path).rstrip("/").rsplit("/", 1)[-1]:
+                    item["name"] = str(name)
+        if path in self.tree:
+            moves = []
+            for key, value in list(self.tree.items()):
+                if key == path or key.startswith(path.rstrip("/") + "/"):
+                    moves.append((key, new_path + key[len(path) :], value))
+            for old_key, new_key, value in moves:
+                self.tree[new_key] = value
+                if old_key != new_key:
+                    self.tree.pop(old_key, None)
         return {"code": 200, "message": "success"}
 
     def move_names(self, src_dir, dst_dir, names):

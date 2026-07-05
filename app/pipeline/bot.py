@@ -56,6 +56,7 @@ DEFAULT_TASK_LIST_LIMIT = 10
 DEFAULT_TASK_LIST_PAGE_SIZE = 5
 DEFAULT_TASK_LIST_FETCH_LIMIT = 100
 DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES = 20 * 1024 * 1024
+ADULT_EXTRA_VIDEO_HIDE_MIN_BYTES = 200 * 1024 * 1024
 FINAL_TASK_STATUS_NAMES = {"success", "failed", "cancelled"}
 ACTIVE_115_STATUS_NAMES = {"submitted", "allocating", "downloading"}
 ACTIVE_115_FAST_POLL_WINDOW_SECONDS = 20
@@ -1029,6 +1030,24 @@ class PipelineBotService:
         if format_result.get("openlist_adult_code"):
             queries = [format_result["openlist_adult_code"]] + queries
 
+        adult_extra_hide_result = prefixed_task_fields(progress, "openlist_adult_extra_hide_")
+        if (
+            category == "adult"
+            and self.config.openlist_pre_scan_clean_enabled
+            and progress.get("msg_scan_status") != "success"
+        ):
+            if not stage_is_complete(progress.get("openlist_adult_extra_hide_status")):
+                emit({"openlist_adult_extra_hide_status": "running", "openlist_adult_extra_hide_error": None})
+                adult_extra_hide_result = self._hide_openlist_adult_extra_videos_before_msg(
+                    get_openlist_client(), category, queries, progress
+                )
+                if adult_extra_hide_result.get("openlist_adult_extra_hide_status") != "skipped":
+                    emit(adult_extra_hide_result)
+                else:
+                    apply_progress(adult_extra_hide_result)
+            else:
+                apply_progress(adult_extra_hide_result)
+
         media_id = progress.get("msg_media_id")
         media_title = progress.get("msg_media_title")
         root = category_to_msg_library_root(category)
@@ -1097,6 +1116,7 @@ class PipelineBotService:
             "msg_synced_at": int(time.time()),
             **clean_result,
             **format_result,
+            **adult_extra_hide_result,
             **extras_result,
             **visibility_result,
             **artwork_result,
@@ -1134,6 +1154,20 @@ class PipelineBotService:
             "msg_extra_cleanup_reason": result.get("reason"),
             "msg_extra_cleanup_error": None,
         }
+
+    def _hide_openlist_adult_extra_videos_before_msg(self, client, category, queries, task):
+        result = hide_openlist_adult_extra_videos(
+            client,
+            category_to_openlist_path(category),
+            queries,
+            task=task,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("OpenList adult extra video hide returned invalid response")
+        status = result.get("openlist_adult_extra_hide_status")
+        if status not in ("success", "skipped"):
+            raise RuntimeError("OpenList adult extra video hide returned invalid status: %s" % (status or "-"))
+        return result
 
     def _repair_msg_episode_visibility(self, category, media_id):
         result = self._build_msg_db_client().repair_episode_visibility(category, media_id=media_id)
@@ -2738,6 +2772,7 @@ def task_sync_is_running(task):
             "msg_sync_status",
             "openlist_clean_status",
             "openlist_adult_format_status",
+            "openlist_adult_extra_hide_status",
             "msg_scan_status",
             "msg_scrape_status",
             "msg_extra_cleanup_status",
@@ -2762,6 +2797,9 @@ def mark_current_sync_stage_failed(task, error):
     elif task.get("openlist_adult_format_status") == "running":
         task["openlist_adult_format_status"] = "failed"
         task["openlist_adult_format_error"] = error
+    elif task.get("openlist_adult_extra_hide_status") == "running":
+        task["openlist_adult_extra_hide_status"] = "failed"
+        task["openlist_adult_extra_hide_error"] = error
     elif task.get("msg_scan_status") == "running":
         task["msg_scan_status"] = "failed"
     elif task.get("msg_scrape_status") == "running":
@@ -3331,6 +3369,60 @@ def format_openlist_adult_code(client, category_path, queries, task=None):
         "openlist_adult_formatted_at": int(time.time()),
         "openlist_adult_format_error": None,
     }
+
+
+def hide_openlist_adult_extra_videos(client, category_path, queries, task=None):
+    target = find_openlist_task_target(client, category_path, queries, task=task)
+    if target is None:
+        return {
+            "openlist_adult_extra_hide_status": "skipped",
+            "openlist_adult_extra_hide_reason": "target_not_found",
+            "openlist_adult_extra_hidden_count": 0,
+            "openlist_adult_extra_hidden_at": int(time.time()),
+        }
+
+    _target_dir, target_item = target
+    if not openlist_item_is_dir(target_item):
+        return {
+            "openlist_adult_extra_hide_status": "skipped",
+            "openlist_adult_extra_hide_reason": "not_directory",
+            "openlist_adult_extra_hidden_count": 0,
+            "openlist_adult_extra_hidden_at": int(time.time()),
+        }
+
+    target_path = openlist_item_path(_target_dir, target_item)
+    patterns = openlist_adult_extra_video_hide_patterns(client, target_path)
+    if patterns:
+        client.upsert_meta_hide(target_path, patterns, h_sub=True)
+
+    return {
+        "openlist_adult_extra_hide_status": "success",
+        "openlist_adult_extra_hide_path": target_path,
+        "openlist_adult_extra_hidden_count": len(patterns),
+        "openlist_adult_extra_hidden_at": int(time.time()),
+        "openlist_adult_extra_hide_error": None,
+        "openlist_adult_extra_hide_reason": "extras_hidden" if patterns else "already_clean",
+    }
+
+
+def openlist_adult_extra_video_hide_patterns(client, target_path):
+    videos = []
+    for item in client.list_all(target_path, refresh=False):
+        if openlist_item_is_dir(item) or not is_openlist_video_file(item):
+            continue
+        name = openlist_item_name(item)
+        if name:
+            videos.append((name, openlist_item_size(item)))
+    if len(videos) <= 1:
+        return []
+
+    max_size = max(size for _name, size in videos)
+    threshold = max(ADULT_EXTRA_VIDEO_HIDE_MIN_BYTES, int(max_size * 0.2))
+    patterns = []
+    for name, size in videos:
+        if size < max_size and size < threshold:
+            patterns.append("^%s$" % re.escape(name))
+    return patterns
 
 
 def openlist_target_names(client, target_dir, target_item):
