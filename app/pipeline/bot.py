@@ -1104,9 +1104,7 @@ class PipelineBotService:
         result = summarize_submit(
             self._call_115(category, lambda client: client.add_offline_urls([download_uri], category_to_folder_id(category)))
         )
-        info_hash = first_info_hash(result)
-        if info_hash:
-            result["task_status"] = self._call_115(category, lambda client: find_task_by_info_hash(client, info_hash, max_pages=10))
+        ensure_submit_result_has_task_identity(result, download_uri)
         return result
 
     def _resolve_download_uri(self, download_uri):
@@ -2279,11 +2277,17 @@ class TelegramBot:
     def _submit_candidate(self, user_id, chat_id, message_id, callback_id, category, candidate_id, record, force=False, answer=True, content_profile=None):
         candidate = record["candidate"]
         content_profile = normalize_content_profile(category, content_profile)
+        callback_answered = False
+        if answer:
+            self.telegram.answer_callback_query(callback_id, "正在处理入库")
+            callback_answered = True
         with self._typing_action(chat_id or record["chat_id"]):
             if not force:
                 duplicate = self._find_duplicate_before_submit(category, record, candidate)
                 if duplicate:
-                    self.telegram.answer_callback_query(callback_id, "发现重复作品")
+                    if answer and not callback_answered:
+                        self.telegram.answer_callback_query(callback_id, "发现重复作品")
+                        callback_answered = True
                     self._update_callback_message(
                         chat_id,
                         message_id,
@@ -2295,7 +2299,7 @@ class TelegramBot:
 
             result = self.service.submit(category, candidate["download_uri"])
         self._save_tasks_from_submit(record, candidate, result, category, content_profile=content_profile)
-        if answer:
+        if answer and not callback_answered:
             self.telegram.answer_callback_query(callback_id, "已提交 115 离线")
         self._delete_callback_message(chat_id, message_id)
         sent = self.telegram.send_message(
@@ -3884,6 +3888,33 @@ def summarize_submit(response):
     }
 
 
+def ensure_submit_result_has_task_identity(result, download_uri):
+    info_hash = candidate_info_hash({"download_uri": download_uri})
+    if not info_hash or not submit_response_should_track(result):
+        return result
+    tasks = result.setdefault("tasks", [])
+    for task in tasks:
+        if str((task or {}).get("info_hash") or "").strip():
+            return result
+    tasks.append(
+        {
+            "info_hash": info_hash,
+            "state": result.get("state"),
+            "code": result.get("code"),
+            "message": result.get("message"),
+            "status_name": "submitted",
+        }
+    )
+    return result
+
+
+def submit_response_should_track(result):
+    if (result or {}).get("state") is True:
+        return True
+    text = " ".join(str((result or {}).get(key) or "") for key in ("code", "message"))
+    return "已存在" in text or "已添加" in text
+
+
 def access_token_invalid_response(response):
     if not isinstance(response, dict):
         return False
@@ -4014,13 +4045,6 @@ def prioritized_task_records(records):
         )
 
     return sorted(records or [], key=sort_key)
-
-
-def first_info_hash(result):
-    for task in result.get("tasks") or []:
-        if task.get("info_hash"):
-            return task["info_hash"]
-    return None
 
 
 def build_bot(config=None):

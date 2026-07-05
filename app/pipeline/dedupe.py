@@ -13,6 +13,7 @@ from pipeline.openlist_utils import (
     replace_openlist_path_prefix,
 )
 from pipeline.search import magnet_info_hash
+from pipeline.task_state import TASK_STATE
 
 
 DEDUPE_CATEGORIES = {"movie", "tv", "anime", "adult", "other"}
@@ -23,6 +24,8 @@ def find_local_duplicate(records, category, candidate_record, candidate):
     if info_hash:
         for record in records:
             if str(record.get("info_hash") or "").lower() == info_hash.lower():
+                if not local_task_blocks_duplicate(record):
+                    continue
                 duplicate = duplicate_from_task("strong", "same_info_hash", "Bot状态库", record, can_force=False)
                 duplicate["identity_type"] = "info_hash"
                 duplicate["identity_value"] = info_hash
@@ -35,6 +38,8 @@ def find_local_duplicate(records, category, candidate_record, candidate):
                 if record.get("category") != "adult":
                     continue
                 if code in task_duplicate_codes(record):
+                    if not local_task_blocks_duplicate(record):
+                        continue
                     duplicate = duplicate_from_task("strong", "adult_code", "Bot状态库", record, can_force=False)
                     duplicate["code"] = code
                     duplicate["identity_type"] = "adult_code"
@@ -84,6 +89,9 @@ def duplicate_from_dedupe_entry(identity, entry):
         level = "strong"
         reason = "adult_code"
         can_force = False
+    if entry.get("source") == "openlist":
+        level = "weak"
+        can_force = True
     duplicate = {
         "level": level,
         "reason": reason,
@@ -99,6 +107,11 @@ def duplicate_from_dedupe_entry(identity, entry):
     if identity_type == "adult_code":
         duplicate["code"] = identity.get("identity_value")
     return duplicate
+
+
+def local_task_blocks_duplicate(record):
+    task = (record or {}).get("task") or {}
+    return TASK_STATE.is_offline_active(task) or TASK_STATE.msg_synced(task)
 
 
 def duplicate_from_task(level, reason, source, record, can_force=False):

@@ -1289,7 +1289,7 @@ class TelegramBotTest(unittest.TestCase):
             self.assertEqual(service.search_calls, [])
             self.assertEqual(service.submit_calls, [("adult", "magnet:?xt=urn:btih:BBB")])
             self.assertEqual(telegram.chat_actions, [{"chat_id": 9001, "action": "typing"}])
-            self.assertEqual(telegram.answers, [{"callback_query_id": "cb1", "text": "已提交 115 离线"}])
+            self.assertEqual(telegram.answers, [{"callback_query_id": "cb1", "text": "正在处理入库"}])
             self.assertEqual(telegram.deletes, [{"chat_id": 9001, "message_id": 502}])
             self.assertIn("BBB", telegram.messages[0]["text"])
             self.assertIn("入库目录：成人库", telegram.messages[0]["text"])
@@ -1332,7 +1332,7 @@ class TelegramBotTest(unittest.TestCase):
             )
 
             self.assertEqual(service.submit_calls, [])
-            self.assertEqual(telegram.answers, [{"callback_query_id": "cb1", "text": "发现重复作品"}])
+            self.assertEqual(telegram.answers, [{"callback_query_id": "cb1", "text": "正在处理入库"}])
             self.assertIn("重复入库拦截", telegram.edits[0]["text"])
             self.assertIn("判定：强重复", telegram.edits[0]["text"])
             self.assertIn("相同info_hash", telegram.edits[0]["text"])
@@ -1351,7 +1351,13 @@ class TelegramBotTest(unittest.TestCase):
                 9001,
                 "adult",
                 "SSIS-450 Existing",
-                {"info_hash": "OLDHASH", "status_name": "success", "openlist_adult_code": "SSIS-450"},
+                {
+                    "info_hash": "OLDHASH",
+                    "status_name": "success",
+                    "msg_sync_status": "success",
+                    "msg_scrape_status": "success",
+                    "openlist_adult_code": "SSIS-450",
+                },
             )
             candidate_id = store.save_candidate(
                 user_id=700656624,
@@ -1378,6 +1384,74 @@ class TelegramBotTest(unittest.TestCase):
             self.assertEqual(service.submit_calls, [])
             self.assertIn("成人番号重复", telegram.edits[0]["text"])
             self.assertIn("SSIS-450", telegram.edits[0]["text"])
+
+    def test_callback_submit_ignores_failed_local_duplicate_record(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            store.save_task(700656624, 9001, "movie", "Failed Sintel", {"info_hash": "BBB", "status_name": "failed"})
+            candidate_id = store.save_candidate(
+                user_id=700656624,
+                chat_id=9001,
+                category="movie",
+                query="sintel",
+                candidate={"title": "Sintel 1080p", "download_uri": "magnet:?xt=urn:btih:BBB", "infoHash": "BBB", "rank": 1},
+            )
+            telegram = FakeTelegram()
+            service = FakeBotService(submit_response={"state": True, "tasks": [{"info_hash": "BBB", "state": True, "code": 0}]})
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb1",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 502},
+                        "data": "submit:movie:%s" % candidate_id,
+                    }
+                }
+            )
+
+            self.assertEqual(service.submit_calls, [("movie", "magnet:?xt=urn:btih:BBB")])
+            self.assertEqual(telegram.edits, [])
+
+    def test_callback_submit_ignores_unsynced_success_local_duplicate_record(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            store.save_task(
+                700656624,
+                9001,
+                "movie",
+                "Unsynced Sintel",
+                {"info_hash": "BBB", "status_name": "success", "msg_sync_status": "failed"},
+            )
+            candidate_id = store.save_candidate(
+                user_id=700656624,
+                chat_id=9001,
+                category="movie",
+                query="sintel",
+                candidate={"title": "Sintel 1080p", "download_uri": "magnet:?xt=urn:btih:BBB", "infoHash": "BBB", "rank": 1},
+            )
+            telegram = FakeTelegram()
+            service = FakeBotService(submit_response={"state": True, "tasks": [{"info_hash": "BBB", "state": True, "code": 0}]})
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb1",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 502},
+                        "data": "submit:movie:%s" % candidate_id,
+                    }
+                }
+            )
+
+            self.assertEqual(service.submit_calls, [("movie", "magnet:?xt=urn:btih:BBB")])
+            self.assertEqual(telegram.edits, [])
 
     def test_callback_submit_blocks_openlist_adult_code_duplicate_without_submitting(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -2680,6 +2754,79 @@ class PipelineBotServiceTest(unittest.TestCase):
             FakeResolvingProwlarr.calls,
             [("http://127.0.0.1:9696", "prowlarr-key-value", "prowlarr-download://9?link=ABC%2BDEF")],
         )
+
+    def test_submit_does_not_wait_for_115_task_list_after_add(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class SubmitOnly115Client(Fake115SubmitClient):
+            def get_offline_tasks(self, page=1):
+                raise AssertionError("submit should not poll task list")
+
+        class SubmitService(PipelineBotService):
+            def _call_115(self, category, callback):
+                self.fake_115 = SubmitOnly115Client({"state": True, "data": [{"info_hash": "ABC"}]})
+                return callback(self.fake_115)
+
+        service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
+
+        result = service.submit("movie", "magnet:?xt=urn:btih:ABC")
+
+        self.assertEqual(service.fake_115.urls, ["magnet:?xt=urn:btih:ABC"])
+        self.assertEqual(result["tasks"][0]["info_hash"], "ABC")
+        self.assertNotIn("task_status", result)
+
+    def test_submit_fills_task_identity_from_magnet_when_115_omits_data(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class SubmitService(PipelineBotService):
+            def _call_115(self, category, callback):
+                self.fake_115 = Fake115SubmitClient({"state": True, "data": [], "message": "ok"})
+                return callback(self.fake_115)
+
+        service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
+
+        result = service.submit("adult", "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233")
+
+        self.assertEqual(result["tasks"], [
+            {
+                "info_hash": "D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+                "state": True,
+                "code": None,
+                "message": "ok",
+                "status_name": "submitted",
+            }
+        ])
+        self.assertEqual(service.fake_115.urls, ["magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233"])
+
+    def test_submit_does_not_fill_task_identity_for_rejected_115_response(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class SubmitService(PipelineBotService):
+            def _call_115(self, category, callback):
+                self.fake_115 = Fake115SubmitClient({"state": False, "code": 400, "message": "invalid url"})
+                return callback(self.fake_115)
+
+        service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
+
+        result = service.submit("adult", "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233")
+
+        self.assertEqual(result["tasks"], [])
+        self.assertEqual(result["state"], False)
+
+    def test_submit_fills_task_identity_for_existing_115_task_response(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class SubmitService(PipelineBotService):
+            def _call_115(self, category, callback):
+                self.fake_115 = Fake115SubmitClient({"state": False, "code": 10008, "message": "任务已存在"})
+                return callback(self.fake_115)
+
+        service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
+
+        result = service.submit("adult", "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233")
+
+        self.assertEqual(result["tasks"][0]["info_hash"], "D00D7132F75BEB644A19E6A1CC011AA3523CF233")
+        self.assertEqual(result["tasks"][0]["message"], "任务已存在")
 
     def test_task_status_refreshes_openlist_and_retries_when_115_token_is_invalid(self):
         from pipeline.bot import BotConfig, PipelineBotService
