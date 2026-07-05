@@ -91,6 +91,8 @@ Validation:
 
 ### 5. Standardize Hide-Only Cleanup
 
+Status: completed.
+
 Goal:
 Remove remaining source-file deletion paths from normal media cleanup and keep Meta Hide as the default cleanup mechanism.
 

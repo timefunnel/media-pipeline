@@ -3710,11 +3710,11 @@ def format_task_diagnostics_message(record):
             lines.append("- %s：%s" % (label, msg_sync_status_label(value)))
 
     for key, label in (
-        ("openlist_clean_error", "OpenList清理错误"),
+        ("openlist_clean_error", "OpenList隐藏错误"),
         ("openlist_adult_format_error", "番号格式化错误"),
         ("openlist_adult_extra_hide_error", "成人附加隐藏错误"),
         ("msg_error", "MSG错误"),
-        ("msg_extra_cleanup_error", "特典清理错误"),
+        ("msg_extra_cleanup_error", "特典隐藏错误"),
         ("msg_visibility_repair_error", "可见性修复错误"),
         ("msg_artwork_repair_error", "图片修复错误"),
     ):

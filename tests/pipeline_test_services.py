@@ -296,6 +296,68 @@ class CategoryConfigTest(unittest.TestCase):
             )
         )
 
+    def test_msgdb_movie_extra_repair_reason_uses_hidden_terms(self):
+        from pipeline.msgdb import MediaStationDbClient
+
+        class FakeCursor:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def fetchone(self):
+                return self.rows[0] if self.rows else None
+
+            def fetchall(self):
+                return list(self.rows)
+
+        class FakeConn:
+            def __init__(self):
+                self.step = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def transaction(self):
+                return self
+
+            def execute(self, sql, params=()):
+                self.step += 1
+                if self.step == 1:
+                    return FakeCursor(
+                        [
+                            {
+                                "id": "main-1",
+                                "path": "cloud://openlist/115/电影/Godzilla Pack/[DBD-Raws][Godzilla Final Wars][Ver.A].mkv",
+                            }
+                        ]
+                    )
+                if self.step == 2:
+                    return FakeCursor(
+                        [
+                            {
+                                "id": "main-1",
+                                "path": "cloud://openlist/115/电影/Godzilla Pack/[DBD-Raws][Godzilla Final Wars][Ver.A].mkv",
+                                "title": "Godzilla Final Wars",
+                                "deleted_at": None,
+                            },
+                            {
+                                "id": "extra-1",
+                                "path": "cloud://openlist/115/电影/Godzilla Pack/PV/sample.mkv",
+                                "title": "PV",
+                                "deleted_at": None,
+                            },
+                        ]
+                    )
+                return FakeCursor([])
+
+        client = MediaStationDbClient("postgres://unused", connect=lambda: FakeConn())
+        result = client.repair_movie_extras("movie", "main-1")
+
+        self.assertEqual(result["reason"], "extras_hidden")
+        self.assertEqual(result["openlist_hide_patterns"], ["^PV$"])
+
     def test_routes_movie_tv_anime_adult_and_other_to_separate_115_folders(self):
         self.assertEqual(category_to_folder_id("movie"), "3464134653584082023")
         self.assertEqual(category_to_folder_id("tv"), "3465137076394001831")

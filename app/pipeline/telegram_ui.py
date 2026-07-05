@@ -208,12 +208,12 @@ def format_task_status_message(title, task, category=None):
 def task_diagnostic_stage_values(task):
     out = []
     for key, label in (
-        ("openlist_clean_status", "OpenList清理"),
+        ("openlist_clean_status", "OpenList隐藏"),
         ("openlist_adult_format_status", "番号格式化"),
         ("openlist_adult_extra_hide_status", "成人附加隐藏"),
         ("msg_scan_status", "MSG扫描"),
         ("msg_scrape_status", "MSG刮削"),
-        ("msg_extra_cleanup_status", "特典清理"),
+        ("msg_extra_cleanup_status", "特典隐藏"),
         ("msg_visibility_repair_status", "可见性修复"),
         ("msg_artwork_repair_status", "图片修复"),
     ):
@@ -300,14 +300,14 @@ def append_task_lines(lines, task, category=None):
                 lines.append("MSG错误：%s" % task.get("msg_error"))
     if task.get("openlist_clean_status") and task.get("openlist_clean_status") != "skipped":
         if task.get("openlist_clean_status") == "success":
-            lines.append("OpenList清理：已完成（%s 个）" % (task.get("openlist_cleaned_count") or 0))
+            lines.append("OpenList隐藏：已完成（%s 个）" % (task.get("openlist_hidden_count") or task.get("openlist_cleaned_count") or 0))
         elif task.get("openlist_clean_status") == "running":
-            lines.append("OpenList清理：进行中")
+            lines.append("OpenList隐藏：进行中")
         else:
-            lines.append("OpenList清理：失败")
+            lines.append("OpenList隐藏：失败")
             if task.get("openlist_clean_error"):
                 lines.append("OpenList错误：%s" % task.get("openlist_clean_error"))
-            lines.append("OpenList处理：请手动进入目标目录检查并删除广告/样片等无效小文件，然后点击重试MSG同步")
+            lines.append("OpenList处理：请手动为目标目录添加 Meta Hide，隐藏广告/样片等无效小文件，然后点击重试MSG同步")
     if category == "adult" and task.get("openlist_adult_format_status") and task.get("openlist_adult_format_status") != "skipped":
         if task.get("openlist_adult_format_status") == "success":
             lines.append("番号格式化：已完成（%s）" % task.get("openlist_adult_code"))

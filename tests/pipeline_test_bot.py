@@ -1820,8 +1820,8 @@ class TelegramBotTest(unittest.TestCase):
 
             texts = [edit["text"] for edit in telegram.edits]
             self.assertEqual(telegram.answers, [{"callback_query_id": "cb1", "text": "正在刷新进度"}])
-            self.assertTrue(any("OpenList清理：进行中" in text for text in texts))
-            self.assertTrue(any("OpenList清理：已完成（2 个）" in text for text in texts))
+            self.assertTrue(any("OpenList隐藏：进行中" in text for text in texts))
+            self.assertTrue(any("OpenList隐藏：已完成（2 个）" in text for text in texts))
             self.assertTrue(any("番号格式化：进行中" in text for text in texts))
             self.assertTrue(any("番号格式化：已完成（MIDA-304）" in text for text in texts))
             self.assertTrue(any("MSG扫描：进行中" in text for text in texts))
@@ -2155,8 +2155,8 @@ class TelegramBotTest(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(telegram.messages, [])
         self.assertTrue(all(edit["message_id"] == 777 for edit in telegram.edits))
-        self.assertTrue(any("OpenList清理：进行中" in text for text in texts))
-        self.assertTrue(any("OpenList清理：已完成（2 个）" in text for text in texts))
+        self.assertTrue(any("OpenList隐藏：进行中" in text for text in texts))
+        self.assertTrue(any("OpenList隐藏：已完成（2 个）" in text for text in texts))
         self.assertTrue(any("MSG扫描：进行中" in text for text in texts))
         self.assertTrue(any("MSG刮削：进行中" in text for text in texts))
         self.assertIn("MSG同步：已完成", texts[-1])
@@ -2299,7 +2299,7 @@ class TelegramBotTest(unittest.TestCase):
         text = format_task_status_message("MIDA-304", task, category="adult")
         markup = task_reply_markup(task)
 
-        self.assertIn("OpenList处理：请手动进入目标目录检查并删除广告/样片等无效小文件，然后点击重试MSG同步", text)
+        self.assertIn("OpenList处理：请手动为目标目录添加 Meta Hide，隐藏广告/样片等无效小文件，然后点击重试MSG同步", text)
         self.assertIn("番号处理：请手动将目录重命名为“标准番号 - 原名称”，然后点击重试MSG同步", text)
         self.assertEqual(markup["inline_keyboard"][0][0]["text"], "重试MSG同步")
 
@@ -2828,6 +2828,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                 ("/115/电影/Movie/Extras", [r"^sample\.mp4$"], True),
             ],
         )
+        self.assertEqual(fake_openlist.source_delete_calls, [])
         self.assertLess(
             events.index(("meta_hide", "/115/电影/Movie", (r"^trailer\.mp4$", r"^poster\.jpg$", "^Extras$"), True)),
             events.index(("scan",)),
@@ -2848,12 +2849,13 @@ class PipelineBotServiceTest(unittest.TestCase):
                 "media_count": 2,
                 "openlist_hide_path": "/115/movie/Movie",
                 "openlist_hide_patterns": [r"^Extras$"],
-                "reason": "extras_deleted",
+                "reason": "extras_hidden",
             }
             service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
             result = service._repair_msg_movie_extras("movie", "media-1", fake_openlist)
 
         self.assertEqual(fake_openlist.meta_hide_calls, [("/115/movie/Movie", [r"^Extras$"], True)])
+        self.assertEqual(fake_openlist.source_delete_calls, [])
         self.assertEqual(result["msg_extra_cleanup_status"], "success")
         self.assertEqual(result["msg_extra_cleanup_updated"], 1)
         self.assertEqual(result["msg_extra_cleanup_hidden_count"], 1)
@@ -2954,6 +2956,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         self.assertEqual(result["openlist_clean_target"], "/root/Movie A")
         self.assertEqual(fake_openlist.meta_hide_calls, [("/root/Movie A", [r"^ad\.mp4$"], True)])
+        self.assertEqual(fake_openlist.source_delete_calls, [])
 
     def test_clean_openlist_default_threshold_keeps_episode_videos_and_hides_small_non_episode_videos(self):
         from pipeline.bot import clean_openlist_task_media
@@ -2986,6 +2989,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             fake_openlist.meta_hide_calls,
             [("/root/Jackie Chan Adventures", [r"^ad\.mp4$", r"^bonus\.mp4$", r"^poster\.jpg$"], True)],
         )
+        self.assertEqual(fake_openlist.source_delete_calls, [])
         self.assertEqual(result["openlist_cleaned_count"], 3)
         self.assertEqual(result["openlist_hidden_count"], 3)
 
@@ -3016,6 +3020,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         self.assertEqual(result["openlist_clean_target"], "/root/Movie A")
         self.assertEqual(fake_openlist.meta_hide_calls, [("/root/Movie A", [r"^ad\.mp4$"], True)])
+        self.assertEqual(fake_openlist.source_delete_calls, [])
 
     def test_clean_openlist_movie_pack_hides_extra_directories_without_deleting_them(self):
         from pipeline.bot import clean_openlist_task_media
@@ -3044,6 +3049,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertIn("^PV$", fake_openlist.meta_hide_calls[0][1])
         self.assertIn("^特典映像$", fake_openlist.meta_hide_calls[0][1])
         self.assertIn("^图集$", fake_openlist.meta_hide_calls[0][1])
+        self.assertEqual(fake_openlist.source_delete_calls, [])
 
     def test_sync_completed_adult_task_formats_code_before_mediastation_scan(self):
         from pipeline.bot import BotConfig, PipelineBotService
@@ -3089,6 +3095,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             )
 
         self.assertEqual(fake_openlist.meta_hide_calls, [("/115/成人/MIDA-304 - downloaded folder", [r"^ad\.mp4$"], True)])
+        self.assertEqual(fake_openlist.source_delete_calls, [])
         self.assertEqual(fake_openlist.rename_calls, [("/115/成人/downloaded folder", "MIDA-304 - downloaded folder")])
         self.assertLess(
             events.index(("rename", "/115/成人/downloaded folder", "MIDA-304 - downloaded folder")),
@@ -3154,6 +3161,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         self.assertEqual(fake_openlist.rename_calls, [(old_path, "SSIS-218")])
         self.assertEqual(fake_openlist.meta_hide_calls, [(new_path, [r"^side\.mp4$"], True)])
+        self.assertEqual(fake_openlist.source_delete_calls, [])
         self.assertLess(events.index(("rename", old_path, "SSIS-218")), events.index(("meta_hide", new_path, (r"^side\.mp4$",), True)))
         self.assertLess(events.index(("meta_hide", new_path, (r"^side\.mp4$",), True)), events.index(("scan",)))
         self.assertEqual(task["openlist_adult_extra_hide_status"], "success")

@@ -231,6 +231,7 @@ class CleaningOpenList:
         self.rename_calls = []
         self.move_calls = []
         self.meta_hide_calls = []
+        self.source_delete_calls = []
 
     def list_path(self, path, refresh=False):
         self.events.append(("openlist", path, refresh))
@@ -264,6 +265,30 @@ class CleaningOpenList:
         self.move_calls.append((src_dir, dst_dir, list(names)))
         self.events.append(("move", src_dir, dst_dir, tuple(names)))
         return {"code": 200, "message": "success"}
+
+    def delete_path(self, path):
+        self.source_delete_calls.append(("delete_path", path))
+        raise AssertionError("OpenList source files must be hidden with Meta Hide, not deleted")
+
+    def remove_path(self, path):
+        self.source_delete_calls.append(("remove_path", path))
+        raise AssertionError("OpenList source files must be hidden with Meta Hide, not deleted")
+
+    def trash_path(self, path):
+        self.source_delete_calls.append(("trash_path", path))
+        raise AssertionError("OpenList source files must be hidden with Meta Hide, not deleted")
+
+    def delete_names(self, src_dir, names):
+        self.source_delete_calls.append(("delete_names", src_dir, list(names)))
+        raise AssertionError("OpenList source files must be hidden with Meta Hide, not deleted")
+
+    def remove_names(self, src_dir, names):
+        self.source_delete_calls.append(("remove_names", src_dir, list(names)))
+        raise AssertionError("OpenList source files must be hidden with Meta Hide, not deleted")
+
+    def trash_names(self, src_dir, names):
+        self.source_delete_calls.append(("trash_names", src_dir, list(names)))
+        raise AssertionError("OpenList source files must be hidden with Meta Hide, not deleted")
 
     def upsert_meta_hide(self, path, hide_patterns, h_sub=True):
         self.meta_hide_calls.append((path, list(hide_patterns), h_sub))

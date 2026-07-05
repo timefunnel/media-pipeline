@@ -287,7 +287,7 @@ class MediaStationDbClient:
             "openlist_hide_path": source_path if hide_patterns else "",
             "openlist_hide_patterns": hide_patterns,
             "openlist_hidden_count": len(hide_patterns),
-            "reason": "extras_deleted" if extra_ids else ("extras_already_deleted" if hide_patterns else "already_clean"),
+            "reason": "extras_hidden" if extra_ids else ("extras_already_hidden" if hide_patterns else "already_clean"),
         }
 
     def _connect(self):
