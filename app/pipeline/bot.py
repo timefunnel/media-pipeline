@@ -1032,21 +1032,6 @@ class PipelineBotService:
                 msg_client = self._build_msg_client()
             return msg_client
 
-        clean_result = prefixed_task_fields(progress, "openlist_clean_")
-        if self.config.openlist_pre_scan_clean_enabled:
-            if not stage_is_complete(progress.get("openlist_clean_status")):
-                emit({"openlist_clean_status": "running", "openlist_clean_error": None})
-                clean_result = self._clean_openlist_before_msg(get_openlist_client(), category, title, progress)
-                if clean_result.get("openlist_clean_status") != "skipped":
-                    emit(clean_result)
-                else:
-                    apply_progress(clean_result)
-            else:
-                apply_progress(clean_result)
-        else:
-            clean_result = {"openlist_clean_status": "skipped", "openlist_clean_reason": "disabled"}
-            apply_progress(clean_result)
-
         format_result = prefixed_task_fields(progress, "openlist_adult_")
         if category == "adult" and self.config.openlist_adult_code_format_enabled:
             if not stage_is_complete(progress.get("openlist_adult_format_status")):
@@ -1065,6 +1050,21 @@ class PipelineBotService:
                 else {}
             )
             apply_progress(format_result)
+
+        clean_result = prefixed_task_fields(progress, "openlist_clean_")
+        if self.config.openlist_pre_scan_clean_enabled:
+            if not stage_is_complete(progress.get("openlist_clean_status")):
+                emit({"openlist_clean_status": "running", "openlist_clean_error": None})
+                clean_result = self._clean_openlist_before_msg(get_openlist_client(), category, title, progress)
+                if clean_result.get("openlist_clean_status") != "skipped":
+                    emit(clean_result)
+                else:
+                    apply_progress(clean_result)
+            else:
+                apply_progress(clean_result)
+        else:
+            clean_result = {"openlist_clean_status": "skipped", "openlist_clean_reason": "disabled"}
+            apply_progress(clean_result)
 
         queries = media_search_queries(title, progress)
         if format_result.get("openlist_adult_code"):
@@ -1223,6 +1223,7 @@ class PipelineBotService:
             category_to_openlist_path(category),
             queries,
             task=task,
+            pre_scan_max_bytes=self.config.openlist_pre_scan_clean_max_bytes,
         )
         if not isinstance(result, dict):
             raise RuntimeError("OpenList adult extra video hide returned invalid response")
@@ -3544,7 +3545,7 @@ def clean_openlist_task_media(
 
     target_dir, target_item = target
     target_path = openlist_item_path(target_dir, target_item)
-    groups = defaultdict(list)
+    hide_groups = defaultdict(list)
     cleaned_count = 0
     cleaned_bytes = 0
     for dir_path, item in iter_openlist_files(client, target_dir, target_item):
@@ -3553,25 +3554,26 @@ def clean_openlist_task_media(
         name = openlist_item_name(item)
         if not name:
             continue
-        groups[dir_path].append(name)
+        hide_groups[dir_path].append("^%s$" % re.escape(name))
         cleaned_count += 1
         cleaned_bytes += openlist_item_size(item)
 
-    for dir_path, names in sorted(groups.items()):
-        client.remove_names(dir_path, names)
-
-    hidden_patterns = []
     if hide_extra_scan_items and openlist_item_is_dir(target_item):
-        hidden_patterns = openlist_extra_scan_hide_patterns(client, target_path)
-        if hidden_patterns:
-            client.upsert_meta_hide(target_path, hidden_patterns, h_sub=True)
+        for pattern in openlist_extra_scan_hide_patterns(client, target_path):
+            if pattern not in hide_groups[target_path]:
+                hide_groups[target_path].append(pattern)
+
+    hidden_count = 0
+    for dir_path, patterns in sorted(hide_groups.items()):
+        client.upsert_meta_hide(dir_path, patterns, h_sub=True)
+        hidden_count += len(patterns)
 
     return {
         "openlist_clean_status": "success",
         "openlist_clean_target": target_path,
         "openlist_cleaned_count": cleaned_count,
         "openlist_cleaned_bytes": cleaned_bytes,
-        "openlist_hidden_count": len(hidden_patterns),
+        "openlist_hidden_count": hidden_count,
         "openlist_cleaned_at": int(time.time()),
         "openlist_clean_error": None,
     }
@@ -3619,7 +3621,13 @@ def format_openlist_adult_code(client, category_path, queries, task=None):
     }
 
 
-def hide_openlist_adult_extra_videos(client, category_path, queries, task=None):
+def hide_openlist_adult_extra_videos(
+    client,
+    category_path,
+    queries,
+    task=None,
+    pre_scan_max_bytes=DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES,
+):
     target = find_openlist_task_target(client, category_path, queries, task=task)
     if target is None:
         return {
@@ -3639,7 +3647,7 @@ def hide_openlist_adult_extra_videos(client, category_path, queries, task=None):
         }
 
     target_path = openlist_item_path(_target_dir, target_item)
-    patterns = openlist_adult_extra_video_hide_patterns(client, target_path)
+    patterns = openlist_adult_extra_video_hide_patterns(client, target_path, pre_scan_max_bytes=pre_scan_max_bytes)
     if patterns:
         client.upsert_meta_hide(target_path, patterns, h_sub=True)
 
@@ -3653,10 +3661,16 @@ def hide_openlist_adult_extra_videos(client, category_path, queries, task=None):
     }
 
 
-def openlist_adult_extra_video_hide_patterns(client, target_path):
+def openlist_adult_extra_video_hide_patterns(
+    client,
+    target_path,
+    pre_scan_max_bytes=DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES,
+):
     videos = []
     for item in client.list_all(target_path, refresh=False):
         if openlist_item_is_dir(item) or not is_openlist_video_file(item):
+            continue
+        if not should_keep_openlist_file(item, max_bytes=pre_scan_max_bytes):
             continue
         name = openlist_item_name(item)
         if name:

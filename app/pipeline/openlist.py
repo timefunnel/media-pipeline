@@ -7,7 +7,6 @@ import urllib.request
 DEFAULT_OPENLIST_URL = "http://127.0.0.1:5244"
 DEFAULT_OPENLIST_TOKEN_FILE = "/run/secrets/openlist_token"
 DEFAULT_LIST_PAGE_SIZE = 200
-DEFAULT_REMOVE_BATCH_SIZE = 50
 DEFAULT_META_LIST_PAGE_SIZE = 200
 
 
@@ -150,22 +149,6 @@ class OpenListClient:
             raise RuntimeError("OpenList get failed: %s" % (response.get("message") or response.get("code")))
         return response
 
-    def remove_names(self, dir_path, names, batch_size=DEFAULT_REMOVE_BATCH_SIZE):
-        names = [str(name) for name in names if str(name or "").strip()]
-        responses = []
-        for index in range(0, len(names), int(batch_size)):
-            batch = names[index : index + int(batch_size)]
-            response = self.transport.request(
-                "POST",
-                self.base_url + "/api/fs/remove",
-                headers={"Authorization": self.token},
-                data={"dir": dir_path, "names": batch},
-                timeout=self.timeout,
-            )
-            if response.get("code") != 200:
-                raise RuntimeError("OpenList remove failed: %s" % (response.get("message") or response.get("code")))
-            responses.append(response)
-        return responses
 
     def rename_path(self, path, name):
         response = self.transport.request(

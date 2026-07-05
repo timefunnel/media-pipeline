@@ -2941,13 +2941,16 @@ class PipelineBotServiceTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            fake_openlist.remove_calls,
+            fake_openlist.meta_hide_calls,
             [
-                ("/115/电影/Movie", ["trailer.mp4", "poster.jpg"]),
-                ("/115/电影/Movie/Extras", ["sample.mp4"]),
+                ("/115/电影/Movie", [r"^trailer\.mp4$", r"^poster\.jpg$", "^Extras$"], True),
+                ("/115/电影/Movie/Extras", [r"^sample\.mp4$"], True),
             ],
         )
-        self.assertLess(events.index(("remove", "/115/电影/Movie", ("trailer.mp4", "poster.jpg"))), events.index(("scan",)))
+        self.assertLess(
+            events.index(("meta_hide", "/115/电影/Movie", (r"^trailer\.mp4$", r"^poster\.jpg$", "^Extras$"), True)),
+            events.index(("scan",)),
+        )
         self.assertEqual(task["openlist_clean_status"], "success")
         self.assertEqual(task["openlist_cleaned_count"], 3)
         self.assertEqual(task["openlist_cleaned_bytes"], 30 * 1024 * 1024 + 300 * 1024)
@@ -3003,17 +3006,17 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"info_hash": "ABC", "status_name": "success", "name": "Movie"},
             )
 
-        self.assertEqual(fake_openlist.remove_calls, [])
+        self.assertEqual(fake_openlist.meta_hide_calls, [])
         self.assertEqual(fake_msg.scan_calls, [("d150a96c-b467-4c60-82f1-207ae5949045", "0c1dda42-29ef-4069-b051-c9549a8d4440")])
         self.assertEqual(task["openlist_clean_status"], "failed")
         self.assertIn("target not found", task["openlist_clean_error"])
         self.assertEqual(task["msg_sync_status"], "success")
 
-    def test_sync_completed_task_keeps_scanning_when_openlist_remove_times_out(self):
+    def test_sync_completed_task_keeps_scanning_when_openlist_meta_hide_times_out(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
         class TimeoutCleaningOpenList(CleaningOpenList):
-            def remove_names(self, dir_path, names):
+            def upsert_meta_hide(self, path, hide_patterns, h_sub=True):
                 raise RuntimeError("OpenList request failed: timed out")
 
         fake_openlist = TimeoutCleaningOpenList(
@@ -3069,9 +3072,9 @@ class PipelineBotServiceTest(unittest.TestCase):
         result = clean_openlist_task_media(fake_openlist, "/root", ["Movie A"], task={"size": 20 * 1024 * 1024})
 
         self.assertEqual(result["openlist_clean_target"], "/root/Movie A")
-        self.assertEqual(fake_openlist.remove_calls, [("/root/Movie A", ["ad.mp4"])])
+        self.assertEqual(fake_openlist.meta_hide_calls, [("/root/Movie A", [r"^ad\.mp4$"], True)])
 
-    def test_clean_openlist_default_threshold_keeps_episode_videos_and_deletes_small_non_episode_videos(self):
+    def test_clean_openlist_default_threshold_keeps_episode_videos_and_hides_small_non_episode_videos(self):
         from pipeline.bot import clean_openlist_task_media
 
         fake_openlist = CleaningOpenList(
@@ -3098,8 +3101,12 @@ class PipelineBotServiceTest(unittest.TestCase):
             task={"size": 10 * 1024 * 1024},
         )
 
-        self.assertEqual(fake_openlist.remove_calls, [("/root/Jackie Chan Adventures", ["ad.mp4", "bonus.mp4", "poster.jpg"])])
+        self.assertEqual(
+            fake_openlist.meta_hide_calls,
+            [("/root/Jackie Chan Adventures", [r"^ad\.mp4$", r"^bonus\.mp4$", r"^poster\.jpg$"], True)],
+        )
         self.assertEqual(result["openlist_cleaned_count"], 3)
+        self.assertEqual(result["openlist_hidden_count"], 3)
 
     def test_clean_openlist_target_uses_task_size_to_break_remaining_ties(self):
         from pipeline.bot import clean_openlist_task_media
@@ -3127,7 +3134,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         )
 
         self.assertEqual(result["openlist_clean_target"], "/root/Movie A")
-        self.assertEqual(fake_openlist.remove_calls, [("/root/Movie A", ["ad.mp4"])])
+        self.assertEqual(fake_openlist.meta_hide_calls, [("/root/Movie A", [r"^ad\.mp4$"], True)])
 
     def test_clean_openlist_movie_pack_hides_extra_directories_without_deleting_them(self):
         from pipeline.bot import clean_openlist_task_media
@@ -3151,7 +3158,6 @@ class PipelineBotServiceTest(unittest.TestCase):
             hide_extra_scan_items=True,
         )
 
-        self.assertEqual(fake_openlist.remove_calls, [])
         self.assertEqual(result["openlist_hidden_count"], 3)
         self.assertEqual(fake_openlist.meta_hide_calls[0][0], "/root/Godzilla Pack")
         self.assertIn("^PV$", fake_openlist.meta_hide_calls[0][1])
@@ -3201,10 +3207,13 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"info_hash": "ABC", "status_name": "success", "name": "downloaded folder"},
             )
 
-        self.assertEqual(fake_openlist.remove_calls, [("/115/成人/downloaded folder", ["ad.mp4"])])
+        self.assertEqual(fake_openlist.meta_hide_calls, [("/115/成人/MIDA-304 - downloaded folder", [r"^ad\.mp4$"], True)])
         self.assertEqual(fake_openlist.rename_calls, [("/115/成人/downloaded folder", "MIDA-304 - downloaded folder")])
-        self.assertLess(events.index(("remove", "/115/成人/downloaded folder", ("ad.mp4",))), events.index(("rename", "/115/成人/downloaded folder", "MIDA-304 - downloaded folder")))
-        self.assertLess(events.index(("rename", "/115/成人/downloaded folder", "MIDA-304 - downloaded folder")), events.index(("scan",)))
+        self.assertLess(
+            events.index(("rename", "/115/成人/downloaded folder", "MIDA-304 - downloaded folder")),
+            events.index(("meta_hide", "/115/成人/MIDA-304 - downloaded folder", (r"^ad\.mp4$",), True)),
+        )
+        self.assertLess(events.index(("meta_hide", "/115/成人/MIDA-304 - downloaded folder", (r"^ad\.mp4$",), True)), events.index(("scan",)))
         self.assertLess(events.index(("scan",)), events.index(("artwork_repair",)))
         self.assertEqual(fake_msg.search_calls[0], ("MIDA-304", 20))
         self.assertEqual(fake_msg.artwork_repair_calls, ["media-1"])
@@ -3262,7 +3271,6 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"info_hash": "ABC", "status_name": "success", "name": "ssis-218ch"},
             )
 
-        self.assertEqual(fake_openlist.remove_calls, [])
         self.assertEqual(fake_openlist.rename_calls, [(old_path, "SSIS-218")])
         self.assertEqual(fake_openlist.meta_hide_calls, [(new_path, [r"^side\.mp4$"], True)])
         self.assertLess(events.index(("rename", old_path, "SSIS-218")), events.index(("meta_hide", new_path, (r"^side\.mp4$",), True)))
@@ -4422,24 +4430,12 @@ class OpenListClientTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "OpenList list failed"):
             client.list_path("/115/电影")
 
-    def test_remove_names_uses_openlist_batch_remove_endpoint(self):
-        transport = FakeTransport({"code": 200, "message": "success", "data": None})
-        client = OpenListClient("http://127.0.0.1:5244", "openlist-token-value", transport=transport)
-
-        client.remove_names("/115/电影/Movie", ["trailer.mp4", "poster.jpg"])
-
-        call = transport.calls[0]
-        self.assertEqual(call["method"], "POST")
-        self.assertEqual(call["url"], "http://127.0.0.1:5244/api/fs/remove")
-        self.assertEqual(call["headers"]["Authorization"], "openlist-token-value")
-        self.assertEqual(call["data"], {"dir": "/115/电影/Movie", "names": ["trailer.mp4", "poster.jpg"]})
-
     def test_transport_converts_timeout_to_runtime_error(self):
         from pipeline.openlist import OpenListTransport
 
         with patch("pipeline.openlist.urllib.request.urlopen", side_effect=TimeoutError("timed out")):
             with self.assertRaisesRegex(RuntimeError, "OpenList request failed: timed out"):
-                OpenListTransport().request("POST", "http://127.0.0.1:5244/api/fs/remove", data={"dir": "/root"}, timeout=1)
+                OpenListTransport().request("POST", "http://127.0.0.1:5244/api/fs/list", data={"path": "/root"}, timeout=1)
 
     def test_rename_path_uses_openlist_rename_endpoint(self):
         transport = FakeTransport({"code": 200, "message": "success", "data": None})
@@ -5705,7 +5701,6 @@ class CleaningOpenList:
     def __init__(self, tree, events=None):
         self.tree = tree
         self.events = events if events is not None else []
-        self.remove_calls = []
         self.rename_calls = []
         self.move_calls = []
         self.meta_hide_calls = []
@@ -5717,11 +5712,6 @@ class CleaningOpenList:
     def list_all(self, path, refresh=False):
         self.events.append(("list_all", path, refresh))
         return list(self.tree.get(path, []))
-
-    def remove_names(self, dir_path, names):
-        self.remove_calls.append((dir_path, list(names)))
-        self.events.append(("remove", dir_path, tuple(names)))
-        return [{"code": 200, "message": "success"}]
 
     def rename_path(self, path, name):
         self.rename_calls.append((path, name))
