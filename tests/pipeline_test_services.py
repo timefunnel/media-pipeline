@@ -1,4 +1,5 @@
 from tests.test_pipeline_core import *
+from pipeline.subtitle_proxy import is_emby_placeholder_image_body
 
 
 class SubtitleProxyTest(unittest.TestCase):
@@ -331,7 +332,8 @@ class SubtitleProxyTest(unittest.TestCase):
         changed = patch_emby_collection_folder_item_cover(folder, covers)
 
         self.assertTrue(changed)
-        self.assertIsNone(folder["PrimaryImageItemId"])
+        self.assertEqual(folder["PrimaryImageItemId"], "library-1")
+        self.assertRegex(folder["PrimaryImageTag"], r"^[0-9a-f]{32}$")
         self.assertRegex(folder["ImageTags"]["Primary"], r"^[0-9a-f]{32}$")
         self.assertEqual(folder["PrimaryImageAspectRatio"], 16 / 9)
 
@@ -363,8 +365,38 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(folder["PrimaryImageItemId"], "library-1")
         self.assertRegex(folder["PrimaryImageTag"], r"^[0-9a-f]{32}$")
-        self.assertNotIn("ImageTags", folder)
+        self.assertRegex(folder["ImageTags"]["Primary"], r"^[0-9a-f]{32}$")
+        self.assertEqual(folder["PrimaryImageAspectRatio"], 16 / 9)
+
+    def test_patch_emby_collection_folder_item_cover_clears_placeholder_without_cover(self):
+        folder = {
+            "Id": "library-1",
+            "Name": "Empty",
+            "Type": "CollectionFolder",
+            "ImageTags": {},
+            "PrimaryImageItemId": "library-1",
+            "PrimaryImageAspectRatio": 16 / 9,
+        }
+
+        changed = patch_emby_collection_folder_item_cover(folder, [])
+
+        self.assertTrue(changed)
+        self.assertEqual(folder["ImageTags"], {})
+        self.assertNotIn("PrimaryImageItemId", folder)
+        self.assertNotIn("PrimaryImageTag", folder)
         self.assertNotIn("PrimaryImageAspectRatio", folder)
+
+    def test_is_emby_placeholder_image_body_detects_one_pixel_png(self):
+        from PIL import Image
+
+        one_pixel = io.BytesIO()
+        Image.new("RGBA", (1, 1), (36, 40, 48, 255)).save(one_pixel, format="PNG")
+        normal = io.BytesIO()
+        Image.new("RGBA", (2, 1), (36, 40, 48, 255)).save(normal, format="PNG")
+
+        self.assertTrue(is_emby_placeholder_image_body(one_pixel.getvalue()))
+        self.assertFalse(is_emby_placeholder_image_body(normal.getvalue()))
+        self.assertFalse(is_emby_placeholder_image_body(b"not an image"))
 
     def test_write_response_patches_json_list_payload(self):
         handler = object.__new__(SubtitleProxyHandler)

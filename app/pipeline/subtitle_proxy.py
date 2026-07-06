@@ -724,19 +724,49 @@ def emby_item_cover(item, image_type="Primary"):
 
 def patch_emby_collection_folder_item_cover(item, cover):
     covers = cover if isinstance(cover, list) else ([cover] if cover else [])
-    if not emby_item_needs_folder_cover(item) or not covers:
+    if not emby_item_is_collection_folder(item):
         return False
-    tag = emby_folder_cover_grid_tag(emby_collection_folder_id(item), covers)
-    if emby_item_is_virtual_folder(item):
-        item["PrimaryImageItemId"] = emby_collection_folder_id(item)
-        item["PrimaryImageTag"] = tag
-        return True
+    if not covers:
+        return clear_emby_collection_folder_item_cover(item) if emby_item_needs_folder_cover(item) else False
+    if not emby_item_needs_folder_cover(item):
+        return False
+    folder_id = emby_collection_folder_id(item)
+    tag = emby_folder_cover_grid_tag(folder_id, covers)
     image_tags = dict(item.get("ImageTags") if isinstance(item.get("ImageTags"), dict) else {})
     image_tags["Primary"] = tag
     item["ImageTags"] = image_tags
-    item["PrimaryImageItemId"] = None
+    item["PrimaryImageItemId"] = folder_id
+    item["PrimaryImageTag"] = tag
     item["PrimaryImageAspectRatio"] = EMBY_FOLDER_COVER_ASPECT_RATIO
     return True
+
+
+def clear_emby_collection_folder_item_cover(item):
+    if not emby_item_is_collection_folder(item):
+        return False
+    changed = False
+    image_tags = item.get("ImageTags")
+    if isinstance(image_tags, dict) and image_tags.get("Primary"):
+        image_tags = dict(image_tags)
+        image_tags.pop("Primary", None)
+        item["ImageTags"] = image_tags
+        changed = True
+    for key in ("PrimaryImageItemId", "PrimaryImageTag", "PrimaryImageAspectRatio"):
+        if key in item:
+            item.pop(key, None)
+            changed = True
+    return changed
+
+
+def is_emby_placeholder_image_body(body):
+    if not body or len(body) > 128:
+        return False
+    png_signature = b"\x89PNG\r\n\x1a\n"
+    if not body.startswith(png_signature) or len(body) < 24:
+        return False
+    width = int.from_bytes(body[16:20], "big")
+    height = int.from_bytes(body[20:24], "big")
+    return width == 1 and height == 1
 
 
 def emby_folder_cover_grid_tag(folder_id, covers):
@@ -1203,6 +1233,16 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             preferred_image_type=image_request["image_type"],
         )
         if not covers:
+            status, headers, body = self._read_upstream(self.path, request_headers)
+            if status >= 200 and status < 300 and is_emby_placeholder_image_body(body):
+                self._write_response(
+                    404,
+                    {"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"},
+                    b"",
+                    request_headers=request_headers,
+                    request_path=self.path,
+                )
+                return True
             return False
         body = self._build_emby_folder_cover_image(
             user_id,
