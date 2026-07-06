@@ -170,6 +170,43 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.search_profile_categories["anime"], (5070, 5080))
         self.assertEqual(config.search_profile_tag_labels["adult"], ("adult", "sukebei"))
 
+    def test_bot_config_reads_llm_rerank_settings(self):
+        from pipeline.bot import BotConfig
+
+        config = BotConfig.from_env(
+            {
+                "TG_BOT_TOKEN": "123:token",
+                "TG_ALLOWED_USER_IDS": "700656624",
+                "LLM_SEARCH_RERANK_ENABLED": "1",
+                "LLM_API_KEY": "llm-key",
+                "LLM_BASE_URL": "https://api.deepseek.com/v1",
+                "LLM_MODEL": "deepseek-v4-flash",
+                "LLM_TIMEOUT_SECONDS": "3",
+                "LLM_SEARCH_RERANK_LIMIT": "25",
+                "LLM_THINKING_DISABLED": "0",
+            }
+        )
+
+        self.assertTrue(config.llm_search_rerank_enabled)
+        self.assertEqual(config.llm_api_key, "llm-key")
+        self.assertEqual(config.llm_base_url, "https://api.deepseek.com/v1")
+        self.assertEqual(config.llm_model, "deepseek-v4-flash")
+        self.assertEqual(config.llm_timeout_seconds, 3)
+        self.assertEqual(config.llm_search_rerank_limit, 25)
+        self.assertFalse(config.llm_thinking_disabled)
+
+    def test_bot_config_rejects_enabled_llm_rerank_without_api_key(self):
+        from pipeline.bot import BotConfig
+
+        with self.assertRaisesRegex(RuntimeError, "LLM_API_KEY missing"):
+            BotConfig.from_env(
+                {
+                    "TG_BOT_TOKEN": "123:token",
+                    "TG_ALLOWED_USER_IDS": "700656624",
+                    "LLM_SEARCH_RERANK_ENABLED": "1",
+                }
+            )
+
 
 class CandidateStoreTest(unittest.TestCase):
     def test_candidate_store_persists_candidate_for_callback(self):
@@ -2760,7 +2797,195 @@ class TelegramBotTest(unittest.TestCase):
         self.assertIn("处理失败", telegram.messages[0]["text"])
 
 
+class LlmSearchRerankClientTest(unittest.TestCase):
+    def test_rerank_search_candidates_sends_deepseek_json_request_and_reorders(self):
+        from pipeline.llm import SearchRerankClient
+
+        class FakeTransport:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, url, payload, headers=None, timeout=None):
+                self.calls.append({"url": url, "payload": payload, "headers": headers, "timeout": timeout})
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "selected_ids": ["c2", "c1"],
+                                        "best_id": "c2",
+                                        "confidence": 0.95,
+                                        "reason": "exact match",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+
+        transport = FakeTransport()
+        client = SearchRerankClient(
+            base_url="https://api.deepseek.com/v1",
+            api_key="llm-key",
+            model="deepseek-v4-flash",
+            timeout=3,
+            thinking_disabled=True,
+            transport=transport,
+        )
+
+        ranked = client.rerank_search_candidates(
+            "sintel 1080p",
+            "movie",
+            [
+                {"title": "Sintel 720p", "seeders": 90, "rank": 1},
+                {"title": "Sintel 1080p", "seeders": 20, "rank": 2},
+            ],
+            max_candidates=2,
+        )
+
+        self.assertEqual([item["title"] for item in ranked], ["Sintel 1080p", "Sintel 720p"])
+        self.assertEqual([item["rank"] for item in ranked], [1, 2])
+        call = transport.calls[0]
+        self.assertEqual(call["url"], "https://api.deepseek.com/v1/chat/completions")
+        self.assertEqual(call["headers"]["Authorization"], "Bearer llm-key")
+        self.assertEqual(call["timeout"], 3)
+        self.assertEqual(call["payload"]["model"], "deepseek-v4-flash")
+        self.assertEqual(call["payload"]["response_format"], {"type": "json_object"})
+        self.assertEqual(call["payload"]["thinking"], {"type": "disabled"})
+        self.assertIn("json", call["payload"]["messages"][0]["content"].lower())
+        self.assertNotIn("download_uri", call["payload"]["messages"][1]["content"])
+
+    def test_rerank_search_candidates_rejects_invalid_llm_confidence(self):
+        from pipeline.llm import SearchRerankClient
+
+        class FakeTransport:
+            def request(self, url, payload, headers=None, timeout=None):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "selected_ids": ["c1"],
+                                        "best_id": "c1",
+                                        "confidence": "high",
+                                        "reason": "exact match",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+
+        client = SearchRerankClient(api_key="llm-key", transport=FakeTransport())
+
+        with self.assertRaisesRegex(RuntimeError, "confidence must be numeric"):
+            client.rerank_search_candidates(
+                "sintel",
+                "movie",
+                [{"title": "Sintel 720p", "rank": 1}, {"title": "Sintel 1080p", "rank": 2}],
+                max_candidates=2,
+            )
+
+
 class PipelineBotServiceTest(unittest.TestCase):
+    def test_search_uses_llm_rerank_when_enabled(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class FakeProwlarrConfig:
+            def __init__(self, config_path):
+                self.config_path = config_path
+
+            def load_api_key(self):
+                return "prowlarr-key-value"
+
+        fake_prowlarr = FakeProwlarr(
+            [
+                {"title": "Sintel 720p", "seeders": 90, "infoHash": "LOW"},
+                {"title": "Sintel 1080p", "seeders": 20, "infoHash": "HIGH"},
+            ]
+        )
+
+        class FakeReranker:
+            calls = []
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def rerank_search_candidates(self, query, category, candidates, max_candidates=None):
+                self.calls.append((query, category, [item["title"] for item in candidates], max_candidates, self.kwargs))
+                ordered = [dict(candidates[1]), dict(candidates[0])]
+                for index, item in enumerate(ordered, start=1):
+                    item["rank"] = index
+                return ordered
+
+        config = BotConfig(
+            "token",
+            {700656624},
+            "/tmp/state.db",
+            llm_search_rerank_enabled=True,
+            llm_api_key="llm-key",
+            llm_search_rerank_limit=25,
+            llm_timeout_seconds=3,
+        )
+
+        with patch("pipeline.bot.ProwlarrConfig", FakeProwlarrConfig), patch(
+            "pipeline.bot.ProwlarrClient", return_value=fake_prowlarr
+        ), patch("pipeline.bot.SearchRerankClient", FakeReranker):
+            results = PipelineBotService(config).search("sintel", "movie", limit=10)
+
+        self.assertEqual([item["title"] for item in results], ["Sintel 720p", "Sintel 1080p"])
+        self.assertEqual([item["rank"] for item in results], [1, 2])
+        self.assertEqual(FakeReranker.calls[0][0], "sintel")
+        self.assertEqual(FakeReranker.calls[0][1], "movie")
+        self.assertEqual(FakeReranker.calls[0][3], 25)
+        self.assertEqual(FakeReranker.calls[0][4]["api_key"], "llm-key")
+        self.assertEqual(results.metadata["sources"][-1]["source"], "LLM rerank")
+        self.assertEqual(results.metadata["sources"][-1]["status"], "success")
+
+    def test_search_keeps_original_ranking_when_llm_rerank_fails(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class FakeProwlarrConfig:
+            def __init__(self, config_path):
+                self.config_path = config_path
+
+            def load_api_key(self):
+                return "prowlarr-key-value"
+
+        fake_prowlarr = FakeProwlarr(
+            [
+                {"title": "Sintel 720p", "seeders": 90, "infoHash": "LOW"},
+                {"title": "Sintel 1080p", "seeders": 20, "infoHash": "HIGH"},
+            ]
+        )
+
+        class FailingReranker:
+            def __init__(self, **kwargs):
+                pass
+
+            def rerank_search_candidates(self, query, category, candidates, max_candidates=None):
+                raise RuntimeError("invalid llm response")
+
+        config = BotConfig(
+            "token",
+            {700656624},
+            "/tmp/state.db",
+            llm_search_rerank_enabled=True,
+            llm_api_key="llm-key",
+        )
+
+        with patch("pipeline.bot.ProwlarrConfig", FakeProwlarrConfig), patch(
+            "pipeline.bot.ProwlarrClient", return_value=fake_prowlarr
+        ), patch("pipeline.bot.SearchRerankClient", FailingReranker):
+            results = PipelineBotService(config).search("sintel", "movie", limit=10)
+
+        self.assertEqual([item["title"] for item in results], ["Sintel 1080p", "Sintel 720p"])
+        self.assertEqual(results.metadata["sources"][-1]["source"], "LLM rerank")
+        self.assertEqual(results.metadata["sources"][-1]["status"], "failed")
+        self.assertIn("invalid llm response", results.metadata["sources"][-1]["error"])
+
     def test_submit_resolves_prowlarr_download_uri_before_115_offline(self):
         from pipeline.bot import BotConfig, PipelineBotService
 

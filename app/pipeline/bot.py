@@ -3,6 +3,7 @@ import os
 import posixpath
 import re
 import sqlite3
+import sys
 import threading
 import time
 import urllib.parse
@@ -33,6 +34,13 @@ from pipeline.dedupe import (
     task_duplicate_codes,
     unique_dedupe_entries,
     unique_dedupe_identities,
+)
+from pipeline.llm import (
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_SEARCH_RERANK_LIMIT,
+    DEFAULT_LLM_TIMEOUT_SECONDS,
+    SearchRerankClient,
 )
 from pipeline.openlist_utils import (
     is_openlist_video_file,
@@ -329,6 +337,13 @@ class BotConfig:
     search_profile_upstream_limits: dict = None
     search_profile_timeout_seconds: dict = None
     search_profile_max_workers: dict = None
+    llm_search_rerank_enabled: bool = False
+    llm_base_url: str = DEFAULT_LLM_BASE_URL
+    llm_model: str = DEFAULT_LLM_MODEL
+    llm_api_key: str = ""
+    llm_timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
+    llm_search_rerank_limit: int = DEFAULT_LLM_SEARCH_RERANK_LIMIT
+    llm_thinking_disabled: bool = True
 
     @classmethod
     def from_env(cls, env=None):
@@ -351,6 +366,10 @@ class BotConfig:
 
         msg_admin_user = (env.get("MSG_ADMIN_USER") or "").strip()
         msg_admin_password = env.get("MSG_ADMIN_PASSWORD") or ""
+        llm_search_rerank_enabled = parse_bool(env.get("LLM_SEARCH_RERANK_ENABLED"), False)
+        llm_api_key = (env.get("LLM_API_KEY") or env.get("DEEPSEEK_API_KEY") or "").strip()
+        if llm_search_rerank_enabled and not llm_api_key:
+            raise RuntimeError("LLM_API_KEY missing")
 
         return cls(
             token=token,
@@ -402,6 +421,13 @@ class BotConfig:
             search_profile_upstream_limits=search_profile_upstream_limits_from_env(env),
             search_profile_timeout_seconds=search_profile_timeout_seconds_from_env(env),
             search_profile_max_workers=search_profile_max_workers_from_env(env),
+            llm_search_rerank_enabled=llm_search_rerank_enabled,
+            llm_base_url=env.get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
+            llm_model=env.get("LLM_MODEL", DEFAULT_LLM_MODEL),
+            llm_api_key=llm_api_key,
+            llm_timeout_seconds=int(env.get("LLM_TIMEOUT_SECONDS", str(DEFAULT_LLM_TIMEOUT_SECONDS))),
+            llm_search_rerank_limit=int(env.get("LLM_SEARCH_RERANK_LIMIT", str(DEFAULT_LLM_SEARCH_RERANK_LIMIT))),
+            llm_thinking_disabled=parse_bool(env.get("LLM_THINKING_DISABLED"), True),
         )
 
 
@@ -1114,6 +1140,8 @@ class PipelineBotService:
             "max_workers": int(max_workers),
             "categories": list(categories_by_profile.get(profile, ())),
             "tag_labels": list(tag_labels_by_profile.get(profile, ())),
+            "llm_rerank_enabled": bool(self.config.llm_search_rerank_enabled),
+            "llm_rerank_limit": int(self.config.llm_search_rerank_limit),
         }
         candidates = search_profile_indexer_results(
             prowlarr,
@@ -1136,6 +1164,30 @@ class PipelineBotService:
                 stats.to_metadata(profile=profile, raw_count=len(candidates), selected_count=0, settings=search_settings),
             )
             raise
+        if self.config.llm_search_rerank_enabled:
+            started = time.monotonic()
+            try:
+                ranked = self._build_search_reranker().rerank_search_candidates(
+                    query,
+                    category,
+                    ranked,
+                    max_candidates=self.config.llm_search_rerank_limit,
+                )
+                stats.record(
+                    "LLM rerank",
+                    result_count=len(ranked),
+                    duration_seconds=time.monotonic() - started,
+                    phase="llm_rerank",
+                )
+            except Exception as error:
+                stats.record(
+                    "LLM rerank",
+                    status="failed",
+                    duration_seconds=time.monotonic() - started,
+                    error=error,
+                    phase="llm_rerank",
+                )
+                print("llm rerank failed: %s" % error, file=sys.stderr)
         return SearchResultList(
             ranked,
             metadata=stats.to_metadata(profile=profile, raw_count=len(candidates), selected_count=len(ranked), settings=search_settings),
@@ -1149,6 +1201,15 @@ class PipelineBotService:
 
     def search_migration_candidates(self, query, limit=20):
         return self._build_msg_db_client().search_migration_candidates(query, limit=limit)
+
+    def _build_search_reranker(self):
+        return SearchRerankClient(
+            base_url=self.config.llm_base_url,
+            api_key=self.config.llm_api_key,
+            model=self.config.llm_model,
+            timeout=self.config.llm_timeout_seconds,
+            thinking_disabled=self.config.llm_thinking_disabled,
+        )
 
     def msg_media_diagnostics(self, media_id):
         media_id = str(media_id or "").strip()

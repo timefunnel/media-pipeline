@@ -108,6 +108,13 @@ services:
       PROWLARR_PROFILE_GENERAL_TAG_LABELS: "${PROWLARR_PROFILE_GENERAL_TAG_LABELS:-media-general,general}"
       PROWLARR_PROFILE_ADULT_TAG_LABELS: "${PROWLARR_PROFILE_ADULT_TAG_LABELS:-media-adult,adult}"
       PROWLARR_PROFILE_ANIME_TAG_LABELS: "${PROWLARR_PROFILE_ANIME_TAG_LABELS:-media-anime,anime}"
+      LLM_SEARCH_RERANK_ENABLED: "${LLM_SEARCH_RERANK_ENABLED:-0}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-https://api.deepseek.com/v1}"
+      LLM_MODEL: "${LLM_MODEL:-deepseek-v4-flash}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_TIMEOUT_SECONDS: "${LLM_TIMEOUT_SECONDS:-4}"
+      LLM_SEARCH_RERANK_LIMIT: "${LLM_SEARCH_RERANK_LIMIT:-40}"
+      LLM_THINKING_DISABLED: "${LLM_THINKING_DISABLED:-1}"
     restart: unless-stopped
     command: ["bot"]
     volumes:
