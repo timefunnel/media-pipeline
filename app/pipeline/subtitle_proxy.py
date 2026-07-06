@@ -68,6 +68,7 @@ EMBY_FOLDER_COVER_DEFAULT_WIDTH = 640
 EMBY_FOLDER_COVER_MIN_WIDTH = 160
 EMBY_FOLDER_COVER_MAX_WIDTH = 1200
 EMBY_FOLDER_COVER_TAG_LENGTH = 32
+EMBY_FOLDER_COVER_TAG_VERSION = "folder-cover-grid-v4"
 SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
 VIDEO_EXTENSIONS = {
     ".avi",
@@ -773,6 +774,7 @@ def emby_folder_cover_grid_tag(folder_id, covers):
     digest = hashlib.sha1(
         json.dumps(
             [
+                EMBY_FOLDER_COVER_TAG_VERSION,
                 str(folder_id or ""),
                 [
                     [

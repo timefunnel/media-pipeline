@@ -1,5 +1,5 @@
 from tests.test_pipeline_core import *
-from pipeline.subtitle_proxy import is_emby_placeholder_image_body
+from pipeline.subtitle_proxy import emby_folder_cover_grid_tag, is_emby_placeholder_image_body
 
 
 class SubtitleProxyTest(unittest.TestCase):
@@ -449,6 +449,15 @@ class SubtitleProxyTest(unittest.TestCase):
         )
 
         self.assertEqual([cover["item_id"] for cover in covers], ["media-1", "media-2", "media-3", "media-4"])
+
+    def test_emby_folder_cover_grid_tag_is_hex_and_versioned(self):
+        tag = emby_folder_cover_grid_tag(
+            "library-1",
+            [{"item_id": "media-1", "image_type": "Primary", "tag": "media-1-tag"}],
+        )
+
+        self.assertRegex(tag, r"^[0-9a-f]{32}$")
+        self.assertNotEqual(tag, "8fe669ca35dc3e79fa26747829372c53")
 
     def test_build_emby_folder_cover_grid_outputs_jpeg(self):
         from PIL import Image
