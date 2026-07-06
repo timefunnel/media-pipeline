@@ -1,5 +1,9 @@
 from tests.test_pipeline_core import *
-from pipeline.subtitle_proxy import emby_folder_cover_grid_tag, is_emby_placeholder_image_body
+from pipeline.subtitle_proxy import (
+    emby_folder_cover_grid_tag,
+    emby_request_prefers_real_folder_cover,
+    is_emby_placeholder_image_body,
+)
 
 
 class SubtitleProxyTest(unittest.TestCase):
@@ -336,6 +340,37 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertRegex(folder["PrimaryImageTag"], r"^[0-9a-f]{32}$")
         self.assertRegex(folder["ImageTags"]["Primary"], r"^[0-9a-f]{32}$")
         self.assertEqual(folder["PrimaryImageAspectRatio"], 16 / 9)
+
+    def test_patch_emby_collection_folder_item_cover_can_use_real_item_for_infuse(self):
+        folder = {
+            "Id": "library-1",
+            "Name": "Movies",
+            "Type": "CollectionFolder",
+            "ImageTags": {"Primary": "old-grid-tag"},
+            "PrimaryImageItemId": "library-1",
+            "PrimaryImageTag": "old-grid-tag",
+            "PrimaryImageAspectRatio": 16 / 9,
+        }
+        covers = [
+            {
+                "item_id": "media-1",
+                "image_type": "Primary",
+                "tag": "media-1-tag",
+                "primary_image_aspect_ratio": 0.7,
+            }
+        ]
+
+        changed = patch_emby_collection_folder_item_cover(folder, covers, prefer_real_item=True)
+
+        self.assertTrue(changed)
+        self.assertEqual(folder["PrimaryImageItemId"], "media-1")
+        self.assertEqual(folder["PrimaryImageTag"], "media-1-tag")
+        self.assertEqual(folder["ImageTags"]["Primary"], "media-1-tag")
+        self.assertEqual(folder["PrimaryImageAspectRatio"], 0.7)
+
+    def test_emby_request_prefers_real_folder_cover_detects_infuse(self):
+        self.assertTrue(emby_request_prefers_real_folder_cover({"User-Agent": "Infuse/8.0"}))
+        self.assertFalse(emby_request_prefers_real_folder_cover({"User-Agent": "VidHub/1.0"}))
 
     def test_iter_emby_items_accepts_virtual_folder_list(self):
         items = list(

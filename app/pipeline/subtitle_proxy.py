@@ -629,6 +629,15 @@ def emby_request_user_id_from_auth(path="", headers=None):
     return emby_request_user_id(path) or emby_user_id_from_token(emby_auth_token(path, headers))
 
 
+def emby_request_prefers_real_folder_cover(headers=None):
+    user_agent = ""
+    for key, value in (headers or {}).items():
+        if str(key).lower() == "user-agent":
+            user_agent = str(value or "")
+            break
+    return "infuse" in user_agent.lower()
+
+
 def iter_emby_items(payload):
     if isinstance(payload, dict):
         yield payload
@@ -723,12 +732,20 @@ def emby_item_cover(item, image_type="Primary"):
     return cover
 
 
-def patch_emby_collection_folder_item_cover(item, cover):
+def patch_emby_collection_folder_item_cover(item, cover, prefer_real_item=False):
     covers = cover if isinstance(cover, list) else ([cover] if cover else [])
     if not emby_item_is_collection_folder(item):
         return False
     if not covers:
-        return clear_emby_collection_folder_item_cover(item) if emby_item_needs_folder_cover(item) else False
+        if prefer_real_item or emby_item_needs_folder_cover(item):
+            return clear_emby_collection_folder_item_cover(item)
+        return False
+    if prefer_real_item:
+        return patch_emby_collection_folder_item_real_cover(item, covers[0])
+    return patch_emby_collection_folder_item_grid_cover(item, covers)
+
+
+def patch_emby_collection_folder_item_grid_cover(item, covers):
     if not emby_item_needs_folder_cover(item):
         return False
     folder_id = emby_collection_folder_id(item)
@@ -739,6 +756,25 @@ def patch_emby_collection_folder_item_cover(item, cover):
     item["PrimaryImageItemId"] = folder_id
     item["PrimaryImageTag"] = tag
     item["PrimaryImageAspectRatio"] = EMBY_FOLDER_COVER_ASPECT_RATIO
+    return True
+
+
+def patch_emby_collection_folder_item_real_cover(item, cover):
+    if not emby_item_is_collection_folder(item) or not isinstance(cover, dict):
+        return False
+    tag = str(cover.get("tag") or "").strip()
+    item_id = str(cover.get("item_id") or "").strip()
+    if not tag or not item_id:
+        return False
+    image_tags = dict(item.get("ImageTags") if isinstance(item.get("ImageTags"), dict) else {})
+    image_tags["Primary"] = tag
+    item["ImageTags"] = image_tags
+    item["PrimaryImageItemId"] = item_id
+    item["PrimaryImageTag"] = tag
+    if cover.get("primary_image_aspect_ratio") is not None:
+        item["PrimaryImageAspectRatio"] = cover.get("primary_image_aspect_ratio")
+    else:
+        item.pop("PrimaryImageAspectRatio", None)
     return True
 
 
@@ -1394,14 +1430,17 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         user_id = emby_request_user_id_from_auth(request_path or "", request_headers)
         if not user_id:
             return False
+        prefer_real_item = emby_request_prefers_real_folder_cover(request_headers)
         changed = False
         for item in iter_emby_items(payload):
-            if not emby_item_needs_folder_cover(item):
+            if not emby_item_is_collection_folder(item):
+                continue
+            if not prefer_real_item and not emby_item_needs_folder_cover(item):
                 continue
             folder_id = emby_collection_folder_id(item)
             self._remember_emby_collection_folder_id(user_id, folder_id)
             covers = self._find_emby_folder_covers(user_id, folder_id, request_headers, request_path or "")
-            if patch_emby_collection_folder_item_cover(item, covers):
+            if patch_emby_collection_folder_item_cover(item, covers, prefer_real_item=prefer_real_item):
                 changed = True
         return changed
 
