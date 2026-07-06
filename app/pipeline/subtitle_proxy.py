@@ -64,11 +64,11 @@ EMBY_ITEM_IMAGE_RE = re.compile(
 EMBY_FOLDER_COVER_CACHE_TTL_SECONDS = 300
 EMBY_FOLDER_COVER_GRID_LIMIT = 4
 EMBY_FOLDER_COVER_ASPECT_RATIO = 16 / 9
-EMBY_FOLDER_COVER_DEFAULT_WIDTH = 640
+EMBY_FOLDER_COVER_DEFAULT_WIDTH = 960
 EMBY_FOLDER_COVER_MIN_WIDTH = 160
 EMBY_FOLDER_COVER_MAX_WIDTH = 1200
 EMBY_FOLDER_COVER_TAG_LENGTH = 32
-EMBY_FOLDER_COVER_TAG_VERSION = "folder-cover-grid-v5-jpeg"
+EMBY_FOLDER_COVER_TAG_VERSION = "folder-cover-grid-v6-jellyfin-shape"
 SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
 VIDEO_EXTENSIONS = {
     ".avi",
@@ -664,10 +664,11 @@ def emby_collection_folder_id(item):
 def emby_item_needs_folder_cover(item):
     if not emby_item_is_collection_folder(item):
         return False
-    if emby_item_is_virtual_folder(item):
-        return bool(emby_collection_folder_id(item) and not item.get("PrimaryImageTag"))
     image_tags = item.get("ImageTags")
-    if isinstance(image_tags, dict) and image_tags.get("Primary"):
+    has_primary_image = isinstance(image_tags, dict) and bool(image_tags.get("Primary"))
+    if emby_item_is_virtual_folder(item):
+        return bool(emby_collection_folder_id(item) and not (has_primary_image or item.get("PrimaryImageTag")))
+    if has_primary_image:
         return False
     return bool(emby_collection_folder_id(item))
 
@@ -736,8 +737,8 @@ def patch_emby_collection_folder_item_cover(item, cover):
     image_tags = dict(item.get("ImageTags") if isinstance(item.get("ImageTags"), dict) else {})
     image_tags["Primary"] = tag
     item["ImageTags"] = image_tags
-    item["PrimaryImageItemId"] = folder_id
-    item["PrimaryImageTag"] = tag
+    item.pop("PrimaryImageItemId", None)
+    item.pop("PrimaryImageTag", None)
     item["PrimaryImageAspectRatio"] = EMBY_FOLDER_COVER_ASPECT_RATIO
     return True
 
@@ -797,7 +798,7 @@ def emby_folder_cover_response_headers(tag, now=None):
     now = time.time() if now is None else now
     expires_at = now + 31536000
     return {
-        "Content-Type": "image/jpeg",
+        "Content-Type": "image/png",
         "Cache-Control": "public, max-age=31536000",
         "ETag": '"%s"' % tag,
         "Last-Modified": http.server.BaseHTTPRequestHandler.date_time_string(None, now),
@@ -852,7 +853,7 @@ def build_emby_folder_cover_grid(image_bodies, dimensions=None):
             continue
         try:
             with Image.open(io.BytesIO(body)) as image:
-                decoded.append(image.convert("RGB"))
+                decoded.append(image.convert("RGBA"))
         except (OSError, ValueError):
             continue
         if len(decoded) >= EMBY_FOLDER_COVER_GRID_LIMIT:
@@ -865,7 +866,7 @@ def build_emby_folder_cover_grid(image_bodies, dimensions=None):
         width, height = emby_folder_cover_grid_dimensions("")
     width = max(EMBY_FOLDER_COVER_MIN_WIDTH, min(EMBY_FOLDER_COVER_MAX_WIDTH, int_value(width) or EMBY_FOLDER_COVER_DEFAULT_WIDTH))
     height = max(1, int_value(height) or int(round(width / EMBY_FOLDER_COVER_ASPECT_RATIO)))
-    canvas = Image.new("RGB", (width, height), (18, 18, 18))
+    canvas = Image.new("RGBA", (width, height), (18, 18, 18, 255))
     resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
     column_count = min(len(decoded), EMBY_FOLDER_COVER_GRID_LIMIT)
     x = 0
@@ -875,7 +876,7 @@ def build_emby_folder_cover_grid(image_bodies, dimensions=None):
         canvas.paste(ImageOps.fit(image, tile_size, method=resample), (x, 0))
         x = next_x
     out = io.BytesIO()
-    canvas.save(out, format="JPEG", quality=90, optimize=True)
+    canvas.save(out, format="PNG", optimize=True)
     return out.getvalue()
 
 
