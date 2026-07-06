@@ -798,6 +798,60 @@ class TelegramBotTest(unittest.TestCase):
             self.assertEqual(sent["reply_markup"]["inline_keyboard"][0][0]["text"], "#1 入库")
             self.assertRegex(sent["reply_markup"]["inline_keyboard"][0][0]["callback_data"], r"^choose:\d+$")
 
+    def test_message_search_shows_bt4g_retry_when_bt4g_was_skipped(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+        from pipeline.search_stats import SearchResultList
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                search_results=SearchResultList(
+                    [{"title": "Sintel Knaben", "download_uri": "magnet:?xt=urn:btih:AAA", "rank": 1, "indexer": "Knaben"}],
+                    metadata={
+                        "source_count": 2,
+                        "raw_count": 1,
+                        "selected_count": 1,
+                        "sources": [
+                            {"source": "Knaben", "status": "success", "result_count": 1},
+                            {"source": "BT4G", "status": "skipped", "result_count": 0},
+                        ],
+                    },
+                )
+            )
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "sintel"}})
+
+        markup = json.dumps(telegram.messages[0]["reply_markup"], ensure_ascii=False)
+        self.assertIn("bt4g_search", markup)
+        self.assertIn("BT4G", markup)
+
+    def test_message_search_hides_bt4g_retry_when_bt4g_result_is_present(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+        from pipeline.search_stats import SearchResultList
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                search_results=SearchResultList(
+                    [{"title": "Sintel BT4G", "download_uri": "magnet:?xt=urn:btih:BBB", "rank": 1, "indexer": "BT4G"}],
+                    metadata={
+                        "source_count": 1,
+                        "raw_count": 1,
+                        "selected_count": 1,
+                        "sources": [{"source": "BT4G", "status": "success", "result_count": 1}],
+                    },
+                )
+            )
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "sintel"}})
+
+        markup = json.dumps(telegram.messages[0]["reply_markup"], ensure_ascii=False)
+        self.assertNotIn("bt4g_search", markup)
+
     def test_message_search_shows_manual_llm_rerank_button_when_enabled(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
 
@@ -1221,6 +1275,60 @@ class TelegramBotTest(unittest.TestCase):
             self.assertNotEqual(telegram.messages[0]["text"], telegram.messages[1]["text"])
             self.assertNotIn("adult_search", json.dumps(telegram.messages[1]["reply_markup"], ensure_ascii=False))
             self.assertNotIn("anime_search", json.dumps(telegram.messages[1]["reply_markup"], ensure_ascii=False))
+            self.assertEqual(telegram.edits, [])
+
+    def test_callback_bt4g_search_sends_separate_bt4g_result_message(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+        from pipeline.search_stats import SearchResultList
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                search_results=SearchResultList(
+                    [{"title": "Sintel Knaben", "download_uri": "magnet:?xt=urn:btih:AAA", "rank": 1, "indexer": "Knaben"}],
+                    metadata={
+                        "source_count": 2,
+                        "raw_count": 1,
+                        "selected_count": 1,
+                        "sources": [
+                            {"source": "Knaben", "status": "success", "result_count": 1},
+                            {"source": "BT4G", "status": "skipped", "result_count": 0},
+                        ],
+                    },
+                ),
+                bt4g_search_results=[
+                    {"title": "Sintel BT4G", "download_uri": "magnet:?xt=urn:btih:BBB", "rank": 1, "seeders": 2, "indexer": "BT4G"}
+                ],
+            )
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "sintel"}})
+            bt4g_button = next(
+                button
+                for row in telegram.messages[0]["reply_markup"]["inline_keyboard"]
+                for button in row
+                if button["callback_data"].startswith("bt4g_search:")
+            )
+
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-bt4g-search",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 701},
+                        "data": bt4g_button["callback_data"],
+                    }
+                }
+            )
+
+            self.assertEqual(service.search_calls, [("sintel", "movie", 100)])
+            self.assertEqual(service.bt4g_search_calls, [("sintel", 100)])
+            self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-bt4g-search", "text": "正在补查 BT4G"})
+            self.assertEqual(len(telegram.messages), 2)
+            self.assertIn("BT4G搜索结果：sintel", telegram.messages[1]["text"])
+            self.assertNotEqual(telegram.messages[0]["text"], telegram.messages[1]["text"])
+            self.assertNotIn("bt4g_search", json.dumps(telegram.messages[1]["reply_markup"], ensure_ascii=False))
             self.assertEqual(telegram.edits, [])
 
     def test_message_strong_adult_code_uses_adult_search_without_retry_button(self):

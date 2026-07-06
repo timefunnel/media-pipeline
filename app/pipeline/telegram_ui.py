@@ -387,6 +387,7 @@ def search_page_reply_markup(
     page_count,
     allow_adult_retry=False,
     allow_anime_retry=False,
+    allow_bt4g_retry=False,
     allow_llm_rerank=False,
 ):
     rows = []
@@ -407,6 +408,8 @@ def search_page_reply_markup(
         retry.append({"text": "🔞", "callback_data": "adult_search:%s" % session_id})
     if allow_anime_retry:
         retry.append({"text": "动漫", "callback_data": "anime_search:%s" % session_id})
+    if allow_bt4g_retry:
+        retry.append({"text": "BT4G", "callback_data": "bt4g_search:%s" % session_id})
     if retry:
         rows.append(retry)
     if allow_llm_rerank:

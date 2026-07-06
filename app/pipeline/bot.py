@@ -149,6 +149,7 @@ from pipeline.search import (
     SEARCH_PROFILE_GENERAL,
     SEARCH_PROFILE_TAG_LABELS,
     indexer_priority_map,
+    indexer_enabled,
     is_strong_adult_code_query,
     magnet_candidate_from_text,
     parse_csv_ints,
@@ -1242,6 +1243,59 @@ class PipelineBotService:
     def search_anime(self, query, limit=DEFAULT_SEARCH_LIMIT):
         return self.search(query, "movie", limit=limit, profile=SEARCH_PROFILE_ANIME)
 
+    def search_bt4g(self, query, limit=DEFAULT_SEARCH_LIMIT):
+        stats = SearchStats()
+        api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
+        prowlarr = ProwlarrClient(self.config.prowlarr_url, api_key, timeout=self.config.prowlarr_search_timeout_seconds)
+        indexers = prowlarr.indexers()
+        bt4g_indexers = [indexer for indexer in indexers if indexer_enabled(indexer) and indexer_matches_label(indexer, "BT4G")]
+        if not bt4g_indexers:
+            raise RuntimeError("Prowlarr indexer not found: BT4G")
+
+        categories_by_profile = self.config.search_profile_categories or SEARCH_PROFILE_CATEGORIES
+        categories = categories_by_profile.get(SEARCH_PROFILE_GENERAL, SEARCH_PROFILE_CATEGORIES[SEARCH_PROFILE_GENERAL])
+        upstream_limit = search_profile_value(
+            self.config.search_profile_upstream_limits,
+            SEARCH_PROFILE_GENERAL,
+            self.config.prowlarr_upstream_search_limit,
+        )
+        request_limit = max(int(limit), int(upstream_limit))
+        search_settings = {
+            "upstream_limit": int(upstream_limit),
+            "categories": list(categories),
+            "indexers": [indexer.get("name") or indexer.get("id") for indexer in bt4g_indexers],
+        }
+        candidates = []
+        for indexer in bt4g_indexers:
+            indexer_id = indexer.get("id")
+            source = indexer.get("name") or indexer_id
+            candidates.extend(
+                stats.measure(
+                    source,
+                    lambda indexer_id=indexer_id: prowlarr.search(
+                        query,
+                        limit=request_limit,
+                        indexer_ids=[indexer_id],
+                        categories=categories,
+                    ),
+                    phase="bt4g_indexer",
+                    indexer_id=indexer_id,
+                )
+            )
+
+        try:
+            ranked = ResourceSelector(indexer_priorities=indexer_priority_map(indexers)).select_ranked_limited(candidates, query=query, limit=limit)
+        except RuntimeError as exc:
+            attach_search_metadata(
+                exc,
+                stats.to_metadata(profile="bt4g", raw_count=len(candidates), selected_count=0, settings=search_settings),
+            )
+            raise
+        return SearchResultList(
+            ranked,
+            metadata=stats.to_metadata(profile="bt4g", raw_count=len(candidates), selected_count=len(ranked), settings=search_settings),
+        )
+
     def _rerank_search_candidates_with_timeout(self, query, category, ranked):
         timeout = max(0.1, float(self.config.llm_timeout_seconds or DEFAULT_LLM_TIMEOUT_SECONDS))
         if not self._llm_rerank_lock.acquire(blocking=False):
@@ -2143,6 +2197,9 @@ class TelegramBot:
         if action == "anime_search":
             self._handle_anime_search_callback(user_id, chat_id, callback_id, value)
             return
+        if action == "bt4g_search":
+            self._handle_bt4g_search_callback(user_id, chat_id, callback_id, value)
+            return
         if action == "llm_rerank":
             self._handle_llm_rerank_callback(user_id, chat_id, message_id, callback_id, value)
             return
@@ -2501,6 +2558,69 @@ class TelegramBot:
             metadata=search_result_metadata(candidates),
         )
         text, reply_markup = self._render_search_page(anime_session_id, page=0)
+        self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
+
+    def _handle_bt4g_search_callback(self, user_id, chat_id, callback_id, session_id):
+        try:
+            session = self.store.load_search_session(session_id)
+        except RuntimeError:
+            self.telegram.answer_callback_query(callback_id, "搜索结果不存在")
+            return
+        if session["user_id"] != user_id:
+            self.telegram.answer_callback_query(callback_id, "无权查看此搜索")
+            return
+        if session["category"] == "bt4g":
+            self.telegram.answer_callback_query(callback_id, "当前已是 BT4G 结果")
+            return
+
+        self.telegram.answer_callback_query(callback_id, "正在补查 BT4G")
+        try:
+            with self._typing_action(session["chat_id"]):
+                candidates = self.service.search_bt4g(session["query"], limit=self.config.search_limit)
+        except RuntimeError as exc:
+            if "no acceptable resource" in str(exc):
+                empty_session_id = self.store.save_search_session(
+                    user_id,
+                    session["chat_id"],
+                    "bt4g",
+                    session["query"],
+                    [],
+                    metadata=exception_search_metadata(exc),
+                )
+                text, reply_markup = self._render_search_page(empty_session_id, page=0)
+                self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
+                return
+            self.telegram.send_message(session["chat_id"], "BT4G 补查失败：%s" % exc)
+            return
+        except Exception as exc:
+            self.telegram.send_message(session["chat_id"], "BT4G 补查失败：%s" % exc)
+            return
+        if not candidates:
+            empty_session_id = self.store.save_search_session(
+                user_id,
+                session["chat_id"],
+                "bt4g",
+                session["query"],
+                [],
+                metadata=search_result_metadata(candidates),
+            )
+            text, reply_markup = self._render_search_page(empty_session_id, page=0)
+            self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
+            return
+
+        candidate_ids = []
+        for candidate in candidates:
+            candidate_id = self.store.save_candidate(user_id, session["chat_id"], DEFAULT_SEARCH_CATEGORY, session["query"], candidate)
+            candidate_ids.append(candidate_id)
+        bt4g_session_id = self.store.save_search_session(
+            user_id,
+            session["chat_id"],
+            "bt4g",
+            session["query"],
+            candidate_ids,
+            metadata=search_result_metadata(candidates),
+        )
+        text, reply_markup = self._render_search_page(bt4g_session_id, page=0)
         self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
 
     def _handle_choose_library_callback(self, user_id, chat_id, message_id, callback_id, candidate_id):
@@ -3020,6 +3140,7 @@ class TelegramBot:
             candidates.append((candidate_id, record["candidate"]))
         is_adult_session = session["category"] == "adult"
         is_anime_session = session["category"] == "anime"
+        is_bt4g_session = session["category"] == "bt4g"
         title = "搜索结果"
         if not candidate_ids:
             title = "未找到可用资源"
@@ -3027,6 +3148,8 @@ class TelegramBot:
             title = "成人源搜索结果"
         elif is_anime_session:
             title = "动漫源搜索结果"
+        elif is_bt4g_session:
+            title = "BT4G搜索结果"
         return format_search_page_message(
             session["query"],
             candidates,
@@ -3040,13 +3163,32 @@ class TelegramBot:
             candidates,
             page,
             page_count,
-            allow_adult_retry=not is_adult_session and not is_anime_session and not is_strong_adult_code_query(session["query"]),
+            allow_adult_retry=not is_adult_session and not is_anime_session and not is_bt4g_session and not is_strong_adult_code_query(session["query"]),
             allow_anime_retry=not is_adult_session
             and not is_anime_session
+            and not is_bt4g_session
             and not is_strong_adult_code_query(session["query"])
             and not should_search_anime(DEFAULT_SEARCH_CATEGORY, session["query"]),
+            allow_bt4g_retry=self._should_allow_bt4g_retry(session),
             allow_llm_rerank=self.config.llm_search_rerank_enabled and bool(candidate_ids),
         )
+
+    def _should_allow_bt4g_retry(self, session):
+        if (session or {}).get("category") != DEFAULT_SEARCH_CATEGORY:
+            return False
+        query = (session or {}).get("query")
+        if is_strong_adult_code_query(query) or should_search_anime(DEFAULT_SEARCH_CATEGORY, query):
+            return False
+        if not search_metadata_has_source((session or {}).get("metadata"), "BT4G"):
+            return False
+        for candidate_id in (session or {}).get("candidate_ids") or []:
+            try:
+                record = self.store.load_candidate(candidate_id)
+            except RuntimeError:
+                continue
+            if candidate_matches_indexer_label(record.get("candidate"), "BT4G"):
+                return False
+        return True
 
     def _save_tasks_from_submit(self, record, candidate, result, category, telegram_status_message_id=None, content_profile=None):
         title = candidate.get("title") or record["query"]
@@ -3452,6 +3594,47 @@ def content_profile_to_category(content_profile):
     if content_profile in CONTENT_PROFILE_LABELS:
         return content_profile
     raise ValueError("unsupported content profile: %s" % (content_profile or "-"))
+
+
+def indexer_matches_label(indexer, label):
+    return candidate_matches_indexer_label(indexer, label)
+
+
+def candidate_matches_indexer_label(candidate, label):
+    label = str(label or "").strip().casefold()
+    if not label:
+        return False
+    values = [
+        (candidate or {}).get("name"),
+        (candidate or {}).get("indexer"),
+        (candidate or {}).get("indexerName"),
+        (candidate or {}).get("site"),
+        (candidate or {}).get("tracker"),
+        (candidate or {}).get("guid"),
+        (candidate or {}).get("infoUrl"),
+        (candidate or {}).get("details"),
+        (candidate or {}).get("downloadUrl"),
+    ]
+    return any(indexer_label_text_matches(value, label) for value in values)
+
+
+def search_metadata_has_source(metadata, label):
+    label = str(label or "").strip().casefold()
+    if not label:
+        return False
+    for source in (metadata or {}).get("sources") or []:
+        if indexer_label_text_matches((source or {}).get("source"), label):
+            return True
+    return False
+
+
+def indexer_label_text_matches(value, normalized_label):
+    text = str(value or "").strip().casefold()
+    if not text:
+        return False
+    if text == normalized_label:
+        return True
+    return re.search(r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(normalized_label), text) is not None
 
 
 def task_msg_synced(task):
@@ -4073,6 +4256,8 @@ def parse_callback_data(value):
         return "adult_search", int(payload)
     if action == "anime_search":
         return "anime_search", int(payload)
+    if action == "bt4g_search":
+        return "bt4g_search", int(payload)
     if action == "llm_rerank":
         return "llm_rerank", int(payload)
     if action == "profile":

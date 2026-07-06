@@ -2221,6 +2221,40 @@ class CliSubmitSearchTest(unittest.TestCase):
         self.assertEqual(metadata["settings"]["timeout_seconds"], 2)
         self.assertEqual(metadata["settings"]["max_workers"], 1)
 
+    def test_bot_search_bt4g_uses_only_bt4g_indexer(self):
+        from pipeline.bot import BotConfig, PipelineBotService, SEARCH_PROFILE_GENERAL
+        from pipeline.search_stats import search_result_metadata
+
+        fake_prowlarr = FakeProwlarr(
+            [],
+            indexers=[
+                {"id": 2, "name": "BT4G", "enable": True, "priority": 25, "capabilities": {"categories": [{"id": 2000}]}},
+                {"id": 3, "name": "Knaben", "enable": True, "priority": 10, "capabilities": {"categories": [{"id": 2000}]}},
+            ],
+            indexer_results={
+                (2,): [{"title": "Sintel BT4G 1080p", "indexer": "BT4G", "seeders": 5, "infoHash": "B1"}],
+                (3,): [{"title": "Sintel Knaben 1080p", "indexer": "Knaben", "seeders": 5, "infoHash": "K1"}],
+            },
+        )
+
+        with patch("pipeline.bot.ProwlarrConfig") as config_cls, patch("pipeline.bot.ProwlarrClient", return_value=fake_prowlarr):
+            config_cls.return_value.load_api_key.return_value = "prowlarr-key"
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    search_profile_upstream_limits={SEARCH_PROFILE_GENERAL: 40},
+                )
+            )
+            results = service.search_bt4g("sintel", limit=5)
+
+        metadata = search_result_metadata(results)
+        self.assertEqual([item["infoHash"] for item in results], ["B1"])
+        self.assertEqual(fake_prowlarr.search_calls, [("sintel", 40, (2,), (2000, 5000))])
+        self.assertEqual(metadata["profile"], "bt4g")
+        self.assertEqual(metadata["settings"]["indexers"], ["BT4G"])
+
     def test_primary_search_falls_back_to_single_indexers_when_aggregate_times_out(self):
         from pipeline.bot import search_primary_indexer_results
 
