@@ -1,7 +1,6 @@
 from tests.test_pipeline_core import *
 from pipeline.subtitle_proxy import (
     emby_folder_cover_grid_tag,
-    emby_request_prefers_real_folder_cover,
     is_emby_placeholder_image_body,
 )
 
@@ -341,37 +340,6 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertRegex(folder["ImageTags"]["Primary"], r"^[0-9a-f]{32}$")
         self.assertEqual(folder["PrimaryImageAspectRatio"], 16 / 9)
 
-    def test_patch_emby_collection_folder_item_cover_can_use_real_item_for_infuse(self):
-        folder = {
-            "Id": "library-1",
-            "Name": "Movies",
-            "Type": "CollectionFolder",
-            "ImageTags": {"Primary": "old-grid-tag"},
-            "PrimaryImageItemId": "library-1",
-            "PrimaryImageTag": "old-grid-tag",
-            "PrimaryImageAspectRatio": 16 / 9,
-        }
-        covers = [
-            {
-                "item_id": "media-1",
-                "image_type": "Primary",
-                "tag": "media-1-tag",
-                "primary_image_aspect_ratio": 0.7,
-            }
-        ]
-
-        changed = patch_emby_collection_folder_item_cover(folder, covers, prefer_real_item=True)
-
-        self.assertTrue(changed)
-        self.assertEqual(folder["PrimaryImageItemId"], "media-1")
-        self.assertEqual(folder["PrimaryImageTag"], "media-1-tag")
-        self.assertEqual(folder["ImageTags"]["Primary"], "media-1-tag")
-        self.assertEqual(folder["PrimaryImageAspectRatio"], 0.7)
-
-    def test_emby_request_prefers_real_folder_cover_detects_infuse(self):
-        self.assertTrue(emby_request_prefers_real_folder_cover({"User-Agent": "Infuse/8.0"}))
-        self.assertFalse(emby_request_prefers_real_folder_cover({"User-Agent": "VidHub/1.0"}))
-
     def test_iter_emby_items_accepts_virtual_folder_list(self):
         items = list(
             iter_emby_items(
@@ -506,8 +474,9 @@ class SubtitleProxyTest(unittest.TestCase):
 
         body = build_emby_folder_cover_grid(bodies, dimensions=(400, 225))
 
-        self.assertTrue(body.startswith(b"\x89PNG"))
+        self.assertTrue(body.startswith(b"\xff\xd8"))
         with Image.open(io.BytesIO(body)) as image:
+            self.assertEqual(image.format, "JPEG")
             self.assertEqual(image.size, (400, 225))
 
     def test_emby_folder_cover_grid_dimensions_use_client_limit(self):
@@ -518,7 +487,7 @@ class SubtitleProxyTest(unittest.TestCase):
     def test_emby_folder_cover_response_headers_match_emby_image_shape(self):
         headers = emby_folder_cover_response_headers("0123456789abcdef0123456789abcdef", now=0)
 
-        self.assertEqual(headers["Content-Type"], "image/png")
+        self.assertEqual(headers["Content-Type"], "image/jpeg")
         self.assertEqual(headers["Cache-Control"], "public, max-age=31536000")
         self.assertEqual(headers["ETag"], '"0123456789abcdef0123456789abcdef"')
         self.assertEqual(headers["Last-Modified"], "Thu, 01 Jan 1970 00:00:00 GMT")
