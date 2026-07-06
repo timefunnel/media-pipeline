@@ -1,5 +1,6 @@
-from tests.test_pipeline_core import *
 import threading
+
+from tests.test_pipeline_core import *
 from pipeline.subtitle_proxy import (
     emby_image_request_tag,
     emby_folder_cover_grid_tag,
@@ -362,6 +363,7 @@ class SubtitleProxyTest(unittest.TestCase):
             "CollectionType": "movies",
             "Locations": ["cloud://openlist/115%2FMovies"],
             "PrimaryImageItemId": "library-1",
+            "PrimaryImageTag": "old-direct-tag",
         }
         covers = [{"item_id": "media-1", "image_type": "Primary", "tag": "media-1-tag"}]
 
@@ -413,8 +415,7 @@ class SubtitleProxyTest(unittest.TestCase):
         handler.end_headers = lambda: sent_headers.append(("end", None))
 
         def patch_payload(payload, request_headers, request_path):
-            payload[0]["PrimaryImageItemId"] = "library-1"
-            payload[0]["PrimaryImageTag"] = "0123456789abcdef0123456789abcdef"
+            payload[0]["ImageTags"] = {"Primary": "0123456789abcdef0123456789abcdef"}
             return True
 
         handler._patch_emby_collection_folder_covers = patch_payload
@@ -439,7 +440,7 @@ class SubtitleProxyTest(unittest.TestCase):
         )
 
         patched = json.loads(written.getvalue().decode("utf-8"))
-        self.assertEqual(patched[0]["PrimaryImageTag"], "0123456789abcdef0123456789abcdef")
+        self.assertEqual(patched[0]["ImageTags"]["Primary"], "0123456789abcdef0123456789abcdef")
         self.assertIn(("Cache-Control", "no-store"), sent_headers)
 
     def test_select_emby_folder_cover_items_limits_to_four_unique_items(self):
@@ -464,7 +465,7 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertRegex(tag, r"^[0-9a-f]{32}$")
         self.assertNotEqual(tag, "8fe669ca35dc3e79fa26747829372c53")
 
-    def test_build_emby_folder_cover_grid_outputs_jpeg(self):
+    def test_build_emby_folder_cover_grid_outputs_png(self):
         from PIL import Image
 
         bodies = []
@@ -520,6 +521,7 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertEqual(handler._find_published_emby_folder_covers("library-1", "Primary", tag), covers)
         self.assertEqual(handler._find_published_emby_folder_covers("library-1", "Primary", "wrong-tag"), [])
+        self.assertEqual(handler._find_published_emby_folder_covers("library-1", "Primary", ""), [])
 
     def test_serve_emby_folder_image_uses_published_cache_without_auth(self):
         from PIL import Image

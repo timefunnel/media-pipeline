@@ -667,15 +667,10 @@ def emby_item_needs_folder_cover(item):
     image_tags = item.get("ImageTags")
     has_primary_image = isinstance(image_tags, dict) and bool(image_tags.get("Primary"))
     if emby_item_is_virtual_folder(item):
-        return bool(emby_collection_folder_id(item) and not (has_primary_image or item.get("PrimaryImageTag")))
+        return bool(emby_collection_folder_id(item) and not has_primary_image)
     if has_primary_image:
         return False
     return bool(emby_collection_folder_id(item))
-
-
-def select_emby_folder_cover_item(items, preferred_image_type="Primary"):
-    covers = select_emby_folder_cover_items(items, preferred_image_type=preferred_image_type, limit=1)
-    return covers[0] if covers else None
 
 
 def select_emby_folder_cover_items(items, preferred_image_type="Primary", limit=EMBY_FOLDER_COVER_GRID_LIMIT):
@@ -1180,6 +1175,8 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
     folder_cover_cache = {}
     folder_image_cache = {}
     folder_id_cache = {}
+    # Some Emby-compatible clients omit tokens on image requests after authenticated Views responses.
+    # Only serve tokenless folder covers when the exact folder/tag pair was just published by this proxy.
     published_folder_cover_cache = {}
     folder_cover_cache_lock = threading.Lock()
 

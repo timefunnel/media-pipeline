@@ -54,7 +54,6 @@ from pipeline.subtitle_proxy import (
     emby_folder_cover_grid_dimensions,
     patch_emby_collection_folder_item_cover,
     select_emby_folder_cover_items,
-    select_emby_folder_cover_item,
     emby_image_proxy_path,
     emby_request_user_id_from_auth,
     redact_sensitive_query_values,
