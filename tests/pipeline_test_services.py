@@ -2080,6 +2080,112 @@ class CliSubmitSearchTest(unittest.TestCase):
         self.assertEqual(metadata["timeout_count"], 1)
         self.assertEqual({source["source"] for source in metadata["sources"]}, {"FastIndexer", "SlowIndexer"})
 
+    def test_profile_search_early_returns_after_prioritized_sources_finish(self):
+        import time
+
+        from pipeline.bot import SEARCH_PROFILE_GENERAL, search_profile_indexer_results
+        from pipeline.search_stats import SearchStats
+
+        class DelayedProwlarr(FakeProwlarr):
+            def search(self, query, limit=20, indexer_ids=None, categories=None):
+                if tuple(indexer_ids or []) == (3,):
+                    time.sleep(0.2)
+                return super().search(query, limit=limit, indexer_ids=indexer_ids, categories=categories)
+
+        fake_prowlarr = DelayedProwlarr(
+            [],
+            indexers=[
+                {"id": 1, "name": "YTS", "enable": True, "priority": 5, "capabilities": {"categories": [{"id": 2000}]}},
+                {"id": 2, "name": "BT4G", "enable": True, "priority": 10, "capabilities": {"categories": [{"id": 2000}]}},
+                {"id": 3, "name": "SlowLowPriority", "enable": True, "priority": 25, "capabilities": {"categories": [{"id": 2000}]}},
+            ],
+            indexer_results={
+                (1,): [{"title": "Sintel YTS", "indexer": "YTS", "seeders": 2, "infoHash": "Y1"}],
+                (2,): [{"title": "Sintel BT4G", "indexer": "BT4G", "seeders": 2, "infoHash": "B1"}],
+                (3,): [{"title": "Sintel Slow", "indexer": "SlowLowPriority", "seeders": 2, "infoHash": "S1"}],
+            },
+        )
+        stats = SearchStats()
+
+        started = time.monotonic()
+        results = search_profile_indexer_results(
+            fake_prowlarr,
+            "sintel",
+            SEARCH_PROFILE_GENERAL,
+            100,
+            indexers=fake_prowlarr.indexers(),
+            timeout_seconds=0.5,
+            stats=stats,
+            max_workers=3,
+            early_return_after_seconds=0.01,
+            early_return_min_results=2,
+            early_return_required_priority=10,
+        )
+        elapsed = time.monotonic() - started
+        metadata = stats.to_metadata(raw_count=len(results), selected_count=len(results))
+
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual({item["infoHash"] for item in results}, {"Y1", "B1"})
+        self.assertEqual(metadata["success_count"], 2)
+        self.assertEqual(metadata["skipped_count"], 1)
+        self.assertEqual(next(source for source in metadata["sources"] if source["source"] == "SlowLowPriority")["status"], "skipped")
+
+    def test_profile_search_does_not_early_return_before_required_priority_source_finishes(self):
+        import time
+
+        from pipeline.bot import SEARCH_PROFILE_GENERAL, search_profile_indexer_results
+        from pipeline.search_stats import SearchStats
+
+        class DelayedProwlarr(FakeProwlarr):
+            def search(self, query, limit=20, indexer_ids=None, categories=None):
+                key = tuple(indexer_ids or [])
+                if key == (1,):
+                    time.sleep(0.05)
+                if key == (3,):
+                    time.sleep(0.2)
+                return super().search(query, limit=limit, indexer_ids=indexer_ids, categories=categories)
+
+        fake_prowlarr = DelayedProwlarr(
+            [],
+            indexers=[
+                {"id": 1, "name": "RequiredSlow", "enable": True, "priority": 5, "capabilities": {"categories": [{"id": 2000}]}},
+                {"id": 2, "name": "FastLowPriority", "enable": True, "priority": 25, "capabilities": {"categories": [{"id": 2000}]}},
+                {"id": 3, "name": "SlowLowPriority", "enable": True, "priority": 25, "capabilities": {"categories": [{"id": 2000}]}},
+            ],
+            indexer_results={
+                (1,): [{"title": "Sintel Required", "indexer": "RequiredSlow", "seeders": 2, "infoHash": "R1"}],
+                (2,): [
+                    {"title": "Sintel Fast 1", "indexer": "FastLowPriority", "seeders": 2, "infoHash": "F1"},
+                    {"title": "Sintel Fast 2", "indexer": "FastLowPriority", "seeders": 2, "infoHash": "F2"},
+                ],
+                (3,): [{"title": "Sintel Slow", "indexer": "SlowLowPriority", "seeders": 2, "infoHash": "S1"}],
+            },
+        )
+        stats = SearchStats()
+
+        started = time.monotonic()
+        results = search_profile_indexer_results(
+            fake_prowlarr,
+            "sintel",
+            SEARCH_PROFILE_GENERAL,
+            100,
+            indexers=fake_prowlarr.indexers(),
+            timeout_seconds=0.5,
+            stats=stats,
+            max_workers=3,
+            early_return_after_seconds=0.01,
+            early_return_min_results=2,
+            early_return_required_priority=10,
+        )
+        elapsed = time.monotonic() - started
+        metadata = stats.to_metadata(raw_count=len(results), selected_count=len(results))
+
+        self.assertGreaterEqual(elapsed, 0.04)
+        self.assertEqual({item["infoHash"] for item in results}, {"R1", "F1", "F2"})
+        self.assertEqual(metadata["success_count"], 2)
+        self.assertEqual(metadata["skipped_count"], 1)
+        self.assertEqual(next(source for source in metadata["sources"] if source["source"] == "SlowLowPriority")["status"], "skipped")
+
     def test_bot_search_uses_profile_specific_tuning_settings(self):
         from pipeline.bot import BotConfig, PipelineBotService, SEARCH_PROFILE_ADULT
         from pipeline.search_stats import search_result_metadata

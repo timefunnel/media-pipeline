@@ -2,7 +2,7 @@ import re
 import sys
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from pipeline.mediastation import extract_codes
 from pipeline.resource_selector import ResourceSelector
@@ -15,6 +15,9 @@ DEFAULT_PRIMARY_INDEXER_TIMEOUT_SECONDS = 12
 DEFAULT_OPTIONAL_INDEXER_TIMEOUT_SECONDS = 12
 DEFAULT_PROWLARR_MAX_WORKERS = 8
 DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS = 4
+DEFAULT_PROWLARR_EARLY_RETURN_AFTER_SECONDS = 1.0
+DEFAULT_PROWLARR_EARLY_RETURN_MIN_RESULTS = 50
+DEFAULT_PROWLARR_EARLY_RETURN_REQUIRED_PRIORITY = 10
 ANIME_QUERY_HINT_PATTERN = re.compile(
     r"(anime|bangumi|mikan|nyaa|acg|动漫|動畫|动画|番剧|番劇|新番|日漫|"
     r"鬼灭|鬼滅|葬送|芙莉莲|芙莉蓮|海贼|海賊|火影|柯南|进击|進擊|咒术|咒術|"
@@ -77,6 +80,9 @@ def search_profile_indexer_results(
     categories_by_profile=None,
     tag_labels_by_profile=None,
     max_workers=DEFAULT_PROWLARR_MAX_WORKERS,
+    early_return_after_seconds=DEFAULT_PROWLARR_EARLY_RETURN_AFTER_SECONDS,
+    early_return_min_results=DEFAULT_PROWLARR_EARLY_RETURN_MIN_RESULTS,
+    early_return_required_priority=DEFAULT_PROWLARR_EARLY_RETURN_REQUIRED_PRIORITY,
 ):
     if indexers is None:
         indexers = prowlarr.indexers()
@@ -105,6 +111,9 @@ def search_profile_indexer_results(
         timeout_seconds=timeout_seconds or DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS,
         stats=stats,
         max_workers=max_workers,
+        early_return_after_seconds=early_return_after_seconds,
+        early_return_min_results=early_return_min_results,
+        early_return_required_priority=early_return_required_priority,
     )
 
 
@@ -183,6 +192,9 @@ def search_indexers_concurrently(
     timeout_seconds=DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS,
     stats=None,
     max_workers=DEFAULT_PROWLARR_MAX_WORKERS,
+    early_return_after_seconds=DEFAULT_PROWLARR_EARLY_RETURN_AFTER_SECONDS,
+    early_return_min_results=DEFAULT_PROWLARR_EARLY_RETURN_MIN_RESULTS,
+    early_return_required_priority=DEFAULT_PROWLARR_EARLY_RETURN_REQUIRED_PRIORITY,
 ):
     results = []
     if not indexers:
@@ -193,33 +205,102 @@ def search_indexers_concurrently(
         executor.submit(prowlarr.search, query, limit, [indexer.get("id")], categories): indexer for indexer in indexers
     }
     future_started = {future: time.monotonic() for future in future_to_indexer}
-    done, pending = wait(future_to_indexer, timeout=timeout_seconds)
-    for future in done:
+    pending = set(future_to_indexer)
+    required_futures = required_priority_futures(future_to_indexer, early_return_required_priority)
+    started = time.monotonic()
+    deadline = started + max(0, float(timeout_seconds or 0))
+    early_after = float(early_return_after_seconds or 0)
+    early_deadline = started + early_after if early_after > 0 else None
+    early_returned = False
+
+    while pending:
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        if should_early_return_indexer_search(
+            now,
+            early_deadline,
+            results,
+            pending,
+            required_futures,
+            early_return_min_results,
+        ):
+            early_returned = True
+            break
+        wait_timeout = deadline - now
+        if early_deadline and now < early_deadline:
+            wait_timeout = min(wait_timeout, early_deadline - now)
+        done, pending = wait(pending, timeout=wait_timeout, return_when=FIRST_COMPLETED)
+        for future in done:
+            collect_indexer_future_result(future, future_to_indexer, future_started, results, stats)
+    for future in pending:
         indexer = future_to_indexer[future]
         source = indexer.get("name") or indexer.get("id")
         duration = time.monotonic() - future_started[future]
-        try:
-            found = future.result()
-            if stats is not None:
-                stats.record(source, result_count=len(found or []), duration_seconds=duration, phase="profile_indexer", indexer_id=indexer.get("id"))
-            results.extend(found)
-        except Exception as error:
-            if stats is not None:
-                stats.record(source, status="failed", duration_seconds=duration, error=error, phase="profile_indexer", indexer_id=indexer.get("id"))
-            print("profile indexer search failed: %s: %s" % (indexer.get("name") or indexer.get("id"), error), file=sys.stderr)
-    for future in pending:
-        indexer = future_to_indexer[future]
         if stats is not None:
-            stats.record_timeout(
-                indexer.get("name") or indexer.get("id"),
-                phase="profile_indexer",
-                indexer_id=indexer.get("id"),
-                duration_seconds=time.monotonic() - future_started[future],
-            )
-        print("profile indexer search timed out: %s" % (indexer.get("name") or indexer.get("id")), file=sys.stderr)
+            if early_returned:
+                stats.record(
+                    source,
+                    status="skipped",
+                    duration_seconds=duration,
+                    error="early return after enough prioritized results",
+                    phase="profile_indexer",
+                    indexer_id=indexer.get("id"),
+                )
+            else:
+                stats.record_timeout(source, phase="profile_indexer", indexer_id=indexer.get("id"), duration_seconds=duration)
+        if early_returned:
+            print("profile indexer search skipped after early return: %s" % source, file=sys.stderr)
+        else:
+            print("profile indexer search timed out: %s" % source, file=sys.stderr)
         future.cancel()
     executor.shutdown(wait=False, cancel_futures=True)
     return results
+
+
+def collect_indexer_future_result(future, future_to_indexer, future_started, results, stats=None):
+    indexer = future_to_indexer[future]
+    source = indexer.get("name") or indexer.get("id")
+    duration = time.monotonic() - future_started[future]
+    try:
+        found = future.result()
+        if stats is not None:
+            stats.record(source, result_count=len(found or []), duration_seconds=duration, phase="profile_indexer", indexer_id=indexer.get("id"))
+        results.extend(found)
+    except Exception as error:
+        if stats is not None:
+            stats.record(source, status="failed", duration_seconds=duration, error=error, phase="profile_indexer", indexer_id=indexer.get("id"))
+        print("profile indexer search failed: %s: %s" % (source, error), file=sys.stderr)
+
+
+def required_priority_futures(future_to_indexer, required_priority):
+    try:
+        threshold = int(required_priority)
+    except (TypeError, ValueError):
+        return set()
+    if threshold <= 0:
+        return set()
+    required = set()
+    for future, indexer in future_to_indexer.items():
+        try:
+            priority = int(indexer.get("priority"))
+        except (TypeError, ValueError):
+            continue
+        if priority <= threshold:
+            required.add(future)
+    return required
+
+
+def should_early_return_indexer_search(now, early_deadline, results, pending, required_futures, min_results):
+    if not early_deadline or now < early_deadline:
+        return False
+    try:
+        required_count = int(min_results)
+    except (TypeError, ValueError):
+        return False
+    if required_count <= 0 or len(results) < required_count:
+        return False
+    return not required_futures.intersection(pending)
 
 
 def search_primary_indexer_results(prowlarr, query, limit, indexers=None, stats=None):
@@ -509,5 +590,4 @@ def search_profile_max_workers_from_env(env):
         SEARCH_PROFILE_ADULT: parse_int(env.get("PROWLARR_PROFILE_ADULT_MAX_WORKERS"), default_workers),
         SEARCH_PROFILE_ANIME: parse_int(env.get("PROWLARR_PROFILE_ANIME_MAX_WORKERS"), default_workers),
     }
-
 

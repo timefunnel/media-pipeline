@@ -136,6 +136,9 @@ from pipeline.search import (
     DEFAULT_ANIME_INDEXER_SEARCH_LIMIT,
     DEFAULT_OPTIONAL_INDEXER_TIMEOUT_SECONDS,
     DEFAULT_PRIMARY_INDEXER_TIMEOUT_SECONDS,
+    DEFAULT_PROWLARR_EARLY_RETURN_AFTER_SECONDS,
+    DEFAULT_PROWLARR_EARLY_RETURN_MIN_RESULTS,
+    DEFAULT_PROWLARR_EARLY_RETURN_REQUIRED_PRIORITY,
     DEFAULT_PROWLARR_MAX_WORKERS,
     DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS,
     DEFAULT_REQUIRED_INDEXER_SEARCH_LIMIT,
@@ -334,6 +337,9 @@ class BotConfig:
     prowlarr_primary_indexer_timeout_seconds: int = DEFAULT_PRIMARY_INDEXER_TIMEOUT_SECONDS
     prowlarr_optional_indexer_timeout_seconds: int = DEFAULT_OPTIONAL_INDEXER_TIMEOUT_SECONDS
     prowlarr_max_workers: int = DEFAULT_PROWLARR_MAX_WORKERS
+    prowlarr_early_return_after_seconds: float = DEFAULT_PROWLARR_EARLY_RETURN_AFTER_SECONDS
+    prowlarr_early_return_min_results: int = DEFAULT_PROWLARR_EARLY_RETURN_MIN_RESULTS
+    prowlarr_early_return_required_priority: int = DEFAULT_PROWLARR_EARLY_RETURN_REQUIRED_PRIORITY
     search_profile_categories: dict = None
     search_profile_tag_labels: dict = None
     search_profile_upstream_limits: dict = None
@@ -418,6 +424,15 @@ class BotConfig:
                 env.get("PROWLARR_OPTIONAL_INDEXER_TIMEOUT_SECONDS", str(DEFAULT_OPTIONAL_INDEXER_TIMEOUT_SECONDS))
             ),
             prowlarr_max_workers=int(env.get("PROWLARR_MAX_WORKERS", str(DEFAULT_PROWLARR_MAX_WORKERS))),
+            prowlarr_early_return_after_seconds=float(
+                env.get("PROWLARR_EARLY_RETURN_AFTER_SECONDS", str(DEFAULT_PROWLARR_EARLY_RETURN_AFTER_SECONDS))
+            ),
+            prowlarr_early_return_min_results=int(
+                env.get("PROWLARR_EARLY_RETURN_MIN_RESULTS", str(DEFAULT_PROWLARR_EARLY_RETURN_MIN_RESULTS))
+            ),
+            prowlarr_early_return_required_priority=int(
+                env.get("PROWLARR_EARLY_RETURN_REQUIRED_PRIORITY", str(DEFAULT_PROWLARR_EARLY_RETURN_REQUIRED_PRIORITY))
+            ),
             search_profile_categories=search_profile_categories_from_env(env),
             search_profile_tag_labels=search_profile_tag_labels_from_env(env),
             search_profile_upstream_limits=search_profile_upstream_limits_from_env(env),
@@ -588,6 +603,20 @@ class CandidateStore:
             "candidate": json.loads(row[4]),
         }
 
+    def update_candidate(self, candidate_id, candidate):
+        payload = json.dumps(candidate, ensure_ascii=False, sort_keys=True)
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                "update candidates set candidate_json = ? where id = ?",
+                (payload, int(candidate_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        if cursor.rowcount != 1:
+            raise RuntimeError("candidate not found: %s" % candidate_id)
+
     def claim_candidate_submission(self, candidate_id):
         now = int(time.time())
         conn = self._connect()
@@ -670,6 +699,25 @@ class CandidateStore:
             "candidate_ids": json.loads(row[5]),
             "metadata": json.loads(row[6] or "{}"),
         }
+
+    def update_search_session(self, session_id, candidate_ids, metadata=None):
+        payload = json.dumps([int(candidate_id) for candidate_id in candidate_ids], sort_keys=True)
+        metadata_payload = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True)
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """
+                update search_sessions
+                set candidate_ids_json = ?, metadata_json = ?
+                where id = ?
+                """,
+                (payload, metadata_payload, int(session_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        if cursor.rowcount != 1:
+            raise RuntimeError("search session not found: %s" % session_id)
 
     def find_search_session_by_candidate(self, candidate_id):
         target = int(candidate_id)
@@ -1148,6 +1196,9 @@ class PipelineBotService:
             "max_workers": int(max_workers),
             "categories": list(categories_by_profile.get(profile, ())),
             "tag_labels": list(tag_labels_by_profile.get(profile, ())),
+            "early_return_after_seconds": float(self.config.prowlarr_early_return_after_seconds),
+            "early_return_min_results": int(self.config.prowlarr_early_return_min_results),
+            "early_return_required_priority": int(self.config.prowlarr_early_return_required_priority),
             "llm_rerank_enabled": bool(self.config.llm_search_rerank_enabled),
             "llm_rerank_limit": int(self.config.llm_search_rerank_limit),
         }
@@ -1163,6 +1214,9 @@ class PipelineBotService:
             categories_by_profile=categories_by_profile,
             tag_labels_by_profile=tag_labels_by_profile,
             max_workers=max_workers,
+            early_return_after_seconds=self.config.prowlarr_early_return_after_seconds,
+            early_return_min_results=self.config.prowlarr_early_return_min_results,
+            early_return_required_priority=self.config.prowlarr_early_return_required_priority,
         )
         try:
             ranked = ResourceSelector(indexer_priorities=indexer_priority_map(indexers)).select_ranked_limited(candidates, query=query, limit=limit)
@@ -1172,51 +1226,15 @@ class PipelineBotService:
                 stats.to_metadata(profile=profile, raw_count=len(candidates), selected_count=0, settings=search_settings),
             )
             raise
-        if self.config.llm_search_rerank_enabled:
-            started = time.monotonic()
-            try:
-                ranked = self._rerank_search_candidates_with_timeout(
-                    query,
-                    category,
-                    ranked,
-                )
-                stats.record(
-                    "LLM rerank",
-                    result_count=len(ranked),
-                    duration_seconds=time.monotonic() - started,
-                    phase="llm_rerank",
-                )
-            except FutureTimeoutError as error:
-                stats.record(
-                    "LLM rerank",
-                    status="timeout",
-                    duration_seconds=time.monotonic() - started,
-                    error=error,
-                    phase="llm_rerank",
-                )
-                print("llm rerank timed out after %ss" % self.config.llm_timeout_seconds, file=sys.stderr)
-            except LlmRerankBusy as error:
-                stats.record(
-                    "LLM rerank",
-                    status="skipped",
-                    duration_seconds=time.monotonic() - started,
-                    error=error,
-                    phase="llm_rerank",
-                )
-                print("llm rerank skipped: %s" % error, file=sys.stderr)
-            except Exception as error:
-                stats.record(
-                    "LLM rerank",
-                    status="failed",
-                    duration_seconds=time.monotonic() - started,
-                    error=error,
-                    phase="llm_rerank",
-                )
-                print("llm rerank failed: %s" % error, file=sys.stderr)
         return SearchResultList(
             ranked,
             metadata=stats.to_metadata(profile=profile, raw_count=len(candidates), selected_count=len(ranked), settings=search_settings),
         )
+
+    def rerank_search_candidates(self, query, category, candidates):
+        if not self.config.llm_search_rerank_enabled:
+            raise RuntimeError("LLM rerank disabled")
+        return self._rerank_search_candidates_with_timeout(query, category, candidates)
 
     def search_adult(self, query, limit=DEFAULT_SEARCH_LIMIT):
         return self.search(query, "adult", limit=limit, profile=SEARCH_PROFILE_ADULT)
@@ -2125,6 +2143,9 @@ class TelegramBot:
         if action == "anime_search":
             self._handle_anime_search_callback(user_id, chat_id, callback_id, value)
             return
+        if action == "llm_rerank":
+            self._handle_llm_rerank_callback(user_id, chat_id, message_id, callback_id, value)
+            return
         if action == "tasks_page":
             self._handle_task_page_callback(user_id, chat_id, message_id, callback_id, value)
             return
@@ -2203,6 +2224,146 @@ class TelegramBot:
             reply_markup=reply_markup,
             fallback_chat_id=session["chat_id"],
         )
+
+    def _handle_llm_rerank_callback(self, user_id, chat_id, message_id, callback_id, session_id):
+        try:
+            session = self.store.load_search_session(session_id)
+        except RuntimeError:
+            self.telegram.answer_callback_query(callback_id, "搜索结果不存在")
+            return
+        if session["user_id"] != user_id:
+            self.telegram.answer_callback_query(callback_id, "无权查看此搜索")
+            return
+        if not self.config.llm_search_rerank_enabled:
+            self.telegram.answer_callback_query(callback_id, "LLM优选未启用")
+            return
+
+        candidate_ids = [int(value) for value in session["candidate_ids"]]
+        if len(candidate_ids) <= 1:
+            self.telegram.answer_callback_query(callback_id, "候选太少，无需优选")
+            return
+
+        candidates = []
+        for candidate_id in candidate_ids:
+            record = self.store.load_candidate(candidate_id)
+            if record["user_id"] != user_id:
+                self.telegram.answer_callback_query(callback_id, "无权操作此候选")
+                return
+            candidate = dict(record["candidate"])
+            candidate["_candidate_id"] = int(candidate_id)
+            candidates.append(candidate)
+
+        self.telegram.answer_callback_query(callback_id, "正在 LLM 优选")
+        started = time.monotonic()
+        try:
+            with self._typing_action(session["chat_id"]):
+                reranked = self.service.rerank_search_candidates(session["query"], session["category"], candidates)
+            new_candidate_ids = self._store_llm_reranked_candidates(candidate_ids, reranked)
+            metadata = self._search_metadata_with_llm_rerank(
+                session.get("metadata"),
+                "success",
+                time.monotonic() - started,
+                result_count=len(new_candidate_ids),
+            )
+            self.store.update_search_session(session_id, new_candidate_ids, metadata=metadata)
+            text, reply_markup = self._render_search_page(session_id, page=0)
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                text,
+                reply_markup=reply_markup,
+                fallback_chat_id=session["chat_id"],
+            )
+        except FutureTimeoutError as error:
+            metadata = self._search_metadata_with_llm_rerank(
+                session.get("metadata"),
+                "timeout",
+                time.monotonic() - started,
+                error=error,
+            )
+            self.store.update_search_session(session_id, candidate_ids, metadata=metadata)
+            text, reply_markup = self._render_search_page(session_id, page=0)
+            self._update_callback_message(chat_id, message_id, text, reply_markup=reply_markup, fallback_chat_id=session["chat_id"])
+        except LlmRerankBusy as error:
+            print("llm rerank skipped: %s" % error, file=sys.stderr)
+            metadata = self._search_metadata_with_llm_rerank(
+                session.get("metadata"),
+                "skipped",
+                time.monotonic() - started,
+                error=error,
+            )
+            self.store.update_search_session(session_id, candidate_ids, metadata=metadata)
+            text, reply_markup = self._render_search_page(session_id, page=0)
+            self._update_callback_message(chat_id, message_id, text, reply_markup=reply_markup, fallback_chat_id=session["chat_id"])
+        except Exception as error:
+            metadata = self._search_metadata_with_llm_rerank(
+                session.get("metadata"),
+                "failed",
+                time.monotonic() - started,
+                error=error,
+            )
+            self.store.update_search_session(session_id, candidate_ids, metadata=metadata)
+            text, reply_markup = self._render_search_page(session_id, page=0)
+            self._update_callback_message(chat_id, message_id, text, reply_markup=reply_markup, fallback_chat_id=session["chat_id"])
+
+    def _store_llm_reranked_candidates(self, original_candidate_ids, reranked):
+        expected_ids = {int(candidate_id) for candidate_id in original_candidate_ids}
+        new_candidate_ids = []
+        seen = set()
+        for index, candidate in enumerate(reranked or [], start=1):
+            candidate_id = int(candidate.get("_candidate_id") or 0)
+            if candidate_id not in expected_ids:
+                raise RuntimeError("LLM rerank returned unknown candidate id: %s" % candidate_id)
+            if candidate_id in seen:
+                raise RuntimeError("LLM rerank returned duplicate candidate id: %s" % candidate_id)
+            updated = dict(candidate)
+            updated.pop("_candidate_id", None)
+            updated["rank"] = index
+            self.store.update_candidate(candidate_id, updated)
+            new_candidate_ids.append(candidate_id)
+            seen.add(candidate_id)
+        if seen != expected_ids:
+            missing = sorted(expected_ids - seen)
+            raise RuntimeError("LLM rerank missed candidate ids: %s" % missing)
+        return new_candidate_ids
+
+    def _search_metadata_with_llm_rerank(self, metadata, status, duration_seconds, result_count=0, error=None):
+        updated = dict(metadata or {})
+        existing_sources = list(updated.get("sources") or [])
+        previous_llm_duration_ms = sum(
+            int(source.get("duration_ms") or 0)
+            for source in existing_sources
+            if source.get("phase") == "llm_rerank" or source.get("source") == "LLM rerank"
+        )
+        sources = [
+            source
+            for source in existing_sources
+            if source.get("phase") != "llm_rerank" and source.get("source") != "LLM rerank"
+        ]
+        duration_ms = int(round(float(duration_seconds or 0) * 1000))
+        entry = {
+            "source": "LLM rerank",
+            "status": str(status or "success"),
+            "result_count": int(result_count or 0),
+            "duration_ms": duration_ms,
+            "phase": "llm_rerank",
+        }
+        if error:
+            entry["error"] = str(error)
+        sources.append(entry)
+        updated["sources"] = sources
+        updated["source_count"] = len(sources)
+        updated["success_count"] = sum(1 for source in sources if source.get("status") == "success")
+        updated["failed_count"] = sum(1 for source in sources if source.get("status") == "failed")
+        updated["timeout_count"] = sum(1 for source in sources if source.get("status") == "timeout")
+        updated["skipped_count"] = sum(1 for source in sources if source.get("status") == "skipped")
+        updated["selected_count"] = int(updated.get("selected_count") or result_count or 0)
+        updated["total_ms"] = max(0, int(updated.get("total_ms") or 0) - previous_llm_duration_ms) + duration_ms
+        settings = dict(updated.get("settings") or {})
+        settings["llm_rerank_enabled"] = bool(self.config.llm_search_rerank_enabled)
+        settings["llm_rerank_manual"] = True
+        updated["settings"] = settings
+        return updated
 
     def _handle_close_search_callback(self, user_id, chat_id, message_id, callback_id, session_id):
         try:
@@ -2884,6 +3045,7 @@ class TelegramBot:
             and not is_anime_session
             and not is_strong_adult_code_query(session["query"])
             and not should_search_anime(DEFAULT_SEARCH_CATEGORY, session["query"]),
+            allow_llm_rerank=self.config.llm_search_rerank_enabled and bool(candidate_ids),
         )
 
     def _save_tasks_from_submit(self, record, candidate, result, category, telegram_status_message_id=None, content_profile=None):
@@ -3911,6 +4073,8 @@ def parse_callback_data(value):
         return "adult_search", int(payload)
     if action == "anime_search":
         return "anime_search", int(payload)
+    if action == "llm_rerank":
+        return "llm_rerank", int(payload)
     if action == "profile":
         profile, profile_sep, candidate_id = payload.partition(":")
         if profile_sep:

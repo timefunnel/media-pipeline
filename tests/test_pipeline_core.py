@@ -497,10 +497,14 @@ class FakeBotService:
         migration_candidates=None,
         migration_response=None,
         msg_diag_response=None,
+        rerank_results=None,
+        rerank_error=None,
     ):
         self.search_results = search_results or []
         self.adult_search_results = adult_search_results or []
         self.anime_search_results = anime_search_results or []
+        self.rerank_results = rerank_results
+        self.rerank_error = rerank_error
         self.submit_response = submit_response or {"state": True, "tasks": []}
         self.search_error = search_error
         self.status_response = status_response or {"info_hash": "ABC", "status_name": "success", "percent_done": 100}
@@ -514,6 +518,7 @@ class FakeBotService:
         self.search_calls = []
         self.adult_search_calls = []
         self.anime_search_calls = []
+        self.rerank_calls = []
         self.submit_calls = []
         self.status_calls = []
         self.statuses_calls = []
@@ -555,6 +560,14 @@ class FakeBotService:
         if self.search_error:
             raise self.search_error
         return self.anime_search_results
+
+    def rerank_search_candidates(self, query, category, candidates):
+        self.rerank_calls.append((query, category, [item.get("title") for item in candidates]))
+        if self.rerank_error:
+            raise self.rerank_error
+        if self.rerank_results is not None:
+            return self.rerank_results
+        return list(candidates)
 
     def submit(self, category, download_uri):
         self.submit_calls.append((category, download_uri))

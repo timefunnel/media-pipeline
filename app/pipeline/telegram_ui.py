@@ -380,7 +380,15 @@ def submit_reply_markup(result):
         return task_reply_markup(task_status)
     return None
 
-def search_page_reply_markup(session_id, candidates, page, page_count, allow_adult_retry=False, allow_anime_retry=False):
+def search_page_reply_markup(
+    session_id,
+    candidates,
+    page,
+    page_count,
+    allow_adult_retry=False,
+    allow_anime_retry=False,
+    allow_llm_rerank=False,
+):
     rows = []
     for candidate_id, candidate in candidates:
         rows.append([{"text": "#%s 入库" % candidate.get("rank"), "callback_data": "choose:%s" % candidate_id}])
@@ -401,6 +409,8 @@ def search_page_reply_markup(session_id, candidates, page, page_count, allow_adu
         retry.append({"text": "动漫", "callback_data": "anime_search:%s" % session_id})
     if retry:
         rows.append(retry)
+    if allow_llm_rerank:
+        rows.append([{"text": "LLM优选", "callback_data": "llm_rerank:%s" % session_id}])
     rows.append([{"text": "关闭", "callback_data": "close_search:%s" % session_id}])
     return {"inline_keyboard": rows}
 

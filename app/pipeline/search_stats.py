@@ -59,6 +59,7 @@ class SearchStats:
         success_count = sum(1 for source in self.sources if source.get("status") == "success")
         failed_count = sum(1 for source in self.sources if source.get("status") == "failed")
         timeout_count = sum(1 for source in self.sources if source.get("status") == "timeout")
+        skipped_count = sum(1 for source in self.sources if source.get("status") == "skipped")
         result_count = sum(int(source.get("result_count") or 0) for source in self.sources)
         metadata = {
             "profile": profile or "",
@@ -67,6 +68,7 @@ class SearchStats:
             "success_count": success_count,
             "failed_count": failed_count,
             "timeout_count": timeout_count,
+            "skipped_count": skipped_count,
             "raw_count": int(raw_count or result_count),
             "selected_count": int(selected_count or 0),
             "sources": list(self.sources),
@@ -102,6 +104,7 @@ def format_search_stats(metadata):
     selected_count = int(metadata.get("selected_count") or 0)
     failed_count = int(metadata.get("failed_count") or 0)
     timeout_count = int(metadata.get("timeout_count") or 0)
+    skipped_count = int(metadata.get("skipped_count") or 0)
     parts = ["来源%s个" % source_count, "耗时%.1fs" % (total_ms / 1000.0), "返回%s条" % raw_count]
     if selected_count:
         parts.append("展示%s条" % selected_count)
@@ -109,6 +112,8 @@ def format_search_stats(metadata):
         parts.append("失败%s个" % failed_count)
     if timeout_count:
         parts.append("超时%s个" % timeout_count)
+    if skipped_count:
+        parts.append("跳过慢源%s个" % skipped_count)
     llm_part = format_llm_rerank_stats(metadata)
     if llm_part:
         parts.append(llm_part)

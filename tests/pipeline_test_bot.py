@@ -134,6 +134,9 @@ class BotConfigTest(unittest.TestCase):
                 "BOT_TASK_LIST_FETCH_LIMIT": "77",
                 "PROWLARR_UPSTREAM_SEARCH_LIMIT": "150",
                 "PROWLARR_MAX_WORKERS": "3",
+                "PROWLARR_EARLY_RETURN_AFTER_SECONDS": "1.5",
+                "PROWLARR_EARLY_RETURN_MIN_RESULTS": "55",
+                "PROWLARR_EARLY_RETURN_REQUIRED_PRIORITY": "10",
                 "PROWLARR_PROFILE_GENERAL_UPSTREAM_LIMIT": "120",
                 "PROWLARR_PROFILE_ADULT_UPSTREAM_LIMIT": "200",
                 "PROWLARR_PROFILE_ANIME_UPSTREAM_LIMIT": "80",
@@ -157,6 +160,9 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.task_list_fetch_limit, 77)
         self.assertEqual(config.prowlarr_upstream_search_limit, 150)
         self.assertEqual(config.prowlarr_max_workers, 3)
+        self.assertEqual(config.prowlarr_early_return_after_seconds, 1.5)
+        self.assertEqual(config.prowlarr_early_return_min_results, 55)
+        self.assertEqual(config.prowlarr_early_return_required_priority, 10)
         self.assertEqual(config.search_profile_upstream_limits["general"], 120)
         self.assertEqual(config.search_profile_upstream_limits["adult"], 200)
         self.assertEqual(config.search_profile_upstream_limits["anime"], 80)
@@ -791,6 +797,114 @@ class TelegramBotTest(unittest.TestCase):
             self.assertIn("第 1/1 页，共 2 条", sent["text"])
             self.assertEqual(sent["reply_markup"]["inline_keyboard"][0][0]["text"], "#1 入库")
             self.assertRegex(sent["reply_markup"]["inline_keyboard"][0][0]["callback_data"], r"^choose:\d+$")
+
+    def test_message_search_shows_manual_llm_rerank_button_when_enabled(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                search_results=[
+                    {"title": "Sintel 720p", "download_uri": "magnet:?xt=urn:btih:AAA", "rank": 1},
+                    {"title": "Sintel 1080p", "download_uri": "magnet:?xt=urn:btih:BBB", "rank": 2},
+                ]
+            )
+            config = BotConfig("token", {700656624}, store.db_path, llm_search_rerank_enabled=True, llm_api_key="llm-key")
+            bot = TelegramBot(config, telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "sintel"}})
+
+        buttons = telegram.messages[0]["reply_markup"]["inline_keyboard"]
+        self.assertEqual(service.rerank_calls, [])
+        self.assertTrue(any(row[0]["text"] == "LLM优选" and row[0]["callback_data"].startswith("llm_rerank:") for row in buttons))
+
+    def test_llm_rerank_callback_updates_same_search_message(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                search_results=[
+                    {"title": "Sintel 720p", "download_uri": "magnet:?xt=urn:btih:AAA", "rank": 1},
+                    {"title": "Sintel 1080p", "download_uri": "magnet:?xt=urn:btih:BBB", "rank": 2},
+                ],
+            )
+            config = BotConfig("token", {700656624}, store.db_path, llm_search_rerank_enabled=True, llm_api_key="llm-key")
+            bot = TelegramBot(config, telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "sintel"}})
+            first_session = store.find_search_session_by_candidate(1)
+            service.rerank_results = [
+                {
+                    "_candidate_id": 2,
+                    "title": "Sintel 1080p",
+                    "download_uri": "magnet:?xt=urn:btih:BBB",
+                    "rank": 1,
+                },
+                {
+                    "_candidate_id": 1,
+                    "title": "Sintel 720p",
+                    "download_uri": "magnet:?xt=urn:btih:AAA",
+                    "rank": 2,
+                },
+            ]
+
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-llm",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 1001},
+                        "data": "llm_rerank:%s" % first_session["id"],
+                    }
+                }
+            )
+
+            session = store.load_search_session(first_session["id"])
+            candidate_2_rank = store.load_candidate(2)["candidate"]["rank"]
+            candidate_1_rank = store.load_candidate(1)["candidate"]["rank"]
+
+        self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-llm", "text": "正在 LLM 优选"})
+        self.assertEqual(service.rerank_calls, [("sintel", "movie", ["Sintel 720p", "Sintel 1080p"])])
+        self.assertEqual(session["candidate_ids"], [2, 1])
+        self.assertEqual(candidate_2_rank, 1)
+        self.assertEqual(candidate_1_rank, 2)
+        self.assertEqual(len(telegram.edits), 1)
+        self.assertEqual(telegram.edits[0]["chat_id"], 9001)
+        self.assertEqual(telegram.edits[0]["message_id"], 1001)
+        self.assertIn("1. Sintel 1080p", telegram.edits[0]["text"])
+        self.assertIn("LLM重排成功", telegram.edits[0]["text"])
+
+    def test_llm_rerank_metadata_replaces_previous_llm_timing(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            bot = TelegramBot(
+                BotConfig("token", {700656624}, store.db_path, llm_search_rerank_enabled=True, llm_api_key="llm-key"),
+                FakeTelegram(),
+                store,
+                FakeBotService(),
+            )
+
+            metadata = bot._search_metadata_with_llm_rerank(
+                {
+                    "total_ms": 1500,
+                    "sources": [
+                        {"source": "Indexer", "status": "success", "result_count": 10, "duration_ms": 1000},
+                        {"source": "LLM rerank", "status": "timeout", "duration_ms": 500, "phase": "llm_rerank"},
+                    ],
+                },
+                "success",
+                0.2,
+                result_count=5,
+            )
+
+        self.assertEqual(metadata["total_ms"], 1200)
+        self.assertEqual([source["source"] for source in metadata["sources"]], ["Indexer", "LLM rerank"])
+        self.assertEqual(metadata["sources"][-1]["status"], "success")
 
     def test_message_search_shows_source_timing_summary(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -2903,7 +3017,7 @@ class LlmSearchRerankClientTest(unittest.TestCase):
 
 
 class PipelineBotServiceTest(unittest.TestCase):
-    def test_search_uses_llm_rerank_when_enabled(self):
+    def test_search_does_not_run_llm_rerank_automatically(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
         class FakeProwlarrConfig:
@@ -2919,6 +3033,39 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"title": "Sintel 1080p", "seeders": 20, "infoHash": "HIGH"},
             ]
         )
+
+        class FakeReranker:
+            calls = []
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def rerank_search_candidates(self, query, category, candidates, max_candidates=None):
+                self.calls.append((query, category, [item["title"] for item in candidates], max_candidates))
+                return list(reversed(candidates))
+
+        config = BotConfig(
+            "token",
+            {700656624},
+            "/tmp/state.db",
+            llm_search_rerank_enabled=True,
+            llm_api_key="llm-key",
+            llm_search_rerank_limit=25,
+            llm_timeout_seconds=3,
+        )
+
+        with patch("pipeline.bot.ProwlarrConfig", FakeProwlarrConfig), patch(
+            "pipeline.bot.ProwlarrClient", return_value=fake_prowlarr
+        ), patch("pipeline.bot.SearchRerankClient", FakeReranker):
+            results = PipelineBotService(config).search("sintel", "movie", limit=10)
+
+        self.assertEqual([item["title"] for item in results], ["Sintel 1080p", "Sintel 720p"])
+        self.assertEqual(FakeReranker.calls, [])
+        self.assertFalse(any(source.get("phase") == "llm_rerank" for source in results.metadata["sources"]))
+        self.assertTrue(results.metadata["settings"]["llm_rerank_enabled"])
+
+    def test_rerank_search_candidates_uses_llm_when_enabled(self):
+        from pipeline.bot import BotConfig, PipelineBotService
 
         class FakeReranker:
             calls = []
@@ -2943,36 +3090,25 @@ class PipelineBotServiceTest(unittest.TestCase):
             llm_timeout_seconds=3,
         )
 
-        with patch("pipeline.bot.ProwlarrConfig", FakeProwlarrConfig), patch(
-            "pipeline.bot.ProwlarrClient", return_value=fake_prowlarr
-        ), patch("pipeline.bot.SearchRerankClient", FakeReranker):
-            results = PipelineBotService(config).search("sintel", "movie", limit=10)
+        with patch("pipeline.bot.SearchRerankClient", FakeReranker):
+            results = PipelineBotService(config).rerank_search_candidates(
+                "sintel",
+                "movie",
+                [
+                    {"title": "Sintel 720p", "rank": 1},
+                    {"title": "Sintel 1080p", "rank": 2},
+                ],
+            )
 
-        self.assertEqual([item["title"] for item in results], ["Sintel 720p", "Sintel 1080p"])
+        self.assertEqual([item["title"] for item in results], ["Sintel 1080p", "Sintel 720p"])
         self.assertEqual([item["rank"] for item in results], [1, 2])
         self.assertEqual(FakeReranker.calls[0][0], "sintel")
         self.assertEqual(FakeReranker.calls[0][1], "movie")
         self.assertEqual(FakeReranker.calls[0][3], 25)
         self.assertEqual(FakeReranker.calls[0][4]["api_key"], "llm-key")
-        self.assertEqual(results.metadata["sources"][-1]["source"], "LLM rerank")
-        self.assertEqual(results.metadata["sources"][-1]["status"], "success")
 
-    def test_search_keeps_original_ranking_when_llm_rerank_fails(self):
+    def test_rerank_search_candidates_raises_llm_error(self):
         from pipeline.bot import BotConfig, PipelineBotService
-
-        class FakeProwlarrConfig:
-            def __init__(self, config_path):
-                self.config_path = config_path
-
-            def load_api_key(self):
-                return "prowlarr-key-value"
-
-        fake_prowlarr = FakeProwlarr(
-            [
-                {"title": "Sintel 720p", "seeders": 90, "infoHash": "LOW"},
-                {"title": "Sintel 1080p", "seeders": 20, "infoHash": "HIGH"},
-            ]
-        )
 
         class FailingReranker:
             def __init__(self, **kwargs):
@@ -2989,35 +3125,18 @@ class PipelineBotServiceTest(unittest.TestCase):
             llm_api_key="llm-key",
         )
 
-        with patch("pipeline.bot.ProwlarrConfig", FakeProwlarrConfig), patch(
-            "pipeline.bot.ProwlarrClient", return_value=fake_prowlarr
-        ), patch("pipeline.bot.SearchRerankClient", FailingReranker):
-            results = PipelineBotService(config).search("sintel", "movie", limit=10)
+        with patch("pipeline.bot.SearchRerankClient", FailingReranker):
+            with self.assertRaisesRegex(RuntimeError, "invalid llm response"):
+                PipelineBotService(config).rerank_search_candidates(
+                    "sintel",
+                    "movie",
+                    [{"title": "Sintel 720p", "rank": 1}, {"title": "Sintel 1080p", "rank": 2}],
+                )
 
-        self.assertEqual([item["title"] for item in results], ["Sintel 1080p", "Sintel 720p"])
-        self.assertEqual(results.metadata["sources"][-1]["source"], "LLM rerank")
-        self.assertEqual(results.metadata["sources"][-1]["status"], "failed")
-        self.assertIn("invalid llm response", results.metadata["sources"][-1]["error"])
-
-    def test_search_keeps_original_ranking_when_llm_rerank_times_out(self):
+    def test_rerank_search_candidates_times_out(self):
         from concurrent.futures import TimeoutError as FutureTimeoutError
 
         from pipeline.bot import BotConfig, PipelineBotService
-        from pipeline.search_stats import format_search_stats
-
-        class FakeProwlarrConfig:
-            def __init__(self, config_path):
-                self.config_path = config_path
-
-            def load_api_key(self):
-                return "prowlarr-key-value"
-
-        fake_prowlarr = FakeProwlarr(
-            [
-                {"title": "Sintel 720p", "seeders": 90, "infoHash": "LOW"},
-                {"title": "Sintel 1080p", "seeders": 20, "infoHash": "HIGH"},
-            ]
-        )
 
         class FakeReranker:
             def __init__(self, **kwargs):
@@ -3069,38 +3188,22 @@ class PipelineBotServiceTest(unittest.TestCase):
             llm_timeout_seconds=2,
         )
 
-        with patch("pipeline.bot.ProwlarrConfig", FakeProwlarrConfig), patch(
-            "pipeline.bot.ProwlarrClient", return_value=fake_prowlarr
-        ), patch("pipeline.bot.SearchRerankClient", FakeReranker), patch(
+        with patch("pipeline.bot.SearchRerankClient", FakeReranker), patch(
             "pipeline.bot.ThreadPoolExecutor", TimeoutExecutor
         ):
-            results = PipelineBotService(config).search("sintel", "movie", limit=10)
+            with self.assertRaises(FutureTimeoutError):
+                PipelineBotService(config).rerank_search_candidates(
+                    "sintel",
+                    "movie",
+                    [{"title": "Sintel 720p", "rank": 1}, {"title": "Sintel 1080p", "rank": 2}],
+                )
 
-        self.assertEqual([item["title"] for item in results], ["Sintel 1080p", "Sintel 720p"])
         self.assertEqual(TimeoutExecutor.instances[0].future.timeouts, [2.0])
         self.assertTrue(TimeoutExecutor.instances[0].future.cancel_called)
         self.assertIsNone(TimeoutExecutor.instances[0].shutdown_args)
-        self.assertEqual(results.metadata["sources"][-1]["source"], "LLM rerank")
-        self.assertEqual(results.metadata["sources"][-1]["status"], "timeout")
-        self.assertIn("LLM重排超时", format_search_stats(results.metadata))
 
-    def test_search_skips_llm_rerank_when_previous_rerank_is_still_running(self):
-        from pipeline.bot import BotConfig, PipelineBotService
-        from pipeline.search_stats import format_search_stats
-
-        class FakeProwlarrConfig:
-            def __init__(self, config_path):
-                self.config_path = config_path
-
-            def load_api_key(self):
-                return "prowlarr-key-value"
-
-        fake_prowlarr = FakeProwlarr(
-            [
-                {"title": "Sintel 720p", "seeders": 90, "infoHash": "LOW"},
-                {"title": "Sintel 1080p", "seeders": 20, "infoHash": "HIGH"},
-            ]
-        )
+    def test_rerank_search_candidates_rejects_parallel_run(self):
+        from pipeline.bot import BotConfig, LlmRerankBusy, PipelineBotService
 
         class GuardedExecutor:
             instances = []
@@ -3124,21 +3227,20 @@ class PipelineBotServiceTest(unittest.TestCase):
             llm_timeout_seconds=2,
         )
 
-        with patch("pipeline.bot.ProwlarrConfig", FakeProwlarrConfig), patch(
-            "pipeline.bot.ProwlarrClient", return_value=fake_prowlarr
-        ), patch("pipeline.bot.ThreadPoolExecutor", GuardedExecutor):
+        with patch("pipeline.bot.ThreadPoolExecutor", GuardedExecutor):
             service = PipelineBotService(config)
             service._llm_rerank_lock.acquire()
             try:
-                results = service.search("sintel", "movie", limit=10)
+                with self.assertRaisesRegex(LlmRerankBusy, "previous LLM rerank"):
+                    service.rerank_search_candidates(
+                        "sintel",
+                        "movie",
+                        [{"title": "Sintel 720p", "rank": 1}, {"title": "Sintel 1080p", "rank": 2}],
+                    )
             finally:
                 service._llm_rerank_lock.release()
 
-        self.assertEqual([item["title"] for item in results], ["Sintel 1080p", "Sintel 720p"])
         self.assertFalse(GuardedExecutor.instances[0].submit_called)
-        self.assertEqual(results.metadata["sources"][-1]["source"], "LLM rerank")
-        self.assertEqual(results.metadata["sources"][-1]["status"], "skipped")
-        self.assertIn("LLM重排跳过", format_search_stats(results.metadata))
 
     def test_submit_resolves_prowlarr_download_uri_before_115_offline(self):
         from pipeline.bot import BotConfig, PipelineBotService
