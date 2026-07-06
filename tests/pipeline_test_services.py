@@ -1,5 +1,7 @@
 from tests.test_pipeline_core import *
+import threading
 from pipeline.subtitle_proxy import (
+    emby_image_request_tag,
     emby_folder_cover_grid_tag,
     is_emby_placeholder_image_body,
 )
@@ -503,6 +505,49 @@ class SubtitleProxyTest(unittest.TestCase):
         )
 
         self.assertEqual(path, "/emby/Items/media-1/Images/Primary?maxWidth=400&api_key=secret&tag=new-tag")
+
+    def test_emby_image_request_tag_reads_tag_case_insensitively(self):
+        self.assertEqual(emby_image_request_tag("maxWidth=400&Tag=folder-tag"), "folder-tag")
+
+    def test_published_folder_cover_cache_requires_matching_tag(self):
+        handler = object.__new__(SubtitleProxyHandler)
+        handler.published_folder_cover_cache = {}
+        handler.folder_cover_cache_lock = threading.Lock()
+        covers = [{"item_id": "media-1", "image_type": "Primary", "tag": "media-1-tag"}]
+        tag = emby_folder_cover_grid_tag("library-1", covers)
+
+        handler._remember_published_emby_folder_covers("library-1", "Primary", covers)
+
+        self.assertEqual(handler._find_published_emby_folder_covers("library-1", "Primary", tag), covers)
+        self.assertEqual(handler._find_published_emby_folder_covers("library-1", "Primary", "wrong-tag"), [])
+
+    def test_serve_emby_folder_image_uses_published_cache_without_auth(self):
+        from PIL import Image
+
+        cover = io.BytesIO()
+        Image.new("RGB", (24, 36), "red").save(cover, format="PNG")
+        covers = [{"item_id": "media-1", "image_type": "Primary", "tag": "media-1-tag"}]
+        tag = emby_folder_cover_grid_tag("library-1", covers)
+        handler = object.__new__(SubtitleProxyHandler)
+        handler.published_folder_cover_cache = {}
+        handler.folder_image_cache = {}
+        handler.folder_cover_cache_lock = threading.Lock()
+        handler._remember_published_emby_folder_covers("library-1", "Primary", covers)
+        handler.path = "/emby/Items/library-1/Images/Primary?tag=%s&maxWidth=400" % tag
+        written = io.BytesIO()
+        sent_headers = []
+        handler.wfile = written
+        handler.send_response = lambda status: sent_headers.append(("status", status))
+        handler.send_header = lambda key, value: sent_headers.append((key, value))
+        handler.end_headers = lambda: sent_headers.append(("end", None))
+        handler._read_upstream = lambda path, headers: (200, {"Content-Type": "image/png"}, cover.getvalue())
+
+        handled = handler._serve_emby_folder_image({})
+
+        self.assertTrue(handled)
+        self.assertIn(("status", 200), sent_headers)
+        self.assertIn(("Content-Type", "image/png"), sent_headers)
+        self.assertTrue(written.getvalue().startswith(b"\x89PNG"))
 
 
 class CategoryConfigTest(unittest.TestCase):

@@ -823,6 +823,13 @@ def emby_image_proxy_path(cover, original_query=""):
     )
 
 
+def emby_image_request_tag(query=""):
+    for key, value in urllib.parse.parse_qsl(query or "", keep_blank_values=True):
+        if key.lower() == "tag":
+            return str(value or "")
+    return ""
+
+
 def emby_folder_cover_grid_dimensions(query=""):
     max_width = 0
     max_height = 0
@@ -1173,6 +1180,7 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
     folder_cover_cache = {}
     folder_image_cache = {}
     folder_id_cache = {}
+    published_folder_cover_cache = {}
     folder_cover_cache_lock = threading.Lock()
 
     def do_GET(self):
@@ -1224,17 +1232,26 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         if not image_request:
             return False
         user_id = emby_request_user_id_from_auth(self.path, request_headers)
-        if not user_id:
-            return False
-        if not self._is_emby_collection_folder_id(user_id, image_request["item_id"], request_headers, self.path):
-            return False
-        covers = self._find_emby_folder_covers(
-            user_id,
-            image_request["item_id"],
-            request_headers,
-            self.path,
-            preferred_image_type=image_request["image_type"],
-        )
+        if user_id:
+            if not self._is_emby_collection_folder_id(user_id, image_request["item_id"], request_headers, self.path):
+                return False
+            covers = self._find_emby_folder_covers(
+                user_id,
+                image_request["item_id"],
+                request_headers,
+                self.path,
+                preferred_image_type=image_request["image_type"],
+            )
+            cache_user_id = user_id
+        else:
+            covers = self._find_published_emby_folder_covers(
+                image_request["item_id"],
+                image_request["image_type"],
+                emby_image_request_tag(image_request["query"]),
+            )
+            cache_user_id = "published"
+            if not covers:
+                return False
         if not covers:
             status, headers, body = self._read_upstream(self.path, request_headers)
             if status >= 200 and status < 300 and is_emby_placeholder_image_body(body):
@@ -1248,7 +1265,7 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                 return True
             return False
         body = self._build_emby_folder_cover_image(
-            user_id,
+            cache_user_id,
             image_request["item_id"],
             covers,
             request_headers,
@@ -1403,8 +1420,41 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             self._remember_emby_collection_folder_id(user_id, folder_id)
             covers = self._find_emby_folder_covers(user_id, folder_id, request_headers, request_path or "")
             if patch_emby_collection_folder_item_cover(item, covers):
+                self._remember_published_emby_folder_covers(folder_id, "Primary", covers)
                 changed = True
         return changed
+
+    def _remember_published_emby_folder_covers(self, folder_id, preferred_image_type, covers):
+        folder_id = str(folder_id or "").strip()
+        covers = [cover for cover in (covers or []) if isinstance(cover, dict)]
+        if not folder_id or not covers:
+            return
+        preferred_image_type = image_type_value(preferred_image_type)
+        tag = emby_folder_cover_grid_tag(folder_id, covers)
+        now = time.time()
+        with self.folder_cover_cache_lock:
+            self.published_folder_cover_cache[(folder_id, preferred_image_type)] = {
+                "covers": covers,
+                "tag": tag,
+                "expires_at": now + EMBY_FOLDER_COVER_CACHE_TTL_SECONDS,
+            }
+
+    def _find_published_emby_folder_covers(self, folder_id, preferred_image_type, requested_tag=""):
+        folder_id = str(folder_id or "").strip()
+        if not folder_id:
+            return []
+        preferred_image_type = image_type_value(preferred_image_type)
+        requested_tag = str(requested_tag or "").strip()
+        if not requested_tag:
+            return []
+        now = time.time()
+        with self.folder_cover_cache_lock:
+            cached = self.published_folder_cover_cache.get((folder_id, preferred_image_type))
+            if not cached or cached.get("expires_at", 0) <= now:
+                return []
+            if requested_tag != cached.get("tag"):
+                return []
+            return cached.get("covers") or []
 
     def _remember_emby_collection_folder_id(self, user_id, folder_id):
         user_id = str(user_id or "").strip()
