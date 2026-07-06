@@ -109,4 +109,31 @@ def format_search_stats(metadata):
         parts.append("失败%s个" % failed_count)
     if timeout_count:
         parts.append("超时%s个" % timeout_count)
+    llm_part = format_llm_rerank_stats(metadata)
+    if llm_part:
+        parts.append(llm_part)
     return "搜索统计：" + "，".join(parts)
+
+
+def format_llm_rerank_stats(metadata):
+    settings = (metadata or {}).get("settings") or {}
+    sources = (metadata or {}).get("sources") or []
+    llm_entry = None
+    for source in sources:
+        if source.get("phase") == "llm_rerank" or source.get("source") == "LLM rerank":
+            llm_entry = source
+            break
+    if not llm_entry:
+        if settings.get("llm_rerank_enabled"):
+            return "LLM重排未执行"
+        return ""
+
+    duration_ms = int(llm_entry.get("duration_ms") or 0)
+    duration = "%.1fs" % (duration_ms / 1000.0)
+    if llm_entry.get("status") == "success":
+        return "LLM重排成功%s" % duration
+    if llm_entry.get("status") == "timeout":
+        return "LLM重排超时%s" % duration
+    if llm_entry.get("status") == "skipped":
+        return "LLM重排跳过%s" % duration
+    return "LLM重排失败%s" % duration

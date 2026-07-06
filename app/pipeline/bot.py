@@ -9,6 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -207,10 +208,11 @@ HELP_TEXT = """直接发送关键词、番号或磁链即可。
 /dedupe_refresh 刷新已入库记录（需二次确认）
 /version 查看当前版本
 
+搜索统计会显示来源、耗时、返回/展示数量和 LLM 重排状态。
 搜索结果里选择资源后，再选择入电影、剧集、动漫、成人或其他库。"""
 BOT_COMMANDS = [
     {"command": "start", "description": "打开使用说明"},
-    {"command": "help", "description": "查看功能和直接搜索说明"},
+    {"command": "help", "description": "查看搜索统计和功能说明"},
     {"command": "tasks", "description": "查看最近任务、刷新进度或取消任务"},
     {"command": "status", "description": "按 info_hash 查询任务进度"},
     {"command": "diag", "description": "查看任务或MSG媒体诊断"},
@@ -1106,9 +1108,15 @@ class TelegramTransport:
         return data
 
 
+class LlmRerankBusy(RuntimeError):
+    pass
+
+
 class PipelineBotService:
     def __init__(self, config):
         self.config = config
+        self._llm_rerank_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-rerank")
+        self._llm_rerank_lock = threading.Lock()
 
     def search(self, query, category, limit=DEFAULT_SEARCH_LIMIT, profile=None):
         profile = profile or search_profile_for_query(category, query)
@@ -1167,11 +1175,10 @@ class PipelineBotService:
         if self.config.llm_search_rerank_enabled:
             started = time.monotonic()
             try:
-                ranked = self._build_search_reranker().rerank_search_candidates(
+                ranked = self._rerank_search_candidates_with_timeout(
                     query,
                     category,
                     ranked,
-                    max_candidates=self.config.llm_search_rerank_limit,
                 )
                 stats.record(
                     "LLM rerank",
@@ -1179,6 +1186,24 @@ class PipelineBotService:
                     duration_seconds=time.monotonic() - started,
                     phase="llm_rerank",
                 )
+            except FutureTimeoutError as error:
+                stats.record(
+                    "LLM rerank",
+                    status="timeout",
+                    duration_seconds=time.monotonic() - started,
+                    error=error,
+                    phase="llm_rerank",
+                )
+                print("llm rerank timed out after %ss" % self.config.llm_timeout_seconds, file=sys.stderr)
+            except LlmRerankBusy as error:
+                stats.record(
+                    "LLM rerank",
+                    status="skipped",
+                    duration_seconds=time.monotonic() - started,
+                    error=error,
+                    phase="llm_rerank",
+                )
+                print("llm rerank skipped: %s" % error, file=sys.stderr)
             except Exception as error:
                 stats.record(
                     "LLM rerank",
@@ -1198,6 +1223,31 @@ class PipelineBotService:
 
     def search_anime(self, query, limit=DEFAULT_SEARCH_LIMIT):
         return self.search(query, "movie", limit=limit, profile=SEARCH_PROFILE_ANIME)
+
+    def _rerank_search_candidates_with_timeout(self, query, category, ranked):
+        timeout = max(0.1, float(self.config.llm_timeout_seconds or DEFAULT_LLM_TIMEOUT_SECONDS))
+        if not self._llm_rerank_lock.acquire(blocking=False):
+            raise LlmRerankBusy("previous LLM rerank is still running")
+        try:
+            future = self._llm_rerank_executor.submit(
+                self._build_search_reranker().rerank_search_candidates,
+                query,
+                category,
+                ranked,
+                max_candidates=self.config.llm_search_rerank_limit,
+            )
+        except Exception:
+            self._llm_rerank_lock.release()
+            raise
+        future.add_done_callback(self._release_llm_rerank_lock)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError:
+            future.cancel()
+            raise
+
+    def _release_llm_rerank_lock(self, future):
+        self._llm_rerank_lock.release()
 
     def search_migration_candidates(self, query, limit=20):
         return self._build_msg_db_client().search_migration_candidates(query, limit=limit)

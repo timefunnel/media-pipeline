@@ -648,6 +648,7 @@ class TelegramBotTest(unittest.TestCase):
         self.assertIn("/tasks 查看最近任务", telegram.messages[0]["text"])
         self.assertIn("/diag <info_hash|media_id>", telegram.messages[0]["text"])
         self.assertIn("/migrate <关键词>", telegram.messages[0]["text"])
+        self.assertIn("搜索统计会显示来源、耗时、返回/展示数量和 LLM 重排状态", telegram.messages[0]["text"])
 
     def test_migrate_command_searches_msg_and_prompts_candidates(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -807,6 +808,17 @@ class TelegramBotTest(unittest.TestCase):
                         "raw_count": 7,
                         "selected_count": 1,
                         "failed_count": 1,
+                        "settings": {"llm_rerank_enabled": True},
+                        "sources": [
+                            {"source": "Indexer", "status": "success", "result_count": 7, "duration_ms": 900},
+                            {
+                                "source": "LLM rerank",
+                                "status": "success",
+                                "result_count": 1,
+                                "duration_ms": 321,
+                                "phase": "llm_rerank",
+                            },
+                        ],
                     },
                 )
             )
@@ -817,6 +829,7 @@ class TelegramBotTest(unittest.TestCase):
             session = store.find_search_session_by_candidate(1)
 
         self.assertIn("搜索统计：来源2个，耗时1.2s，返回7条，展示1条，失败1个", telegram.messages[0]["text"])
+        self.assertIn("LLM重排成功0.3s", telegram.messages[0]["text"])
         self.assertEqual(session["metadata"]["source_count"], 2)
 
     def test_message_search_sends_typing_action_before_search(self):
@@ -2985,6 +2998,147 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(results.metadata["sources"][-1]["source"], "LLM rerank")
         self.assertEqual(results.metadata["sources"][-1]["status"], "failed")
         self.assertIn("invalid llm response", results.metadata["sources"][-1]["error"])
+
+    def test_search_keeps_original_ranking_when_llm_rerank_times_out(self):
+        from concurrent.futures import TimeoutError as FutureTimeoutError
+
+        from pipeline.bot import BotConfig, PipelineBotService
+        from pipeline.search_stats import format_search_stats
+
+        class FakeProwlarrConfig:
+            def __init__(self, config_path):
+                self.config_path = config_path
+
+            def load_api_key(self):
+                return "prowlarr-key-value"
+
+        fake_prowlarr = FakeProwlarr(
+            [
+                {"title": "Sintel 720p", "seeders": 90, "infoHash": "LOW"},
+                {"title": "Sintel 1080p", "seeders": 20, "infoHash": "HIGH"},
+            ]
+        )
+
+        class FakeReranker:
+            def __init__(self, **kwargs):
+                pass
+
+            def rerank_search_candidates(self, query, category, candidates, max_candidates=None):
+                return list(reversed(candidates))
+
+        class TimeoutFuture:
+            def __init__(self):
+                self.timeouts = []
+                self.callbacks = []
+                self.cancel_called = False
+
+            def result(self, timeout=None):
+                self.timeouts.append(timeout)
+                raise FutureTimeoutError()
+
+            def add_done_callback(self, callback):
+                self.callbacks.append(callback)
+
+            def cancel(self):
+                self.cancel_called = True
+                return False
+
+        class TimeoutExecutor:
+            instances = []
+
+            def __init__(self, max_workers=None, thread_name_prefix=None):
+                self.max_workers = max_workers
+                self.thread_name_prefix = thread_name_prefix
+                self.future = TimeoutFuture()
+                self.shutdown_args = None
+                self.__class__.instances.append(self)
+
+            def submit(self, *args, **kwargs):
+                self.submitted = (args, kwargs)
+                return self.future
+
+            def shutdown(self, wait=False, cancel_futures=False):
+                self.shutdown_args = (wait, cancel_futures)
+
+        config = BotConfig(
+            "token",
+            {700656624},
+            "/tmp/state.db",
+            llm_search_rerank_enabled=True,
+            llm_api_key="llm-key",
+            llm_timeout_seconds=2,
+        )
+
+        with patch("pipeline.bot.ProwlarrConfig", FakeProwlarrConfig), patch(
+            "pipeline.bot.ProwlarrClient", return_value=fake_prowlarr
+        ), patch("pipeline.bot.SearchRerankClient", FakeReranker), patch(
+            "pipeline.bot.ThreadPoolExecutor", TimeoutExecutor
+        ):
+            results = PipelineBotService(config).search("sintel", "movie", limit=10)
+
+        self.assertEqual([item["title"] for item in results], ["Sintel 1080p", "Sintel 720p"])
+        self.assertEqual(TimeoutExecutor.instances[0].future.timeouts, [2.0])
+        self.assertTrue(TimeoutExecutor.instances[0].future.cancel_called)
+        self.assertIsNone(TimeoutExecutor.instances[0].shutdown_args)
+        self.assertEqual(results.metadata["sources"][-1]["source"], "LLM rerank")
+        self.assertEqual(results.metadata["sources"][-1]["status"], "timeout")
+        self.assertIn("LLM重排超时", format_search_stats(results.metadata))
+
+    def test_search_skips_llm_rerank_when_previous_rerank_is_still_running(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+        from pipeline.search_stats import format_search_stats
+
+        class FakeProwlarrConfig:
+            def __init__(self, config_path):
+                self.config_path = config_path
+
+            def load_api_key(self):
+                return "prowlarr-key-value"
+
+        fake_prowlarr = FakeProwlarr(
+            [
+                {"title": "Sintel 720p", "seeders": 90, "infoHash": "LOW"},
+                {"title": "Sintel 1080p", "seeders": 20, "infoHash": "HIGH"},
+            ]
+        )
+
+        class GuardedExecutor:
+            instances = []
+
+            def __init__(self, max_workers=None, thread_name_prefix=None):
+                self.max_workers = max_workers
+                self.thread_name_prefix = thread_name_prefix
+                self.submit_called = False
+                self.__class__.instances.append(self)
+
+            def submit(self, *args, **kwargs):
+                self.submit_called = True
+                raise AssertionError("LLM rerank should not be submitted while a previous rerank is running")
+
+        config = BotConfig(
+            "token",
+            {700656624},
+            "/tmp/state.db",
+            llm_search_rerank_enabled=True,
+            llm_api_key="llm-key",
+            llm_timeout_seconds=2,
+        )
+
+        with patch("pipeline.bot.ProwlarrConfig", FakeProwlarrConfig), patch(
+            "pipeline.bot.ProwlarrClient", return_value=fake_prowlarr
+        ), patch("pipeline.bot.ThreadPoolExecutor", GuardedExecutor):
+            service = PipelineBotService(config)
+            service._llm_rerank_lock.acquire()
+            try:
+                results = service.search("sintel", "movie", limit=10)
+            finally:
+                service._llm_rerank_lock.release()
+
+        self.assertEqual([item["title"] for item in results], ["Sintel 1080p", "Sintel 720p"])
+        self.assertFalse(GuardedExecutor.instances[0].submit_called)
+        self.assertEqual(results.metadata["sources"][-1]["source"], "LLM rerank")
+        self.assertEqual(results.metadata["sources"][-1]["status"], "skipped")
+        self.assertIn("LLM重排跳过", format_search_stats(results.metadata))
 
     def test_submit_resolves_prowlarr_download_uri_before_115_offline(self):
         from pipeline.bot import BotConfig, PipelineBotService
