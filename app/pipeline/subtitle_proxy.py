@@ -1125,6 +1125,17 @@ def int_query_value(query, key, default=0):
         return default
 
 
+def case_insensitive_query_variants(term):
+    value = str(term or "").strip()
+    if not value:
+        return []
+    variants = []
+    for candidate in (value, value.upper(), value.lower(), value.title()):
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
 def parse_emby_user_items_search_request(path):
     parsed = urllib.parse.urlparse(path)
     match = EMBY_USER_ITEMS_RE.match(parsed.path)
@@ -1508,34 +1519,36 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         requested_limit = max(1, min(int(limit or 50), 100))
         offset = max(0, int(start_index or 0))
         api_limit = min(requested_limit + offset, 100)
-        query = urllib.parse.urlencode(
-            {
-                "q": str(term or ""),
-                "limit": str(api_limit),
-            }
-        )
-        status, _headers, body = self._read_msg_api("/media?%s" % query)
-        if status < 200 or status >= 300 or not body:
-            raise RuntimeError("MSG media search HTTP %s for %r" % (status, term))
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("MSG media search invalid JSON for %r" % term) from exc
-        rows = payload.get("items") if isinstance(payload, dict) else None
-        if not isinstance(rows, list):
-            raise RuntimeError("MSG media search response missing items for %r" % term)
-        rows = rows[offset : offset + requested_limit]
         ids = []
         seen = set()
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            media_id = str(row.get("id") or row.get("Id") or "").strip()
-            if not media_id or media_id in seen:
-                continue
-            seen.add(media_id)
-            ids.append(media_id)
-        return ids
+        for query_term in case_insensitive_query_variants(term):
+            query = urllib.parse.urlencode(
+                {
+                    "q": query_term,
+                    "limit": str(api_limit),
+                }
+            )
+            status, _headers, body = self._read_msg_api("/media?%s" % query)
+            if status < 200 or status >= 300 or not body:
+                raise RuntimeError("MSG media search HTTP %s for %r" % (status, query_term))
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("MSG media search invalid JSON for %r" % query_term) from exc
+            rows = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(rows, list):
+                raise RuntimeError("MSG media search response missing items for %r" % query_term)
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                media_id = str(row.get("id") or row.get("Id") or "").strip()
+                if not media_id or media_id in seen:
+                    continue
+                seen.add(media_id)
+                ids.append(media_id)
+            if len(ids) >= offset + requested_limit:
+                break
+        return ids[offset : offset + requested_limit]
 
     def _fetch_emby_items_by_ids(self, user_id, media_ids, request_headers):
         items = []

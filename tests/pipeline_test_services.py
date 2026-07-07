@@ -747,6 +747,42 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertEqual(payload["TotalRecordCount"], 2)
         self.assertEqual([item["Id"] for item in payload["Items"]], ["media-1", "media-2"])
 
+    def test_serve_emby_items_search_retries_case_variants(self):
+        handler = object.__new__(SubtitleProxyHandler)
+        handler.path = "/emby/Users/user-1/Items?SearchTerm=mide&Limit=1"
+        handler.folder_cover_cache_lock = threading.Lock()
+        handler.folder_id_cache = {}
+        handler.folder_cover_cache = {}
+        handler.published_folder_cover_cache = {}
+        written = io.BytesIO()
+        sent_headers = []
+        handler.wfile = written
+        handler.send_response = lambda status: sent_headers.append(("status", status))
+        handler.send_header = lambda key, value: sent_headers.append((key, value))
+        handler.end_headers = lambda: sent_headers.append(("end", None))
+        msg_calls = []
+
+        def read_msg_api(path):
+            msg_calls.append(path)
+            if path == "/media?q=MIDE&limit=1":
+                return 200, {"Content-Type": "application/json"}, json.dumps({"items": [{"id": "media-1"}]}).encode("utf-8")
+            return 200, {"Content-Type": "application/json"}, json.dumps({"items": []}).encode("utf-8")
+
+        handler._read_msg_api = read_msg_api
+        handler._read_upstream = lambda path, request_headers: (
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps({"Id": path.rsplit("/", 1)[-1], "Name": "MIDE result", "Type": "Movie"}).encode("utf-8"),
+        )
+
+        handled = handler._serve_emby_items_search({"X-Emby-Token": "token"})
+
+        self.assertTrue(handled)
+        self.assertEqual(msg_calls, ["/media?q=mide&limit=1", "/media?q=MIDE&limit=1"])
+        payload = json.loads(written.getvalue().decode("utf-8"))
+        self.assertEqual(payload["TotalRecordCount"], 1)
+        self.assertEqual(payload["Items"][0]["Id"], "media-1")
+
     def test_serve_emby_items_search_fails_when_all_item_details_fail(self):
         handler = object.__new__(SubtitleProxyHandler)
         handler.path = "/emby/Users/user-1/Items?SearchTerm=MIDE&Limit=2"
