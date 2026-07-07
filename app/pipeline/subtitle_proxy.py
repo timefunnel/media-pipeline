@@ -20,6 +20,7 @@ except ImportError:
     ImageOps = None
 
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider
+from pipeline.external_subtitles import DEFAULT_SUBTITLE_CACHE_DIR, LocalSubtitleProvider, local_subtitle_uri_valid
 
 
 DEFAULT_SUBTITLE_PROXY_HOST = "127.0.0.1"
@@ -1172,6 +1173,7 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
     upstream_base_url = DEFAULT_SUBTITLE_PROXY_UPSTREAM
     msg_api_auth = None
     openlist_subtitle_provider = None
+    local_subtitle_provider = None
     folder_cover_cache = {}
     folder_image_cache = {}
     folder_id_cache = {}
@@ -1297,6 +1299,9 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         if tracks[track_index].get("source") == "openlist":
             self._serve_openlist_subtitle_track(tracks[track_index], request_headers, stream_request["extension"])
             return True
+        if tracks[track_index].get("source") in ("assrt", "opensubtitles", "local") or local_subtitle_uri_valid(track_path):
+            self._serve_local_subtitle_track(tracks[track_index], request_headers, stream_request["extension"])
+            return True
         query = urllib.parse.urlencode({"path": track_path})
         upstream_path = "/api/subtitles/%s?%s" % (urllib.parse.quote(stream_request["media_id"], safe=""), query)
         try:
@@ -1333,6 +1338,32 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             request_path=self.path,
         )
 
+    def _serve_local_subtitle_track(self, track, request_headers, target_extension):
+        if self.local_subtitle_provider is None:
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"Local subtitle provider is not configured\n")
+            return
+        try:
+            body, filename = self.local_subtitle_provider.read_subtitle(track.get("path"))
+            content_type = subtitle_content_type(filename)
+            if str(target_extension or "").lower() == ".vtt":
+                body, content_type = subtitle_body_to_vtt(body, filename, content_type)
+        except RuntimeError as exc:
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(("Local subtitle stream error: %s\n" % exc).encode("utf-8"))
+            return
+        self._write_response(
+            200,
+            {"Content-Type": content_type},
+            body,
+            request_headers=request_headers,
+            request_path=self.path,
+        )
+
     def _fetch_msg_subtitle_tracks(self, media_id):
         msg_tracks = []
         try:
@@ -1353,9 +1384,20 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(tracks, list):
                 msg_tracks = [track for track in tracks if isinstance(track, dict) and track.get("path")]
         openlist_tracks = self._fetch_openlist_subtitle_tracks(media_id)
-        if openlist_tracks:
-            return openlist_tracks
-        return merge_subtitle_tracks(msg_tracks)
+        local_tracks = self._fetch_local_subtitle_tracks(media_id)
+        return merge_subtitle_tracks(openlist_tracks, local_tracks, msg_tracks)
+
+    def _fetch_local_subtitle_tracks(self, media_id):
+        if self.local_subtitle_provider is None or not self.local_subtitle_provider.enabled():
+            return []
+        try:
+            tracks = self.local_subtitle_provider.tracks_for_media_id(media_id)
+        except RuntimeError as exc:
+            print("subtitle proxy local subtitle discovery error: %s" % exc, flush=True)
+            return []
+        if tracks:
+            print("subtitle proxy local subtitle tracks %s for media %s" % (len(tracks), media_id), flush=True)
+        return tracks
 
     def _fetch_openlist_subtitle_tracks(self, media_id):
         if self.openlist_subtitle_provider is None or not self.openlist_subtitle_provider.enabled():
@@ -1690,6 +1732,7 @@ def run_subtitle_proxy(
     openlist_base_url=None,
     openlist_username=None,
     openlist_password=None,
+    subtitle_cache_dir=None,
 ):
     SubtitleProxyHandler.upstream_base_url = upstream
     SubtitleProxyHandler.msg_api_auth = MsgApiAuthenticator(
@@ -1701,6 +1744,9 @@ def run_subtitle_proxy(
         openlist_base_url or os.environ.get("OPENLIST_URL") or DEFAULT_OPENLIST_URL,
         openlist_username if openlist_username is not None else os.environ.get("OPENLIST_MEDIA_SCAN_USERNAME", ""),
         openlist_password if openlist_password is not None else os.environ.get("OPENLIST_MEDIA_SCAN_PASSWORD", ""),
+    )
+    SubtitleProxyHandler.local_subtitle_provider = LocalSubtitleProvider(
+        subtitle_cache_dir or os.environ.get("SUBTITLE_CACHE_DIR") or DEFAULT_SUBTITLE_CACHE_DIR
     )
     server = ThreadingHTTPServer((host, port), SubtitleProxyHandler)
     print("subtitle proxy listening on %s:%s upstream=%s" % (host, port, upstream), flush=True)

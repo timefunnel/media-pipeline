@@ -22,6 +22,7 @@ from pipeline.openlist_tokens import OpenListTokenStore
 from pipeline.prowlarr import DEFAULT_PROWLARR_CONFIG, DEFAULT_PROWLARR_URL, ProwlarrClient, ProwlarrConfig, is_prowlarr_download_uri
 from pipeline.resource_selector import ResourceSelector
 from pipeline.subtitle_proxy import (
+    DEFAULT_SUBTITLE_CACHE_DIR,
     DEFAULT_SUBTITLE_PROXY_HOST,
     DEFAULT_SUBTITLE_PROXY_PORT,
     DEFAULT_SUBTITLE_PROXY_UPSTREAM,
@@ -56,6 +57,7 @@ def build_parser():
     subtitle_proxy_parser.add_argument("--msg-base-url", default=os.environ.get("MSG_BASE_URL", DEFAULT_MSG_BASE_URL))
     subtitle_proxy_parser.add_argument("--msg-admin-user", default=os.environ.get("MSG_ADMIN_USER", ""))
     subtitle_proxy_parser.add_argument("--msg-admin-password", default=os.environ.get("MSG_ADMIN_PASSWORD", ""))
+    subtitle_proxy_parser.add_argument("--subtitle-cache-dir", default=os.environ.get("SUBTITLE_CACHE_DIR", DEFAULT_SUBTITLE_CACHE_DIR))
 
     msg_scan_parser = subparsers.add_parser("msg-scan")
     msg_scan_parser.add_argument("--category", choices=sorted(FOLDER_IDS.keys()), required=True)
@@ -113,6 +115,7 @@ def main(argv=None):
             msg_api_base_url=args.msg_base_url,
             msg_admin_user=args.msg_admin_user,
             msg_admin_password=args.msg_admin_password,
+            subtitle_cache_dir=args.subtitle_cache_dir,
         )
         return 0
 

@@ -43,6 +43,13 @@ from pipeline.llm import (
     DEFAULT_LLM_TIMEOUT_SECONDS,
     SearchRerankClient,
 )
+from pipeline.external_subtitles import (
+    DEFAULT_SUBTITLE_CACHE_DIR,
+    DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES,
+    DEFAULT_SUBTITLE_PROVIDERS,
+    DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS,
+    build_subtitle_matcher_from_config,
+)
 from pipeline.openlist_utils import (
     is_openlist_video_file,
     normalize_openlist_path,
@@ -331,6 +338,16 @@ class BotConfig:
     sync_recovery_interval_seconds: int = 60
     task_workers: int = DEFAULT_TASK_WORKERS
     task_message_edit_min_interval_seconds: float = DEFAULT_TASK_MESSAGE_EDIT_MIN_INTERVAL_SECONDS
+    subtitle_auto_match_enabled: bool = False
+    subtitle_auto_match_adult_only: bool = True
+    subtitle_cache_dir: str = DEFAULT_SUBTITLE_CACHE_DIR
+    subtitle_providers: tuple = DEFAULT_SUBTITLE_PROVIDERS
+    subtitle_search_timeout_seconds: int = DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS
+    subtitle_download_max_bytes: int = DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES
+    assrt_api_token: str = ""
+    opensubtitles_api_key: str = ""
+    opensubtitles_username: str = ""
+    opensubtitles_password: str = ""
     openlist_scan_username: str = ""
     openlist_scan_password: str = ""
     search_page_size: int = SEARCH_PAGE_SIZE
@@ -424,6 +441,22 @@ class BotConfig:
                     )
                 ),
             ),
+            subtitle_auto_match_enabled=parse_bool(env.get("SUBTITLE_AUTO_MATCH_ENABLED"), False),
+            subtitle_auto_match_adult_only=parse_bool(env.get("SUBTITLE_AUTO_MATCH_ADULT_ONLY"), True),
+            subtitle_cache_dir=env.get("SUBTITLE_CACHE_DIR", DEFAULT_SUBTITLE_CACHE_DIR),
+            subtitle_providers=parse_csv_strings(env.get("SUBTITLE_PROVIDERS"), DEFAULT_SUBTITLE_PROVIDERS),
+            subtitle_search_timeout_seconds=max(
+                1,
+                int(env.get("SUBTITLE_SEARCH_TIMEOUT_SECONDS", str(DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS))),
+            ),
+            subtitle_download_max_bytes=max(
+                1024,
+                int(env.get("SUBTITLE_DOWNLOAD_MAX_BYTES", str(DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES))),
+            ),
+            assrt_api_token=env.get("ASSRT_API_TOKEN", ""),
+            opensubtitles_api_key=env.get("OPENSUBTITLES_API_KEY", ""),
+            opensubtitles_username=env.get("OPENSUBTITLES_USERNAME", ""),
+            opensubtitles_password=env.get("OPENSUBTITLES_PASSWORD", ""),
             search_page_size=int(env.get("BOT_SEARCH_PAGE_SIZE", str(SEARCH_PAGE_SIZE))),
             task_list_page_size=int(env.get("BOT_TASK_LIST_PAGE_SIZE", str(DEFAULT_TASK_LIST_PAGE_SIZE))),
             task_list_fetch_limit=int(env.get("BOT_TASK_LIST_FETCH_LIMIT", str(DEFAULT_TASK_LIST_FETCH_LIMIT))),
@@ -1183,6 +1216,7 @@ class PipelineBotService:
         self.config = config
         self._llm_rerank_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-rerank")
         self._llm_rerank_lock = threading.Lock()
+        self._subtitle_matcher = None
 
     def search(self, query, category, limit=DEFAULT_SEARCH_LIMIT, profile=None):
         profile = profile or search_profile_for_query(category, query)
@@ -1493,6 +1527,14 @@ class PipelineBotService:
         out.update(result)
         return out
 
+    def match_task_subtitles(self, category, title, task, force=False):
+        return self._build_subtitle_matcher().match_task(category, title, task, force=force)
+
+    def _build_subtitle_matcher(self):
+        if self._subtitle_matcher is None:
+            self._subtitle_matcher = build_subtitle_matcher_from_config(self.config)
+        return self._subtitle_matcher
+
     def _call_115(self, category, callback):
         client = self._build_115_client(category)
         try:
@@ -1675,6 +1717,20 @@ class PipelineBotService:
                 apply_progress(artwork_result)
         msg_library_id = (root or {}).get("library_id") or progress.get("msg_library_id")
         msg_root_id = (root or {}).get("root_id") or progress.get("msg_root_id")
+        subtitle_result = prefixed_task_fields(progress, "subtitle_match_")
+        if self.config.subtitle_auto_match_enabled:
+            if not stage_is_complete(progress.get("subtitle_match_status")):
+                emit({"subtitle_match_status": "running", "subtitle_match_error": None, "msg_media_id": media_id, "msg_media_title": media_title})
+                subtitle_result = self._match_subtitles(category, title, progress)
+                if subtitle_result.get("subtitle_match_status") == "skipped":
+                    apply_progress(subtitle_result)
+                else:
+                    emit(subtitle_result)
+            else:
+                apply_progress(subtitle_result)
+        else:
+            subtitle_result = {"subtitle_match_status": "skipped", "subtitle_match_reason": "disabled"}
+            apply_progress(subtitle_result)
         return {
             "msg_sync_status": "success",
             "msg_scan_status": "success",
@@ -1694,7 +1750,14 @@ class PipelineBotService:
             **extras_result,
             **visibility_result,
             **artwork_result,
+            **subtitle_result,
         }
+
+    def _match_subtitles(self, category, title, task):
+        try:
+            return self.match_task_subtitles(category, title, task)
+        except Exception as exc:
+            return {"subtitle_match_status": "failed", "subtitle_match_error": str(exc)}
 
     def _scrape_msg_media(self, client, category, media_id, title, task, media=None):
         root = category_to_msg_library_root(category)
@@ -2253,6 +2316,9 @@ class TelegramBot:
             return
         if action == "retry_msg":
             self._handle_retry_msg_callback(user_id, chat_id, message_id, callback_id, value)
+            return
+        if action == "subtitle":
+            self._handle_subtitle_callback(user_id, chat_id, message_id, callback_id, value)
             return
         if action == "cancel":
             self._handle_cancel_callback(user_id, chat_id, message_id, callback_id, value)
@@ -2944,6 +3010,47 @@ class TelegramBot:
                 record["task"],
                 progress_callback=self._callback_sync_progress_updater(record, chat_id, message_id),
             )
+        self.store.save_task(user_id, record["chat_id"], record["category"], record["title"], task)
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_task_status_message(record["title"], task, category=record["category"]),
+            reply_markup=callback_task_reply_markup(task),
+            fallback_chat_id=record["chat_id"],
+        )
+
+    def _handle_subtitle_callback(self, user_id, chat_id, message_id, callback_id, info_hash):
+        lock = self._try_acquire_task_lock(info_hash)
+        if lock is None:
+            self.telegram.answer_callback_query(callback_id, "任务正在处理，请稍后刷新")
+            return
+        try:
+            return self._handle_subtitle_callback_unlocked(user_id, chat_id, message_id, callback_id, info_hash)
+        finally:
+            lock.release()
+
+    def _handle_subtitle_callback_unlocked(self, user_id, chat_id, message_id, callback_id, info_hash):
+        record = self._load_owned_task(user_id, callback_id, info_hash)
+        if record is None:
+            return
+        record = self._remember_status_message_id(record, message_id)
+        task = dict(record["task"] or {})
+        if not task.get("msg_media_id"):
+            self.telegram.answer_callback_query(callback_id, "当前任务没有MSG媒体ID")
+            return
+        self.telegram.answer_callback_query(callback_id, "正在查找字幕")
+        task["subtitle_match_status"] = "running"
+        task["subtitle_match_error"] = None
+        self.store.save_task(user_id, record["chat_id"], record["category"], record["title"], task)
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_task_status_message(record["title"], task, category=record["category"]),
+            reply_markup=callback_task_reply_markup(task),
+            fallback_chat_id=record["chat_id"],
+        )
+        result = self.service.match_task_subtitles(record["category"], record["title"], task, force=False)
+        task.update(result)
         self.store.save_task(user_id, record["chat_id"], record["category"], record["title"], task)
         self._update_callback_message(
             chat_id,
@@ -4414,7 +4521,7 @@ def parse_callback_data(value):
         if len(parts) >= 2 and parts[0] in CATEGORY_LABELS:
             content_profile = parts[2] if len(parts) >= 3 and parts[2] else None
             return "force_submit", (parts[0], int(parts[1]), content_profile)
-    if action in ("status", "cancel", "retry_msg") and payload:
+    if action in ("status", "cancel", "retry_msg", "subtitle") and payload:
         return action, payload
     if action == "migrate_select" and payload:
         return "migrate_select", int(payload)

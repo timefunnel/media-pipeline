@@ -9,6 +9,150 @@ from pipeline.subtitle_proxy import (
 
 
 class SubtitleProxyTest(unittest.TestCase):
+    def test_subtitle_cache_saves_and_lists_local_tracks(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleDownload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SubtitleCache(tmp)
+            track = cache.save_download(
+                "media-1",
+                SubtitleDownload(
+                    source="assrt",
+                    provider_id="123",
+                    filename="SSIS-218.chs.srt",
+                    body=b"1\n00:00:01,000 --> 00:00:02,000\nhello\n",
+                    lang="zh-Hans",
+                    label="简体中文",
+                    query="SSIS-218",
+                ),
+            )
+            tracks = cache.list_tracks("media-1")
+            body, filename = cache.read_local_uri(track["path"])
+
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]["source"], "assrt")
+        self.assertEqual(tracks[0]["lang"], "zh-Hans")
+        self.assertEqual(body, b"1\n00:00:01,000 --> 00:00:02,000\nhello\n")
+        self.assertTrue(filename.endswith(".srt"))
+
+    def test_assrt_provider_downloads_exact_adult_code_subtitle(self):
+        from pipeline.external_subtitles import AssrtSubtitleProvider
+
+        class FakeTransport:
+            def __init__(self):
+                self.json_urls = []
+                self.download_urls = []
+
+            def json_request(self, method, url, headers=None, data=None, timeout=None):
+                self.json_urls.append(url)
+                self.headers = headers
+                if "/sub/search" in url:
+                    return {
+                        "status": 0,
+                        "sub": {
+                            "subs": [
+                                {
+                                    "id": 1,
+                                    "native_name": "Other",
+                                    "videoname": "OTHER-001",
+                                    "lang": {"desc": "简体"},
+                                },
+                                {
+                                    "id": 2,
+                                    "native_name": "SSIS-218",
+                                    "videoname": "SSIS-218 1080p",
+                                    "lang": {"desc": "简体"},
+                                },
+                            ]
+                        },
+                    }
+                return {
+                    "status": 0,
+                    "sub": {
+                        "subs": [
+                            {
+                                "id": 2,
+                                "filelist": [
+                                    {"f": "SSIS-218.chs.srt", "url": "https://file.example/SSIS-218.chs.srt"},
+                                    {"f": "cover.jpg", "url": "https://file.example/cover.jpg"},
+                                ],
+                            }
+                        ]
+                    },
+                }
+
+            def download(self, url, headers=None, timeout=None, max_bytes=None):
+                self.download_urls.append(url)
+                return b"subtitle-body"
+
+        transport = FakeTransport()
+        provider = AssrtSubtitleProvider("secret-token", transport=transport)
+        candidates = provider.search("SSIS-218", code="SSIS-218")
+        download = provider.download(candidates[0], "SSIS-218", code="SSIS-218")
+
+        self.assertEqual(candidates[0]["id"], 2)
+        self.assertEqual(download.filename, "SSIS-218.chs.srt")
+        self.assertEqual(download.body, b"subtitle-body")
+        self.assertEqual(transport.download_urls, ["https://file.example/SSIS-218.chs.srt"])
+        self.assertNotIn("secret-token", transport.json_urls[0])
+        self.assertEqual(transport.headers["Authorization"], "Bearer secret-token")
+
+    def test_subtitle_matcher_caches_first_matching_subtitle(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
+
+        class FakeProvider:
+            name = "fake"
+
+            def enabled(self):
+                return True
+
+            def search(self, query, code=""):
+                self.search_args = (query, code)
+                return [{"id": "candidate-1"}]
+
+            def download(self, candidate, query, code=""):
+                return SubtitleDownload(
+                    source=self.name,
+                    provider_id="candidate-1",
+                    filename="SSIS-218.sc.ass",
+                    body=b"[Script Info]\n",
+                    query=query,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SubtitleCache(tmp)
+            provider = FakeProvider()
+            matcher = SubtitleMatcher(cache, [provider], enabled=True, adult_only=True)
+            result = matcher.match_task(
+                "adult",
+                "SSIS-218",
+                {"msg_media_id": "media-1", "openlist_adult_code": "SSIS-218"},
+            )
+            tracks = cache.list_tracks("media-1")
+
+        self.assertEqual(result["subtitle_match_status"], "success")
+        self.assertEqual(result["subtitle_match_source"], "fake")
+        self.assertEqual(provider.search_args, ("SSIS-218", "SSIS-218"))
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]["source"], "fake")
+
+    def test_local_subtitle_provider_reads_cached_subtitle(self):
+        from pipeline.external_subtitles import LocalSubtitleProvider, SubtitleCache, SubtitleDownload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SubtitleCache(tmp)
+            track = cache.save_download(
+                "media-1",
+                SubtitleDownload(source="assrt", provider_id="1", filename="SSIS-218.srt", body=b"body"),
+            )
+            provider = LocalSubtitleProvider(tmp)
+            tracks = provider.tracks_for_media_id("media-1")
+            body, filename = provider.read_subtitle(track["path"])
+
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(body, b"body")
+        self.assertTrue(filename.endswith(".srt"))
+
     def test_normalize_webvtt_timestamps_pads_centiseconds(self):
         text = "WEBVTT\n\n1\n00:00:06.06 --> 00:00:08.16\nhello\n"
 

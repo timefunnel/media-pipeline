@@ -104,12 +104,28 @@ class BotConfigTest(unittest.TestCase):
                 "BOT_SYNC_RECOVERY_INTERVAL_SECONDS": "120",
                 "BOT_TASK_WORKERS": "3",
                 "BOT_TASK_MESSAGE_EDIT_MIN_INTERVAL_SECONDS": "1.5",
+                "SUBTITLE_AUTO_MATCH_ENABLED": "1",
+                "SUBTITLE_AUTO_MATCH_ADULT_ONLY": "1",
+                "SUBTITLE_CACHE_DIR": "/subtitle-cache",
+                "SUBTITLE_PROVIDERS": "assrt,opensubtitles",
+                "SUBTITLE_SEARCH_TIMEOUT_SECONDS": "9",
+                "SUBTITLE_DOWNLOAD_MAX_BYTES": "123456",
+                "ASSRT_API_TOKEN": "assrt-token",
+                "OPENSUBTITLES_API_KEY": "opensubtitles-key",
             }
         )
 
         self.assertEqual(config.sync_recovery_interval_seconds, 120)
         self.assertEqual(config.task_workers, 3)
         self.assertEqual(config.task_message_edit_min_interval_seconds, 1.5)
+        self.assertTrue(config.subtitle_auto_match_enabled)
+        self.assertTrue(config.subtitle_auto_match_adult_only)
+        self.assertEqual(config.subtitle_cache_dir, "/subtitle-cache")
+        self.assertEqual(config.subtitle_providers, ("assrt", "opensubtitles"))
+        self.assertEqual(config.subtitle_search_timeout_seconds, 9)
+        self.assertEqual(config.subtitle_download_max_bytes, 123456)
+        self.assertEqual(config.assrt_api_token, "assrt-token")
+        self.assertEqual(config.opensubtitles_api_key, "opensubtitles-key")
 
     def test_bot_config_reads_msg_trash_hide_sync_settings(self):
         from pipeline.bot import BotConfig
@@ -2479,6 +2495,53 @@ class TelegramBotTest(unittest.TestCase):
         self.assertEqual(saved["msg_sync_status"], "success")
         self.assertIn("MSG同步：已完成", telegram.edits[-1]["text"])
 
+    def test_completed_msg_task_shows_subtitle_button_and_matches_from_callback(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot, task_reply_markup
+
+        task = {
+            "info_hash": "ABC",
+            "status_name": "success",
+            "percent_done": 100,
+            "msg_sync_status": "success",
+            "msg_scrape_status": "success",
+            "msg_media_id": "media-1",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            store.save_task(700656624, 9001, "adult", "SSIS-218", task)
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                subtitle_response={
+                    "subtitle_match_status": "success",
+                    "subtitle_match_count": 1,
+                    "subtitle_match_source": "assrt",
+                    "subtitle_match_filename": "assrt-123.srt",
+                }
+            )
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path, msg_enabled=True), telegram, store, service)
+
+            markup = task_reply_markup(task)
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb1",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 104},
+                        "data": "subtitle:ABC",
+                    }
+                }
+            )
+            saved = store.load_task("ABC")["task"]
+
+        self.assertEqual(markup["inline_keyboard"][0][0]["text"], "查找字幕")
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], "subtitle:ABC")
+        self.assertEqual(service.subtitle_calls, [("adult", "SSIS-218", "ABC", False)])
+        self.assertEqual(saved["subtitle_match_status"], "success")
+        self.assertEqual(saved["subtitle_match_source"], "assrt")
+        self.assertEqual(telegram.answers, [{"callback_query_id": "cb1", "text": "正在查找字幕"}])
+        self.assertIn("字幕匹配：已完成", telegram.edits[-1]["text"])
+        self.assertEqual(telegram.messages, [])
+
     def test_recover_running_msg_sync_tasks_once_updates_store_without_user_refresh(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
 
@@ -4175,10 +4238,21 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
             artwork_repair_response={"status": "success", "updated": 1, "fields": ["poster_url"]},
         )
+        class FakeSubtitleMatcher:
+            def match_task(self, category, title, task, force=False):
+                events.append(("subtitle_match", category, title, task.get("msg_media_id"), task.get("openlist_adult_code")))
+                return {
+                    "subtitle_match_status": "success",
+                    "subtitle_match_count": 1,
+                    "subtitle_match_source": "assrt",
+                    "subtitle_match_filename": "assrt-123.srt",
+                }
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
             "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
-        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist):
+        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist), patch(
+            "pipeline.bot.build_subtitle_matcher_from_config", return_value=FakeSubtitleMatcher()
+        ):
             service = PipelineBotService(
                 BotConfig(
                     "token",
@@ -4190,6 +4264,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     msg_sync_poll_seconds=0,
                     openlist_pre_scan_clean_enabled=True,
                     openlist_adult_code_format_enabled=True,
+                    subtitle_auto_match_enabled=True,
                 )
             )
             task = service.sync_completed_task(
@@ -4207,6 +4282,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         )
         self.assertLess(events.index(("meta_hide", "/115/成人/MIDA-304 - downloaded folder", (r"^ad\.mp4$",), True)), events.index(("scan",)))
         self.assertLess(events.index(("scan",)), events.index(("artwork_repair",)))
+        self.assertLess(events.index(("artwork_repair",)), events.index(("subtitle_match", "adult", "downloaded folder", "media-1", "MIDA-304")))
         self.assertEqual(fake_msg.search_calls[0], ("MIDA-304", 20))
         self.assertEqual(fake_msg.artwork_repair_calls, ["media-1"])
         self.assertEqual(task["openlist_adult_format_status"], "success")
@@ -4214,6 +4290,8 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["msg_artwork_repair_status"], "success")
         self.assertEqual(task["msg_artwork_repair_updated"], 1)
         self.assertEqual(task["msg_artwork_repair_fields"], "poster_url")
+        self.assertEqual(task["subtitle_match_status"], "success")
+        self.assertEqual(task["subtitle_match_source"], "assrt")
         self.assertEqual(task["msg_sync_status"], "success")
 
     def test_sync_completed_adult_task_hides_secondary_videos_after_format(self):

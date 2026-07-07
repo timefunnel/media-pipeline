@@ -81,6 +81,16 @@ services:
       BOT_SYNC_RECOVERY_INTERVAL_SECONDS: "${BOT_SYNC_RECOVERY_INTERVAL_SECONDS:-60}"
       BOT_TASK_WORKERS: "${BOT_TASK_WORKERS:-2}"
       BOT_TASK_MESSAGE_EDIT_MIN_INTERVAL_SECONDS: "${BOT_TASK_MESSAGE_EDIT_MIN_INTERVAL_SECONDS:-2}"
+      SUBTITLE_AUTO_MATCH_ENABLED: "${SUBTITLE_AUTO_MATCH_ENABLED:-0}"
+      SUBTITLE_AUTO_MATCH_ADULT_ONLY: "${SUBTITLE_AUTO_MATCH_ADULT_ONLY:-1}"
+      SUBTITLE_CACHE_DIR: "${SUBTITLE_CACHE_DIR:-/subtitle-cache}"
+      SUBTITLE_PROVIDERS: "${SUBTITLE_PROVIDERS:-assrt,opensubtitles}"
+      SUBTITLE_SEARCH_TIMEOUT_SECONDS: "${SUBTITLE_SEARCH_TIMEOUT_SECONDS:-12}"
+      SUBTITLE_DOWNLOAD_MAX_BYTES: "${SUBTITLE_DOWNLOAD_MAX_BYTES:-2097152}"
+      ASSRT_API_TOKEN: "${ASSRT_API_TOKEN:-}"
+      OPENSUBTITLES_API_KEY: "${OPENSUBTITLES_API_KEY:-}"
+      OPENSUBTITLES_USERNAME: "${OPENSUBTITLES_USERNAME:-}"
+      OPENSUBTITLES_PASSWORD: "${OPENSUBTITLES_PASSWORD:-}"
       OPENLIST_PRE_SCAN_CLEAN_ENABLED: "${OPENLIST_PRE_SCAN_CLEAN_ENABLED:-1}"
       OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES: "${OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES:-20971520}"
       OPENLIST_ADULT_CODE_FORMAT_ENABLED: "${OPENLIST_ADULT_CODE_FORMAT_ENABLED:-1}"
@@ -126,6 +136,7 @@ services:
       - /data/OpenList/data:/openlist-data:ro
       - /data/Prowlarr/config:/prowlarr-config:ro
       - /data/media-pipeline/bot:/bot-data
+      - /data/media-pipeline/subtitles:/subtitle-cache
 
   media-pipeline-subtitle-proxy:
     build:
@@ -145,5 +156,8 @@ services:
       MSG_BASE_URL: "${MSG_BASE_URL:-http://127.0.0.1:18080/api}"
       MSG_ADMIN_USER: "${MSG_ADMIN_USER:-admin}"
       MSG_ADMIN_PASSWORD: "${MSG_ADMIN_PASSWORD:?MSG_ADMIN_PASSWORD missing}"
+      SUBTITLE_CACHE_DIR: "${SUBTITLE_CACHE_DIR:-/subtitle-cache}"
     restart: unless-stopped
     command: ["subtitle-proxy"]
+    volumes:
+      - /data/media-pipeline/subtitles:/subtitle-cache

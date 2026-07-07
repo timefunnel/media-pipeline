@@ -498,6 +498,7 @@ class FakeBotService:
         migration_candidates=None,
         migration_response=None,
         msg_diag_response=None,
+        subtitle_response=None,
         rerank_results=None,
         rerank_error=None,
     ):
@@ -528,7 +529,9 @@ class FakeBotService:
         self.cancel_calls = []
         self.sync_response = sync_response or {}
         self.sync_progress = sync_progress or []
+        self.subtitle_response = subtitle_response or {"subtitle_match_status": "success", "subtitle_match_count": 1, "subtitle_match_source": "cache"}
         self.sync_calls = []
+        self.subtitle_calls = []
         self.duplicate_response = duplicate_response
         self.duplicate_calls = []
         self.dedupe_entries = dedupe_entries or []
@@ -629,6 +632,10 @@ class FakeBotService:
                 progress_callback(dict(out))
         out.update(self.sync_response)
         return out
+
+    def match_task_subtitles(self, category, title, task, force=False):
+        self.subtitle_calls.append((category, title, (task or {}).get("info_hash"), force))
+        return dict(self.subtitle_response)
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]

@@ -217,6 +217,7 @@ def task_diagnostic_stage_values(task):
         ("msg_extra_cleanup_status", "特典隐藏"),
         ("msg_visibility_repair_status", "可见性修复"),
         ("msg_artwork_repair_status", "图片修复"),
+        ("subtitle_match_status", "字幕匹配"),
     ):
         value = (task or {}).get(key)
         if value:
@@ -365,6 +366,26 @@ def append_task_lines(lines, task, category=None):
             lines.append("成人图片修复：失败")
             if task.get("msg_artwork_repair_error"):
                 lines.append("图片修复错误：%s" % task.get("msg_artwork_repair_error"))
+    if task.get("subtitle_match_status"):
+        if task.get("subtitle_match_status") == "success":
+            lines.append(
+                "字幕匹配：已完成（%s 条，%s）"
+                % (task.get("subtitle_match_count") or 0, task.get("subtitle_match_source") or "-")
+            )
+            if task.get("subtitle_match_filename"):
+                lines.append("字幕文件：%s" % task.get("subtitle_match_filename"))
+        elif task.get("subtitle_match_status") == "running":
+            lines.append("字幕匹配：进行中")
+        elif task.get("subtitle_match_status") == "skipped":
+            reason = task.get("subtitle_match_reason")
+            if reason == "not_found":
+                lines.append("字幕匹配：未找到")
+            elif reason in ("provider_missing", "query_missing", "media_id_missing"):
+                lines.append("字幕匹配：已跳过（%s）" % reason)
+        else:
+            lines.append("字幕匹配：失败")
+            if task.get("subtitle_match_error"):
+                lines.append("字幕错误：%s" % task.get("subtitle_match_error"))
 
 def format_percent(value):
     if value is None:
@@ -484,12 +505,15 @@ def task_reply_markup(task):
     info_hash = (task or {}).get("info_hash")
     if task_can_retry_msg_sync(task):
         return {"inline_keyboard": [[{"text": "重试MSG同步", "callback_data": "retry_msg:%s" % info_hash}]]}
-    if not TASK_STATE.can_refresh_offline_status(task):
-        return None
-    row = [{"text": "刷新进度", "callback_data": "status:%s" % info_hash}]
-    if TASK_STATE.can_cancel_offline_task(task):
-        row.append({"text": "取消任务", "callback_data": "cancel:%s" % info_hash})
-    return {"inline_keyboard": [row]}
+    rows = []
+    if TASK_STATE.can_refresh_offline_status(task):
+        row = [{"text": "刷新进度", "callback_data": "status:%s" % info_hash}]
+        if TASK_STATE.can_cancel_offline_task(task):
+            row.append({"text": "取消任务", "callback_data": "cancel:%s" % info_hash})
+        rows.append(row)
+    if task_can_match_subtitles(task):
+        rows.append([{"text": "查找字幕", "callback_data": "subtitle:%s" % info_hash}])
+    return {"inline_keyboard": rows} if rows else None
 
 def callback_task_reply_markup(task):
     return task_reply_markup(task) or {"inline_keyboard": []}
@@ -500,6 +524,16 @@ def task_is_final(task):
 
 def task_can_retry_msg_sync(task):
     return TASK_STATE.can_retry_msg_sync(task)
+
+
+def task_can_match_subtitles(task):
+    task = task or {}
+    return bool(
+        task.get("info_hash")
+        and task.get("msg_media_id")
+        and task.get("msg_sync_status") == "success"
+        and task.get("subtitle_match_status") != "running"
+    )
 
 
 def task_page_count(total, page_size=DEFAULT_TASK_LIST_PAGE_SIZE):
