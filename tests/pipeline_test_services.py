@@ -557,6 +557,29 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertEqual(media_id, "7303b838-dab8-4eb7-a8b6-4dc761f69c18")
 
+    def test_parse_emby_user_items_search_request_reads_search_term(self):
+        parsed = parse_emby_user_items_search_request(
+            "/emby/Users/user-1/Items?SearchTerm=MIDE&Limit=500&StartIndex=2"
+        )
+
+        self.assertEqual(parsed["user_id"], "user-1")
+        self.assertEqual(parsed["term"], "MIDE")
+        self.assertEqual(parsed["mode"], "SearchTerm")
+        self.assertEqual(parsed["limit"], 100)
+        self.assertEqual(parsed["start_index"], 2)
+
+    def test_parse_emby_user_items_search_request_reads_name_starts_with(self):
+        parsed = parse_emby_user_items_search_request("/Users/user-1/Items?NameStartsWith=MIDE&Limit=20")
+
+        self.assertEqual(parsed["term"], "MIDE")
+        self.assertEqual(parsed["mode"], "NameStartsWith")
+        self.assertEqual(parsed["limit"], 20)
+
+    def test_parse_emby_user_items_search_request_ignores_plain_items_list(self):
+        parsed = parse_emby_user_items_search_request("/emby/Users/user-1/Items?Limit=20")
+
+        self.assertIsNone(parsed)
+
     def test_parse_emby_item_image_request_accepts_primary_image_path(self):
         parsed = parse_emby_item_image_request("/emby/Items/library-1/Images/Primary?tag=old&maxWidth=400")
 
@@ -669,6 +692,82 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertTrue(is_emby_placeholder_image_body(one_pixel.getvalue()))
         self.assertFalse(is_emby_placeholder_image_body(normal.getvalue()))
         self.assertFalse(is_emby_placeholder_image_body(b"not an image"))
+
+    def test_serve_emby_items_search_returns_msg_media_as_emby_items(self):
+        handler = object.__new__(SubtitleProxyHandler)
+        handler.path = "/emby/Users/user-1/Items?SearchTerm=MIDE&Limit=2"
+        handler.folder_cover_cache_lock = threading.Lock()
+        handler.folder_id_cache = {}
+        handler.folder_cover_cache = {}
+        handler.published_folder_cover_cache = {}
+        written = io.BytesIO()
+        sent_headers = []
+        handler.wfile = written
+        handler.send_response = lambda status: sent_headers.append(("status", status))
+        handler.send_header = lambda key, value: sent_headers.append((key, value))
+        handler.end_headers = lambda: sent_headers.append(("end", None))
+        msg_calls = []
+        upstream_calls = []
+
+        def read_msg_api(path):
+            msg_calls.append(path)
+            body = json.dumps({"items": [{"id": "media-1"}, {"id": "media-2"}, {"id": "media-1"}]}).encode("utf-8")
+            return 200, {"Content-Type": "application/json"}, body
+
+        def read_upstream(path, request_headers):
+            upstream_calls.append(path)
+            media_id = path.rsplit("/", 1)[-1]
+            body = json.dumps(
+                {
+                    "Id": media_id,
+                    "Name": "MIDE result " + media_id,
+                    "Type": "Movie",
+                    "MediaType": "Video",
+                    "ImageTags": {"Primary": media_id},
+                }
+            ).encode("utf-8")
+            return 200, {"Content-Type": "application/json"}, body
+
+        handler._read_msg_api = read_msg_api
+        handler._read_upstream = read_upstream
+
+        handled = handler._serve_emby_items_search({"X-Emby-Token": "token"})
+
+        self.assertTrue(handled)
+        self.assertEqual(msg_calls, ["/media?q=MIDE&limit=2"])
+        self.assertEqual(
+            upstream_calls,
+            [
+                "/emby/Users/user-1/Items/media-1",
+                "/emby/Users/user-1/Items/media-2",
+            ],
+        )
+        self.assertIn(("status", 200), sent_headers)
+        payload = json.loads(written.getvalue().decode("utf-8"))
+        self.assertEqual(payload["TotalRecordCount"], 2)
+        self.assertEqual([item["Id"] for item in payload["Items"]], ["media-1", "media-2"])
+
+    def test_serve_emby_items_search_fails_when_all_item_details_fail(self):
+        handler = object.__new__(SubtitleProxyHandler)
+        handler.path = "/emby/Users/user-1/Items?SearchTerm=MIDE&Limit=2"
+        written = io.BytesIO()
+        sent_headers = []
+        handler.wfile = written
+        handler.send_response = lambda status: sent_headers.append(("status", status))
+        handler.send_header = lambda key, value: sent_headers.append((key, value))
+        handler.end_headers = lambda: sent_headers.append(("end", None))
+        handler._read_msg_api = lambda path: (
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps({"items": [{"id": "media-1"}]}).encode("utf-8"),
+        )
+        handler._read_upstream = lambda path, request_headers: (404, {"Content-Type": "application/json"}, b"{}")
+
+        handled = handler._serve_emby_items_search({"X-Emby-Token": "token"})
+
+        self.assertTrue(handled)
+        self.assertIn(("status", 502), sent_headers)
+        self.assertIn("Emby item detail lookup returned no usable items", written.getvalue().decode("utf-8"))
 
     def test_write_response_patches_json_list_payload(self):
         handler = object.__new__(SubtitleProxyHandler)

@@ -47,6 +47,7 @@ from pipeline.subtitle_proxy import (
     patch_emby_playback_info_runtime,
     patch_emby_resume_runtime_fields,
     parse_emby_item_image_request,
+    parse_emby_user_items_search_request,
     parse_emby_subtitle_stream_path,
     parse_emby_item_media_id,
     build_emby_folder_cover_grid,

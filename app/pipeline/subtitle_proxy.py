@@ -62,6 +62,7 @@ EMBY_ITEM_IMAGE_RE = re.compile(
     r"^%s/Items/(?P<item_id>[^/]+)/Images/(?P<image_type>Primary|Backdrop|Thumb)(?:/\d+)?/?$" % EMBY_PATH_PREFIX_PATTERN,
     re.IGNORECASE,
 )
+EMBY_USER_ITEMS_RE = re.compile(r"^%s/Users/(?P<user_id>[^/]+)/Items/?$" % EMBY_PATH_PREFIX_PATTERN, re.IGNORECASE)
 EMBY_FOLDER_COVER_CACHE_TTL_SECONDS = 300
 EMBY_FOLDER_COVER_GRID_LIMIT = 4
 EMBY_FOLDER_COVER_ASPECT_RATIO = 16 / 9
@@ -1111,6 +1112,43 @@ def emby_request_user_id(path):
     return str(values[0]) if values else ""
 
 
+def query_first_value(query, key):
+    values = query.get(key) or []
+    return str(values[0]) if values else ""
+
+
+def int_query_value(query, key, default=0):
+    value = query_first_value(query, key)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_emby_user_items_search_request(path):
+    parsed = urllib.parse.urlparse(path)
+    match = EMBY_USER_ITEMS_RE.match(parsed.path)
+    if not match:
+        return None
+    query = urllib.parse.parse_qs(parsed.query)
+    term = query_first_value(query, "SearchTerm").strip()
+    mode = "SearchTerm"
+    if not term:
+        term = query_first_value(query, "NameStartsWith").strip()
+        mode = "NameStartsWith"
+    if not term:
+        return None
+    limit = max(1, min(int_query_value(query, "Limit", 50), 100))
+    start_index = max(0, int_query_value(query, "StartIndex", 0))
+    return {
+        "user_id": urllib.parse.unquote(match.group("user_id")),
+        "term": term,
+        "mode": mode,
+        "limit": limit,
+        "start_index": start_index,
+    }
+
+
 class MsgApiAuthenticator:
     def __init__(self, base_url=DEFAULT_MSG_API_BASE_URL, username="", password=""):
         self.base_url = str(base_url or DEFAULT_MSG_API_BASE_URL).rstrip("/")
@@ -1208,6 +1246,8 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         if method == "GET" and not head_only and self._serve_emby_folder_image(headers):
             return
         if method == "GET" and not head_only and self._serve_emby_subtitle_stream(headers):
+            return
+        if method == "GET" and not head_only and self._serve_emby_items_search(headers):
             return
         upstream_url = urllib.parse.urljoin(self.upstream_base_url.rstrip("/") + "/", self.path.lstrip("/"))
         headers["Accept-Encoding"] = "identity"
@@ -1313,6 +1353,43 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(("subtitle proxy MSG subtitle stream error: %s\n" % exc).encode("utf-8"))
             return True
         self._write_response(status, headers, body, request_headers=request_headers, request_path=self.path)
+        return True
+
+    def _serve_emby_items_search(self, request_headers):
+        search_request = parse_emby_user_items_search_request(self.path)
+        if not search_request:
+            return False
+        try:
+            item_ids = self._fetch_msg_search_media_ids(search_request["term"], search_request["limit"], search_request["start_index"])
+            items = self._fetch_emby_items_by_ids(search_request["user_id"], item_ids, request_headers)
+            if item_ids and not items:
+                raise RuntimeError("Emby item detail lookup returned no usable items for %r" % search_request["term"])
+        except RuntimeError as exc:
+            print("subtitle proxy Emby search error: %s" % exc, flush=True)
+            self._write_response(
+                502,
+                {"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"},
+                ("subtitle proxy Emby search error: %s\n" % exc).encode("utf-8"),
+                request_headers=request_headers,
+                request_path=self.path,
+            )
+            return True
+        payload = {
+            "Items": items,
+            "TotalRecordCount": len(items),
+        }
+        self._write_response(
+            200,
+            {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"},
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            request_headers=request_headers,
+            request_path=self.path,
+        )
+        print(
+            "subtitle proxy Emby search %s term=%r ids=%d items=%d"
+            % (search_request["mode"], search_request["term"], len(item_ids), len(items)),
+            flush=True,
+        )
         return True
 
     def _serve_openlist_subtitle_track(self, track, request_headers, target_extension):
@@ -1426,6 +1503,59 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         if tracks:
             print("subtitle proxy OpenList subtitle tracks %s for media %s" % (len(tracks), media_id), flush=True)
         return tracks
+
+    def _fetch_msg_search_media_ids(self, term, limit, start_index=0):
+        requested_limit = max(1, min(int(limit or 50), 100))
+        offset = max(0, int(start_index or 0))
+        api_limit = min(requested_limit + offset, 100)
+        query = urllib.parse.urlencode(
+            {
+                "q": str(term or ""),
+                "limit": str(api_limit),
+            }
+        )
+        status, _headers, body = self._read_msg_api("/media?%s" % query)
+        if status < 200 or status >= 300 or not body:
+            raise RuntimeError("MSG media search HTTP %s for %r" % (status, term))
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("MSG media search invalid JSON for %r" % term) from exc
+        rows = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise RuntimeError("MSG media search response missing items for %r" % term)
+        rows = rows[offset : offset + requested_limit]
+        ids = []
+        seen = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            media_id = str(row.get("id") or row.get("Id") or "").strip()
+            if not media_id or media_id in seen:
+                continue
+            seen.add(media_id)
+            ids.append(media_id)
+        return ids
+
+    def _fetch_emby_items_by_ids(self, user_id, media_ids, request_headers):
+        items = []
+        for media_id in media_ids:
+            path = "/emby/Users/%s/Items/%s" % (
+                urllib.parse.quote(str(user_id), safe=""),
+                urllib.parse.quote(str(media_id), safe=""),
+            )
+            status, _headers, body = self._read_upstream(path, request_headers)
+            if status < 200 or status >= 300 or not body:
+                print("subtitle proxy Emby search item HTTP %s for media %s" % (status, media_id), flush=True)
+                continue
+            try:
+                item = json.loads(body.decode("utf-8"))
+            except (TypeError, ValueError):
+                print("subtitle proxy Emby search item invalid JSON for media %s" % media_id, flush=True)
+                continue
+            if isinstance(item, dict) and item.get("Id"):
+                items.append(item)
+        return items
 
     def _fetch_emby_resume_runtime_ticks(self, media_id, request_headers, request_path):
         user_id = emby_request_user_id(request_path or "")
