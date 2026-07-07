@@ -196,6 +196,8 @@ DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES = 20 * 1024 * 1024
 ADULT_EXTRA_VIDEO_HIDE_MIN_BYTES = 200 * 1024 * 1024
 DEFAULT_SUBTITLE_BACKFILL_LIMIT = 20
 DEFAULT_SUBTITLE_REMATCH_LIMIT = 10
+DEFAULT_SUBTITLE_FIND_LIMIT = 8
+SUBTITLE_FIND_SCAN_PAGE_LIMIT = 5
 DEFAULT_SUBTITLE_LLM_PREVIEW_LIMIT = 5
 DEFAULT_SUBTITLE_LLM_PREVIEW_CHARS = 2000
 MAX_SUBTITLE_BACKFILL_LIMIT = 50
@@ -240,6 +242,7 @@ HELP_TEXT = """直接发送关键词、番号或磁链即可。
 /diag <info_hash|media_id> 查看任务或MSG媒体诊断
 /migrate <关键词> 迁移已有媒体到其他库
 /subtitle_report 查看成人库字幕补齐统计
+/subtitle_find <番号或标题> 查找成人库影片并重配字幕
 /dedupe_refresh 刷新已入库记录（需二次确认）
 /version 查看当前版本
 
@@ -253,9 +256,19 @@ BOT_COMMANDS = [
     {"command": "diag", "description": "查看任务或MSG媒体诊断"},
     {"command": "migrate", "description": "迁移已入库媒体到其他库"},
     {"command": "subtitle_report", "description": "查看成人库字幕补齐统计"},
+    {"command": "subtitle_find", "description": "按番号或标题查找字幕影片"},
     {"command": "dedupe_refresh", "description": "刷新重复判断索引（需二次确认）"},
     {"command": "version", "description": "查看当前版本"},
 ]
+
+SUBTITLE_FIND_PROMPT_TEXT = """字幕影片查找
+
+直接发送：
+字幕 番号或标题
+
+例如：
+字幕 SSIS-218
+字幕 秋色之空"""
 
 DEDUPE_REFRESH_WARNING_TEXT = """刷新已入库记录？
 
@@ -1682,6 +1695,56 @@ class PipelineBotService:
             "candidates": candidates,
         }
 
+    def subtitle_find_adult(self, query, limit=DEFAULT_SUBTITLE_FIND_LIMIT):
+        if not self.config.msg_enabled:
+            raise RuntimeError("MediaStationGo is disabled")
+        query = str(query or "").strip()
+        if not query:
+            raise ValueError("请输入番号或标题")
+        limit = max(1, int(limit or DEFAULT_SUBTITLE_FIND_LIMIT))
+        root = category_to_msg_library_root("adult")
+        client = self._build_msg_client()
+        matcher = self._build_subtitle_matcher()
+        store = CandidateStore(self.config.state_db_path)
+
+        media_by_id = {}
+
+        def add_media(media):
+            media_id = extract_media_id(media)
+            if not media_id or media_id in media_by_id:
+                return
+            if not media_belongs_to_library(media, root["library_id"]):
+                return
+            if subtitle_find_media_matches_query(media, query):
+                media_by_id[media_id] = media
+
+        for media in extract_media_items(client.search_media(query, limit=max(limit * 3, 20))):
+            add_media(media)
+            if len(media_by_id) >= limit:
+                break
+
+        page = 1
+        page_size = 200
+        while len(media_by_id) < limit and page <= SUBTITLE_FIND_SCAN_PAGE_LIMIT:
+            items = extract_media_items(client.list_library_media(root["library_id"], page=page, page_size=page_size, group_versions=0))
+            if not items:
+                break
+            for media in items:
+                add_media(media)
+                if len(media_by_id) >= limit:
+                    break
+            if len(items) < page_size:
+                break
+            page += 1
+
+        media_items = sorted(media_by_id.values(), key=lambda item: subtitle_find_media_score(item, query), reverse=True)
+        records = store.subtitle_backfill_records([extract_media_id(media) for media in media_items])
+        return {
+            "query": query,
+            "limit": limit,
+            "items": [subtitle_find_result_item_from_media(media, matcher, records) for media in media_items[:limit]],
+        }
+
     def apply_subtitle_candidate(self, candidate_record):
         candidate_record = dict(candidate_record or {})
         media_id = str(candidate_record.get("media_id") or "").strip()
@@ -2473,6 +2536,10 @@ class TelegramBot:
             with self._typing_action(chat_id):
                 self._handle_subtitle_report_command(chat_id)
             return
+        if command == "/subtitle_find":
+            with self._typing_action(chat_id):
+                self._handle_subtitle_find_command(chat_id, argument)
+            return
         if command == "/dedupe_refresh":
             self._handle_dedupe_refresh_command(chat_id)
             return
@@ -2481,6 +2548,12 @@ class TelegramBot:
             return
         if text.startswith("/"):
             self.telegram.send_message(chat_id, "这个命令不再作为搜索入口。直接发送关键词、番号或磁链即可；/help 查看功能。")
+            return
+
+        subtitle_find_query = parse_subtitle_find_query(text)
+        if subtitle_find_query is not None:
+            with self._typing_action(chat_id):
+                self._handle_subtitle_find_command(chat_id, subtitle_find_query)
             return
 
         direct_candidate = magnet_candidate_from_text(text)
@@ -2652,6 +2725,9 @@ class TelegramBot:
         if action == "subtitle_report":
             bucket, page = value
             self._handle_subtitle_report_callback(chat_id, message_id, callback_id, bucket, page)
+            return
+        if action == "subfind_prompt":
+            self._handle_subtitle_find_prompt_callback(chat_id, message_id, callback_id)
             return
         if action in ("sub1", "sub1r"):
             bucket, page, media_id = value
@@ -3628,6 +3704,32 @@ class TelegramBot:
             fallback_chat_id=chat_id,
         )
 
+    def _handle_subtitle_find_prompt_callback(self, chat_id, message_id, callback_id):
+        self.telegram.answer_callback_query(callback_id, "请输入字幕查找关键词")
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            SUBTITLE_FIND_PROMPT_TEXT,
+            reply_markup=subtitle_find_prompt_reply_markup(),
+            fallback_chat_id=chat_id,
+        )
+
+    def _handle_subtitle_find_command(self, chat_id, query):
+        query = str(query or "").strip()
+        if not query:
+            self.telegram.send_message(chat_id, SUBTITLE_FIND_PROMPT_TEXT, reply_markup=subtitle_find_prompt_reply_markup())
+            return
+        try:
+            result = self.service.subtitle_find_adult(query, limit=DEFAULT_SUBTITLE_FIND_LIMIT)
+        except (RuntimeError, ValueError) as exc:
+            self.telegram.send_message(chat_id, "字幕影片查找失败：%s" % exc)
+            return
+        self.telegram.send_message(
+            chat_id,
+            format_subtitle_find_message(result),
+            reply_markup=subtitle_find_reply_markup(result),
+        )
+
     def _handle_dedupe_refresh_confirm_callback(self, chat_id, message_id, callback_id):
         self.telegram.answer_callback_query(callback_id, "开始刷新已入库记录")
         self._update_callback_message(chat_id, message_id, "正在刷新已入库记录，请稍候...", reply_markup={"inline_keyboard": []})
@@ -4431,6 +4533,22 @@ def split_command(text):
     return command, argument.strip()
 
 
+def parse_subtitle_find_query(text):
+    value = str(text or "").strip()
+    if not value:
+        return None
+    for prefix in ("重新匹配字幕", "字幕重配", "重配字幕", "字幕", "重配"):
+        if value == prefix:
+            return ""
+        if value.startswith(prefix + " ") or value.startswith(prefix + "\u3000"):
+            return value[len(prefix) :].strip()
+        for separator in ("：", ":"):
+            marker = prefix + separator
+            if value.startswith(marker):
+                return value[len(marker) :].strip()
+    return None
+
+
 def parse_bool(value, default=False):
     if value is None:
         return default
@@ -5054,6 +5172,111 @@ def subtitle_report_bucket_items(report, bucket):
     return list(buckets.get(bucket) or [])
 
 
+def subtitle_find_media_matches_query(media, query):
+    return subtitle_find_media_score(media, query) > 0
+
+
+def subtitle_find_media_score(media, query):
+    query_text = str(query or "").strip()
+    if not query_text or not isinstance(media, dict):
+        return 0
+    haystack = media_haystack(media)
+    query_codes = extract_codes(query_text)
+    media_codes = extract_codes(haystack)
+    score = 0
+    if query_codes and query_codes.intersection(media_codes):
+        score += 1000
+    normalized_query = normalize_fragment(query_text)
+    normalized_haystack = normalize_fragment(haystack)
+    title = media_display_title(media)
+    normalized_title = normalize_fragment(title)
+    if normalized_query and normalized_query in normalized_title:
+        score += 500
+    elif normalized_query and normalized_query in normalized_haystack:
+        score += 250
+    query_terms = [normalize_fragment(part) for part in re.split(r"\s+", query_text) if normalize_fragment(part)]
+    if query_terms and all(term in normalized_haystack for term in query_terms):
+        score += 100
+    return score
+
+
+def subtitle_find_result_item_from_media(media, matcher, records):
+    item = subtitle_report_item_from_media(media, records)
+    media_id = item.get("media_id")
+    if media_id and subtitle_matcher_has_cached_tracks(matcher, media_id):
+        item["status"] = "cached"
+        item["status_label"] = "已补"
+    return item
+
+
+def subtitle_find_bucket_for_item(item):
+    status = str((item or {}).get("status") or "")
+    if status == "cached":
+        return "cached"
+    if status in ("untried", "not_found", "failed", "no_code"):
+        return status
+    return "pending"
+
+
+def subtitle_find_item_button_label(index, item):
+    status = (item or {}).get("status")
+    if status == "cached":
+        return "#%s 重配" % index
+    if status in SUBTITLE_BACKFILL_SKIP_STATUSES:
+        return "#%s 重试" % index
+    return "#%s 补齐" % index
+
+
+def format_subtitle_find_message(result):
+    result = result or {}
+    items = list(result.get("items") or [])
+    lines = [
+        "字幕影片查找：%s" % (result.get("query") or "-"),
+        "结果：%s 条" % len(items),
+    ]
+    if not items:
+        lines.append("未找到匹配影片。")
+        return "\n".join(lines)
+    for index, item in enumerate(items, start=1):
+        code = item.get("code") or "-"
+        title = item.get("title") or "-"
+        line = "#%s %s / %s" % (index, code, title)
+        details = []
+        if item.get("status_label"):
+            details.append(item["status_label"])
+        if item.get("source"):
+            details.append(item["source"])
+        if item.get("attempt_count"):
+            details.append("尝试%s次" % item.get("attempt_count"))
+        if details:
+            line += "\n   " + "，".join(details)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def subtitle_find_reply_markup(result):
+    items = list((result or {}).get("items") or [])
+    keyboard = []
+    buttons = []
+    for index, item in enumerate(items, start=1):
+        callback_data = subtitle_report_item_callback_data(item, subtitle_find_bucket_for_item(item), 0)
+        if not callback_data:
+            continue
+        buttons.append({"text": subtitle_find_item_button_label(index, item), "callback_data": callback_data})
+    for offset in range(0, len(buttons), 2):
+        keyboard.append(buttons[offset : offset + 2])
+    keyboard.extend(subtitle_find_prompt_reply_markup()["inline_keyboard"])
+    return {"inline_keyboard": keyboard}
+
+
+def subtitle_find_prompt_reply_markup():
+    return {
+        "inline_keyboard": [
+            [{"text": "返回字幕报表", "callback_data": "subtitle_report:pending:0"}],
+        ]
+    }
+
+
 def format_subtitle_backfill_report_message(report, bucket="pending", page=0):
     report = report or new_subtitle_backfill_report()
     bucket = normalize_subtitle_report_bucket(bucket)
@@ -5128,6 +5351,7 @@ def subtitle_backfill_report_reply_markup(report, bucket="pending", page=0, batc
         item_buttons.append({"text": label, "callback_data": callback_data})
     for offset in range(0, len(item_buttons), 2):
         keyboard.append(item_buttons[offset : offset + 2])
+    keyboard.append([{"text": "查找影片", "callback_data": "subfind_prompt:1"}])
     keyboard.append(
         [
             {"text": "上一页", "callback_data": "subtitle_report:%s:%s" % (bucket, previous_page)},
@@ -5742,6 +5966,8 @@ def parse_callback_data(value):
         bucket, sep, page = payload.partition(":")
         if sep:
             return action, (bucket, int(page))
+    if action == "subfind_prompt" and payload:
+        return action, payload
     if action in ("subbulk", "subbulkr") and payload:
         bucket, sep, limit = payload.partition(":")
         if sep:

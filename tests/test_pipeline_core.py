@@ -514,6 +514,7 @@ class FakeBotService:
         subtitle_backfill_response=None,
         subtitle_backfill_one_response=None,
         subtitle_report_response=None,
+        subtitle_find_response=None,
         subtitle_rematch_response=None,
         subtitle_apply_response=None,
         rerank_results=None,
@@ -620,11 +621,17 @@ class FakeBotService:
                 "no_code": [],
             },
         }
+        self.subtitle_find_response = subtitle_find_response or {
+            "query": "SSIS-218",
+            "limit": 8,
+            "items": [{"media_id": "media-1", "title": "SSIS-218", "code": "SSIS-218", "status": "cached", "status_label": "已补"}],
+        }
         self.sync_calls = []
         self.subtitle_calls = []
         self.subtitle_backfill_calls = []
         self.subtitle_backfill_one_calls = []
         self.subtitle_report_calls = 0
+        self.subtitle_find_calls = []
         self.subtitle_rematch_calls = []
         self.subtitle_preview_calls = []
         self.subtitle_apply_calls = []
@@ -765,6 +772,13 @@ class FakeBotService:
     def subtitle_backfill_report_adult(self):
         self.subtitle_report_calls += 1
         return dict(self.subtitle_report_response)
+
+    def subtitle_find_adult(self, query, limit=8):
+        self.subtitle_find_calls.append((query, limit))
+        result = dict(self.subtitle_find_response)
+        result["query"] = query
+        result["limit"] = limit
+        return result
 
     def subtitle_rematch_candidates_adult(self, media_id, limit=10):
         self.subtitle_rematch_calls.append((media_id, limit))
