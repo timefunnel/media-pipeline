@@ -192,6 +192,8 @@ ACTIVE_115_FAST_POLL_INTERVAL_SECONDS = 2
 ACTIVE_115_SLOW_AFTER_POLLS = 10
 ACTIVE_115_SLOW_POLL_INTERVAL_SECONDS = 600
 ACTIVE_115_TIMEOUT_SECONDS = 7200
+DEFAULT_TASK_WORKERS = 2
+DEFAULT_TASK_MESSAGE_EDIT_MIN_INTERVAL_SECONDS = 2
 CATEGORY_LABELS = {"movie": "电影库", "tv": "剧集库", "anime": "动漫库", "adult": "成人库", "other": "其他库"}
 CONTENT_PROFILE_LABELS = {
     "adult": "成人",
@@ -327,6 +329,8 @@ class BotConfig:
     openlist_pre_scan_clean_max_bytes: int = DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES
     openlist_adult_code_format_enabled: bool = True
     sync_recovery_interval_seconds: int = 60
+    task_workers: int = DEFAULT_TASK_WORKERS
+    task_message_edit_min_interval_seconds: float = DEFAULT_TASK_MESSAGE_EDIT_MIN_INTERVAL_SECONDS
     openlist_scan_username: str = ""
     openlist_scan_password: str = ""
     search_page_size: int = SEARCH_PAGE_SIZE
@@ -410,6 +414,16 @@ class BotConfig:
             ),
             openlist_adult_code_format_enabled=parse_bool(env.get("OPENLIST_ADULT_CODE_FORMAT_ENABLED"), True),
             sync_recovery_interval_seconds=int(env.get("BOT_SYNC_RECOVERY_INTERVAL_SECONDS", "60")),
+            task_workers=max(1, int(env.get("BOT_TASK_WORKERS", str(DEFAULT_TASK_WORKERS)))),
+            task_message_edit_min_interval_seconds=max(
+                0.0,
+                float(
+                    env.get(
+                        "BOT_TASK_MESSAGE_EDIT_MIN_INTERVAL_SECONDS",
+                        str(DEFAULT_TASK_MESSAGE_EDIT_MIN_INTERVAL_SECONDS),
+                    )
+                ),
+            ),
             search_page_size=int(env.get("BOT_SEARCH_PAGE_SIZE", str(SEARCH_PAGE_SIZE))),
             task_list_page_size=int(env.get("BOT_TASK_LIST_PAGE_SIZE", str(DEFAULT_TASK_LIST_PAGE_SIZE))),
             task_list_fetch_limit=int(env.get("BOT_TASK_LIST_FETCH_LIMIT", str(DEFAULT_TASK_LIST_FETCH_LIMIT))),
@@ -457,7 +471,10 @@ class CandidateStore:
         self._init_schema()
 
     def _connect(self):
-        return sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("pragma busy_timeout = 30000")
+        conn.execute("pragma journal_mode = wal")
+        return conn
 
     def _init_schema(self):
         conn = self._connect()
@@ -2063,6 +2080,10 @@ class TelegramBot:
         self.store = store
         self.service = service
         self._recovery_thread = None
+        self._task_locks = {}
+        self._task_locks_guard = threading.Lock()
+        self._task_message_update_times = {}
+        self._task_message_update_guard = threading.Lock()
 
     def handle_update(self, update):
         if update.get("message"):
@@ -2785,6 +2806,16 @@ class TelegramBot:
         return self.service.check_duplicate(category, record.get("query") or "", candidate)
 
     def _handle_status_callback(self, user_id, chat_id, message_id, callback_id, info_hash):
+        lock = self._try_acquire_task_lock(info_hash)
+        if lock is None:
+            self.telegram.answer_callback_query(callback_id, "任务正在处理，请稍后刷新")
+            return
+        try:
+            return self._handle_status_callback_unlocked(user_id, chat_id, message_id, callback_id, info_hash)
+        finally:
+            lock.release()
+
+    def _handle_status_callback_unlocked(self, user_id, chat_id, message_id, callback_id, info_hash):
         record = self._load_owned_task(user_id, callback_id, info_hash)
         if record is None:
             return
@@ -2840,6 +2871,16 @@ class TelegramBot:
             )
 
     def _handle_cancel_callback(self, user_id, chat_id, message_id, callback_id, info_hash):
+        lock = self._try_acquire_task_lock(info_hash)
+        if lock is None:
+            self.telegram.answer_callback_query(callback_id, "任务正在处理，请稍后刷新")
+            return
+        try:
+            return self._handle_cancel_callback_unlocked(user_id, chat_id, message_id, callback_id, info_hash)
+        finally:
+            lock.release()
+
+    def _handle_cancel_callback_unlocked(self, user_id, chat_id, message_id, callback_id, info_hash):
         record = self._load_owned_task(user_id, callback_id, info_hash)
         if record is None:
             return
@@ -2871,6 +2912,16 @@ class TelegramBot:
         )
 
     def _handle_retry_msg_callback(self, user_id, chat_id, message_id, callback_id, info_hash):
+        lock = self._try_acquire_task_lock(info_hash)
+        if lock is None:
+            self.telegram.answer_callback_query(callback_id, "任务正在处理，请稍后刷新")
+            return
+        try:
+            return self._handle_retry_msg_callback_unlocked(user_id, chat_id, message_id, callback_id, info_hash)
+        finally:
+            lock.release()
+
+    def _handle_retry_msg_callback_unlocked(self, user_id, chat_id, message_id, callback_id, info_hash):
         record = self._load_owned_task(user_id, callback_id, info_hash)
         if record is None:
             return
@@ -3245,6 +3296,8 @@ class TelegramBot:
         def update(task):
             task = self._task_with_known_status_message_id(record, task, message_id=message_id)
             self.store.save_task(record["user_id"], record["chat_id"], record["category"], record["title"], task)
+            if not self._should_emit_task_message_update(record, task):
+                return
             self._update_callback_message(
                 chat_id,
                 message_id,
@@ -3329,6 +3382,41 @@ class TelegramBot:
         except RuntimeError:
             return
 
+    def _task_lock_key(self, info_hash):
+        return str(info_hash or "").strip().lower()
+
+    def _try_acquire_task_lock(self, info_hash):
+        key = self._task_lock_key(info_hash)
+        if not key:
+            return None
+        with self._task_locks_guard:
+            lock = self._task_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._task_locks[key] = lock
+        if not lock.acquire(blocking=False):
+            return None
+        return lock
+
+    def _should_emit_task_message_update(self, record, task=None, force=False):
+        if force:
+            return True
+        interval = max(0.0, float(self.config.task_message_edit_min_interval_seconds or 0))
+        if interval <= 0:
+            return True
+        message_id = task_telegram_status_message_id(task) or task_telegram_status_message_id((record or {}).get("task"))
+        if not message_id:
+            return True
+        info_hash = self._task_lock_key((task or {}).get("info_hash") or (record or {}).get("info_hash"))
+        key = "%s:%s:%s" % ((record or {}).get("chat_id"), message_id, info_hash)
+        now = time.monotonic()
+        with self._task_message_update_guard:
+            last = self._task_message_update_times.get(key)
+            if last is not None and now - last < interval:
+                return False
+            self._task_message_update_times[key] = now
+        return True
+
     def _update_callback_message(self, chat_id, message_id, text, reply_markup=None, fallback_chat_id=None):
         target_chat_id = chat_id or fallback_chat_id
         last_error = None
@@ -3366,20 +3454,8 @@ class TelegramBot:
         return TypingActionPulse(self, chat_id)
 
     def recover_running_msg_sync_tasks_once(self):
-        count = 0
-        for record in self.store.list_msg_sync_running_tasks():
-            try:
-                task = self._sync_completed_task(record, record["task"])
-                self.store.save_task(record["user_id"], record["chat_id"], record["category"], record["title"], task)
-                self.telegram.send_message(
-                    record["chat_id"],
-                    format_task_status_message(record["title"], task, category=record["category"]),
-                    reply_markup=task_reply_markup(task),
-                )
-                count += 1
-            except Exception as exc:
-                print("bot sync recovery failed for %s: %s" % (record["info_hash"], exc), flush=True)
-        return count
+        records = self.store.list_msg_sync_running_tasks()
+        return self._run_task_records_parallel(records, self._recover_running_msg_sync_record)
 
     def recover_active_115_tasks_once(self, now=None):
         now = int(time.time() if now is None else now)
@@ -3391,6 +3467,7 @@ class TelegramBot:
             elif active_115_task_poll_due(record, now, normal_interval_seconds=self.config.sync_recovery_interval_seconds):
                 records_by_category[record["category"]].append(record)
 
+        active_work = []
         for category, records in records_by_category.items():
             info_hashes = [record["info_hash"] for record in records]
             try:
@@ -3410,14 +3487,64 @@ class TelegramBot:
                 else:
                     task = polled_task
                 task = self._task_with_known_status_message_id(record, task)
+                active_work.append((record, task))
+        return count + self._run_task_records_parallel(active_work, self._recover_active_115_task_record)
+
+    def _run_task_records_parallel(self, items, handler):
+        items = list(items or [])
+        if not items:
+            return 0
+        workers = max(1, int(self.config.task_workers or 1))
+        if workers == 1 or len(items) == 1:
+            count = 0
+            for item in items:
+                count += handler(item)
+            return count
+        count = 0
+        with ThreadPoolExecutor(max_workers=min(workers, len(items)), thread_name_prefix="task-recovery") as executor:
+            futures = [executor.submit(handler, item) for item in items]
+            for future in futures:
+                count += future.result()
+        return count
+
+    def _recover_running_msg_sync_record(self, record):
+        lock = self._try_acquire_task_lock(record["info_hash"])
+        if lock is None:
+            return 0
+        try:
+            try:
+                task = self._sync_completed_task(record, record["task"])
+                task = self._task_with_known_status_message_id(record, task)
+                self.store.save_task(record["user_id"], record["chat_id"], record["category"], record["title"], task)
+                self._update_recovered_115_task_message(record, task, force=True)
+                return 1
+            except Exception as exc:
+                print("bot sync recovery failed for %s: %s" % (record["info_hash"], exc), flush=True)
+                return 0
+        finally:
+            lock.release()
+
+    def _recover_active_115_task_record(self, item):
+        record, task = item
+        lock = self._try_acquire_task_lock(record["info_hash"])
+        if lock is None:
+            return 0
+        try:
+            try:
                 task = self._sync_completed_task_with_store_progress(record, task)
                 task = self._task_with_known_status_message_id(record, task)
                 self.store.save_task(record["user_id"], record["chat_id"], record["category"], record["title"], task)
-                self._update_recovered_115_task_message(record, task)
-                count += 1
-        return count
+                self._update_recovered_115_task_message(record, task, force=True)
+                return 1
+            except Exception as exc:
+                print("bot active task recovery failed for %s: %s" % (record["info_hash"], exc), flush=True)
+                return 0
+        finally:
+            lock.release()
 
-    def _update_recovered_115_task_message(self, record, task, final_fallback=True):
+    def _update_recovered_115_task_message(self, record, task, final_fallback=True, force=False):
+        if not force and not self._should_emit_task_message_update(record, task):
+            return
         message_id = task_telegram_status_message_id(task) or task_telegram_status_message_id(record.get("task"))
         text = format_task_status_message(record["title"], task, category=record["category"])
         markup = task_reply_markup(task)
@@ -3434,24 +3561,30 @@ class TelegramBot:
             self.telegram.send_message(record["chat_id"], text, reply_markup=markup)
 
     def _auto_cancel_timed_out_115_task(self, record, now):
-        try:
-            result = self.service.cancel_task(record["category"], record["info_hash"])
-        except Exception as exc:
-            print("bot 115 timeout cancel failed for %s: %s" % (record["info_hash"], exc), flush=True)
+        lock = self._try_acquire_task_lock(record["info_hash"])
+        if lock is None:
             return 0
-        task = dict(result.get("task") or record["task"] or {})
-        task.setdefault("info_hash", record["info_hash"])
-        if result.get("cancelled"):
-            mark_task_auto_cancelled(task, now)
-        if TASK_STATE.is_offline_success(task):
-            task = self._sync_completed_task_with_store_progress(record, task)
-        self.store.save_task(record["user_id"], record["chat_id"], record["category"], record["title"], task)
-        if result.get("cancelled"):
-            message = format_auto_cancel_result_message(record["title"], result, task, category=record["category"])
-        else:
-            message = format_cancel_result_message(record["title"], result, category=record["category"])
-        self.telegram.send_message(record["chat_id"], message, reply_markup=task_reply_markup(task))
-        return 1
+        try:
+            try:
+                result = self.service.cancel_task(record["category"], record["info_hash"])
+            except Exception as exc:
+                print("bot 115 timeout cancel failed for %s: %s" % (record["info_hash"], exc), flush=True)
+                return 0
+            task = dict(result.get("task") or record["task"] or {})
+            task.setdefault("info_hash", record["info_hash"])
+            if result.get("cancelled"):
+                mark_task_auto_cancelled(task, now)
+            if TASK_STATE.is_offline_success(task):
+                task = self._sync_completed_task_with_store_progress(record, task)
+            self.store.save_task(record["user_id"], record["chat_id"], record["category"], record["title"], task)
+            if result.get("cancelled"):
+                message = format_auto_cancel_result_message(record["title"], result, task, category=record["category"])
+            else:
+                message = format_cancel_result_message(record["title"], result, category=record["category"])
+            self.telegram.send_message(record["chat_id"], message, reply_markup=task_reply_markup(task))
+            return 1
+        finally:
+            lock.release()
 
     def _sync_completed_task_with_store_progress(self, record, task):
         def save_progress(progress):

@@ -102,10 +102,14 @@ class BotConfigTest(unittest.TestCase):
                 "TG_BOT_TOKEN": "123:token",
                 "TG_ALLOWED_USER_IDS": "700656624",
                 "BOT_SYNC_RECOVERY_INTERVAL_SECONDS": "120",
+                "BOT_TASK_WORKERS": "3",
+                "BOT_TASK_MESSAGE_EDIT_MIN_INTERVAL_SECONDS": "1.5",
             }
         )
 
         self.assertEqual(config.sync_recovery_interval_seconds, 120)
+        self.assertEqual(config.task_workers, 3)
+        self.assertEqual(config.task_message_edit_min_interval_seconds, 1.5)
 
     def test_bot_config_reads_msg_trash_hide_sync_settings(self):
         from pipeline.bot import BotConfig
@@ -2254,7 +2258,18 @@ class TelegramBotTest(unittest.TestCase):
                 ],
                 sync_response={"msg_sync_status": "success", "msg_scrape_status": "success", "msg_media_id": "media-1"},
             )
-            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path, msg_enabled=True), telegram, store, service)
+            bot = TelegramBot(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    store.db_path,
+                    msg_enabled=True,
+                    task_message_edit_min_interval_seconds=0,
+                ),
+                telegram,
+                store,
+                service,
+            )
 
             bot.handle_update(
                 {
@@ -2276,6 +2291,80 @@ class TelegramBotTest(unittest.TestCase):
             self.assertTrue(any("MSG扫描：进行中" in text for text in texts))
             self.assertTrue(any("MSG刮削：进行中" in text for text in texts))
             self.assertIn("MSG同步：已完成", texts[-1])
+
+    def test_status_callback_throttles_nonfinal_progress_message_edits(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot, format_task_status_message
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            store.save_task(700656624, 9001, "movie", "Sintel", {"info_hash": "ABC", "status_name": "downloading", "percent_done": 5})
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                status_response={"info_hash": "ABC", "status_name": "success", "percent_done": 100, "file_id": "file1"},
+                sync_progress=[
+                    {"msg_sync_status": "running", "openlist_clean_status": "running"},
+                    {"msg_sync_status": "running", "openlist_clean_status": "success", "openlist_cleaned_count": 2},
+                    {"msg_sync_status": "running", "msg_scan_status": "running"},
+                    {"msg_sync_status": "running", "msg_scrape_status": "running", "msg_media_id": "media-1"},
+                ],
+                sync_response={"msg_sync_status": "success", "msg_scrape_status": "success", "msg_media_id": "media-1"},
+            )
+            bot = TelegramBot(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    store.db_path,
+                    msg_enabled=True,
+                    task_message_edit_min_interval_seconds=60,
+                ),
+                telegram,
+                store,
+                service,
+            )
+
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb1",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 101},
+                        "data": "status:ABC",
+                    }
+                }
+            )
+            saved = store.load_task("ABC")["task"]
+
+        self.assertLess(len(telegram.edits), 6)
+        self.assertEqual(saved["msg_sync_status"], "success")
+        self.assertEqual(saved["msg_media_id"], "media-1")
+        self.assertEqual(telegram.edits[-1]["text"], format_task_status_message("Sintel", saved, category="movie"))
+
+    def test_status_callback_skips_when_same_task_is_already_running(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            store.save_task(700656624, 9001, "movie", "Sintel", {"info_hash": "ABC", "status_name": "downloading", "percent_done": 5})
+            telegram = FakeTelegram()
+            service = FakeBotService(status_response={"info_hash": "ABC", "status_name": "success", "percent_done": 100})
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+            lock = bot._try_acquire_task_lock("ABC")
+            try:
+                bot.handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb1",
+                            "from": {"id": 700656624},
+                            "message": {"chat": {"id": 9001}, "message_id": 101},
+                            "data": "status:ABC",
+                        }
+                    }
+                )
+            finally:
+                lock.release()
+
+        self.assertEqual(service.status_calls, [])
+        self.assertEqual(telegram.answers, [{"callback_query_id": "cb1", "text": "任务正在处理，请稍后刷新"}])
 
     def test_status_callback_keeps_syncing_when_progress_message_update_times_out(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -2446,6 +2535,105 @@ class TelegramBotTest(unittest.TestCase):
         self.assertEqual(telegram.messages[0]["chat_id"], 9001)
         self.assertIn("MSG同步：已完成", telegram.messages[0]["text"])
 
+    def test_recover_active_115_tasks_batches_115_lookup_before_parallel_sync(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        class CapturingExecutor:
+            instances = []
+
+            def __init__(self, max_workers=None, thread_name_prefix=None):
+                self.max_workers = max_workers
+                self.thread_name_prefix = thread_name_prefix
+                self.submitted = []
+                self.__class__.instances.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def submit(self, fn, item):
+                self.submitted.append(item)
+
+                class DoneFuture:
+                    def result(self_inner):
+                        return fn(item)
+
+                return DoneFuture()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            with patch("pipeline.bot.time.time", return_value=1000):
+                store.save_task(
+                    700656624,
+                    9001,
+                    "movie",
+                    "Sintel A",
+                    {"info_hash": "AAA", "status_name": "downloading", "poll_count": 0, "last_polled_at": 1000},
+                )
+                store.save_task(
+                    700656624,
+                    9001,
+                    "movie",
+                    "Sintel B",
+                    {"info_hash": "BBB", "status_name": "downloading", "poll_count": 0, "last_polled_at": 1000},
+                )
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                statuses_response={
+                    "AAA": {"info_hash": "AAA", "status_name": "success", "percent_done": 100},
+                    "BBB": {"info_hash": "BBB", "status_name": "success", "percent_done": 100},
+                },
+                sync_response={"msg_sync_status": "success", "msg_scrape_status": "success"},
+            )
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path, msg_enabled=True, task_workers=2), telegram, store, service)
+
+            with patch("pipeline.bot.ThreadPoolExecutor", CapturingExecutor):
+                count = bot.recover_active_115_tasks_once(now=1002)
+            saved_a = store.load_task("AAA")["task"]
+            saved_b = store.load_task("BBB")["task"]
+
+        self.assertEqual(count, 2)
+        self.assertEqual(len(service.statuses_calls), 1)
+        self.assertEqual(service.statuses_calls[0][0], "movie")
+        self.assertEqual(set(service.statuses_calls[0][1]), {"AAA", "BBB"})
+        self.assertEqual({call[2] for call in service.sync_calls}, {"AAA", "BBB"})
+        self.assertEqual(CapturingExecutor.instances[0].max_workers, 2)
+        self.assertEqual(len(CapturingExecutor.instances[0].submitted), 2)
+        self.assertEqual(saved_a["msg_sync_status"], "success")
+        self.assertEqual(saved_b["msg_sync_status"], "success")
+
+    def test_recover_active_115_tasks_skips_locked_task_after_batch_status_lookup(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            with patch("pipeline.bot.time.time", return_value=1000):
+                store.save_task(
+                    700656624,
+                    9001,
+                    "movie",
+                    "Sintel",
+                    {"info_hash": "ABC", "status_name": "downloading", "percent_done": 5, "poll_count": 0, "last_polled_at": 1000},
+                )
+            telegram = FakeTelegram()
+            service = FakeBotService(statuses_response={"ABC": {"info_hash": "ABC", "status_name": "success", "percent_done": 100}})
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path, msg_enabled=True), telegram, store, service)
+            lock = bot._try_acquire_task_lock("ABC")
+            try:
+                count = bot.recover_active_115_tasks_once(now=1002)
+            finally:
+                lock.release()
+            saved = store.load_task("ABC")["task"]
+
+        self.assertEqual(count, 0)
+        self.assertEqual(len(service.statuses_calls), 1)
+        self.assertEqual(service.sync_calls, [])
+        self.assertEqual(saved["status_name"], "downloading")
+        self.assertEqual(saved["percent_done"], 5)
+        self.assertEqual(telegram.messages, [])
+
     def test_recover_active_115_tasks_skips_fast_poll_before_two_seconds(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
 
@@ -2596,7 +2784,18 @@ class TelegramBotTest(unittest.TestCase):
                 ],
                 sync_response={"msg_sync_status": "success", "msg_scrape_status": "success", "msg_media_id": "media-1"},
             )
-            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path, msg_enabled=True), telegram, store, service)
+            bot = TelegramBot(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    store.db_path,
+                    msg_enabled=True,
+                    task_message_edit_min_interval_seconds=0,
+                ),
+                telegram,
+                store,
+                service,
+            )
 
             count = bot.recover_active_115_tasks_once(now=1002)
             texts = [edit["text"] for edit in telegram.edits]
