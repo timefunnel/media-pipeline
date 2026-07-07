@@ -715,6 +715,24 @@ class SubtitleProxyTest(unittest.TestCase):
 
         self.assertEqual(user_id, "user-1")
 
+    def test_subtitle_proxy_timing_log_redacts_tokens(self):
+        import contextlib
+
+        handler = object.__new__(SubtitleProxyHandler)
+        handler.timing_log_enabled = True
+        timing = handler._new_timing("GET", "/emby/Users/u/Items/media-1/PlaybackInfo?api_key=secret-token")
+        handler._mark_timing(timing, "upstream")
+        out = io.StringIO()
+
+        with contextlib.redirect_stdout(out):
+            handler._log_timing(timing, 200, timing["path"])
+
+        text = out.getvalue()
+        self.assertIn("subtitle proxy timing status=200", text)
+        self.assertIn("api_key=REDACTED", text)
+        self.assertIn("upstream=", text)
+        self.assertNotIn("secret-token", text)
+
     def test_patch_emby_collection_folder_item_cover_uses_self_grid_image(self):
         folder = {
             "Id": "library-1",

@@ -71,6 +71,7 @@ EMBY_FOLDER_COVER_MIN_WIDTH = 160
 EMBY_FOLDER_COVER_MAX_WIDTH = 1200
 EMBY_FOLDER_COVER_TAG_LENGTH = 32
 EMBY_FOLDER_COVER_TAG_VERSION = "folder-cover-grid-v6-jellyfin-shape"
+SUBTITLE_PROXY_TIMING_LOG_ENV = "MSG_SUBTITLE_PROXY_TIMING_LOG"
 SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
 VIDEO_EXTENSIONS = {
     ".avi",
@@ -460,6 +461,17 @@ def subtitle_lang_label(name):
 
 def redact_sensitive_query_values(text):
     return SENSITIVE_QUERY_RE.sub(r"\1REDACTED", text)
+
+
+def parse_bool(value, default=False):
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
 
 
 def inject_subtitle_track_bootstrap(text):
@@ -1230,6 +1242,7 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
     # Only serve tokenless folder covers when the exact folder/tag pair was just published by this proxy.
     published_folder_cover_cache = {}
     folder_cover_cache_lock = threading.Lock()
+    timing_log_enabled = False
 
     def do_GET(self):
         self._proxy()
@@ -1242,6 +1255,7 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _proxy(self, head_only=False, method=None):
         method = method or ("HEAD" if head_only else "GET")
+        timing = self._new_timing(method, self.path)
         request_body = None
         if method not in ("GET", "HEAD"):
             try:
@@ -1266,16 +1280,20 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 body = b"" if head_only else response.read()
-                self._write_response(response.status, response.headers, body, head_only=head_only, request_headers=headers, request_path=self.path)
+                self._mark_timing(timing, "upstream")
+                self._write_response(response.status, response.headers, body, head_only=head_only, request_headers=headers, request_path=self.path, timing=timing)
         except urllib.error.HTTPError as exc:
             body = b"" if head_only else exc.read()
-            self._write_response(exc.code, exc.headers, body, head_only=head_only, request_headers=headers, request_path=self.path)
+            self._mark_timing(timing, "upstream_http_error")
+            self._write_response(exc.code, exc.headers, body, head_only=head_only, request_headers=headers, request_path=self.path, timing=timing)
         except (OSError, TimeoutError) as exc:
             self.send_response(502)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             if not head_only:
                 self.wfile.write(("subtitle proxy upstream error: %s\n" % exc).encode("utf-8"))
+            self._mark_timing(timing, "upstream_error")
+            self._log_timing(timing, 502, self.path)
 
     def _serve_emby_folder_image(self, request_headers):
         image_request = parse_emby_item_image_request(self.path)
@@ -1452,11 +1470,13 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             request_path=self.path,
         )
 
-    def _fetch_msg_subtitle_tracks(self, media_id):
+    def _fetch_msg_subtitle_tracks(self, media_id, timing=None):
         msg_tracks = []
         try:
             status, _headers, body = self._read_msg_api("/media/%s/subtitles" % urllib.parse.quote(str(media_id), safe=""))
+            self._mark_timing(timing, "msg_subtitles")
         except RuntimeError as exc:
+            self._mark_timing(timing, "msg_subtitles_error")
             print("subtitle proxy MSG subtitle list error: %s" % exc, flush=True)
             status = 0
             body = b""
@@ -1471,28 +1491,32 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             tracks = payload.get("tracks") if isinstance(payload, dict) else None
             if isinstance(tracks, list):
                 msg_tracks = [track for track in tracks if isinstance(track, dict) and track.get("path")]
-        openlist_tracks = self._fetch_openlist_subtitle_tracks(media_id)
-        local_tracks = self._fetch_local_subtitle_tracks(media_id)
+        openlist_tracks = self._fetch_openlist_subtitle_tracks(media_id, timing=timing)
+        local_tracks = self._fetch_local_subtitle_tracks(media_id, timing=timing)
         return merge_subtitle_tracks(openlist_tracks, local_tracks, msg_tracks)
 
-    def _fetch_local_subtitle_tracks(self, media_id):
+    def _fetch_local_subtitle_tracks(self, media_id, timing=None):
         if self.local_subtitle_provider is None or not self.local_subtitle_provider.enabled():
             return []
         try:
             tracks = self.local_subtitle_provider.tracks_for_media_id(media_id)
+            self._mark_timing(timing, "local_subtitle_tracks")
         except RuntimeError as exc:
+            self._mark_timing(timing, "local_subtitle_tracks_error")
             print("subtitle proxy local subtitle discovery error: %s" % exc, flush=True)
             return []
         if tracks:
             print("subtitle proxy local subtitle tracks %s for media %s" % (len(tracks), media_id), flush=True)
         return tracks
 
-    def _fetch_openlist_subtitle_tracks(self, media_id):
+    def _fetch_openlist_subtitle_tracks(self, media_id, timing=None):
         if self.openlist_subtitle_provider is None or not self.openlist_subtitle_provider.enabled():
             return []
         try:
             status, _headers, body = self._read_msg_api("/media/%s" % urllib.parse.quote(str(media_id), safe=""))
+            self._mark_timing(timing, "msg_media_detail_for_subtitles")
         except RuntimeError as exc:
+            self._mark_timing(timing, "msg_media_detail_for_subtitles_error")
             print("subtitle proxy MSG media detail error: %s" % exc, flush=True)
             return []
         if status < 200 or status >= 300 or not body:
@@ -1508,7 +1532,9 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             return []
         try:
             tracks = self.openlist_subtitle_provider.tracks_for_media_path(media_path)
+            self._mark_timing(timing, "openlist_subtitle_discovery")
         except RuntimeError as exc:
+            self._mark_timing(timing, "openlist_subtitle_discovery_error")
             print("subtitle proxy OpenList subtitle discovery error: %s" % exc, flush=True)
             return []
         if tracks:
@@ -1808,36 +1834,45 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         except urllib.error.HTTPError as exc:
             return exc.code, exc.headers, exc.read()
 
-    def _write_response(self, status, headers, body, head_only=False, request_headers=None, request_path=None):
+    def _write_response(self, status, headers, body, head_only=False, request_headers=None, request_path=None, timing=None):
         content_type = headers.get("Content-Type", "")
         no_store = False
         if not head_only and body and should_normalize_subtitle(content_type, body):
             body = normalize_webvtt_timestamps(body.decode("utf-8", "replace")).encode("utf-8")
             content_type = "text/vtt; charset=utf-8"
+            self._mark_timing(timing, "normalize_subtitle")
         elif not head_only and body and "application/json" in (content_type or "").lower():
             media_id = parse_emby_item_media_id(request_path or "")
             try:
                 payload = json.loads(body.decode("utf-8"))
+                self._mark_timing(timing, "json_decode")
             except (TypeError, ValueError):
                 payload = None
             if isinstance(payload, (dict, list)):
                 if isinstance(payload, dict) and patch_emby_resume_runtime_fields(payload):
                     no_store = True
+                    self._mark_timing(timing, "resume_runtime_patch")
                 if self._patch_emby_collection_folder_covers(payload, request_headers, request_path or ""):
                     no_store = True
+                    self._mark_timing(timing, "folder_cover_patch")
                 if isinstance(payload, dict) and media_id:
                     runtime_ticks = self._fetch_emby_resume_runtime_ticks(media_id, request_headers, request_path or "")
+                    self._mark_timing(timing, "runtime_ticks")
                     if patch_emby_playback_info_runtime(payload, runtime_ticks, media_id=media_id):
                         no_store = True
-                    tracks = self._fetch_msg_subtitle_tracks(media_id)
+                        self._mark_timing(timing, "playback_runtime_patch")
+                    tracks = self._fetch_msg_subtitle_tracks(media_id, timing=timing)
                     if inject_emby_subtitle_streams(payload, media_id, tracks):
                         no_store = True
+                        self._mark_timing(timing, "subtitle_inject")
                 if no_store:
                     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                     content_type = "application/json; charset=utf-8"
+                    self._mark_timing(timing, "json_encode")
         elif not head_only and body and "text/html" in (content_type or "").lower():
             body = inject_subtitle_track_bootstrap(body.decode("utf-8", "replace")).encode("utf-8")
             no_store = True
+            self._mark_timing(timing, "html_inject")
 
         self.send_response(status)
         for key, value in headers.items():
@@ -1857,6 +1892,40 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         if not head_only:
             self.wfile.write(body)
+        self._mark_timing(timing, "write_response")
+        self._log_timing(timing, status, request_path)
+
+    def _new_timing(self, method, request_path):
+        if not self.timing_log_enabled:
+            return None
+        return {
+            "method": str(method or ""),
+            "path": str(request_path or ""),
+            "start": time.perf_counter(),
+            "last": time.perf_counter(),
+            "marks": [],
+        }
+
+    def _mark_timing(self, timing, name):
+        if not timing:
+            return
+        now = time.perf_counter()
+        timing["marks"].append((str(name), int(round((now - timing["last"]) * 1000))))
+        timing["last"] = now
+
+    def _log_timing(self, timing, status, request_path):
+        if not timing:
+            return
+        total_ms = int(round((time.perf_counter() - timing["start"]) * 1000))
+        parts = ["%s=%sms" % (name, elapsed_ms) for name, elapsed_ms in timing.get("marks") or []]
+        message = "subtitle proxy timing status=%s total=%sms method=%s path=%s %s" % (
+            status,
+            total_ms,
+            timing.get("method") or "",
+            redact_sensitive_query_values(request_path or timing.get("path") or ""),
+            " ".join(parts),
+        )
+        print(message.rstrip(), flush=True)
 
     def log_message(self, format, *args):
         message = redact_sensitive_query_values(format % args)
@@ -1885,6 +1954,7 @@ def run_subtitle_proxy(
         msg_admin_user if msg_admin_user is not None else os.environ.get("MSG_ADMIN_USER", ""),
         msg_admin_password if msg_admin_password is not None else os.environ.get("MSG_ADMIN_PASSWORD", ""),
     )
+    SubtitleProxyHandler.timing_log_enabled = parse_bool(os.environ.get(SUBTITLE_PROXY_TIMING_LOG_ENV), False)
     SubtitleProxyHandler.openlist_subtitle_provider = OpenListSubtitleProvider(
         openlist_base_url or os.environ.get("OPENLIST_URL") or DEFAULT_OPENLIST_URL,
         openlist_username if openlist_username is not None else os.environ.get("OPENLIST_MEDIA_SCAN_USERNAME", ""),
@@ -1894,7 +1964,11 @@ def run_subtitle_proxy(
         subtitle_cache_dir or os.environ.get("SUBTITLE_CACHE_DIR") or DEFAULT_SUBTITLE_CACHE_DIR
     )
     server = ThreadingHTTPServer((host, port), SubtitleProxyHandler)
-    print("subtitle proxy listening on %s:%s upstream=%s" % (host, port, upstream), flush=True)
+    print(
+        "subtitle proxy listening on %s:%s upstream=%s timing_log=%s"
+        % (host, port, upstream, int(SubtitleProxyHandler.timing_log_enabled)),
+        flush=True,
+    )
     try:
         server.serve_forever()
     finally:
