@@ -110,6 +110,7 @@ class BotConfigTest(unittest.TestCase):
                 "SUBTITLE_PROVIDERS": "assrt,opensubtitles",
                 "SUBTITLE_SEARCH_TIMEOUT_SECONDS": "9",
                 "SUBTITLE_DOWNLOAD_MAX_BYTES": "123456",
+                "SUBTITLE_BACKFILL_DEFAULT_LIMIT": "7",
                 "ASSRT_API_TOKEN": "assrt-token",
                 "OPENSUBTITLES_API_KEY": "opensubtitles-key",
             }
@@ -124,6 +125,7 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.subtitle_providers, ("assrt", "opensubtitles"))
         self.assertEqual(config.subtitle_search_timeout_seconds, 9)
         self.assertEqual(config.subtitle_download_max_bytes, 123456)
+        self.assertEqual(config.subtitle_backfill_default_limit, 7)
         self.assertEqual(config.assrt_api_token, "assrt-token")
         self.assertEqual(config.opensubtitles_api_key, "opensubtitles-key")
 
@@ -321,6 +323,32 @@ class CandidateStoreTest(unittest.TestCase):
         self.assertEqual(session["candidate_ids"], [first_id, second_id])
         self.assertEqual(session["metadata"], {"source_count": 2, "total_ms": 1234})
         self.assertEqual(found["metadata"], {"source_count": 2, "total_ms": 1234})
+
+    def test_candidate_store_records_subtitle_backfill_attempts(self):
+        from pipeline.bot import CandidateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            store.save_subtitle_backfill_record(
+                "media-1",
+                "MIDE-882",
+                "MIDE-882",
+                {"subtitle_match_status": "skipped", "subtitle_match_reason": "not_found"},
+            )
+            first = store.subtitle_backfill_records(["media-1"])["media-1"]
+            store.save_subtitle_backfill_record(
+                "media-1",
+                "MIDE-882",
+                "MIDE-882",
+                {"subtitle_match_status": "failed", "subtitle_match_error": "upstream"},
+            )
+            second = store.subtitle_backfill_records(["media-1", "missing"])["media-1"]
+
+        self.assertEqual(first["status"], "not_found")
+        self.assertEqual(first["attempt_count"], 1)
+        self.assertEqual(second["status"], "failed")
+        self.assertEqual(second["error"], "upstream")
+        self.assertEqual(second["attempt_count"], 2)
 
     def test_candidate_store_persists_migration_candidate(self):
         from pipeline.bot import CandidateStore
@@ -2081,8 +2109,11 @@ class TelegramBotTest(unittest.TestCase):
                     "limit": 3,
                     "scanned": 4,
                     "attempted": 3,
+                    "with_subtitles": 3,
+                    "pending": 1,
                     "matched": 2,
                     "cached": 1,
+                    "previous": 0,
                     "not_found": 0,
                     "failed": 0,
                     "skipped": 1,
@@ -2091,19 +2122,20 @@ class TelegramBotTest(unittest.TestCase):
                 }
             )
             bot = TelegramBot(
-                BotConfig("token", {700656624}, store.db_path, task_message_edit_min_interval_seconds=0),
+                BotConfig("token", {700656624}, store.db_path, task_message_edit_min_interval_seconds=0, subtitle_backfill_default_limit=3),
                 telegram,
                 store,
                 service,
             )
 
-            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/subtitle_backfill 3"}})
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/subtitle_backfill"}})
             buttons = telegram.messages[0]["reply_markup"]["inline_keyboard"][0]
 
             self.assertEqual(service.subtitle_backfill_calls, [])
             self.assertIn("批量补齐成人库字幕？", telegram.messages[0]["text"])
             self.assertIn("不会访问 115", telegram.messages[0]["text"])
-            self.assertEqual([button["text"] for button in buttons], ["确认补齐", "取消"])
+            self.assertIn("默认跳过之前已经尝试", telegram.messages[0]["text"])
+            self.assertEqual([button["text"] for button in buttons], ["开始补齐", "重试已尝试"])
             self.assertEqual(buttons[0]["callback_data"], "subtitle_backfill_confirm:3")
 
             with patch("pipeline.bot.threading.Thread", ImmediateThread):
@@ -2118,10 +2150,55 @@ class TelegramBotTest(unittest.TestCase):
                     }
                 )
 
-        self.assertEqual(service.subtitle_backfill_calls, [3])
+        self.assertEqual(service.subtitle_backfill_calls, [(3, False)])
         self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-subtitle-backfill", "text": "开始补齐字幕"})
         self.assertIn("成人库字幕补齐：已完成", telegram.edits[-1]["text"])
+        self.assertIn("已补字幕：3", telegram.edits[-1]["text"])
+        self.assertIn("待补：1", telegram.edits[-1]["text"])
         self.assertIn("命中：2", telegram.edits[-1]["text"])
+
+    def test_subtitle_backfill_retry_button_retries_previous_attempts(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+                self.target = target
+                self.args = args
+                self.kwargs = kwargs or {}
+                self.daemon = daemon
+
+            def start(self):
+                self.target(*self.args, **self.kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService()
+            bot = TelegramBot(
+                BotConfig("token", {700656624}, store.db_path, task_message_edit_min_interval_seconds=0, subtitle_backfill_default_limit=20),
+                telegram,
+                store,
+                service,
+            )
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/subtitle_backfill"}})
+            retry_button = telegram.messages[0]["reply_markup"]["inline_keyboard"][0][1]
+
+            with patch("pipeline.bot.threading.Thread", ImmediateThread):
+                bot.handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-subtitle-backfill-retry",
+                            "from": {"id": 700656624},
+                            "message": {"chat": {"id": 9001}, "message_id": 1001},
+                            "data": retry_button["callback_data"],
+                        }
+                    }
+                )
+
+        self.assertEqual(retry_button["callback_data"], "subtitle_backfill_retry:20")
+        self.assertEqual(service.subtitle_backfill_calls, [(20, True)])
+        self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-subtitle-backfill-retry", "text": "开始重试字幕补齐"})
 
     def test_callback_submit_reports_current_task_status(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -4538,7 +4615,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         matcher = FakeSubtitleMatcher()
         progress = []
 
-        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+        with tempfile.TemporaryDirectory() as tmp, patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
             "pipeline.bot.build_subtitle_matcher_from_config", return_value=matcher
         ), patch("pipeline.bot.OpenListClient", side_effect=AssertionError("OpenList must not be called")), patch(
             "pipeline.bot.Client115", side_effect=AssertionError("115 must not be called")
@@ -4547,7 +4624,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                 BotConfig(
                     "token",
                     {700656624},
-                    "/tmp/state.db",
+                    str(Path(tmp) / "state.db"),
                     msg_admin_user="admin",
                     msg_admin_password="secret",
                     msg_enabled=True,
@@ -4562,6 +4639,8 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(result["attempted"], 1)
         self.assertEqual(result["matched"], 1)
         self.assertEqual(result["cached"], 1)
+        self.assertEqual(result["with_subtitles"], 2)
+        self.assertEqual(result["pending"], 1)
         self.assertEqual(result["skipped"], 1)
         self.assertTrue(progress)
         self.assertTrue(progress[-1][1])
@@ -4600,14 +4679,14 @@ class PipelineBotServiceTest(unittest.TestCase):
         )
         matcher = FakeSubtitleMatcher()
 
-        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+        with tempfile.TemporaryDirectory() as tmp, patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
             "pipeline.bot.build_subtitle_matcher_from_config", return_value=matcher
         ):
             service = PipelineBotService(
                 BotConfig(
                     "token",
                     {700656624},
-                    "/tmp/state.db",
+                    str(Path(tmp) / "state.db"),
                     msg_admin_user="admin",
                     msg_admin_password="secret",
                     msg_enabled=True,
@@ -4618,6 +4697,78 @@ class PipelineBotServiceTest(unittest.TestCase):
                 service.subtitle_backfill_adult(limit=1)
 
         self.assertEqual(matcher.calls, [])
+
+    def test_subtitle_backfill_skips_previous_not_found_until_retry_requested(self):
+        from pipeline.bot import BotConfig, CandidateStore, PipelineBotService
+        from pipeline.config import category_to_msg_library_root
+
+        class FakeSubtitleCache:
+            def list_tracks(self, media_id):
+                return []
+
+        class FakeSubtitleMatcher:
+            def __init__(self):
+                self.cache = FakeSubtitleCache()
+                self.calls = []
+
+            def match_task(self, category, title, task, force=False):
+                self.calls.append((category, title, task.get("msg_media_id"), task.get("openlist_adult_code"), force))
+                return {
+                    "subtitle_match_status": "success",
+                    "subtitle_match_count": 1,
+                    "subtitle_match_source": "subtitlecat",
+                    "subtitle_match_filename": "MIDE-882.srt",
+                }
+
+        root = category_to_msg_library_root("adult")
+        fake_msg = FakeMediaStationClient(
+            list_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-target",
+                            "library_id": root["library_id"],
+                            "title": "MIDE-882",
+                            "path": "cloud://openlist/115/成人/MIDE-882/MIDE-882.mp4",
+                        }
+                    ]
+                }
+            }
+        )
+        matcher = FakeSubtitleMatcher()
+
+        with tempfile.TemporaryDirectory() as tmp, patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.build_subtitle_matcher_from_config", return_value=matcher
+        ):
+            state_db = str(Path(tmp) / "state.db")
+            store = CandidateStore(state_db)
+            store.save_subtitle_backfill_record(
+                "media-target",
+                "MIDE-882",
+                "MIDE-882",
+                {"subtitle_match_status": "skipped", "subtitle_match_reason": "not_found"},
+            )
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    state_db,
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    subtitle_auto_match_enabled=True,
+                )
+            )
+            skipped = service.subtitle_backfill_adult(limit=1)
+            retried = service.subtitle_backfill_adult(limit=1, retry_attempted=True)
+
+        self.assertEqual(skipped["attempted"], 0)
+        self.assertEqual(skipped["previous"], 1)
+        self.assertEqual(skipped["pending"], 1)
+        self.assertEqual(retried["attempted"], 1)
+        self.assertEqual(retried["matched"], 1)
+        self.assertEqual(retried["with_subtitles"], 1)
+        self.assertEqual(matcher.calls, [("adult", "MIDE-882", "media-target", "MIDE-882", False)])
 
     def test_sync_completed_movie_task_does_not_format_adult_code(self):
         from pipeline.bot import BotConfig, PipelineBotService
