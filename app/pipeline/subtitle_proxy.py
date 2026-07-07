@@ -1535,9 +1535,11 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                 payload = json.loads(body.decode("utf-8"))
             except (TypeError, ValueError) as exc:
                 raise RuntimeError("MSG media search invalid JSON for %r" % query_term) from exc
-            rows = payload.get("items") if isinstance(payload, dict) else None
-            if not isinstance(rows, list):
+            if not isinstance(payload, dict) or "items" not in payload:
                 raise RuntimeError("MSG media search response missing items for %r" % query_term)
+            rows = payload.get("items") or []
+            if not isinstance(rows, list):
+                raise RuntimeError("MSG media search response items must be a list for %r" % query_term)
             for row in rows:
                 if not isinstance(row, dict):
                     continue

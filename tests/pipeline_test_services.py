@@ -766,7 +766,7 @@ class SubtitleProxyTest(unittest.TestCase):
             msg_calls.append(path)
             if path == "/media?q=MIDE&limit=1":
                 return 200, {"Content-Type": "application/json"}, json.dumps({"items": [{"id": "media-1"}]}).encode("utf-8")
-            return 200, {"Content-Type": "application/json"}, json.dumps({"items": []}).encode("utf-8")
+            return 200, {"Content-Type": "application/json"}, json.dumps({"items": None}).encode("utf-8")
 
         handler._read_msg_api = read_msg_api
         handler._read_upstream = lambda path, request_headers: (
