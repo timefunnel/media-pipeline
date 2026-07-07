@@ -529,16 +529,16 @@ class SubtitleProxyTest(unittest.TestCase):
         changed = patch_emby_adult_code_titles(payload)
 
         self.assertTrue(changed)
-        self.assertEqual(payload["Items"][0]["Name"], "SSIS-218 - 无码标题")
+        self.assertEqual(payload["Items"][0]["Name"], "SSIS-218 无码标题")
 
     def test_patch_emby_adult_code_titles_skips_already_prefixed_name(self):
         adult = category_to_msg_library_root("adult")
-        payload = {"Id": "media-1", "Name": "SSIS-218 - 无码标题", "LibraryId": adult["library_id"]}
+        payload = {"Id": "media-1", "Name": "SSIS-218 无码标题", "LibraryId": adult["library_id"]}
 
         changed = patch_emby_adult_code_titles(payload)
 
         self.assertFalse(changed)
-        self.assertEqual(payload["Name"], "SSIS-218 - 无码标题")
+        self.assertEqual(payload["Name"], "SSIS-218 无码标题")
 
     def test_patch_emby_adult_code_titles_skips_non_adult_library(self):
         movie = category_to_msg_library_root("movie")
@@ -564,7 +564,7 @@ class SubtitleProxyTest(unittest.TestCase):
         changed = patch_emby_adult_code_titles(payload)
 
         self.assertTrue(changed)
-        self.assertEqual(payload["Name"], "MIDE-882 - 标题")
+        self.assertEqual(payload["Name"], "MIDE-882 标题")
 
     def test_patch_emby_adult_code_titles_prefers_path_code_over_title_noise(self):
         adult = category_to_msg_library_root("adult")
@@ -578,7 +578,7 @@ class SubtitleProxyTest(unittest.TestCase):
         changed = patch_emby_adult_code_titles(payload)
 
         self.assertTrue(changed)
-        self.assertEqual(payload["Name"], "MIDE-882 - 合集标题 SSIS-001")
+        self.assertEqual(payload["Name"], "MIDE-882 合集标题 SSIS-001")
 
     def test_patch_emby_playback_info_runtime_updates_media_sources(self):
         payload = {"MediaSources": [{"Id": "media-1", "RunTimeTicks": 0}, {"Id": "media-2", "RunTimeTicks": 10}]}

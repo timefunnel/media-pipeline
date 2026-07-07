@@ -680,7 +680,7 @@ def patch_emby_adult_code_title(item):
     title = str(item.get("Name") or item.get("name") or "").strip()
     if not title or title_starts_with_code(title, code):
         return False
-    item["Name"] = "%s - %s" % (code, title)
+    item["Name"] = "%s %s" % (code, title)
     return True
 
 
