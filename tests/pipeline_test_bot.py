@@ -2059,6 +2059,70 @@ class TelegramBotTest(unittest.TestCase):
             self.assertEqual(telegram.answers, [{"callback_query_id": "cb-dedupe-cancel", "text": "已取消刷新"}])
             self.assertEqual(telegram.edits[-1]["text"], "已取消刷新已入库记录。")
 
+    def test_subtitle_backfill_command_requires_confirmation_and_runs_after_confirm(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+                self.target = target
+                self.args = args
+                self.kwargs = kwargs or {}
+                self.daemon = daemon
+
+            def start(self):
+                self.target(*self.args, **self.kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(
+                subtitle_backfill_response={
+                    "status": "success",
+                    "limit": 3,
+                    "scanned": 4,
+                    "attempted": 3,
+                    "matched": 2,
+                    "cached": 1,
+                    "not_found": 0,
+                    "failed": 0,
+                    "skipped": 1,
+                    "recent": [{"media_id": "media-1", "code": "SSIS-218", "status": "success", "source": "assrt", "title": "SSIS-218"}],
+                    "current": {},
+                }
+            )
+            bot = TelegramBot(
+                BotConfig("token", {700656624}, store.db_path, task_message_edit_min_interval_seconds=0),
+                telegram,
+                store,
+                service,
+            )
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/subtitle_backfill 3"}})
+            buttons = telegram.messages[0]["reply_markup"]["inline_keyboard"][0]
+
+            self.assertEqual(service.subtitle_backfill_calls, [])
+            self.assertIn("批量补齐成人库字幕？", telegram.messages[0]["text"])
+            self.assertIn("不会访问 115", telegram.messages[0]["text"])
+            self.assertEqual([button["text"] for button in buttons], ["确认补齐", "取消"])
+            self.assertEqual(buttons[0]["callback_data"], "subtitle_backfill_confirm:3")
+
+            with patch("pipeline.bot.threading.Thread", ImmediateThread):
+                bot.handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-subtitle-backfill",
+                            "from": {"id": 700656624},
+                            "message": {"chat": {"id": 9001}, "message_id": 1001},
+                            "data": buttons[0]["callback_data"],
+                        }
+                    }
+                )
+
+        self.assertEqual(service.subtitle_backfill_calls, [3])
+        self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-subtitle-backfill", "text": "开始补齐字幕"})
+        self.assertIn("成人库字幕补齐：已完成", telegram.edits[-1]["text"])
+        self.assertIn("命中：2", telegram.edits[-1]["text"])
+
     def test_callback_submit_reports_current_task_status(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
 
@@ -4429,6 +4493,131 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["openlist_adult_format_status"], "skipped")
         self.assertEqual(task["openlist_adult_format_reason"], "code_not_found")
         self.assertEqual(task["msg_sync_status"], "success")
+
+    def test_subtitle_backfill_reads_msg_adult_library_and_skips_cached_or_uncoded_media(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+        from pipeline.config import category_to_msg_library_root
+
+        class FakeSubtitleCache:
+            def list_tracks(self, media_id):
+                if media_id == "media-cached":
+                    return [{"path": "local-subtitle://media-cached/cached.srt"}]
+                return []
+
+        class FakeSubtitleMatcher:
+            def __init__(self):
+                self.cache = FakeSubtitleCache()
+                self.calls = []
+
+            def match_task(self, category, title, task, force=False):
+                self.calls.append((category, title, task.get("msg_media_id"), task.get("openlist_adult_code"), force))
+                return {
+                    "subtitle_match_status": "success",
+                    "subtitle_match_count": 1,
+                    "subtitle_match_source": "assrt",
+                    "subtitle_match_filename": "assrt-123.srt",
+                }
+
+        root = category_to_msg_library_root("adult")
+        fake_msg = FakeMediaStationClient(
+            list_response={
+                "data": {
+                    "items": [
+                        {"id": "media-cached", "library_id": root["library_id"], "title": "SSIS-001"},
+                        {"id": "media-no-code", "library_id": root["library_id"], "title": "No Code Title"},
+                        {
+                            "id": "media-target",
+                            "library_id": root["library_id"],
+                            "title": "MIDE-882",
+                            "path": "cloud://openlist/115/成人/MIDE-882/MIDE-882.mp4",
+                        },
+                    ]
+                }
+            }
+        )
+        matcher = FakeSubtitleMatcher()
+        progress = []
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.build_subtitle_matcher_from_config", return_value=matcher
+        ), patch("pipeline.bot.OpenListClient", side_effect=AssertionError("OpenList must not be called")), patch(
+            "pipeline.bot.Client115", side_effect=AssertionError("115 must not be called")
+        ):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    subtitle_auto_match_enabled=True,
+                )
+            )
+            result = service.subtitle_backfill_adult(limit=1, progress_callback=lambda item, force=False: progress.append((item, force)))
+
+        self.assertEqual(fake_msg.list_calls, [(root["library_id"], 1, 200, 0)])
+        self.assertEqual(matcher.calls, [("adult", "MIDE-882", "media-target", "MIDE-882", False)])
+        self.assertEqual(result["scanned"], 3)
+        self.assertEqual(result["attempted"], 1)
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["cached"], 1)
+        self.assertEqual(result["skipped"], 1)
+        self.assertTrue(progress)
+        self.assertTrue(progress[-1][1])
+
+    def test_subtitle_backfill_fails_when_cache_read_fails(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+        from pipeline.config import category_to_msg_library_root
+
+        class BrokenSubtitleCache:
+            def list_tracks(self, media_id):
+                raise RuntimeError("cache index unreadable")
+
+        class FakeSubtitleMatcher:
+            def __init__(self):
+                self.cache = BrokenSubtitleCache()
+                self.calls = []
+
+            def match_task(self, category, title, task, force=False):
+                self.calls.append((category, title, task))
+                return {"subtitle_match_status": "success"}
+
+        root = category_to_msg_library_root("adult")
+        fake_msg = FakeMediaStationClient(
+            list_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-target",
+                            "library_id": root["library_id"],
+                            "title": "MIDE-882",
+                            "path": "cloud://openlist/115/成人/MIDE-882/MIDE-882.mp4",
+                        }
+                    ]
+                }
+            }
+        )
+        matcher = FakeSubtitleMatcher()
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.build_subtitle_matcher_from_config", return_value=matcher
+        ):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    subtitle_auto_match_enabled=True,
+                )
+            )
+            with self.assertRaisesRegex(RuntimeError, "cache index unreadable"):
+                service.subtitle_backfill_adult(limit=1)
+
+        self.assertEqual(matcher.calls, [])
 
     def test_sync_completed_movie_task_does_not_format_adult_code(self):
         from pipeline.bot import BotConfig, PipelineBotService

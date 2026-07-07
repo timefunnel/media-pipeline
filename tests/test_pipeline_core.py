@@ -499,6 +499,7 @@ class FakeBotService:
         migration_response=None,
         msg_diag_response=None,
         subtitle_response=None,
+        subtitle_backfill_response=None,
         rerank_results=None,
         rerank_error=None,
     ):
@@ -530,8 +531,22 @@ class FakeBotService:
         self.sync_response = sync_response or {}
         self.sync_progress = sync_progress or []
         self.subtitle_response = subtitle_response or {"subtitle_match_status": "success", "subtitle_match_count": 1, "subtitle_match_source": "cache"}
+        self.subtitle_backfill_response = subtitle_backfill_response or {
+            "status": "success",
+            "limit": 1,
+            "scanned": 1,
+            "attempted": 1,
+            "matched": 1,
+            "cached": 0,
+            "not_found": 0,
+            "failed": 0,
+            "skipped": 0,
+            "recent": [{"media_id": "media-1", "code": "SSIS-218", "status": "success", "source": "assrt", "title": "SSIS-218"}],
+            "current": {},
+        }
         self.sync_calls = []
         self.subtitle_calls = []
+        self.subtitle_backfill_calls = []
         self.duplicate_response = duplicate_response
         self.duplicate_calls = []
         self.dedupe_entries = dedupe_entries or []
@@ -636,6 +651,14 @@ class FakeBotService:
     def match_task_subtitles(self, category, title, task, force=False):
         self.subtitle_calls.append((category, title, (task or {}).get("info_hash"), force))
         return dict(self.subtitle_response)
+
+    def subtitle_backfill_adult(self, limit=20, progress_callback=None):
+        self.subtitle_backfill_calls.append(limit)
+        result = dict(self.subtitle_backfill_response)
+        result["limit"] = limit
+        if progress_callback:
+            progress_callback(dict(result), force=True)
+        return result
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]
