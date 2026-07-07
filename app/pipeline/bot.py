@@ -197,6 +197,15 @@ ADULT_EXTRA_VIDEO_HIDE_MIN_BYTES = 200 * 1024 * 1024
 DEFAULT_SUBTITLE_BACKFILL_LIMIT = 20
 MAX_SUBTITLE_BACKFILL_LIMIT = 50
 SUBTITLE_BACKFILL_SKIP_STATUSES = {"failed", "not_found"}
+SUBTITLE_REPORT_PAGE_SIZE = 8
+SUBTITLE_REPORT_BUCKET_LABELS = {
+    "pending": "待补",
+    "cached": "已补",
+    "untried": "未尝试",
+    "not_found": "未找到",
+    "failed": "失败",
+    "no_code": "无番号",
+}
 ACTIVE_115_FAST_POLL_WINDOW_SECONDS = 20
 ACTIVE_115_FAST_POLL_INTERVAL_SECONDS = 2
 ACTIVE_115_SLOW_AFTER_POLLS = 10
@@ -221,7 +230,7 @@ HELP_TEXT = """直接发送关键词、番号或磁链即可。
 /status <info_hash> 查询任务状态
 /diag <info_hash|media_id> 查看任务或MSG媒体诊断
 /migrate <关键词> 迁移已有媒体到其他库
-/subtitle_backfill 批量补齐成人库本地字幕缓存
+/subtitle_report 查看成人库字幕补齐统计
 /dedupe_refresh 刷新已入库记录（需二次确认）
 /version 查看当前版本
 
@@ -234,7 +243,7 @@ BOT_COMMANDS = [
     {"command": "status", "description": "按 info_hash 查询任务进度"},
     {"command": "diag", "description": "查看任务或MSG媒体诊断"},
     {"command": "migrate", "description": "迁移已入库媒体到其他库"},
-    {"command": "subtitle_backfill", "description": "批量补齐成人库本地字幕缓存"},
+    {"command": "subtitle_report", "description": "查看成人库字幕补齐统计"},
     {"command": "dedupe_refresh", "description": "刷新重复判断索引（需二次确认）"},
     {"command": "version", "description": "查看当前版本"},
 ]
@@ -244,13 +253,6 @@ DEDUPE_REFRESH_WARNING_TEXT = """刷新已入库记录？
 这个操作会主动刷新 OpenList 目录并重建 Bot 的重复判断基线，可能增加网盘侧请求量，资源多时也会比较慢。
 
 不会删除文件，也不会提交新的离线任务。确认今天确实需要更新重复判断后再执行。"""
-SUBTITLE_BACKFILL_WARNING_TEXT = """批量补齐成人库字幕？
-
-本次最多尝试 {limit} 个尚未命中本地字幕缓存的成人库媒体。默认跳过之前已经尝试但未找到或失败的媒体；需要重新请求字幕站时再点“重试已尝试”。
-
-会读取 MediaStationGo 成人库列表，并调用已配置的字幕源下载中文字幕到服务器本地缓存。
-
-不会访问 115，不会写回网盘，不会重新刮削，也不会修改 MSG 媒体记录。字幕站请求有配额，建议分批执行。"""
 SUBTITLE_EXTENSIONS = {".ass", ".idx", ".srt", ".ssa", ".sub", ".vtt"}
 VIDEO_EXTENSIONS = {
     ".avi",
@@ -1638,45 +1640,17 @@ class PipelineBotService:
                 break
             backfill_records = store.subtitle_backfill_records([extract_media_id(media) for media in items])
             for media in items:
-                result["scanned"] += 1
-                media_id = extract_media_id(media)
-                title = media_display_title(media) or media_id or "-"
-                if not media_id:
-                    result["skipped"] += 1
-                    result["pending"] += 1
-                    result["current"] = {"title": title, "reason": "media_id_missing"}
-                    continue
-                if subtitle_matcher_has_cached_tracks(matcher, media_id):
-                    result["cached"] += 1
-                    result["with_subtitles"] += 1
-                    result["current"] = {"media_id": media_id, "title": title, "reason": "cached"}
-                    continue
-                previous = backfill_records.get(media_id)
-                if previous and not retry_attempted and previous.get("status") in SUBTITLE_BACKFILL_SKIP_STATUSES:
-                    result["previous"] += 1
-                    result["pending"] += 1
-                    result["current"] = {
-                        "media_id": media_id,
-                        "title": title,
-                        "reason": "previous_%s" % previous.get("status"),
-                    }
-                    continue
-                task = subtitle_backfill_task_from_media(media)
-                if not task.get("openlist_adult_code"):
-                    result["skipped"] += 1
-                    result["pending"] += 1
-                    result["current"] = {"media_id": media_id, "title": title, "reason": "query_missing"}
-                    continue
-                result["attempted"] += 1
-                result["current"] = {"media_id": media_id, "title": title, "code": task.get("openlist_adult_code")}
-                emit()
-                try:
-                    match = matcher.match_task("adult", title, task, force=False)
-                except Exception as exc:
-                    match = {"subtitle_match_status": "failed", "subtitle_match_error": str(exc)}
-                store.save_subtitle_backfill_record(media_id, title, task.get("openlist_adult_code"), match)
-                update_subtitle_backfill_result(result, media_id, title, task.get("openlist_adult_code"), match)
-                emit()
+                attempted = process_subtitle_backfill_media(
+                    media,
+                    matcher,
+                    store,
+                    result,
+                    retry_attempted=retry_attempted,
+                    backfill_records=backfill_records,
+                    before_match=emit,
+                )
+                if attempted:
+                    emit()
                 if result["attempted"] >= limit:
                     break
             if len(items) < page_size:
@@ -1686,6 +1660,57 @@ class PipelineBotService:
         result["current"] = {}
         emit(force=True)
         return result
+
+    def subtitle_backfill_one_adult(self, media_id, retry_attempted=False):
+        if not self.config.msg_enabled:
+            raise RuntimeError("MediaStationGo is disabled")
+        media_id = str(media_id or "").strip()
+        if not media_id:
+            raise ValueError("media_id is required")
+        client = self._build_msg_client()
+        matcher = self._build_subtitle_matcher()
+        store = CandidateStore(self.config.state_db_path)
+        media = extract_media_detail(client.get_media(media_id))
+        detail_id = extract_media_id(media)
+        if not detail_id:
+            raise RuntimeError("MediaStationGo media detail missing id: %s" % media_id)
+        if detail_id != media_id:
+            raise RuntimeError("MediaStationGo media id mismatch: expected %s, got %s" % (media_id, detail_id))
+        result = new_subtitle_backfill_result(1, retry_attempted=retry_attempted)
+        process_subtitle_backfill_media(
+            media,
+            matcher,
+            store,
+            result,
+            retry_attempted=retry_attempted,
+            backfill_records=store.subtitle_backfill_records([media_id]),
+        )
+        result["status"] = "success"
+        result["current"] = {}
+        return result
+
+    def subtitle_backfill_report_adult(self):
+        if not self.config.msg_enabled:
+            raise RuntimeError("MediaStationGo is disabled")
+        root = category_to_msg_library_root("adult")
+        client = self._build_msg_client()
+        matcher = self._build_subtitle_matcher()
+        store = CandidateStore(self.config.state_db_path)
+        report = new_subtitle_backfill_report()
+        page = 1
+        page_size = 200
+        while True:
+            items = extract_media_items(client.list_library_media(root["library_id"], page=page, page_size=page_size, group_versions=0))
+            if not items:
+                break
+            records = store.subtitle_backfill_records([extract_media_id(media) for media in items])
+            for media in items:
+                add_media_to_subtitle_backfill_report(report, matcher, records, media)
+            if len(items) < page_size:
+                break
+            page += 1
+        report["generated_at"] = int(time.time())
+        return report
 
     def _build_subtitle_matcher(self):
         if self._subtitle_matcher is None:
@@ -2347,7 +2372,12 @@ class TelegramBot:
                 self._handle_migrate_command(chat_id, user_id, argument)
             return
         if command == "/subtitle_backfill":
-            self._handle_subtitle_backfill_command(chat_id, argument)
+            with self._typing_action(chat_id):
+                self._handle_subtitle_report_command(chat_id)
+            return
+        if command == "/subtitle_report":
+            with self._typing_action(chat_id):
+                self._handle_subtitle_report_command(chat_id)
             return
         if command == "/dedupe_refresh":
             self._handle_dedupe_refresh_command(chat_id)
@@ -2512,6 +2542,22 @@ class TelegramBot:
             return
         if action == "subtitle_backfill_cancel":
             self._handle_subtitle_backfill_cancel_callback(chat_id, message_id, callback_id)
+            return
+        if action == "subtitle_report":
+            bucket, page = value
+            self._handle_subtitle_report_callback(chat_id, message_id, callback_id, bucket, page)
+            return
+        if action in ("sub1", "sub1r"):
+            bucket, page, media_id = value
+            self._handle_subtitle_backfill_one_callback(
+                chat_id,
+                message_id,
+                callback_id,
+                media_id,
+                bucket=bucket,
+                page=page,
+                retry_attempted=action == "sub1r",
+            )
             return
         else:
             self.telegram.answer_callback_query(callback_id, "不支持的操作")
@@ -3424,16 +3470,49 @@ class TelegramBot:
     def _handle_dedupe_refresh_command(self, chat_id):
         self.telegram.send_message(chat_id, DEDUPE_REFRESH_WARNING_TEXT, reply_markup=dedupe_refresh_confirm_reply_markup())
 
-    def _handle_subtitle_backfill_command(self, chat_id, argument):
+    def _handle_subtitle_report_command(self, chat_id):
         try:
-            limit = normalize_subtitle_backfill_limit(argument or self.config.subtitle_backfill_default_limit)
-        except ValueError as exc:
-            self.telegram.send_message(chat_id, "字幕补齐数量无效：%s" % exc)
+            report = self.service.subtitle_backfill_report_adult()
+        except (RuntimeError, ValueError) as exc:
+            self.telegram.send_message(chat_id, "字幕补齐报表生成失败：%s" % exc)
             return
         self.telegram.send_message(
             chat_id,
-            SUBTITLE_BACKFILL_WARNING_TEXT.format(limit=limit),
-            reply_markup=subtitle_backfill_confirm_reply_markup(limit),
+            format_subtitle_backfill_report_message(report, bucket="pending", page=0),
+            reply_markup=subtitle_backfill_report_reply_markup(
+                report,
+                bucket="pending",
+                page=0,
+                batch_limit=self.config.subtitle_backfill_default_limit,
+            ),
+        )
+
+    def _handle_subtitle_report_callback(self, chat_id, message_id, callback_id, bucket, page):
+        bucket = normalize_subtitle_report_bucket(bucket)
+        page = max(0, int(page or 0))
+        self.telegram.answer_callback_query(callback_id, "正在刷新字幕统计")
+        try:
+            report = self.service.subtitle_backfill_report_adult()
+        except (RuntimeError, ValueError) as exc:
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                "字幕补齐报表生成失败：%s" % exc,
+                reply_markup={"inline_keyboard": []},
+                fallback_chat_id=chat_id,
+            )
+            return
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_subtitle_backfill_report_message(report, bucket=bucket, page=page),
+            reply_markup=subtitle_backfill_report_reply_markup(
+                report,
+                bucket=bucket,
+                page=page,
+                batch_limit=self.config.subtitle_backfill_default_limit,
+            ),
+            fallback_chat_id=chat_id,
         )
 
     def _handle_dedupe_refresh_confirm_callback(self, chat_id, message_id, callback_id):
@@ -3466,6 +3545,29 @@ class TelegramBot:
         thread = threading.Thread(
             target=self._run_subtitle_backfill_thread,
             args=(chat_id, message_id, limit, retry_attempted),
+            daemon=True,
+        )
+        thread.start()
+
+    def _handle_subtitle_backfill_one_callback(self, chat_id, message_id, callback_id, media_id, bucket="pending", page=0, retry_attempted=False):
+        bucket = normalize_subtitle_report_bucket(bucket)
+        page = max(0, int(page or 0))
+        if not str(media_id or "").strip():
+            self.telegram.answer_callback_query(callback_id, "media_id 无效")
+            return
+        if not self._subtitle_backfill_lock.acquire(blocking=False):
+            self.telegram.answer_callback_query(callback_id, "字幕补齐任务正在运行")
+            return
+        self.telegram.answer_callback_query(callback_id, "开始补齐单个字幕" if not retry_attempted else "开始重试单个字幕")
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            "正在补齐单个字幕：%s" % media_id,
+            reply_markup={"inline_keyboard": []},
+        )
+        thread = threading.Thread(
+            target=self._run_subtitle_backfill_one_thread,
+            args=(chat_id, message_id, media_id, retry_attempted, bucket, page),
             daemon=True,
         )
         thread.start()
@@ -3515,12 +3617,61 @@ class TelegramBot:
                 )
 
             result = self.service.subtitle_backfill_adult(limit=limit, progress_callback=progress, retry_attempted=retry_attempted)
-            progress(result, force=True)
+            try:
+                report = self.service.subtitle_backfill_report_adult()
+            except Exception as exc:
+                self._update_callback_message(
+                    chat_id,
+                    message_id,
+                    format_subtitle_backfill_message(result) + "\n\n报表刷新失败：%s" % exc,
+                    reply_markup={"inline_keyboard": []},
+                    fallback_chat_id=chat_id,
+                )
+                return
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                format_subtitle_backfill_report_message(report, bucket="pending", page=0) + "\n\n" + format_subtitle_backfill_message(result),
+                reply_markup=subtitle_backfill_report_reply_markup(
+                    report,
+                    bucket="pending",
+                    page=0,
+                    batch_limit=self.config.subtitle_backfill_default_limit,
+                ),
+                fallback_chat_id=chat_id,
+            )
         except Exception as exc:
             self._update_callback_message(
                 chat_id,
                 message_id,
                 "成人库字幕补齐：失败\n错误：%s" % exc,
+                reply_markup={"inline_keyboard": []},
+                fallback_chat_id=chat_id,
+            )
+        finally:
+            self._subtitle_backfill_lock.release()
+
+    def _run_subtitle_backfill_one_thread(self, chat_id, message_id, media_id, retry_attempted, bucket, page):
+        try:
+            result = self.service.subtitle_backfill_one_adult(media_id, retry_attempted=retry_attempted)
+            report = self.service.subtitle_backfill_report_adult()
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                format_subtitle_backfill_report_message(report, bucket=bucket, page=page) + "\n\n" + format_subtitle_backfill_message(result),
+                reply_markup=subtitle_backfill_report_reply_markup(
+                    report,
+                    bucket=bucket,
+                    page=page,
+                    batch_limit=self.config.subtitle_backfill_default_limit,
+                ),
+                fallback_chat_id=chat_id,
+            )
+        except Exception as exc:
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                "单个字幕补齐：失败\nmedia_id：%s\n错误：%s" % (media_id, exc),
                 reply_markup={"inline_keyboard": []},
                 fallback_chat_id=chat_id,
             )
@@ -4304,21 +4455,6 @@ def media_display_title(media):
     return ""
 
 
-def subtitle_backfill_confirm_reply_markup(limit):
-    limit = normalize_subtitle_backfill_limit(limit)
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "开始补齐", "callback_data": "subtitle_backfill_confirm:%s" % limit},
-                {"text": "重试已尝试", "callback_data": "subtitle_backfill_retry:%s" % limit},
-            ],
-            [
-                {"text": "取消", "callback_data": "subtitle_backfill_cancel:1"},
-            ]
-        ]
-    }
-
-
 def normalize_subtitle_backfill_limit(value):
     try:
         limit = int(str(value or "").strip())
@@ -4358,6 +4494,24 @@ def subtitle_matcher_has_cached_tracks(matcher, media_id):
     return bool(cache.list_tracks(media_id))
 
 
+def extract_media_detail(response):
+    if not isinstance(response, dict):
+        return {}
+    data = response.get("data")
+    if isinstance(data, dict):
+        media = data.get("media")
+        if isinstance(media, dict) and extract_media_id(media):
+            return media
+        if extract_media_id(data):
+            return data
+    media = response.get("media")
+    if isinstance(media, dict) and extract_media_id(media):
+        return media
+    if extract_media_id(response):
+        return response
+    return {}
+
+
 def subtitle_backfill_task_from_media(media):
     media_id = extract_media_id(media)
     title = media_display_title(media)
@@ -4372,6 +4526,90 @@ def subtitle_backfill_task_from_media(media):
     if code:
         task["openlist_adult_code"] = code
     return task
+
+
+def process_subtitle_backfill_media(media, matcher, store, result, retry_attempted=False, backfill_records=None, before_match=None):
+    result["scanned"] += 1
+    media_id = extract_media_id(media)
+    title = media_display_title(media) or media_id or "-"
+    if not media_id:
+        result["skipped"] += 1
+        result["pending"] += 1
+        result["current"] = {"title": title, "reason": "media_id_missing"}
+        return False
+    if subtitle_matcher_has_cached_tracks(matcher, media_id):
+        result["cached"] += 1
+        result["with_subtitles"] += 1
+        result["current"] = {"media_id": media_id, "title": title, "reason": "cached"}
+        update_subtitle_backfill_recent(
+            result,
+            {
+                "media_id": media_id,
+                "title": title,
+                "code": "",
+                "status": "success",
+                "source": "cache",
+                "reason": "cached",
+            },
+        )
+        return False
+    records = backfill_records if backfill_records is not None else store.subtitle_backfill_records([media_id])
+    previous = records.get(media_id)
+    if previous and not retry_attempted and previous.get("status") in SUBTITLE_BACKFILL_SKIP_STATUSES:
+        result["previous"] += 1
+        result["pending"] += 1
+        result["current"] = {
+            "media_id": media_id,
+            "title": title,
+            "reason": "previous_%s" % previous.get("status"),
+        }
+        update_subtitle_backfill_recent(
+            result,
+            {
+                "media_id": media_id,
+                "title": title,
+                "code": previous.get("adult_code") or "",
+                "status": previous.get("status") or "unknown",
+                "source": previous.get("source") or "",
+                "reason": "previous",
+                "error": previous.get("error") or "",
+            },
+        )
+        return False
+    task = subtitle_backfill_task_from_media(media)
+    code = task.get("openlist_adult_code")
+    if not code:
+        result["skipped"] += 1
+        result["pending"] += 1
+        result["current"] = {"media_id": media_id, "title": title, "reason": "query_missing"}
+        update_subtitle_backfill_recent(
+            result,
+            {
+                "media_id": media_id,
+                "title": title,
+                "code": "",
+                "status": "skipped",
+                "reason": "query_missing",
+            },
+        )
+        return False
+    result["attempted"] += 1
+    result["current"] = {"media_id": media_id, "title": title, "code": code}
+    if before_match:
+        before_match()
+    try:
+        match = matcher.match_task("adult", title, task, force=False)
+    except Exception as exc:
+        match = {"subtitle_match_status": "failed", "subtitle_match_error": str(exc)}
+    store.save_subtitle_backfill_record(media_id, title, code, match)
+    update_subtitle_backfill_result(result, media_id, title, code, match)
+    return True
+
+
+def update_subtitle_backfill_recent(result, item):
+    recent = list(result.get("recent") or [])
+    recent.append(dict(item or {}))
+    result["recent"] = recent[-5:]
 
 
 def update_subtitle_backfill_result(result, media_id, title, code, match):
@@ -4392,8 +4630,8 @@ def update_subtitle_backfill_result(result, media_id, title, code, match):
     else:
         result["skipped"] += 1
         result["pending"] += 1
-    recent = list(result.get("recent") or [])
-    recent.append(
+    update_subtitle_backfill_recent(
+        result,
         {
             "media_id": media_id,
             "title": title,
@@ -4402,9 +4640,8 @@ def update_subtitle_backfill_result(result, media_id, title, code, match):
             "source": (match or {}).get("subtitle_match_source"),
             "reason": (match or {}).get("subtitle_match_reason"),
             "error": (match or {}).get("subtitle_match_error"),
-        }
+        },
     )
-    result["recent"] = recent[-5:]
 
 
 def format_subtitle_backfill_message(result):
@@ -4449,6 +4686,205 @@ def subtitle_backfill_status_label(item):
     if status == "failed":
         return "失败"
     return status or "未知"
+
+
+def new_subtitle_backfill_report():
+    return {
+        "total": 0,
+        "with_subtitles": 0,
+        "pending": 0,
+        "untried": 0,
+        "not_found": 0,
+        "failed": 0,
+        "no_code": 0,
+        "success_missing_cache": 0,
+        "unknown": 0,
+        "generated_at": 0,
+        "buckets": {
+            "pending": [],
+            "cached": [],
+            "untried": [],
+            "not_found": [],
+            "failed": [],
+            "no_code": [],
+        },
+    }
+
+
+def add_media_to_subtitle_backfill_report(report, matcher, records, media):
+    report["total"] += 1
+    item = subtitle_report_item_from_media(media, records)
+    media_id = item.get("media_id")
+    if media_id and subtitle_matcher_has_cached_tracks(matcher, media_id):
+        item["status"] = "cached"
+        item["status_label"] = "已补"
+        report["with_subtitles"] += 1
+        report["buckets"]["cached"].append(item)
+        return
+
+    report["pending"] += 1
+    report["buckets"]["pending"].append(item)
+    status = item.get("status")
+    if status in ("not_found", "failed", "no_code", "untried"):
+        report[status] += 1
+        report["buckets"][status].append(item)
+    elif status == "success":
+        report["success_missing_cache"] += 1
+    else:
+        report["unknown"] += 1
+
+
+def subtitle_report_item_from_media(media, records):
+    media_id = extract_media_id(media)
+    title = media_display_title(media) or media_id or "-"
+    task = subtitle_backfill_task_from_media(media)
+    code = task.get("openlist_adult_code") or ""
+    record = (records or {}).get(media_id) if media_id else None
+    status = "untried"
+    status_label = "未尝试"
+    if not code:
+        status = "no_code"
+        status_label = "无番号"
+    elif record:
+        status = record.get("status") or "unknown"
+        status_label = subtitle_report_status_label(status)
+    return {
+        "media_id": media_id,
+        "title": title,
+        "code": code,
+        "status": status,
+        "status_label": status_label,
+        "attempt_count": (record or {}).get("attempt_count") or 0,
+        "source": (record or {}).get("source") or "",
+        "reason": (record or {}).get("reason") or "",
+        "error": (record or {}).get("error") or "",
+    }
+
+
+def subtitle_report_status_label(status):
+    return {
+        "cached": "已补",
+        "success": "记录成功但缓存缺失",
+        "not_found": "未找到",
+        "failed": "失败",
+        "no_code": "无番号",
+        "untried": "未尝试",
+        "unknown": "未知",
+    }.get(str(status or ""), str(status or "未知"))
+
+
+def normalize_subtitle_report_bucket(bucket):
+    value = str(bucket or "").strip()
+    return value if value in SUBTITLE_REPORT_BUCKET_LABELS else "pending"
+
+
+def subtitle_report_bucket_items(report, bucket):
+    bucket = normalize_subtitle_report_bucket(bucket)
+    buckets = (report or {}).get("buckets") or {}
+    return list(buckets.get(bucket) or [])
+
+
+def format_subtitle_backfill_report_message(report, bucket="pending", page=0):
+    report = report or new_subtitle_backfill_report()
+    bucket = normalize_subtitle_report_bucket(bucket)
+    items = subtitle_report_bucket_items(report, bucket)
+    page_count = search_page_count(len(items), page_size=SUBTITLE_REPORT_PAGE_SIZE)
+    page = normalize_page(page, page_count)
+    start = page * SUBTITLE_REPORT_PAGE_SIZE
+    page_items = items[start : start + SUBTITLE_REPORT_PAGE_SIZE]
+    lines = [
+        "成人库字幕补齐报表",
+        "总数：%s  已补字幕：%s  待补：%s" % (report.get("total") or 0, report.get("with_subtitles") or 0, report.get("pending") or 0),
+        "未尝试：%s  未找到：%s  失败：%s  无番号：%s"
+        % (report.get("untried") or 0, report.get("not_found") or 0, report.get("failed") or 0, report.get("no_code") or 0),
+        "列表：%s 第 %s/%s 页（%s 条）" % (SUBTITLE_REPORT_BUCKET_LABELS[bucket], page + 1, page_count, len(items)),
+    ]
+    if not page_items:
+        lines.append("暂无记录")
+    for index, item in enumerate(page_items, start=start + 1):
+        code = item.get("code") or "-"
+        title = item.get("title") or "-"
+        line = "%s. %s / %s" % (index, code, title)
+        details = []
+        if item.get("status_label"):
+            details.append(item["status_label"])
+        if item.get("source"):
+            details.append(item["source"])
+        if item.get("attempt_count"):
+            details.append("尝试%s次" % item.get("attempt_count"))
+        if details:
+            line += "\n   " + "，".join(details)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def subtitle_backfill_report_reply_markup(report, bucket="pending", page=0, batch_limit=DEFAULT_SUBTITLE_BACKFILL_LIMIT):
+    bucket = normalize_subtitle_report_bucket(bucket)
+    items = subtitle_report_bucket_items(report, bucket)
+    page_count = search_page_count(len(items), page_size=SUBTITLE_REPORT_PAGE_SIZE)
+    page = normalize_page(page, page_count)
+    previous_page = max(0, page - 1)
+    next_page = min(page_count - 1, page + 1)
+    batch_limit = normalize_subtitle_backfill_limit(batch_limit)
+    start = page * SUBTITLE_REPORT_PAGE_SIZE
+    page_items = items[start : start + SUBTITLE_REPORT_PAGE_SIZE]
+    keyboard = []
+    operation_row = []
+    if (report or {}).get("pending"):
+        operation_row.append({"text": "批量补齐 %s" % batch_limit, "callback_data": "subtitle_backfill_confirm:%s" % batch_limit})
+    if (report or {}).get("not_found") or (report or {}).get("failed"):
+        operation_row.append({"text": "重试已尝试 %s" % batch_limit, "callback_data": "subtitle_backfill_retry:%s" % batch_limit})
+    if operation_row:
+        keyboard.append(operation_row)
+    keyboard.extend(
+        [
+            [
+                {"text": "待补", "callback_data": "subtitle_report:pending:0"},
+                {"text": "已补", "callback_data": "subtitle_report:cached:0"},
+                {"text": "未尝试", "callback_data": "subtitle_report:untried:0"},
+            ],
+            [
+                {"text": "未找到", "callback_data": "subtitle_report:not_found:0"},
+                {"text": "失败", "callback_data": "subtitle_report:failed:0"},
+                {"text": "无番号", "callback_data": "subtitle_report:no_code:0"},
+            ],
+        ]
+    )
+    item_buttons = []
+    for index, item in enumerate(page_items, start=start + 1):
+        callback_data = subtitle_report_item_callback_data(item, bucket, page)
+        if not callback_data:
+            continue
+        label = "重试 %s" % index if (item.get("status") in SUBTITLE_BACKFILL_SKIP_STATUSES) else "补齐 %s" % index
+        item_buttons.append({"text": label, "callback_data": callback_data})
+    for offset in range(0, len(item_buttons), 2):
+        keyboard.append(item_buttons[offset : offset + 2])
+    keyboard.append(
+        [
+            {"text": "上一页", "callback_data": "subtitle_report:%s:%s" % (bucket, previous_page)},
+            {"text": "刷新", "callback_data": "subtitle_report:%s:%s" % (bucket, page)},
+            {"text": "下一页", "callback_data": "subtitle_report:%s:%s" % (bucket, next_page)},
+        ]
+    )
+    return {
+        "inline_keyboard": keyboard
+    }
+
+
+def subtitle_report_item_callback_data(item, bucket, page):
+    media_id = str((item or {}).get("media_id") or "").strip()
+    if not media_id:
+        return None
+    if not (item or {}).get("code"):
+        return None
+    status = (item or {}).get("status")
+    if status in ("cached", "no_code"):
+        return None
+    action = "sub1r" if status in SUBTITLE_BACKFILL_SKIP_STATUSES else "sub1"
+    data = "%s:%s:%s:%s" % (action, normalize_subtitle_report_bucket(bucket), max(0, int(page or 0)), media_id)
+    if len(data.encode("utf-8")) > 64:
+        return None
+    return data
 
 
 def clean_openlist_task_media(
@@ -4926,6 +5362,15 @@ def parse_callback_data(value):
         return action, int(payload)
     if action == "subtitle_backfill_cancel" and payload:
         return action, payload
+    if action == "subtitle_report" and payload:
+        bucket, sep, page = payload.partition(":")
+        if sep:
+            return action, (bucket, int(page))
+    if action in ("sub1", "sub1r") and payload:
+        bucket, sep, rest = payload.partition(":")
+        page, page_sep, media_id = rest.partition(":")
+        if sep and page_sep and media_id:
+            return action, (bucket, int(page), media_id)
     return None, None
 
 

@@ -334,15 +334,25 @@ class Retry115Client:
 
 
 class FakeMediaStationClient:
-    def __init__(self, search_response=None, list_response=None, events=None, artwork_repair_response=None, scrape_search_responses=None):
+    def __init__(
+        self,
+        search_response=None,
+        list_response=None,
+        get_response=None,
+        events=None,
+        artwork_repair_response=None,
+        scrape_search_responses=None,
+    ):
         self.search_response = search_response or {"data": {"items": []}}
         self.list_response = list_response or {"data": {"items": []}}
+        self.get_response = get_response or {}
         self.events = events
         self.artwork_repair_response = artwork_repair_response or {"status": "skipped", "updated": 0, "reason": "not_needed"}
         self.scrape_search_responses = scrape_search_responses or {}
         self.scan_calls = []
         self.search_calls = []
         self.list_calls = []
+        self.get_calls = []
         self.scrape_calls = []
         self.scrape_search_calls = []
         self.scrape_apply_calls = []
@@ -367,7 +377,8 @@ class FakeMediaStationClient:
         return {"ok": True}
 
     def get_media(self, media_id):
-        return {}
+        self.get_calls.append(media_id)
+        return self.get_response
 
     def search_scrape_matches(self, media_id, query, provider, media_type):
         self.scrape_search_calls.append((media_id, query, provider, media_type))
@@ -500,6 +511,8 @@ class FakeBotService:
         msg_diag_response=None,
         subtitle_response=None,
         subtitle_backfill_response=None,
+        subtitle_backfill_one_response=None,
+        subtitle_report_response=None,
         rerank_results=None,
         rerank_error=None,
     ):
@@ -547,9 +560,31 @@ class FakeBotService:
             "recent": [{"media_id": "media-1", "code": "SSIS-218", "status": "success", "source": "assrt", "title": "SSIS-218"}],
             "current": {},
         }
+        self.subtitle_backfill_one_response = subtitle_backfill_one_response or dict(self.subtitle_backfill_response)
+        self.subtitle_report_response = subtitle_report_response or {
+            "total": 2,
+            "with_subtitles": 1,
+            "pending": 1,
+            "untried": 1,
+            "not_found": 0,
+            "failed": 0,
+            "no_code": 0,
+            "success_missing_cache": 0,
+            "unknown": 0,
+            "buckets": {
+                "pending": [{"media_id": "media-2", "title": "MIDE-882", "code": "MIDE-882", "status": "untried", "status_label": "未尝试"}],
+                "cached": [{"media_id": "media-1", "title": "SSIS-218", "code": "SSIS-218", "status": "cached", "status_label": "已补"}],
+                "untried": [{"media_id": "media-2", "title": "MIDE-882", "code": "MIDE-882", "status": "untried", "status_label": "未尝试"}],
+                "not_found": [],
+                "failed": [],
+                "no_code": [],
+            },
+        }
         self.sync_calls = []
         self.subtitle_calls = []
         self.subtitle_backfill_calls = []
+        self.subtitle_backfill_one_calls = []
+        self.subtitle_report_calls = 0
         self.duplicate_response = duplicate_response
         self.duplicate_calls = []
         self.dedupe_entries = dedupe_entries or []
@@ -663,6 +698,17 @@ class FakeBotService:
         if progress_callback:
             progress_callback(dict(result), force=True)
         return result
+
+    def subtitle_backfill_one_adult(self, media_id, retry_attempted=False):
+        self.subtitle_backfill_one_calls.append((media_id, retry_attempted))
+        result = dict(self.subtitle_backfill_one_response)
+        result["limit"] = 1
+        result["retry_attempted"] = bool(retry_attempted)
+        return result
+
+    def subtitle_backfill_report_adult(self):
+        self.subtitle_report_calls += 1
+        return dict(self.subtitle_report_response)
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]
