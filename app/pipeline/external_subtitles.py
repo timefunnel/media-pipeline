@@ -1,4 +1,5 @@
 import hashlib
+import html
 import json
 import os
 import re
@@ -14,10 +15,12 @@ from pipeline.mediastation import extract_codes
 DEFAULT_SUBTITLE_CACHE_DIR = "/subtitle-cache"
 DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS = 12
 DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES = 2 * 1024 * 1024
-DEFAULT_SUBTITLE_PROVIDERS = ("assrt", "opensubtitles")
+DEFAULT_SUBTITLE_PROVIDERS = ("subtitlecat", "assrt", "opensubtitles")
 SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
 LOCAL_SUBTITLE_SCHEME = "local-subtitle"
 CHINESE_LANGUAGE_CODES = ("zh-cn", "zh-tw", "ze")
+SUBTITLECAT_BASE_URL = "https://www.subtitlecat.com/"
+SUBTITLECAT_LANGUAGE_ORDER = ("zh-CN", "zh-TW")
 
 
 @dataclass
@@ -54,6 +57,21 @@ class SubtitleHttpTransport:
             return json.loads(raw)
         except ValueError as exc:
             raise RuntimeError("subtitle API returned invalid JSON") from exc
+
+    def text_request(self, url, headers=None, timeout=DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS, max_bytes=DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES):
+        request = urllib.request.Request(url, headers=dict(headers or {}), method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read(int(max_bytes) + 1)
+                charset = response.headers.get_content_charset() or "utf-8"
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise RuntimeError("subtitle page failed: HTTP %s %s" % (exc.code, detail)) from exc
+        except (OSError, TimeoutError) as exc:
+            raise RuntimeError("subtitle page failed: %s" % exc) from exc
+        if len(body) > int(max_bytes):
+            raise RuntimeError("subtitle page too large")
+        return body.decode(charset, "replace")
 
     def download(self, url, headers=None, timeout=DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS, max_bytes=DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES):
         request = urllib.request.Request(url, headers=dict(headers or {}), method="GET")
@@ -174,6 +192,63 @@ class LocalSubtitleProvider:
 
     def read_subtitle(self, local_uri):
         return self.cache.read_local_uri(local_uri)
+
+
+class SubtitleCatProvider:
+    name = "subtitlecat"
+
+    def __init__(self, base_url=SUBTITLECAT_BASE_URL, transport=None, timeout=DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS, max_bytes=DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES):
+        self.base_url = str(base_url or SUBTITLECAT_BASE_URL).rstrip("/") + "/"
+        self.transport = transport or SubtitleHttpTransport()
+        self.timeout = timeout
+        self.max_bytes = max_bytes
+
+    def enabled(self):
+        return bool(self.base_url)
+
+    def search(self, query, code=""):
+        search_text = str(code or query or "").strip()
+        if not search_text:
+            return []
+        url = urllib.parse.urljoin(self.base_url, "index.php?%s" % urllib.parse.urlencode({"search": search_text}))
+        text = self.transport.text_request(url, headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
+        candidates = []
+        for item in extract_subtitlecat_search_results(text, self.base_url):
+            score = candidate_code_score(item, code or query)
+            if code and score <= 0:
+                continue
+            candidate = dict(item)
+            candidate["_score"] = score + subtitlecat_candidate_bonus(item)
+            candidates.append(candidate)
+        return sorted(candidates, key=lambda item: int(item.get("_score") or 0), reverse=True)
+
+    def download(self, candidate, query, code=""):
+        detail_url = str((candidate or {}).get("url") or "").strip()
+        if not detail_url:
+            return None
+        text = self.transport.text_request(detail_url, headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
+        for item in extract_subtitlecat_download_links(text, self.base_url):
+            filename = safe_subtitle_filename(item.get("filename"))
+            if not filename:
+                continue
+            if code and candidate_code_score({"filename": filename}, code) <= 0 and candidate_code_score(candidate, code) <= 0:
+                continue
+            body = self.transport.download(item["url"], headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
+            lang, label = subtitle_lang_label(filename, item.get("language"))
+            return SubtitleDownload(
+                source=self.name,
+                provider_id=item.get("provider_id") or item.get("url"),
+                filename=filename,
+                body=body,
+                lang=lang,
+                label=label,
+                query=query,
+                score=int((candidate or {}).get("_score") or 0),
+            )
+        return None
+
+    def _headers(self):
+        return {"User-Agent": "MediaPipeline/0.1", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
 
 
 class AssrtSubtitleProvider:
@@ -399,7 +474,14 @@ def build_subtitle_matcher_from_config(config):
     names = tuple(getattr(config, "subtitle_providers", DEFAULT_SUBTITLE_PROVIDERS) or ())
     for name in names:
         normalized = str(name or "").strip().lower()
-        if normalized == "assrt":
+        if normalized == "subtitlecat":
+            providers.append(
+                SubtitleCatProvider(
+                    timeout=getattr(config, "subtitle_search_timeout_seconds", DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS),
+                    max_bytes=getattr(config, "subtitle_download_max_bytes", DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES),
+                )
+            )
+        elif normalized == "assrt":
             providers.append(
                 AssrtSubtitleProvider(
                     getattr(config, "assrt_api_token", ""),
@@ -496,6 +578,85 @@ def open_subtitles_candidate(item):
         "title": attributes.get("release") or feature_details.get("title"),
         "language": attributes.get("language"),
     }
+
+
+def extract_subtitlecat_search_results(text, base_url=SUBTITLECAT_BASE_URL):
+    out = []
+    for row in re.findall(r"<tr\b.*?</tr>", str(text or ""), flags=re.IGNORECASE | re.DOTALL):
+        for tag_match in re.finditer(r"<a\b[^>]*href=[\"'](?P<href>subs/[^\"']+\.html)[\"'][^>]*>(?P<title>.*?)</a>", row, flags=re.IGNORECASE | re.DOTALL):
+            href = html.unescape(tag_match.group("href"))
+            title = strip_html_text(tag_match.group("title"))
+            if not href or not title:
+                continue
+            url = urllib.parse.urljoin(base_url, href)
+            out.append(
+                {
+                    "id": href,
+                    "url": url,
+                    "title": title,
+                    "filename": title,
+                    "release": title,
+                    "row_text": strip_html_text(row),
+                }
+            )
+    return out
+
+
+def extract_subtitlecat_download_links(text, base_url=SUBTITLECAT_BASE_URL):
+    out = []
+    for tag in re.findall(r"<a\b[^>]*>", str(text or ""), flags=re.IGNORECASE | re.DOTALL):
+        language_match = re.search(r"\bid=[\"']download_([^\"']+)[\"']", tag, flags=re.IGNORECASE)
+        href_match = re.search(r"\bhref=[\"']([^\"']+\.srt)[\"']", tag, flags=re.IGNORECASE)
+        if not language_match or not href_match:
+            continue
+        language = html.unescape(language_match.group(1))
+        href = html.unescape(href_match.group(1))
+        url = urllib.parse.urljoin(base_url, href)
+        filename = subtitlecat_filename_from_url(url)
+        if not filename:
+            continue
+        out.append(
+            {
+                "language": language,
+                "url": url,
+                "filename": filename,
+                "provider_id": "%s:%s" % (href, language),
+            }
+        )
+    return sorted(out, key=lambda item: subtitlecat_language_rank(item.get("language")))
+
+
+def subtitlecat_filename_from_url(url):
+    path = urllib.parse.urlparse(str(url or "")).path
+    return urllib.parse.unquote(posix_basename(path))
+
+
+def subtitlecat_language_rank(language):
+    normalized = str(language or "").strip()
+    try:
+        return SUBTITLECAT_LANGUAGE_ORDER.index(normalized)
+    except ValueError:
+        return len(SUBTITLECAT_LANGUAGE_ORDER)
+
+
+def subtitlecat_candidate_bonus(candidate):
+    text = str((candidate or {}).get("row_text") or "").casefold()
+    score = 0
+    if "translated from chinese" in text:
+        score += 80
+    match = re.search(r"(\d+)\s+downloads?", text)
+    if match:
+        score += min(int(match.group(1)), 50)
+    return score
+
+
+def strip_html_text(value):
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def posix_basename(path):
+    return str(path or "").replace("\\", "/").rsplit("/", 1)[-1]
 
 
 def candidate_code_score(candidate, code):

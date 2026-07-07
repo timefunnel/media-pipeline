@@ -97,6 +97,59 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertNotIn("secret-token", transport.json_urls[0])
         self.assertEqual(transport.headers["Authorization"], "Bearer secret-token")
 
+    def test_subtitlecat_provider_downloads_exact_adult_code_subtitle(self):
+        from pipeline.external_subtitles import SubtitleCatProvider
+
+        class FakeTransport:
+            def __init__(self):
+                self.text_urls = []
+                self.download_urls = []
+
+            def text_request(self, url, headers=None, timeout=None, max_bytes=None):
+                self.text_urls.append(url)
+                if "index.php" in url:
+                    return """
+                    <table><tbody>
+                      <tr>
+                        <td><a href="subs/1475/mimk-267-kor.html">mimk-267-kor</a> (translated from Korean)</td>
+                        <td>9 downloads</td>
+                      </tr>
+                      <tr>
+                        <td><a href="subs/1470/MIMK-267-C.html">MIMK-267-C</a> (translated from Chinese)</td>
+                        <td>16 downloads</td>
+                      </tr>
+                    </tbody></table>
+                    """
+                return """
+                <a id="download_zh-TW" href="/subs/1470/MIMK-267-C-zh-TW.srt" class="green-link">Download</a>
+                <a id="download_zh-CN" href="/subs/1470/MIMK-267-C-zh-CN.srt" class="green-link">Download</a>
+                """
+
+            def download(self, url, headers=None, timeout=None, max_bytes=None):
+                self.download_urls.append(url)
+                return b"subtitlecat-body"
+
+        transport = FakeTransport()
+        provider = SubtitleCatProvider(transport=transport)
+        candidates = provider.search("MIMK-267", code="MIMK-267")
+        download = provider.download(candidates[0], "MIMK-267", code="MIMK-267")
+
+        self.assertEqual(candidates[0]["title"], "MIMK-267-C")
+        self.assertEqual(download.source, "subtitlecat")
+        self.assertEqual(download.filename, "MIMK-267-C-zh-CN.srt")
+        self.assertEqual(download.body, b"subtitlecat-body")
+        self.assertEqual(transport.download_urls, ["https://www.subtitlecat.com/subs/1470/MIMK-267-C-zh-CN.srt"])
+
+    def test_build_subtitle_matcher_includes_subtitlecat_by_default(self):
+        from pipeline.external_subtitles import build_subtitle_matcher_from_config
+
+        class Config:
+            subtitle_auto_match_enabled = True
+
+        matcher = build_subtitle_matcher_from_config(Config())
+
+        self.assertEqual([provider.name for provider in matcher.providers], ["subtitlecat", "assrt", "opensubtitles"])
+
     def test_subtitle_matcher_caches_first_matching_subtitle(self):
         from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
 
