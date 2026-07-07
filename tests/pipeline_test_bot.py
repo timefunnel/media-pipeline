@@ -2090,7 +2090,7 @@ class TelegramBotTest(unittest.TestCase):
             self.assertEqual(telegram.answers, [{"callback_query_id": "cb-dedupe-cancel", "text": "已取消刷新"}])
             self.assertEqual(telegram.edits[-1]["text"], "已取消刷新已入库记录。")
 
-    def test_subtitle_backfill_command_redirects_to_report(self):
+    def test_subtitle_backfill_command_is_removed(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2107,9 +2107,8 @@ class TelegramBotTest(unittest.TestCase):
             bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/subtitle_backfill"}})
 
             self.assertEqual(service.subtitle_backfill_calls, [])
-            self.assertEqual(service.subtitle_report_calls, 1)
-            self.assertIn("成人库字幕补齐报表", telegram.messages[0]["text"])
-            self.assertNotIn("批量补齐成人库字幕？", telegram.messages[0]["text"])
+            self.assertEqual(service.subtitle_report_calls, 0)
+            self.assertIn("这个命令不再作为搜索入口", telegram.messages[0]["text"])
 
     def test_subtitle_report_bulk_buttons_run_backfill_and_retry(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot

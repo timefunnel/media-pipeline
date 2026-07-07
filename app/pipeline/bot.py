@@ -2371,10 +2371,6 @@ class TelegramBot:
             with self._typing_action(chat_id):
                 self._handle_migrate_command(chat_id, user_id, argument)
             return
-        if command == "/subtitle_backfill":
-            with self._typing_action(chat_id):
-                self._handle_subtitle_report_command(chat_id)
-            return
         if command == "/subtitle_report":
             with self._typing_action(chat_id):
                 self._handle_subtitle_report_command(chat_id)
