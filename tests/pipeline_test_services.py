@@ -140,6 +140,37 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertEqual(download.body, b"subtitlecat-body")
         self.assertEqual(transport.download_urls, ["https://www.subtitlecat.com/subs/1470/MIMK-267-C-zh-CN.srt"])
 
+    def test_subtitlecat_provider_quotes_download_url_path(self):
+        from pipeline.external_subtitles import SubtitleCatProvider
+
+        class FakeTransport:
+            def __init__(self):
+                self.download_urls = []
+
+            def text_request(self, url, headers=None, timeout=None, max_bytes=None):
+                return """
+                <a id="download_zh-CN" href="/subs/494/MIDV-373 [zh-TW] (2023)-zh-CN.srt" class="green-link">Download</a>
+                <a id="download_zh-TW" href="/subs/281/KAWD-709 さくらゆら-zh-CN.srt" class="green-link">Download</a>
+                """
+
+            def download(self, url, headers=None, timeout=None, max_bytes=None):
+                self.download_urls.append(url)
+                return b"subtitlecat-body"
+
+        transport = FakeTransport()
+        provider = SubtitleCatProvider(transport=transport)
+        download = provider.download(
+            {"url": "https://www.subtitlecat.com/subs/494/MIDV-373.html", "filename": "MIDV-373", "_score": 10},
+            "MIDV-373",
+            code="MIDV-373",
+        )
+
+        self.assertEqual(download.filename, "MIDV-373 [zh-TW] (2023)-zh-CN.srt")
+        self.assertEqual(
+            transport.download_urls,
+            ["https://www.subtitlecat.com/subs/494/MIDV-373%20%5Bzh-TW%5D%20%282023%29-zh-CN.srt"],
+        )
+
     def test_build_subtitle_matcher_includes_subtitlecat_by_default(self):
         from pipeline.external_subtitles import build_subtitle_matcher_from_config
 

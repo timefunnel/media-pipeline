@@ -588,7 +588,7 @@ def extract_subtitlecat_search_results(text, base_url=SUBTITLECAT_BASE_URL):
             title = strip_html_text(tag_match.group("title"))
             if not href or not title:
                 continue
-            url = urllib.parse.urljoin(base_url, href)
+            url = subtitlecat_urljoin(base_url, href)
             out.append(
                 {
                     "id": href,
@@ -611,7 +611,7 @@ def extract_subtitlecat_download_links(text, base_url=SUBTITLECAT_BASE_URL):
             continue
         language = html.unescape(language_match.group(1))
         href = html.unescape(href_match.group(1))
-        url = urllib.parse.urljoin(base_url, href)
+        url = subtitlecat_urljoin(base_url, href)
         filename = subtitlecat_filename_from_url(url)
         if not filename:
             continue
@@ -629,6 +629,15 @@ def extract_subtitlecat_download_links(text, base_url=SUBTITLECAT_BASE_URL):
 def subtitlecat_filename_from_url(url):
     path = urllib.parse.urlparse(str(url or "")).path
     return urllib.parse.unquote(posix_basename(path))
+
+
+def subtitlecat_urljoin(base_url, href):
+    url = urllib.parse.urljoin(str(base_url or ""), str(href or ""))
+    parsed = urllib.parse.urlsplit(url)
+    path = urllib.parse.quote(parsed.path, safe="/%")
+    query = urllib.parse.quote(parsed.query, safe="=&%:+/?")
+    fragment = urllib.parse.quote(parsed.fragment, safe="=&%:+/?")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, query, fragment))
 
 
 def subtitlecat_language_rank(language):
