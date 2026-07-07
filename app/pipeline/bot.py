@@ -206,6 +206,12 @@ SUBTITLE_REPORT_BUCKET_LABELS = {
     "failed": "失败",
     "no_code": "无番号",
 }
+SUBTITLE_BACKFILL_STATUS_FILTERS = {
+    "pending": {"success", "untried"},
+    "untried": {"untried"},
+    "not_found": {"not_found"},
+    "failed": {"failed"},
+}
 ACTIVE_115_FAST_POLL_WINDOW_SECONDS = 20
 ACTIVE_115_FAST_POLL_INTERVAL_SECONDS = 2
 ACTIVE_115_SLOW_AFTER_POLLS = 10
@@ -1618,15 +1624,16 @@ class PipelineBotService:
     def match_task_subtitles(self, category, title, task, force=False):
         return self._build_subtitle_matcher().match_task(category, title, task, force=force)
 
-    def subtitle_backfill_adult(self, limit=DEFAULT_SUBTITLE_BACKFILL_LIMIT, progress_callback=None, retry_attempted=False):
+    def subtitle_backfill_adult(self, limit=DEFAULT_SUBTITLE_BACKFILL_LIMIT, progress_callback=None, retry_attempted=False, status_filter=None):
         if not self.config.msg_enabled:
             raise RuntimeError("MediaStationGo is disabled")
         limit = normalize_subtitle_backfill_limit(limit)
+        status_filter = normalize_subtitle_backfill_status_filter(status_filter)
         root = category_to_msg_library_root("adult")
         client = self._build_msg_client()
         matcher = self._build_subtitle_matcher()
         store = CandidateStore(self.config.state_db_path)
-        result = new_subtitle_backfill_result(limit, retry_attempted=retry_attempted)
+        result = new_subtitle_backfill_result(limit, retry_attempted=retry_attempted, status_filter=status_filter)
 
         def emit(force=False):
             if progress_callback:
@@ -1640,6 +1647,10 @@ class PipelineBotService:
                 break
             backfill_records = store.subtitle_backfill_records([extract_media_id(media) for media in items])
             for media in items:
+                media_status = subtitle_backfill_media_status(media, matcher, backfill_records)
+                if status_filter and media_status not in SUBTITLE_BACKFILL_STATUS_FILTERS[status_filter]:
+                    result["scanned"] += 1
+                    continue
                 attempted = process_subtitle_backfill_media(
                     media,
                     matcher,
@@ -2535,6 +2546,18 @@ class TelegramBot:
             return
         if action == "subtitle_backfill_retry":
             self._handle_subtitle_backfill_confirm_callback(chat_id, message_id, callback_id, value, retry_attempted=True)
+            return
+        if action in ("subbulk", "subbulkr"):
+            bucket, limit = value
+            self._handle_subtitle_backfill_confirm_callback(
+                chat_id,
+                message_id,
+                callback_id,
+                limit,
+                retry_attempted=action == "subbulkr",
+                status_filter=bucket,
+                report_bucket=bucket,
+            )
             return
         if action == "subtitle_backfill_cancel":
             self._handle_subtitle_backfill_cancel_callback(chat_id, message_id, callback_id)
@@ -3521,9 +3544,10 @@ class TelegramBot:
         self.telegram.answer_callback_query(callback_id, "已取消刷新")
         self._update_callback_message(chat_id, message_id, "已取消刷新已入库记录。", reply_markup={"inline_keyboard": []})
 
-    def _handle_subtitle_backfill_confirm_callback(self, chat_id, message_id, callback_id, limit, retry_attempted=False):
+    def _handle_subtitle_backfill_confirm_callback(self, chat_id, message_id, callback_id, limit, retry_attempted=False, status_filter=None, report_bucket="pending"):
         try:
             limit = normalize_subtitle_backfill_limit(limit)
+            status_filter = normalize_subtitle_backfill_status_filter(status_filter)
         except ValueError as exc:
             self.telegram.answer_callback_query(callback_id, "数量无效")
             self._update_callback_message(chat_id, message_id, "字幕补齐数量无效：%s" % exc, reply_markup={"inline_keyboard": []})
@@ -3531,16 +3555,17 @@ class TelegramBot:
         if not self._subtitle_backfill_lock.acquire(blocking=False):
             self.telegram.answer_callback_query(callback_id, "字幕补齐任务正在运行")
             return
-        self.telegram.answer_callback_query(callback_id, "开始补齐字幕" if not retry_attempted else "开始重试字幕补齐")
+        action_label = "重试" if retry_attempted else "补齐"
+        self.telegram.answer_callback_query(callback_id, "开始%s%s字幕" % (action_label, subtitle_backfill_status_filter_label(status_filter)))
         self._update_callback_message(
             chat_id,
             message_id,
-            format_subtitle_backfill_message(new_subtitle_backfill_result(limit, retry_attempted=retry_attempted)),
+            format_subtitle_backfill_message(new_subtitle_backfill_result(limit, retry_attempted=retry_attempted, status_filter=status_filter)),
             reply_markup={"inline_keyboard": []},
         )
         thread = threading.Thread(
             target=self._run_subtitle_backfill_thread,
-            args=(chat_id, message_id, limit, retry_attempted),
+            args=(chat_id, message_id, limit, retry_attempted, status_filter, report_bucket),
             daemon=True,
         )
         thread.start()
@@ -3593,9 +3618,10 @@ class TelegramBot:
             fallback_chat_id=chat_id,
         )
 
-    def _run_subtitle_backfill_thread(self, chat_id, message_id, limit, retry_attempted=False):
+    def _run_subtitle_backfill_thread(self, chat_id, message_id, limit, retry_attempted=False, status_filter=None, report_bucket="pending"):
         try:
             last_emit_at = 0.0
+            report_bucket = normalize_subtitle_report_bucket(report_bucket or status_filter or "pending")
 
             def progress(result, force=False):
                 nonlocal last_emit_at
@@ -3612,7 +3638,12 @@ class TelegramBot:
                     fallback_chat_id=chat_id,
                 )
 
-            result = self.service.subtitle_backfill_adult(limit=limit, progress_callback=progress, retry_attempted=retry_attempted)
+            result = self.service.subtitle_backfill_adult(
+                limit=limit,
+                progress_callback=progress,
+                retry_attempted=retry_attempted,
+                status_filter=status_filter,
+            )
             try:
                 report = self.service.subtitle_backfill_report_adult()
             except Exception as exc:
@@ -3627,10 +3658,10 @@ class TelegramBot:
             self._update_callback_message(
                 chat_id,
                 message_id,
-                format_subtitle_backfill_report_message(report, bucket="pending", page=0) + "\n\n" + format_subtitle_backfill_message(result),
+                format_subtitle_backfill_report_message(report, bucket=report_bucket, page=0) + "\n\n" + format_subtitle_backfill_message(result),
                 reply_markup=subtitle_backfill_report_reply_markup(
                     report,
-                    bucket="pending",
+                    bucket=report_bucket,
                     page=0,
                     batch_limit=self.config.subtitle_backfill_default_limit,
                 ),
@@ -4463,11 +4494,12 @@ def normalize_subtitle_backfill_limit(value):
     return limit
 
 
-def new_subtitle_backfill_result(limit, retry_attempted=False):
+def new_subtitle_backfill_result(limit, retry_attempted=False, status_filter=None):
     return {
         "status": "running",
         "limit": normalize_subtitle_backfill_limit(limit),
         "retry_attempted": bool(retry_attempted),
+        "status_filter": normalize_subtitle_backfill_status_filter(status_filter),
         "scanned": 0,
         "attempted": 0,
         "with_subtitles": 0,
@@ -4488,6 +4520,24 @@ def subtitle_matcher_has_cached_tracks(matcher, media_id):
     if cache is None:
         return False
     return bool(cache.list_tracks(media_id))
+
+
+def normalize_subtitle_backfill_status_filter(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text not in SUBTITLE_BACKFILL_STATUS_FILTERS:
+        raise ValueError("不支持的补齐范围：%s" % text)
+    return text
+
+
+def subtitle_backfill_status_filter_label(value):
+    return {
+        "pending": "待补可尝试",
+        "untried": "未尝试",
+        "not_found": "未找到",
+        "failed": "失败",
+    }.get(str(value or ""), "")
 
 
 def extract_media_detail(response):
@@ -4522,6 +4572,14 @@ def subtitle_backfill_task_from_media(media):
     if code:
         task["openlist_adult_code"] = code
     return task
+
+
+def subtitle_backfill_media_status(media, matcher, records):
+    item = subtitle_report_item_from_media(media, records)
+    media_id = item.get("media_id")
+    if media_id and subtitle_matcher_has_cached_tracks(matcher, media_id):
+        return "cached"
+    return item.get("status") or "unknown"
 
 
 def process_subtitle_backfill_media(media, matcher, store, result, retry_attempted=False, backfill_records=None, before_match=None):
@@ -4646,18 +4704,24 @@ def format_subtitle_backfill_message(result):
     title = "成人库字幕补齐：%s" % ("已完成" if status == "success" else "进行中")
     lines = [
         title,
-        "扫描：%s  尝试：%s/%s" % (result.get("scanned") or 0, result.get("attempted") or 0, result.get("limit") or 0),
-        "已补字幕：%s  待补：%s" % (result.get("with_subtitles") or 0, result.get("pending") or 0),
-        "命中：%s  已有缓存：%s  已尝试跳过：%s  未找到：%s  失败：%s  跳过：%s"
-        % (
-            result.get("matched") or 0,
-            result.get("cached") or 0,
-            result.get("previous") or 0,
-            result.get("not_found") or 0,
-            result.get("failed") or 0,
-            result.get("skipped") or 0,
-        ),
     ]
+    if result.get("status_filter"):
+        lines.append("范围：%s" % subtitle_backfill_status_filter_label(result.get("status_filter")))
+    lines.extend(
+        [
+            "扫描：%s  尝试：%s/%s" % (result.get("scanned") or 0, result.get("attempted") or 0, result.get("limit") or 0),
+            "已补字幕：%s  待补：%s" % (result.get("with_subtitles") or 0, result.get("pending") or 0),
+            "命中：%s  已有缓存：%s  已尝试跳过：%s  未找到：%s  失败：%s  跳过：%s"
+            % (
+                result.get("matched") or 0,
+                result.get("cached") or 0,
+                result.get("previous") or 0,
+                result.get("not_found") or 0,
+                result.get("failed") or 0,
+                result.get("skipped") or 0,
+            ),
+        ]
+    )
     current = result.get("current") or {}
     if current:
         lines.append("当前：%s%s" % (current.get("code") or current.get("media_id") or "-", " / %s" % current.get("title") if current.get("title") else ""))
@@ -4825,11 +4889,7 @@ def subtitle_backfill_report_reply_markup(report, bucket="pending", page=0, batc
     start = page * SUBTITLE_REPORT_PAGE_SIZE
     page_items = items[start : start + SUBTITLE_REPORT_PAGE_SIZE]
     keyboard = []
-    operation_row = []
-    if (report or {}).get("pending"):
-        operation_row.append({"text": "批量补齐 %s" % batch_limit, "callback_data": "subtitle_backfill_confirm:%s" % batch_limit})
-    if (report or {}).get("not_found") or (report or {}).get("failed"):
-        operation_row.append({"text": "重试已尝试 %s" % batch_limit, "callback_data": "subtitle_backfill_retry:%s" % batch_limit})
+    operation_row = subtitle_report_bulk_operation_row(report, bucket, batch_limit)
     if operation_row:
         keyboard.append(operation_row)
     keyboard.extend(
@@ -4851,7 +4911,7 @@ def subtitle_backfill_report_reply_markup(report, bucket="pending", page=0, batc
         callback_data = subtitle_report_item_callback_data(item, bucket, page)
         if not callback_data:
             continue
-        label = "重试 %s" % index if (item.get("status") in SUBTITLE_BACKFILL_SKIP_STATUSES) else "补齐 %s" % index
+        label = "#%s 重试" % index if (item.get("status") in SUBTITLE_BACKFILL_SKIP_STATUSES) else "#%s 补齐" % index
         item_buttons.append({"text": label, "callback_data": callback_data})
     for offset in range(0, len(item_buttons), 2):
         keyboard.append(item_buttons[offset : offset + 2])
@@ -4865,6 +4925,23 @@ def subtitle_backfill_report_reply_markup(report, bucket="pending", page=0, batc
     return {
         "inline_keyboard": keyboard
     }
+
+
+def subtitle_report_bulk_operation_row(report, bucket, batch_limit):
+    bucket = normalize_subtitle_report_bucket(bucket)
+    count = int((report or {}).get(bucket) or 0)
+    if bucket == "pending":
+        count = int((report or {}).get("pending") or 0)
+        if count <= 0:
+            return []
+        return [{"text": "批量补齐待补可尝试 %s" % batch_limit, "callback_data": "subbulk:pending:%s" % batch_limit}]
+    if bucket == "untried" and count > 0:
+        return [{"text": "批量补齐未尝试 %s" % batch_limit, "callback_data": "subbulk:untried:%s" % batch_limit}]
+    if bucket == "failed" and count > 0:
+        return [{"text": "批量重试失败 %s" % batch_limit, "callback_data": "subbulkr:failed:%s" % batch_limit}]
+    if bucket == "not_found" and count > 0:
+        return [{"text": "批量重试未找到 %s" % batch_limit, "callback_data": "subbulkr:not_found:%s" % batch_limit}]
+    return []
 
 
 def subtitle_report_item_callback_data(item, bucket, page):
@@ -5362,6 +5439,10 @@ def parse_callback_data(value):
         bucket, sep, page = payload.partition(":")
         if sep:
             return action, (bucket, int(page))
+    if action in ("subbulk", "subbulkr") and payload:
+        bucket, sep, limit = payload.partition(":")
+        if sep:
+            return action, (bucket, int(limit))
     if action in ("sub1", "sub1r") and payload:
         bucket, sep, rest = payload.partition(":")
         page, page_sep, media_id = rest.partition(":")

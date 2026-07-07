@@ -690,11 +690,12 @@ class FakeBotService:
         self.subtitle_calls.append((category, title, (task or {}).get("info_hash"), force))
         return dict(self.subtitle_response)
 
-    def subtitle_backfill_adult(self, limit=20, progress_callback=None, retry_attempted=False):
-        self.subtitle_backfill_calls.append((limit, retry_attempted))
+    def subtitle_backfill_adult(self, limit=20, progress_callback=None, retry_attempted=False, status_filter=None):
+        self.subtitle_backfill_calls.append((limit, retry_attempted, status_filter))
         result = dict(self.subtitle_backfill_response)
         result["limit"] = limit
         result["retry_attempted"] = bool(retry_attempted)
+        result["status_filter"] = status_filter
         if progress_callback:
             progress_callback(dict(result), force=True)
         return result
