@@ -136,6 +136,43 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertEqual(len(tracks), 1)
         self.assertEqual(tracks[0]["source"], "fake")
 
+    def test_subtitle_matcher_continues_after_candidate_download_error(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
+
+        class FakeProvider:
+            name = "fake"
+
+            def __init__(self):
+                self.download_calls = []
+
+            def enabled(self):
+                return True
+
+            def search(self, query, code=""):
+                return [{"id": "needs-token"}, {"id": "dev-mode-ok"}]
+
+            def download(self, candidate, query, code=""):
+                self.download_calls.append(candidate["id"])
+                if candidate["id"] == "needs-token":
+                    raise RuntimeError("missing token")
+                return SubtitleDownload(
+                    source=self.name,
+                    provider_id="dev-mode-ok",
+                    filename="Avatar.chs.srt",
+                    body=b"subtitle-body",
+                    query=query,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SubtitleCache(tmp)
+            provider = FakeProvider()
+            matcher = SubtitleMatcher(cache, [provider], enabled=True, adult_only=False)
+            result = matcher.match_task("movie", "Avatar 2009", {"msg_media_id": "media-1"})
+
+        self.assertEqual(result["subtitle_match_status"], "success")
+        self.assertEqual(result["subtitle_match_source"], "fake")
+        self.assertEqual(provider.download_calls, ["needs-token", "dev-mode-ok"])
+
     def test_local_subtitle_provider_reads_cached_subtitle(self):
         from pipeline.external_subtitles import LocalSubtitleProvider, SubtitleCache, SubtitleDownload
 

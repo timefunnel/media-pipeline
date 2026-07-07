@@ -369,20 +369,25 @@ class SubtitleMatcher:
             for query in queries:
                 try:
                     candidates = provider.search(query, code=code)
-                    for candidate in candidates:
-                        download = provider.download(candidate, query, code=code)
-                        if not download:
-                            continue
-                        track = self.cache.save_download(media_id, download)
-                        return subtitle_result(
-                            "success",
-                            count=1,
-                            source=provider.name,
-                            query=query,
-                            filename=track.get("filename"),
-                        )
                 except Exception as exc:
                     errors.append("%s: %s" % (provider.name, exc))
+                    continue
+                for candidate in candidates:
+                    try:
+                        download = provider.download(candidate, query, code=code)
+                    except Exception as exc:
+                        errors.append("%s: %s" % (provider.name, exc))
+                        continue
+                    if not download:
+                        continue
+                    track = self.cache.save_download(media_id, download)
+                    return subtitle_result(
+                        "success",
+                        count=1,
+                        source=provider.name,
+                        query=query,
+                        filename=track.get("filename"),
+                    )
         if errors:
             return subtitle_result("failed", error="; ".join(errors[:3]))
         return subtitle_result("skipped", reason="not_found", query=queries[0])
