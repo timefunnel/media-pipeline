@@ -513,6 +513,73 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertTrue(playback_changed)
         self.assertEqual(playback_payload["MediaSources"][0]["RunTimeTicks"], runtime_ticks)
 
+    def test_patch_emby_adult_code_titles_prefixes_adult_media_name(self):
+        adult = category_to_msg_library_root("adult")
+        payload = {
+            "Items": [
+                {
+                    "Id": "media-1",
+                    "Name": "无码标题",
+                    "LibraryId": adult["library_id"],
+                    "Path": "cloud://openlist/115/成人/SSIS-218/SSIS-218.mp4",
+                }
+            ]
+        }
+
+        changed = patch_emby_adult_code_titles(payload)
+
+        self.assertTrue(changed)
+        self.assertEqual(payload["Items"][0]["Name"], "SSIS-218 - 无码标题")
+
+    def test_patch_emby_adult_code_titles_skips_already_prefixed_name(self):
+        adult = category_to_msg_library_root("adult")
+        payload = {"Id": "media-1", "Name": "SSIS-218 - 无码标题", "LibraryId": adult["library_id"]}
+
+        changed = patch_emby_adult_code_titles(payload)
+
+        self.assertFalse(changed)
+        self.assertEqual(payload["Name"], "SSIS-218 - 无码标题")
+
+    def test_patch_emby_adult_code_titles_skips_non_adult_library(self):
+        movie = category_to_msg_library_root("movie")
+        payload = {
+            "Items": [
+                {
+                    "Id": "media-1",
+                    "Name": "SSIS-218 Movie",
+                    "LibraryId": movie["library_id"],
+                    "Path": "cloud://openlist/115/电影/SSIS-218/SSIS-218.mp4",
+                }
+            ]
+        }
+
+        changed = patch_emby_adult_code_titles(payload)
+
+        self.assertFalse(changed)
+        self.assertEqual(payload["Items"][0]["Name"], "SSIS-218 Movie")
+
+    def test_patch_emby_adult_code_titles_uses_adult_path_when_library_id_missing(self):
+        payload = {"Id": "media-1", "Name": "标题", "Path": "cloud://openlist/115/成人/MIDE-882/MIDE-882.mp4"}
+
+        changed = patch_emby_adult_code_titles(payload)
+
+        self.assertTrue(changed)
+        self.assertEqual(payload["Name"], "MIDE-882 - 标题")
+
+    def test_patch_emby_adult_code_titles_prefers_path_code_over_title_noise(self):
+        adult = category_to_msg_library_root("adult")
+        payload = {
+            "Id": "media-1",
+            "Name": "合集标题 SSIS-001",
+            "LibraryId": adult["library_id"],
+            "Path": "cloud://openlist/115/成人/MIDE-882/MIDE-882.mp4",
+        }
+
+        changed = patch_emby_adult_code_titles(payload)
+
+        self.assertTrue(changed)
+        self.assertEqual(payload["Name"], "MIDE-882 - 合集标题 SSIS-001")
+
     def test_patch_emby_playback_info_runtime_updates_media_sources(self):
         payload = {"MediaSources": [{"Id": "media-1", "RunTimeTicks": 0}, {"Id": "media-2", "RunTimeTicks": 10}]}
 

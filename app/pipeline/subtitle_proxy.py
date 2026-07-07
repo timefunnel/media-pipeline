@@ -19,6 +19,8 @@ except ImportError:
     Image = None
     ImageOps = None
 
+from pipeline.config import category_to_msg_library_root
+from pipeline.mediastation import iter_code_matches
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider
 from pipeline.external_subtitles import DEFAULT_SUBTITLE_CACHE_DIR, LocalSubtitleProvider, local_subtitle_uri_valid
 
@@ -27,6 +29,7 @@ DEFAULT_SUBTITLE_PROXY_HOST = "127.0.0.1"
 DEFAULT_SUBTITLE_PROXY_PORT = 18081
 DEFAULT_SUBTITLE_PROXY_UPSTREAM = "http://127.0.0.1:18080"
 DEFAULT_MSG_API_BASE_URL = "http://127.0.0.1:18080/api"
+ADULT_MSG_LIBRARY_ID = category_to_msg_library_root("adult")["library_id"]
 EMBY_TICKS_PER_SECOND = 10_000_000
 MIN_SYNTHETIC_RUNTIME_TICKS = 10 * 60 * EMBY_TICKS_PER_SECOND
 SYNTHETIC_RUNTIME_PADDING_TICKS = 60 * 60 * EMBY_TICKS_PER_SECOND
@@ -658,6 +661,115 @@ def iter_emby_items(payload):
         for item in payload:
             if isinstance(item, dict):
                 yield item
+
+
+def patch_emby_adult_code_titles(payload):
+    changed = False
+    for item in iter_emby_items(payload):
+        if patch_emby_adult_code_title(item):
+            changed = True
+    return changed
+
+
+def patch_emby_adult_code_title(item):
+    if not isinstance(item, dict) or not emby_item_is_adult_media(item):
+        return False
+    code = emby_item_adult_code(item)
+    if not code:
+        return False
+    title = str(item.get("Name") or item.get("name") or "").strip()
+    if not title or title_starts_with_code(title, code):
+        return False
+    item["Name"] = "%s - %s" % (code, title)
+    return True
+
+
+def emby_item_is_adult_media(item):
+    if not isinstance(item, dict) or emby_item_is_collection_folder(item):
+        return False
+    library_id = str(item.get("LibraryId") or item.get("library_id") or item.get("libraryId") or "").strip()
+    if library_id and library_id == ADULT_MSG_LIBRARY_ID:
+        return True
+    for path in emby_item_path_values(item):
+        if openlist_path_is_adult(path):
+            return True
+    return False
+
+
+def emby_item_adult_code(item):
+    for value in emby_item_path_values(item):
+        code = first_code_match(value)
+        if code:
+            return code
+    for key in ("Name", "name", "OriginalTitle", "original_title", "SortName", "sort_name"):
+        code = first_code_match((item or {}).get(key))
+        if code:
+            return code
+    return first_code_match(emby_item_haystack(item))
+
+
+def first_code_match(value):
+    for code in iter_code_matches(value):
+        return code
+    return ""
+
+
+def title_starts_with_code(title, code):
+    normalized_title = re.sub(r"[^0-9A-Za-z]+", "", str(title or "")).upper()
+    normalized_code = re.sub(r"[^0-9A-Za-z]+", "", str(code or "")).upper()
+    return bool(normalized_code and normalized_title.startswith(normalized_code))
+
+
+def emby_item_haystack(value):
+    chunks = []
+    collect_emby_item_text(value, chunks)
+    return " ".join(chunks)
+
+
+def collect_emby_item_text(value, chunks):
+    if isinstance(value, dict):
+        for child in value.values():
+            collect_emby_item_text(child, chunks)
+    elif isinstance(value, list):
+        for child in value:
+            collect_emby_item_text(child, chunks)
+    elif isinstance(value, str):
+        chunks.append(value)
+    elif isinstance(value, (int, float)):
+        chunks.append(str(value))
+
+
+def emby_item_path_values(value):
+    paths = []
+    if isinstance(value, dict):
+        for key in ("Path", "path", "FileName", "file_name", "FilePath", "file_path", "SourcePath", "source_path", "Url", "url"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                paths.append(item)
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                paths.extend(emby_item_path_values(child))
+    elif isinstance(value, list):
+        for child in value:
+            paths.extend(emby_item_path_values(child))
+    return unique_string_values(paths)
+
+
+def unique_string_values(values):
+    seen = set()
+    out = []
+    for value in values or []:
+        text = str(value or "").strip()
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out
+
+
+def openlist_path_is_adult(path):
+    text = urllib.parse.unquote(str(path or "")).replace("\\", "/").casefold()
+    return "/115/成人" in text or "/115%2f成人" in text
 
 
 def emby_item_is_collection_folder(item):
@@ -1864,6 +1976,9 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                 if isinstance(payload, dict) and patch_emby_resume_runtime_fields(payload):
                     no_store = True
                     self._mark_timing(timing, "resume_runtime_patch")
+                if patch_emby_adult_code_titles(payload):
+                    no_store = True
+                    self._mark_timing(timing, "adult_code_title_patch")
                 if self._patch_emby_collection_folder_covers(payload, request_headers, request_path or ""):
                     no_store = True
                     self._mark_timing(timing, "folder_cover_patch")
