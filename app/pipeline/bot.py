@@ -195,6 +195,9 @@ DEFAULT_TASK_LIST_FETCH_LIMIT = 100
 DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES = 20 * 1024 * 1024
 ADULT_EXTRA_VIDEO_HIDE_MIN_BYTES = 200 * 1024 * 1024
 DEFAULT_SUBTITLE_BACKFILL_LIMIT = 20
+DEFAULT_SUBTITLE_REMATCH_LIMIT = 10
+DEFAULT_SUBTITLE_LLM_PREVIEW_LIMIT = 5
+DEFAULT_SUBTITLE_LLM_PREVIEW_CHARS = 2000
 MAX_SUBTITLE_BACKFILL_LIMIT = 50
 SUBTITLE_BACKFILL_SKIP_STATUSES = {"failed", "not_found"}
 SUBTITLE_REPORT_PAGE_SIZE = 8
@@ -1382,6 +1385,11 @@ class PipelineBotService:
             raise RuntimeError("LLM rerank disabled")
         return self._rerank_search_candidates_with_timeout(query, category, candidates)
 
+    def rank_subtitle_candidates(self, media, query, candidates):
+        if not self.config.llm_search_rerank_enabled:
+            raise RuntimeError("LLM rerank disabled")
+        return self._rank_subtitle_candidates_with_timeout(media, query, candidates)
+
     def search_adult(self, query, limit=DEFAULT_SEARCH_LIMIT):
         return self.search(query, "adult", limit=limit, profile=SEARCH_PROFILE_ADULT)
 
@@ -1451,6 +1459,28 @@ class PipelineBotService:
                 query,
                 category,
                 ranked,
+                max_candidates=self.config.llm_search_rerank_limit,
+            )
+        except Exception:
+            self._llm_rerank_lock.release()
+            raise
+        future.add_done_callback(self._release_llm_rerank_lock)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError:
+            future.cancel()
+            raise
+
+    def _rank_subtitle_candidates_with_timeout(self, media, query, candidates):
+        timeout = max(0.1, float(self.config.llm_timeout_seconds or DEFAULT_LLM_TIMEOUT_SECONDS))
+        if not self._llm_rerank_lock.acquire(blocking=False):
+            raise LlmRerankBusy("previous LLM rerank is still running")
+        try:
+            future = self._llm_rerank_executor.submit(
+                self._build_search_reranker().rank_subtitle_candidates,
+                media,
+                query,
+                candidates,
                 max_candidates=self.config.llm_search_rerank_limit,
             )
         except Exception:
@@ -1623,6 +1653,63 @@ class PipelineBotService:
 
     def match_task_subtitles(self, category, title, task, force=False):
         return self._build_subtitle_matcher().match_task(category, title, task, force=force)
+
+    def subtitle_rematch_candidates_adult(self, media_id, limit=DEFAULT_SUBTITLE_REMATCH_LIMIT):
+        if not self.config.msg_enabled:
+            raise RuntimeError("MediaStationGo is disabled")
+        media_id = str(media_id or "").strip()
+        if not media_id:
+            raise ValueError("media_id is required")
+        client = self._build_msg_client()
+        matcher = self._build_subtitle_matcher()
+        media = extract_media_detail(client.get_media(media_id))
+        detail_id = extract_media_id(media)
+        if not detail_id:
+            raise RuntimeError("MediaStationGo media detail missing id: %s" % media_id)
+        if detail_id != media_id:
+            raise RuntimeError("MediaStationGo media id mismatch: expected %s, got %s" % (media_id, detail_id))
+        title = media_display_title(media) or media_id
+        task = subtitle_backfill_task_from_media(media)
+        code = task.get("openlist_adult_code") or ""
+        candidates = matcher.search_task_candidates("adult", title, task, limit=limit)
+        return {
+            "media_id": media_id,
+            "title": title,
+            "code": code,
+            "query": code or title,
+            "task": task,
+            "media": {"media_id": media_id, "title": title, "code": code},
+            "candidates": candidates,
+        }
+
+    def apply_subtitle_candidate(self, candidate_record):
+        candidate_record = dict(candidate_record or {})
+        media_id = str(candidate_record.get("media_id") or "").strip()
+        if not media_id:
+            raise ValueError("media_id is required")
+        title = str(candidate_record.get("title") or media_id)
+        code = str(candidate_record.get("code") or "")
+        result = self._build_subtitle_matcher().apply_candidate(media_id, candidate_record)
+        CandidateStore(self.config.state_db_path).save_subtitle_backfill_record(media_id, title, code, result)
+        out = dict(result)
+        out.update({"media_id": media_id, "title": title, "code": code})
+        return out
+
+    def preview_subtitle_candidates(self, candidates, limit=DEFAULT_SUBTITLE_LLM_PREVIEW_LIMIT, max_chars=DEFAULT_SUBTITLE_LLM_PREVIEW_CHARS):
+        matcher = self._build_subtitle_matcher()
+        limit = max(0, int(limit or 0))
+        out = []
+        for index, candidate in enumerate(candidates or []):
+            if index >= limit:
+                out.append(dict(candidate))
+                continue
+            try:
+                out.append(matcher.preview_candidate(candidate, max_chars=max_chars))
+            except Exception as exc:
+                item = dict(candidate)
+                item["preview_error"] = str(exc)
+                out.append(item)
+        return out
 
     def subtitle_backfill_adult(self, limit=DEFAULT_SUBTITLE_BACKFILL_LIMIT, progress_callback=None, retry_attempted=False, status_filter=None):
         if not self.config.msg_enabled:
@@ -2577,6 +2664,13 @@ class TelegramBot:
                 page=page,
                 retry_attempted=action == "sub1r",
             )
+            return
+        if action == "subrematch":
+            bucket, page, media_id = value
+            self._handle_subtitle_rematch_callback(user_id, chat_id, message_id, callback_id, media_id, bucket=bucket, page=page)
+            return
+        if action == "subpick":
+            self._handle_subtitle_pick_callback(user_id, chat_id, message_id, callback_id, value)
             return
         else:
             self.telegram.answer_callback_query(callback_id, "不支持的操作")
@@ -3593,6 +3687,60 @@ class TelegramBot:
         )
         thread.start()
 
+    def _handle_subtitle_rematch_callback(self, user_id, chat_id, message_id, callback_id, media_id, bucket="cached", page=0):
+        bucket = normalize_subtitle_report_bucket(bucket)
+        page = max(0, int(page or 0))
+        media_id = str(media_id or "").strip()
+        if not media_id:
+            self.telegram.answer_callback_query(callback_id, "media_id 无效")
+            return
+        self.telegram.answer_callback_query(callback_id, "正在重新匹配字幕")
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            "正在重新匹配字幕：%s" % media_id,
+            reply_markup={"inline_keyboard": []},
+        )
+        thread = threading.Thread(
+            target=self._run_subtitle_rematch_thread,
+            args=(user_id, chat_id, message_id, media_id, bucket, page),
+            daemon=True,
+        )
+        thread.start()
+
+    def _handle_subtitle_pick_callback(self, user_id, chat_id, message_id, callback_id, candidate_id):
+        try:
+            record = self.store.load_candidate(candidate_id)
+        except RuntimeError:
+            self.telegram.answer_callback_query(callback_id, "字幕候选不存在")
+            return
+        if record["user_id"] != user_id or record["category"] != "subtitle_rematch":
+            self.telegram.answer_callback_query(callback_id, "无权操作此字幕候选")
+            return
+        candidate = dict(record["candidate"])
+        bucket = normalize_subtitle_report_bucket(candidate.get("report_bucket") or "cached")
+        page = max(0, int(candidate.get("report_page") or 0))
+        self.telegram.answer_callback_query(callback_id, "正在应用字幕")
+        try:
+            with self._typing_action(record["chat_id"]):
+                result = self.service.apply_subtitle_candidate(candidate)
+        except Exception as exc:
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                "字幕应用失败\nmedia_id：%s\n错误：%s" % (candidate.get("media_id") or "-", exc),
+                reply_markup=subtitle_rematch_done_reply_markup(bucket, page),
+                fallback_chat_id=record["chat_id"],
+            )
+            return
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_subtitle_apply_result_message(result),
+            reply_markup=subtitle_rematch_done_reply_markup(bucket, page),
+            fallback_chat_id=record["chat_id"],
+        )
+
     def _handle_subtitle_backfill_cancel_callback(self, chat_id, message_id, callback_id):
         self.telegram.answer_callback_query(callback_id, "已取消字幕补齐")
         self._update_callback_message(chat_id, message_id, "已取消批量补齐成人库字幕。", reply_markup={"inline_keyboard": []})
@@ -3704,6 +3852,68 @@ class TelegramBot:
             )
         finally:
             self._subtitle_backfill_lock.release()
+
+    def _run_subtitle_rematch_thread(self, user_id, chat_id, message_id, media_id, bucket, page):
+        try:
+            with self._typing_action(chat_id):
+                result = self.service.subtitle_rematch_candidates_adult(media_id, limit=DEFAULT_SUBTITLE_REMATCH_LIMIT)
+                candidates = list(result.get("candidates") or [])
+                llm_status = "disabled"
+                llm_error = ""
+                if self.config.llm_search_rerank_enabled and len(candidates) > 1:
+                    try:
+                        previewed = self.service.preview_subtitle_candidates(
+                            candidates,
+                            limit=DEFAULT_SUBTITLE_LLM_PREVIEW_LIMIT,
+                            max_chars=DEFAULT_SUBTITLE_LLM_PREVIEW_CHARS,
+                        )
+                        candidates = self.service.rank_subtitle_candidates(result.get("media") or {}, result.get("query") or "", previewed)
+                        llm_status = "success"
+                    except FutureTimeoutError as exc:
+                        llm_status = "timeout"
+                        llm_error = str(exc)
+                    except LlmRerankBusy as exc:
+                        llm_status = "busy"
+                        llm_error = str(exc)
+                    except Exception as exc:
+                        llm_status = "failed"
+                        llm_error = str(exc)
+
+            candidate_ids = []
+            for index, candidate in enumerate(candidates, start=1):
+                record = dict(candidate)
+                record["rank"] = index
+                record["media_id"] = result.get("media_id") or media_id
+                record["title"] = result.get("title") or media_id
+                record["code"] = result.get("code") or record.get("code") or ""
+                record["category"] = "adult"
+                record["report_bucket"] = bucket
+                record["report_page"] = page
+                candidate_ids.append(
+                    self.store.save_candidate(
+                        user_id,
+                        chat_id,
+                        "subtitle_rematch",
+                        result.get("query") or record.get("query") or "",
+                        record,
+                    )
+                )
+
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                format_subtitle_rematch_candidates_message(result, candidates, llm_status=llm_status, llm_error=llm_error),
+                reply_markup=subtitle_rematch_candidates_reply_markup(candidate_ids, bucket, page),
+                fallback_chat_id=chat_id,
+            )
+        except Exception as exc:
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                "字幕重新匹配失败\nmedia_id：%s\n错误：%s" % (media_id, exc),
+                reply_markup=subtitle_rematch_done_reply_markup(bucket, page),
+                fallback_chat_id=chat_id,
+            )
 
     def _render_search_page(self, session_id, page):
         session = self.store.load_search_session(session_id)
@@ -4911,7 +5121,10 @@ def subtitle_backfill_report_reply_markup(report, bucket="pending", page=0, batc
         callback_data = subtitle_report_item_callback_data(item, bucket, page)
         if not callback_data:
             continue
-        label = "#%s 重试" % index if (item.get("status") in SUBTITLE_BACKFILL_SKIP_STATUSES) else "#%s 补齐" % index
+        if item.get("status") == "cached":
+            label = "#%s 重配" % index
+        else:
+            label = "#%s 重试" % index if (item.get("status") in SUBTITLE_BACKFILL_SKIP_STATUSES) else "#%s 补齐" % index
         item_buttons.append({"text": label, "callback_data": callback_data})
     for offset in range(0, len(item_buttons), 2):
         keyboard.append(item_buttons[offset : offset + 2])
@@ -4951,13 +5164,103 @@ def subtitle_report_item_callback_data(item, bucket, page):
     if not (item or {}).get("code"):
         return None
     status = (item or {}).get("status")
-    if status in ("cached", "no_code"):
+    if status == "no_code":
         return None
-    action = "sub1r" if status in SUBTITLE_BACKFILL_SKIP_STATUSES else "sub1"
+    action = "subrematch" if status == "cached" else ("sub1r" if status in SUBTITLE_BACKFILL_SKIP_STATUSES else "sub1")
     data = "%s:%s:%s:%s" % (action, normalize_subtitle_report_bucket(bucket), max(0, int(page or 0)), media_id)
     if len(data.encode("utf-8")) > 64:
         return None
     return data
+
+
+def format_subtitle_rematch_candidates_message(result, candidates, llm_status="disabled", llm_error=""):
+    result = result or {}
+    candidates = list(candidates or [])
+    lines = [
+        "字幕重新匹配候选",
+        "媒体：%s / %s" % (result.get("code") or "-", result.get("title") or result.get("media_id") or "-"),
+        "候选：%s 条" % len(candidates),
+    ]
+    if llm_status == "success":
+        lines.append("LLM：已基于字幕正文预览排序")
+    elif llm_status == "disabled":
+        lines.append("LLM：未启用，按字幕源顺序展示")
+    elif llm_status == "timeout":
+        lines.append("LLM：超时，按字幕源顺序展示")
+    elif llm_status == "busy":
+        lines.append("LLM：已有任务运行，按字幕源顺序展示")
+    elif llm_status == "failed":
+        lines.append("LLM：评估失败，按字幕源顺序展示")
+    if llm_error:
+        lines.append("LLM错误：%s" % short_text(llm_error, 120))
+    if not candidates:
+        lines.append("未找到可用候选")
+        return "\n".join(lines)
+    for index, candidate in enumerate(candidates, start=1):
+        title = candidate.get("filename") or candidate.get("title") or "-"
+        details = []
+        if candidate.get("provider"):
+            details.append(str(candidate.get("provider")))
+        if candidate.get("language"):
+            details.append(str(candidate.get("language")))
+        if candidate.get("source_score"):
+            details.append("score=%s" % candidate.get("source_score"))
+        if candidate.get("preview_error"):
+            details.append("预览失败")
+        line = "#%s %s" % (index, short_text(title, 64))
+        if details:
+            line += "\n   " + " / ".join(details)
+        if candidate.get("llm_reason"):
+            line += "\n   LLM：" + short_text(candidate.get("llm_reason"), 80)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def subtitle_rematch_candidates_reply_markup(candidate_ids, bucket="cached", page=0):
+    keyboard = []
+    buttons = [
+        {"text": "#%s 应用" % index, "callback_data": "subpick:%s" % candidate_id}
+        for index, candidate_id in enumerate(candidate_ids or [], start=1)
+        if len(("subpick:%s" % candidate_id).encode("utf-8")) <= 64
+    ]
+    for offset in range(0, len(buttons), 2):
+        keyboard.append(buttons[offset : offset + 2])
+    keyboard.extend(subtitle_rematch_done_reply_markup(bucket, page)["inline_keyboard"])
+    return {"inline_keyboard": keyboard}
+
+
+def subtitle_rematch_done_reply_markup(bucket="cached", page=0):
+    bucket = normalize_subtitle_report_bucket(bucket)
+    page = max(0, int(page or 0))
+    return {
+        "inline_keyboard": [
+            [{"text": "返回字幕报表", "callback_data": "subtitle_report:%s:%s" % (bucket, page)}],
+        ]
+    }
+
+
+def format_subtitle_apply_result_message(result):
+    result = result or {}
+    lines = [
+        "字幕已应用",
+        "媒体：%s / %s" % (result.get("code") or "-", result.get("title") or result.get("media_id") or "-"),
+        "来源：%s" % (result.get("subtitle_match_source") or "-"),
+    ]
+    if result.get("subtitle_match_filename"):
+        lines.append("文件：%s" % result.get("subtitle_match_filename"))
+    if result.get("subtitle_match_status") != "success":
+        lines[0] = "字幕应用未完成"
+        if result.get("subtitle_match_reason"):
+            lines.append("原因：%s" % result.get("subtitle_match_reason"))
+    return "\n".join(lines)
+
+
+def short_text(value, limit):
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    limit = max(4, int(limit or 80))
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def clean_openlist_task_media(
@@ -5448,6 +5751,13 @@ def parse_callback_data(value):
         page, page_sep, media_id = rest.partition(":")
         if sep and page_sep and media_id:
             return action, (bucket, int(page), media_id)
+    if action == "subrematch" and payload:
+        bucket, sep, rest = payload.partition(":")
+        page, page_sep, media_id = rest.partition(":")
+        if sep and page_sep and media_id:
+            return action, (bucket, int(page), media_id)
+    if action == "subpick" and payload:
+        return action, int(payload)
     return None, None
 
 

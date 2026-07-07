@@ -81,6 +81,53 @@ class SearchRerankClient:
         ordered.extend(tail)
         return self._ranked_copy(ordered)
 
+    def rank_subtitle_candidates(self, media, query, candidates, max_candidates=None):
+        candidates = [dict(candidate) for candidate in candidates or []]
+        if len(candidates) <= 1:
+            return self._ranked_copy(candidates)
+        if not self.api_key:
+            raise RuntimeError("LLM_API_KEY missing")
+
+        max_candidates = int(max_candidates or len(candidates))
+        if max_candidates <= 1:
+            return self._ranked_copy(candidates)
+        subset = candidates[:max_candidates]
+        tail = candidates[max_candidates:]
+
+        request_candidates = [self._subtitle_candidate_payload(index, candidate) for index, candidate in enumerate(subset, start=1)]
+        payload = self._subtitle_request_payload(media, query, request_candidates)
+        response = self.transport.request(
+            self.base_url + "/chat/completions",
+            payload,
+            headers={
+                "Authorization": "Bearer %s" % self.api_key,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=self.timeout,
+        )
+        content = self._message_content(response)
+        result = self._parse_result(content)
+        selected_ids = self._validate_selected_ids(result, {item["id"] for item in request_candidates})
+
+        by_id = {item["id"]: candidate for item, candidate in zip(request_candidates, subset)}
+        reasons = result.get("reasons") if isinstance(result.get("reasons"), dict) else {}
+        confidence = result.get("confidence")
+        best_id = result.get("best_id")
+        ordered = []
+        for item_id in selected_ids:
+            candidate = dict(by_id[item_id])
+            reason = reasons.get(item_id)
+            if isinstance(reason, str) and reason.strip():
+                candidate["llm_reason"] = reason.strip()[:120]
+            candidate["llm_confidence"] = confidence
+            candidate["llm_best"] = item_id == best_id
+            ordered.append(candidate)
+        selected = set(selected_ids)
+        ordered.extend(candidate for item, candidate in zip(request_candidates, subset) if item["id"] not in selected)
+        ordered.extend(tail)
+        return self._ranked_copy(ordered)
+
     def _request_payload(self, query, category, candidates):
         system = (
             "You are a filename search result reranker. Return strict json only, no markdown. "
@@ -125,6 +172,62 @@ class SearchRerankClient:
             "indexer": str(candidate.get("indexer") or candidate.get("indexerName") or ""),
             "seeders": int(candidate.get("seeders") or 0),
             "size": int(candidate.get("size") or 0),
+            "rank": int(candidate.get("rank") or index),
+        }
+
+    def _subtitle_request_payload(self, media, query, candidates):
+        system = (
+            "You are a Chinese subtitle candidate evaluator. Return strict json only, no markdown. "
+            "Required schema example: "
+            '{"selected_ids":["c2","c1"],"best_id":"c2","confidence":0.8,"reasons":{"c2":"exact code and zh-Hans"}}. '
+            "selected_ids must contain candidate ids ordered from best to worst. Use only ids from candidates. "
+            "Evaluate the subtitle content_sample when present. Prefer exact adult code/title match, readable Chinese text, "
+            "cleaner filenames, and higher source score. Penalize empty, garbled, unrelated, or non-Chinese samples. "
+            "Do not invent candidates. reasons values must be short."
+        )
+        payload = {
+            "model": self.model,
+            "max_tokens": 700,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "media": {
+                                "title": str((media or {}).get("title") or ""),
+                                "code": str((media or {}).get("code") or ""),
+                                "media_id": str((media or {}).get("media_id") or ""),
+                            },
+                            "query": str(query or ""),
+                            "candidates": candidates,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+            ],
+        }
+        if self.thinking_disabled:
+            payload["thinking"] = {"type": "disabled"}
+        return payload
+
+    def _subtitle_candidate_payload(self, index, candidate):
+        return {
+            "id": "c%s" % index,
+            "provider": str(candidate.get("provider") or ""),
+            "title": str(candidate.get("title") or ""),
+            "filename": str(candidate.get("filename") or ""),
+            "language": str(candidate.get("language") or ""),
+            "query": str(candidate.get("query") or ""),
+            "code": str(candidate.get("code") or ""),
+            "source_score": int(candidate.get("source_score") or 0),
+            "preview_char_count": int(candidate.get("preview_char_count") or 0),
+            "preview_line_count": int(candidate.get("preview_line_count") or 0),
+            "preview_error": str(candidate.get("preview_error") or ""),
+            "content_sample": str(candidate.get("content_sample") or "")[:2500],
             "rank": int(candidate.get("rank") or index),
         }
 

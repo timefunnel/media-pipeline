@@ -467,6 +467,90 @@ class SubtitleMatcher:
             return subtitle_result("failed", error="; ".join(errors[:3]))
         return subtitle_result("skipped", reason="not_found", query=queries[0])
 
+    def search_task_candidates(self, category, title, task, limit=10):
+        if not self.enabled:
+            return []
+        if self.adult_only and category != "adult":
+            return []
+        media_id = str((task or {}).get("msg_media_id") or "").strip()
+        if not media_id:
+            raise RuntimeError("subtitle media_id missing")
+        queries, code = subtitle_task_queries(category, title, task)
+        if not queries:
+            return []
+        enabled_providers = [provider for provider in self.providers if provider.enabled()]
+        if not enabled_providers:
+            raise RuntimeError("subtitle provider missing")
+        limit = max(1, int(limit or 10))
+        records = []
+        seen = set()
+        errors = []
+        for provider in enabled_providers:
+            for query in queries:
+                try:
+                    candidates = provider.search(query, code=code)
+                except Exception as exc:
+                    errors.append("%s: %s" % (provider.name, exc))
+                    continue
+                for candidate in candidates:
+                    record = subtitle_candidate_record(provider, query, code, candidate)
+                    key = subtitle_candidate_record_key(record)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    records.append(record)
+                    if len(records) >= limit:
+                        return ranked_subtitle_candidate_records(records)
+        if errors and not records:
+            raise RuntimeError("; ".join(errors[:3]))
+        return ranked_subtitle_candidate_records(records)
+
+    def apply_candidate(self, media_id, candidate_record):
+        media_id = str(media_id or "").strip()
+        if not media_id:
+            raise RuntimeError("subtitle media_id missing")
+        provider_name = str((candidate_record or {}).get("provider") or "").strip()
+        if not provider_name:
+            raise RuntimeError("subtitle provider missing")
+        provider = next((item for item in self.providers if item.name == provider_name and item.enabled()), None)
+        if provider is None:
+            raise RuntimeError("subtitle provider not enabled: %s" % provider_name)
+        query = str((candidate_record or {}).get("query") or "").strip()
+        code = str((candidate_record or {}).get("code") or "").strip()
+        candidate = (candidate_record or {}).get("candidate")
+        if not isinstance(candidate, dict):
+            raise RuntimeError("subtitle candidate payload missing")
+        download = provider.download(candidate, query, code=code)
+        if not download:
+            return subtitle_result("skipped", source=provider.name, query=query, reason="download_missing")
+        track = self.cache.save_download(media_id, download)
+        return subtitle_result(
+            "success",
+            count=1,
+            source=provider.name,
+            query=query,
+            filename=track.get("filename"),
+        )
+
+    def preview_candidate(self, candidate_record, max_chars=2000):
+        provider_name = str((candidate_record or {}).get("provider") or "").strip()
+        if not provider_name:
+            raise RuntimeError("subtitle provider missing")
+        provider = next((item for item in self.providers if item.name == provider_name and item.enabled()), None)
+        if provider is None:
+            raise RuntimeError("subtitle provider not enabled: %s" % provider_name)
+        query = str((candidate_record or {}).get("query") or "").strip()
+        code = str((candidate_record or {}).get("code") or "").strip()
+        candidate = (candidate_record or {}).get("candidate")
+        if not isinstance(candidate, dict):
+            raise RuntimeError("subtitle candidate payload missing")
+        download = provider.download(candidate, query, code=code)
+        if not download:
+            raise RuntimeError("subtitle preview download missing")
+        preview = dict(candidate_record or {})
+        preview.update(subtitle_download_preview(download, max_chars=max_chars))
+        return preview
+
 
 def build_subtitle_matcher_from_config(config):
     cache = SubtitleCache(getattr(config, "subtitle_cache_dir", DEFAULT_SUBTITLE_CACHE_DIR))
@@ -518,6 +602,123 @@ def subtitle_result(status, count=0, source="", query="", filename="", reason=""
         "subtitle_match_error": error,
     }
     return {key: value for key, value in result.items() if value not in ("", None)}
+
+
+def subtitle_candidate_record(provider, query, code, candidate):
+    candidate = dict(candidate or {})
+    return {
+        "provider": str(getattr(provider, "name", "") or ""),
+        "query": str(query or ""),
+        "code": str(code or ""),
+        "provider_id": subtitle_candidate_provider_id(candidate),
+        "title": subtitle_candidate_title(candidate),
+        "filename": subtitle_candidate_filename(candidate),
+        "language": subtitle_candidate_language(candidate),
+        "source_score": int(candidate.get("_score") or 0),
+        "candidate": candidate,
+    }
+
+
+def ranked_subtitle_candidate_records(records):
+    out = [dict(record) for record in records or []]
+    for index, record in enumerate(out, start=1):
+        record["rank"] = index
+    return out
+
+
+def subtitle_candidate_record_key(record):
+    provider = str((record or {}).get("provider") or "")
+    provider_id = str((record or {}).get("provider_id") or "")
+    if provider_id:
+        return provider, provider_id
+    title = str((record or {}).get("title") or "")
+    filename = str((record or {}).get("filename") or "")
+    query = str((record or {}).get("query") or "")
+    return provider, query, title, filename
+
+
+def subtitle_candidate_provider_id(candidate):
+    for key in ("provider_id", "id", "file_id", "url", "download_url", "link"):
+        value = str((candidate or {}).get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def subtitle_candidate_title(candidate):
+    for key in ("title", "name", "filename", "file_name", "release_name"):
+        value = str((candidate or {}).get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def subtitle_candidate_filename(candidate):
+    for key in ("filename", "file_name", "name", "title"):
+        value = safe_subtitle_filename((candidate or {}).get(key) or "")
+        if value:
+            return value
+    return ""
+
+
+def subtitle_candidate_language(candidate):
+    language = (candidate or {}).get("language")
+    if isinstance(language, dict):
+        return str(language.get("language_name") or language.get("desc") or language.get("code") or "").strip()
+    for key in ("lang", "language", "language_name"):
+        value = str((candidate or {}).get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def subtitle_download_preview(download, max_chars=2000):
+    body = (download or SubtitleDownload("", "", "", b"")).body or b""
+    text = decode_subtitle_body(body)
+    sample = subtitle_text_sample(text, max_chars=max_chars)
+    return {
+        "filename": safe_subtitle_filename((download or SubtitleDownload("", "", "", b"")).filename) or "",
+        "language": (download or SubtitleDownload("", "", "", b"")).lang or "",
+        "preview_char_count": len(text),
+        "preview_line_count": len(text.splitlines()),
+        "content_sample": sample,
+    }
+
+
+def decode_subtitle_body(body):
+    data = bytes(body or b"")
+    for encoding in ("utf-8-sig", "utf-16", "gb18030", "big5"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def subtitle_text_sample(text, max_chars=2000):
+    max_chars = max(200, int(max_chars or 2000))
+    cleaned = []
+    for line in str(text or "").splitlines():
+        value = line.strip()
+        if not value:
+            continue
+        if re.match(r"^\d+$", value):
+            continue
+        if "-->" in value:
+            continue
+        if value.startswith(("[Script Info]", "[V4+", "[Events]", "Format:", "Style:")):
+            continue
+        if value.startswith("Dialogue:"):
+            parts = value.split(",", 9)
+            value = parts[-1].strip() if len(parts) >= 10 else value
+        value = re.sub(r"\{\\[^}]+\}", "", value)
+        value = re.sub(r"<[^>]+>", "", value)
+        if value:
+            cleaned.append(value)
+        if sum(len(item) + 1 for item in cleaned) >= max_chars:
+            break
+    sample = "\n".join(cleaned)
+    return sample[:max_chars]
 
 
 def subtitle_task_queries(category, title, task):

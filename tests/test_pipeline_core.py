@@ -514,6 +514,8 @@ class FakeBotService:
         subtitle_backfill_response=None,
         subtitle_backfill_one_response=None,
         subtitle_report_response=None,
+        subtitle_rematch_response=None,
+        subtitle_apply_response=None,
         rerank_results=None,
         rerank_error=None,
     ):
@@ -523,6 +525,43 @@ class FakeBotService:
         self.bt4g_search_results = bt4g_search_results or []
         self.rerank_results = rerank_results
         self.rerank_error = rerank_error
+        self.subtitle_rematch_response = subtitle_rematch_response or {
+            "media_id": "media-1",
+            "title": "SSIS-218",
+            "code": "SSIS-218",
+            "query": "SSIS-218",
+            "media": {"media_id": "media-1", "title": "SSIS-218", "code": "SSIS-218"},
+            "candidates": [
+                {
+                    "provider": "subtitlecat",
+                    "query": "SSIS-218",
+                    "code": "SSIS-218",
+                    "title": "SSIS-218 zh",
+                    "filename": "SSIS-218.zh.srt",
+                    "source_score": 100,
+                    "candidate": {"id": "sub-1"},
+                    "rank": 1,
+                },
+                {
+                    "provider": "assrt",
+                    "query": "SSIS-218",
+                    "code": "SSIS-218",
+                    "title": "SSIS-218 chs",
+                    "filename": "SSIS-218.chs.ass",
+                    "source_score": 80,
+                    "candidate": {"id": "sub-2"},
+                    "rank": 2,
+                },
+            ],
+        }
+        self.subtitle_apply_response = subtitle_apply_response or {
+            "media_id": "media-1",
+            "title": "SSIS-218",
+            "code": "SSIS-218",
+            "subtitle_match_status": "success",
+            "subtitle_match_source": "assrt",
+            "subtitle_match_filename": "assrt-123.srt",
+        }
         self.submit_response = submit_response or {"state": True, "tasks": []}
         self.search_error = search_error
         self.status_response = status_response or {"info_hash": "ABC", "status_name": "success", "percent_done": 100}
@@ -586,6 +625,9 @@ class FakeBotService:
         self.subtitle_backfill_calls = []
         self.subtitle_backfill_one_calls = []
         self.subtitle_report_calls = 0
+        self.subtitle_rematch_calls = []
+        self.subtitle_preview_calls = []
+        self.subtitle_apply_calls = []
         self.duplicate_response = duplicate_response
         self.duplicate_calls = []
         self.dedupe_entries = dedupe_entries or []
@@ -634,6 +676,18 @@ class FakeBotService:
         if self.rerank_results is not None:
             return self.rerank_results
         return list(candidates)
+
+    def rank_subtitle_candidates(self, media, query, candidates):
+        self.rerank_calls.append((query, "subtitle", [item.get("title") for item in candidates]))
+        if self.rerank_error:
+            raise self.rerank_error
+        if self.rerank_results is not None:
+            return self.rerank_results
+        ranked = list(reversed([dict(item) for item in candidates]))
+        for index, item in enumerate(ranked, start=1):
+            item["rank"] = index
+            item["llm_reason"] = "正文更匹配"
+        return ranked
 
     def submit(self, category, download_uri):
         self.submit_calls.append((category, download_uri))
@@ -711,6 +765,25 @@ class FakeBotService:
     def subtitle_backfill_report_adult(self):
         self.subtitle_report_calls += 1
         return dict(self.subtitle_report_response)
+
+    def subtitle_rematch_candidates_adult(self, media_id, limit=10):
+        self.subtitle_rematch_calls.append((media_id, limit))
+        return dict(self.subtitle_rematch_response)
+
+    def preview_subtitle_candidates(self, candidates, limit=5, max_chars=2000):
+        self.subtitle_preview_calls.append((len(candidates or []), limit, max_chars))
+        out = []
+        for item in candidates or []:
+            candidate = dict(item)
+            candidate["content_sample"] = "这是中文字幕正文预览"
+            candidate["preview_char_count"] = len(candidate["content_sample"])
+            candidate["preview_line_count"] = 1
+            out.append(candidate)
+        return out
+
+    def apply_subtitle_candidate(self, candidate_record):
+        self.subtitle_apply_calls.append(dict(candidate_record or {}))
+        return dict(self.subtitle_apply_response)
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]

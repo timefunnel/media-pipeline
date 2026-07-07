@@ -2101,7 +2101,12 @@ class TelegramBotTest(unittest.TestCase):
                 self.daemon = daemon
 
             def start(self):
+                if getattr(self.target, "__name__", "") == "_run":
+                    return
                 self.target(*self.args, **self.kwargs)
+
+            def join(self, timeout=None):
+                return None
 
         with tempfile.TemporaryDirectory() as tmp:
             store = CandidateStore(str(Path(tmp) / "state.db"))
@@ -2244,6 +2249,141 @@ class TelegramBotTest(unittest.TestCase):
         self.assertEqual(telegram.answers[-1], {"callback_query_id": "cb-subtitle-report", "text": "正在刷新字幕统计"})
         self.assertIn("列表：已补", telegram.edits[-1]["text"])
         self.assertIn("SSIS-218", telegram.edits[-1]["text"])
+
+    def test_subtitle_report_cached_button_rematches_and_applies_selected_candidate(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+                self.target = target
+                self.args = args
+                self.kwargs = kwargs or {}
+                self.daemon = daemon
+
+            def start(self):
+                if getattr(self.target, "__name__", "") == "_run":
+                    return
+                self.target(*self.args, **self.kwargs)
+
+            def join(self, timeout=None):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService()
+            bot = TelegramBot(
+                BotConfig("token", {700656624}, store.db_path, task_message_edit_min_interval_seconds=0),
+                telegram,
+                store,
+                service,
+            )
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/subtitle_report"}})
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-subtitle-report-cached",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 1001},
+                        "data": "subtitle_report:cached:0",
+                    }
+                }
+            )
+            rematch_button = next(
+                button
+                for row in telegram.edits[-1]["reply_markup"]["inline_keyboard"]
+                for button in row
+                if button["callback_data"].startswith("subrematch:")
+            )
+
+            with patch("pipeline.bot.threading.Thread", ImmediateThread):
+                bot.handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-subtitle-rematch",
+                            "from": {"id": 700656624},
+                            "message": {"chat": {"id": 9001}, "message_id": 1001},
+                            "data": rematch_button["callback_data"],
+                        }
+                    }
+                )
+
+            pick_button = next(
+                button
+                for row in telegram.edits[-1]["reply_markup"]["inline_keyboard"]
+                for button in row
+                if button["callback_data"].startswith("subpick:")
+            )
+            bot.handle_update(
+                {
+                    "callback_query": {
+                        "id": "cb-subtitle-pick",
+                        "from": {"id": 700656624},
+                        "message": {"chat": {"id": 9001}, "message_id": 1001},
+                        "data": pick_button["callback_data"],
+                    }
+                }
+            )
+
+        self.assertEqual(rematch_button["text"], "#1 重配")
+        self.assertEqual(service.subtitle_rematch_calls, [("media-1", 10)])
+        self.assertEqual(service.subtitle_preview_calls, [])
+        self.assertEqual(service.rerank_calls, [])
+        self.assertEqual(service.subtitle_apply_calls[0]["provider"], "subtitlecat")
+        self.assertIn("字幕已应用", telegram.edits[-1]["text"])
+
+    def test_subtitle_rematch_uses_body_preview_before_llm_when_enabled(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        class ImmediateThread:
+            def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+                self.target = target
+                self.args = args
+                self.kwargs = kwargs or {}
+                self.daemon = daemon
+
+            def start(self):
+                if getattr(self.target, "__name__", "") == "_run":
+                    return
+                self.target(*self.args, **self.kwargs)
+
+            def join(self, timeout=None):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService()
+            bot = TelegramBot(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    store.db_path,
+                    task_message_edit_min_interval_seconds=0,
+                    llm_search_rerank_enabled=True,
+                    llm_api_key="llm-key",
+                ),
+                telegram,
+                store,
+                service,
+            )
+
+            with patch("pipeline.bot.threading.Thread", ImmediateThread):
+                bot.handle_update(
+                    {
+                        "callback_query": {
+                            "id": "cb-subtitle-rematch",
+                            "from": {"id": 700656624},
+                            "message": {"chat": {"id": 9001}, "message_id": 1001},
+                            "data": "subrematch:cached:0:media-1",
+                        }
+                    }
+                )
+
+        self.assertEqual(service.subtitle_preview_calls, [(2, 5, 2000)])
+        self.assertEqual(service.rerank_calls[0][1], "subtitle")
+        self.assertIn("LLM：已基于字幕正文预览排序", telegram.edits[-1]["text"])
 
     def test_subtitle_report_single_button_runs_one_backfill(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot
@@ -3705,6 +3845,51 @@ class LlmSearchRerankClientTest(unittest.TestCase):
                 [{"title": "Sintel 720p", "rank": 1}, {"title": "Sintel 1080p", "rank": 2}],
                 max_candidates=2,
             )
+
+    def test_rank_subtitle_candidates_sends_content_sample_and_reorders(self):
+        from pipeline.llm import SearchRerankClient
+
+        class FakeTransport:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, url, payload, headers=None, timeout=None):
+                self.calls.append({"url": url, "payload": payload, "headers": headers, "timeout": timeout})
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "selected_ids": ["c2", "c1"],
+                                        "best_id": "c2",
+                                        "confidence": 0.82,
+                                        "reasons": {"c2": "正文是简体中文且匹配番号"},
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+
+        transport = FakeTransport()
+        client = SearchRerankClient(api_key="llm-key", transport=transport)
+
+        ranked = client.rank_subtitle_candidates(
+            {"media_id": "media-1", "title": "SSIS-218", "code": "SSIS-218"},
+            "SSIS-218",
+            [
+                {"title": "bad", "content_sample": "English only", "rank": 1},
+                {"title": "good", "content_sample": "这是简体中文字幕正文", "rank": 2},
+            ],
+            max_candidates=2,
+        )
+
+        self.assertEqual([item["title"] for item in ranked], ["good", "bad"])
+        self.assertEqual(ranked[0]["llm_reason"], "正文是简体中文且匹配番号")
+        request_content = transport.calls[0]["payload"]["messages"][1]["content"]
+        self.assertIn("这是简体中文字幕正文", request_content)
+        self.assertNotIn("download_uri", request_content)
 
 
 class PipelineBotServiceTest(unittest.TestCase):

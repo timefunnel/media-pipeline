@@ -257,6 +257,114 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertEqual(result["subtitle_match_source"], "fake")
         self.assertEqual(provider.download_calls, ["needs-token", "dev-mode-ok"])
 
+    def test_subtitle_matcher_search_candidates_does_not_write_cache(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleMatcher
+
+        class FakeProvider:
+            name = "fake"
+
+            def enabled(self):
+                return True
+
+            def search(self, query, code=""):
+                return [
+                    {"id": "candidate-1", "filename": "SSIS-218.zh.srt", "_score": 100},
+                    {"id": "candidate-2", "filename": "SSIS-218.chs.ass", "_score": 80},
+                ]
+
+            def download(self, candidate, query, code=""):
+                raise AssertionError("search candidates must not download subtitles")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SubtitleCache(tmp)
+            matcher = SubtitleMatcher(cache, [FakeProvider()], enabled=True, adult_only=True)
+            candidates = matcher.search_task_candidates(
+                "adult",
+                "SSIS-218",
+                {"msg_media_id": "media-1", "openlist_adult_code": "SSIS-218"},
+                limit=5,
+            )
+            tracks = cache.list_tracks("media-1")
+
+        self.assertEqual([item["provider_id"] for item in candidates], ["candidate-1", "candidate-2"])
+        self.assertEqual([item["rank"] for item in candidates], [1, 2])
+        self.assertEqual(tracks, [])
+
+    def test_subtitle_matcher_apply_candidate_writes_selected_subtitle(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
+
+        class FakeProvider:
+            name = "fake"
+
+            def enabled(self):
+                return True
+
+            def download(self, candidate, query, code=""):
+                self.download_args = (candidate["id"], query, code)
+                return SubtitleDownload(
+                    source=self.name,
+                    provider_id=candidate["id"],
+                    filename="SSIS-218.selected.srt",
+                    body=b"1\n00:00:01,000 --> 00:00:02,000\nhello\n",
+                    query=query,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SubtitleCache(tmp)
+            provider = FakeProvider()
+            matcher = SubtitleMatcher(cache, [provider], enabled=True, adult_only=True)
+            result = matcher.apply_candidate(
+                "media-1",
+                {
+                    "provider": "fake",
+                    "query": "SSIS-218",
+                    "code": "SSIS-218",
+                    "candidate": {"id": "candidate-2"},
+                },
+            )
+            tracks = cache.list_tracks("media-1")
+
+        self.assertEqual(result["subtitle_match_status"], "success")
+        self.assertEqual(provider.download_args, ("candidate-2", "SSIS-218", "SSIS-218"))
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]["source"], "fake")
+
+    def test_subtitle_matcher_preview_candidate_downloads_body_without_cache(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
+
+        class FakeProvider:
+            name = "fake"
+
+            def enabled(self):
+                return True
+
+            def download(self, candidate, query, code=""):
+                return SubtitleDownload(
+                    source=self.name,
+                    provider_id=candidate["id"],
+                    filename="SSIS-218.zh.srt",
+                    body="1\n00:00:01,000 --> 00:00:02,000\n这是中文字幕正文\n".encode("utf-8"),
+                    query=query,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SubtitleCache(tmp)
+            matcher = SubtitleMatcher(cache, [FakeProvider()], enabled=True, adult_only=True)
+            preview = matcher.preview_candidate(
+                {
+                    "provider": "fake",
+                    "query": "SSIS-218",
+                    "code": "SSIS-218",
+                    "candidate": {"id": "candidate-1"},
+                },
+                max_chars=50,
+            )
+            tracks = cache.list_tracks("media-1")
+
+        self.assertIn("这是中文字幕正文", preview["content_sample"])
+        self.assertGreater(preview["preview_char_count"], 0)
+        self.assertEqual(tracks, [])
+
     def test_local_subtitle_provider_reads_cached_subtitle(self):
         from pipeline.external_subtitles import LocalSubtitleProvider, SubtitleCache, SubtitleDownload
 
