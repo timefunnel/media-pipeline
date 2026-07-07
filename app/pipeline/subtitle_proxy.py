@@ -1270,7 +1270,7 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         }
         if method == "GET" and not head_only and self._serve_emby_folder_image(headers):
             return
-        if method == "GET" and not head_only and self._serve_emby_subtitle_stream(headers):
+        if method == "GET" and not head_only and self._serve_emby_subtitle_stream(headers, timing=timing):
             return
         if method == "GET" and not head_only and self._serve_emby_items_search(headers):
             return
@@ -1346,17 +1346,20 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         self._write_response(200, headers, body, request_headers=request_headers, request_path=self.path)
         return True
 
-    def _serve_emby_subtitle_stream(self, request_headers):
+    def _serve_emby_subtitle_stream(self, request_headers, timing=None):
         stream_request = parse_emby_subtitle_stream_path(self.path)
         if not stream_request:
             return False
-        tracks = self._fetch_msg_subtitle_tracks(stream_request["media_id"])
+        tracks = self._fetch_msg_subtitle_tracks(stream_request["media_id"], timing=timing)
+        self._mark_timing(timing, "subtitle_stream_tracks")
         track_index = stream_request["track_index"]
         if track_index < 0 or track_index >= len(tracks):
             self.send_response(404)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             self.wfile.write(b"subtitle track not found\n")
+            self._mark_timing(timing, "subtitle_stream_not_found")
+            self._log_timing(timing, 404, self.path)
             return True
         track_path = tracks[track_index].get("path")
         if not track_path:
@@ -1364,12 +1367,18 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             self.wfile.write(b"subtitle path missing\n")
+            self._mark_timing(timing, "subtitle_stream_path_missing")
+            self._log_timing(timing, 404, self.path)
             return True
         if tracks[track_index].get("source") == "openlist":
             self._serve_openlist_subtitle_track(tracks[track_index], request_headers, stream_request["extension"])
+            self._mark_timing(timing, "serve_openlist_subtitle")
+            self._log_timing(timing, 200, self.path)
             return True
         if tracks[track_index].get("source") in ("assrt", "opensubtitles", "local") or local_subtitle_uri_valid(track_path):
             self._serve_local_subtitle_track(tracks[track_index], request_headers, stream_request["extension"])
+            self._mark_timing(timing, "serve_local_subtitle")
+            self._log_timing(timing, 200, self.path)
             return True
         query = urllib.parse.urlencode({"path": track_path})
         upstream_path = "/api/subtitles/%s?%s" % (urllib.parse.quote(stream_request["media_id"], safe=""), query)
@@ -1381,7 +1390,7 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(("subtitle proxy MSG subtitle stream error: %s\n" % exc).encode("utf-8"))
             return True
-        self._write_response(status, headers, body, request_headers=request_headers, request_path=self.path)
+        self._write_response(status, headers, body, request_headers=request_headers, request_path=self.path, timing=timing)
         return True
 
     def _serve_emby_items_search(self, request_headers):
