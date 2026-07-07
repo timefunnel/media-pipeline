@@ -409,12 +409,19 @@ class SubtitleProxyTest(unittest.TestCase):
         self.assertFalse(should_normalize_subtitle("text/plain", b"not vtt"))
 
     def test_redact_sensitive_query_values_hides_tokens(self):
-        message = 'GET /api/subtitles/id?path=x&token=secret-value&name=y HTTP/1.1'
+        message = (
+            "GET /api/subtitles/id?path=x&token=secret-value"
+            "&X-Emby-Token=emby-secret&X-MediaBrowser-Token=browser-secret&name=y HTTP/1.1"
+        )
 
         redacted = redact_sensitive_query_values(message)
 
         self.assertNotIn("secret-value", redacted)
+        self.assertNotIn("emby-secret", redacted)
+        self.assertNotIn("browser-secret", redacted)
         self.assertIn("token=REDACTED", redacted)
+        self.assertIn("X-Emby-Token=REDACTED", redacted)
+        self.assertIn("X-MediaBrowser-Token=REDACTED", redacted)
 
     def test_msg_api_authenticator_rejects_missing_credentials(self):
         auth = MsgApiAuthenticator("http://127.0.0.1:18080/api", "", "")

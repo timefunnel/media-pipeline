@@ -46,7 +46,10 @@ WEBVTT_TIMESTAMP_RE = re.compile(r"(?P<time>\d{2}:\d{2}:\d{2})\.(?P<fraction>\d{
 SRT_TIMESTAMP_RE = re.compile(r"(?P<time>\d{2}:\d{2}:\d{2}),(?P<fraction>\d{1,3})(?=\s|$)")
 ASS_EVENT_TIME_RE = re.compile(r"^(?P<hour>\d+):(?P<minute>\d{2}):(?P<second>\d{2})\.(?P<fraction>\d{1,2})$")
 ASS_OVERRIDE_RE = re.compile(r"\{[^}]*\}")
-SENSITIVE_QUERY_RE = re.compile(r"([?&](?:api_?key|access_token|token)=)[^&\s\"]+", re.IGNORECASE)
+SENSITIVE_QUERY_RE = re.compile(
+    r"([?&](?:api_?key|access_token|token|x-emby-token|x-mediabrowser-token)=)[^&\s\"]+",
+    re.IGNORECASE,
+)
 EMBY_MEDIA_ID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 EMBY_PATH_PREFIX_PATTERN = r"(?:/emby)?"
 EMBY_ITEM_ID_RE = re.compile(
