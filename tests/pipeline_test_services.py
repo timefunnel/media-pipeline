@@ -1891,7 +1891,11 @@ class MediaStationClientTest(unittest.TestCase):
         from PIL import Image
 
         source = io.BytesIO()
-        Image.new("RGB", (800, 540), (120, 80, 40)).save(source, format="JPEG")
+        image = Image.new("RGB", (800, 540), (200, 20, 20))
+        for x in range(400, 800):
+            for y in range(540):
+                image.putpixel((x, y), (20, 40, 210))
+        image.save(source, format="PNG")
 
         class FakeFetcher:
             def fetch(self, candidate):
@@ -1925,6 +1929,10 @@ class MediaStationClientTest(unittest.TestCase):
             self.assertEqual(result["patch"]["backdrop_url"], "https://img/current-poster.jpg")
             self.assertTrue(os.path.exists(result["generated"]["path"]))
             self.assertEqual(image_orientation(result["generated"]["width"], result["generated"]["height"]), "portrait")
+            with Image.open(result["generated"]["path"]) as generated:
+                red, green, blue = generated.resize((1, 1)).getpixel((0, 0))
+            self.assertLess(red, 80)
+            self.assertGreater(blue, 150)
 
     def test_adult_artwork_semantic_repair_requires_public_base_url_to_generate(self):
         class FakeFetcher:

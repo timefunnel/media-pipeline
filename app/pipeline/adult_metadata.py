@@ -30,6 +30,7 @@ DEFAULT_ADULT_METADATA_BASE_URLS = (
     "https://www.busjav.cyou",
 )
 DEFAULT_GENERATED_POSTER_SIZE = (600, 900)
+GENERATED_POSTER_STRATEGY = "right-half-v1"
 CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,10})[\s._-]?(\d{2,8})(?![\d-])", re.IGNORECASE)
 FC2_PPV_PATTERN = re.compile(r"(?<![A-Za-z0-9])FC2[\s._-]*PPV[\s._-]*(\d{5,10})(?!\d)", re.IGNORECASE)
 HEYZO_PATTERN = re.compile(r"(?<![A-Za-z0-9])HEYZO[\s._-]*(\d{3,6})(?!\d)", re.IGNORECASE)
@@ -518,7 +519,9 @@ def generate_portrait_artwork(probe, cache_dir="", public_base_url="", size=DEFA
     if not public_base_url:
         raise RuntimeError("adult artwork public base url missing")
     os.makedirs(cache_dir, exist_ok=True)
-    digest = hashlib.sha1(("%s\n%s" % (probe.url, hashlib.sha1(probe.body).hexdigest())).encode("utf-8")).hexdigest()[:20]
+    digest = hashlib.sha1(
+        ("%s\n%s\n%s" % (GENERATED_POSTER_STRATEGY, probe.url, hashlib.sha1(probe.body).hexdigest())).encode("utf-8")
+    ).hexdigest()[:20]
     filename = "%s.jpg" % digest
     path = os.path.join(cache_dir, filename)
     width, height = size
@@ -526,18 +529,9 @@ def generate_portrait_artwork(probe, cache_dir="", public_base_url="", size=DEFA
         with Image.open(io.BytesIO(probe.body)) as image:
             source = image.convert("RGB")
             resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
-            background = ImageOps.fit(source, (width, height), method=resample)
-            background = background.filter(ImageFilter.GaussianBlur(radius=18))
-            overlay_width = int(width * 0.92)
-            overlay_height = int(round(overlay_width * source.height / max(1, source.width)))
-            if overlay_height > int(height * 0.78):
-                overlay_height = int(height * 0.78)
-                overlay_width = int(round(overlay_height * source.width / max(1, source.height)))
-            overlay = source.resize((max(1, overlay_width), max(1, overlay_height)), resample=resample)
-            x = (width - overlay.width) // 2
-            y = (height - overlay.height) // 2
-            background.paste(overlay, (x, y))
-            background.save(path, format="JPEG", quality=90, optimize=True)
+            right_half = source.crop((source.width // 2, 0, source.width, source.height))
+            poster = ImageOps.fit(right_half, (width, height), method=resample)
+            poster.save(path, format="JPEG", quality=90, optimize=True)
     return {
         "path": path,
         "filename": filename,
