@@ -4781,13 +4781,20 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(fake_openlist.source_delete_calls, [])
 
     def test_sync_completed_adult_task_formats_code_before_mediastation_scan(self):
+        import posixpath
+
         from pipeline.bot import BotConfig, PipelineBotService
+        from pipeline.config import category_to_openlist_path
 
         events = []
+        adult_root = category_to_openlist_path("adult")
+        old_path = posixpath.join(adult_root, "downloaded folder")
+        new_path = posixpath.join(adult_root, "MIDA-304")
+        old_video_path = posixpath.join(new_path, "mida.304.mp4")
         fake_openlist = CleaningOpenList(
             {
-                "/115/成人": [{"name": "downloaded folder", "is_dir": True, "size": 0}],
-                "/115/成人/downloaded folder": [
+                adult_root: [{"name": "downloaded folder", "is_dir": True, "size": 0}],
+                old_path: [
                     {"name": "mida.304.mp4", "is_dir": False, "size": 800 * 1024 * 1024},
                     {"name": "ad.mp4", "is_dir": False, "size": 3 * 1024 * 1024},
                     {"name": "mida.304.srt", "is_dir": False, "size": 20 * 1024},
@@ -4800,6 +4807,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
             artwork_repair_response={"status": "success", "updated": 1, "fields": ["poster_url"]},
         )
+
         class FakeSubtitleMatcher:
             def match_task(self, category, title, task, force=False):
                 events.append(("subtitle_match", category, title, task.get("msg_media_id"), task.get("openlist_adult_code")))
@@ -4835,14 +4843,12 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"info_hash": "ABC", "status_name": "success", "name": "downloaded folder"},
             )
 
-        self.assertEqual(fake_openlist.meta_hide_calls, [("/115/成人/MIDA-304 - downloaded folder", [r"^ad\.mp4$"], True)])
+        self.assertEqual(fake_openlist.meta_hide_calls, [(new_path, [r"^ad\.mp4$"], True)])
         self.assertEqual(fake_openlist.source_delete_calls, [])
-        self.assertEqual(fake_openlist.rename_calls, [("/115/成人/downloaded folder", "MIDA-304 - downloaded folder")])
-        self.assertLess(
-            events.index(("rename", "/115/成人/downloaded folder", "MIDA-304 - downloaded folder")),
-            events.index(("meta_hide", "/115/成人/MIDA-304 - downloaded folder", (r"^ad\.mp4$",), True)),
-        )
-        self.assertLess(events.index(("meta_hide", "/115/成人/MIDA-304 - downloaded folder", (r"^ad\.mp4$",), True)), events.index(("scan",)))
+        self.assertEqual(fake_openlist.rename_calls, [(old_path, "MIDA-304"), (old_video_path, "MIDA-304.mp4")])
+        self.assertLess(events.index(("rename", old_path, "MIDA-304")), events.index(("rename", old_video_path, "MIDA-304.mp4")))
+        self.assertLess(events.index(("rename", old_video_path, "MIDA-304.mp4")), events.index(("meta_hide", new_path, (r"^ad\.mp4$",), True)))
+        self.assertLess(events.index(("meta_hide", new_path, (r"^ad\.mp4$",), True)), events.index(("scan",)))
         self.assertLess(events.index(("scan",)), events.index(("artwork_repair",)))
         self.assertLess(events.index(("artwork_repair",)), events.index(("subtitle_match", "adult", "downloaded folder", "media-1", "MIDA-304")))
         self.assertEqual(fake_msg.search_calls[0], ("MIDA-304", 20))
@@ -4903,10 +4909,11 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"info_hash": "ABC", "status_name": "success", "name": "ssis-218ch"},
             )
 
-        self.assertEqual(fake_openlist.rename_calls, [(old_path, "SSIS-218")])
+        self.assertEqual(fake_openlist.rename_calls, [(old_path, "SSIS-218"), (posixpath.join(new_path, "ssis-218ch.mp4"), "SSIS-218.mp4")])
         self.assertEqual(fake_openlist.meta_hide_calls, [(new_path, [r"^side\.mp4$"], True)])
         self.assertEqual(fake_openlist.source_delete_calls, [])
-        self.assertLess(events.index(("rename", old_path, "SSIS-218")), events.index(("meta_hide", new_path, (r"^side\.mp4$",), True)))
+        self.assertLess(events.index(("rename", old_path, "SSIS-218")), events.index(("rename", posixpath.join(new_path, "ssis-218ch.mp4"), "SSIS-218.mp4")))
+        self.assertLess(events.index(("rename", posixpath.join(new_path, "ssis-218ch.mp4"), "SSIS-218.mp4")), events.index(("meta_hide", new_path, (r"^side\.mp4$",), True)))
         self.assertLess(events.index(("meta_hide", new_path, (r"^side\.mp4$",), True)), events.index(("scan",)))
         self.assertEqual(task["openlist_adult_extra_hide_status"], "success")
         self.assertEqual(task["openlist_adult_extra_hidden_count"], 1)
@@ -4939,14 +4946,16 @@ class PipelineBotServiceTest(unittest.TestCase):
             )
         )
 
-    def test_adult_code_formatting_strips_ch_noise_suffix(self):
+    def test_adult_code_formatting_keeps_only_standard_code(self):
         from pipeline.bot import adult_code_formatted_name, adult_code_prefix_matches
 
         self.assertFalse(adult_code_prefix_matches("ssis-152ch", "SSIS-152"))
         self.assertTrue(adult_code_prefix_matches("SSIS-152", "SSIS-152"))
         self.assertTrue(adult_code_prefix_matches("SSIS-152 - title", "SSIS-152"))
         self.assertEqual(adult_code_formatted_name("SSIS-152", "ssis-152ch"), "SSIS-152")
-        self.assertEqual(adult_code_formatted_name("SSIS-152", "SSIS-152CH title"), "SSIS-152 - title")
+        self.assertEqual(adult_code_formatted_name("SSIS-152", "SSIS-152CH title"), "SSIS-152")
+        self.assertEqual(adult_code_formatted_name("HON-001", "olo@SIS001@HON-001"), "HON-001")
+        self.assertEqual(adult_code_formatted_name("HON-001", "hon 001 olo@sis001@hon 001.mp4"), "HON-001.mp4")
 
     def test_sync_completed_adult_task_clears_format_running_when_format_is_skipped(self):
         from pipeline.bot import BotConfig, PipelineBotService

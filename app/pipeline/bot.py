@@ -4647,7 +4647,7 @@ def mark_current_sync_stage_failed(task, error):
 
 def media_search_queries(title, task):
     values = []
-    for value in (title, (task or {}).get("name"), (task or {}).get("file_name")):
+    for value in ((task or {}).get("openlist_adult_code"), title, (task or {}).get("name"), (task or {}).get("file_name")):
         if value:
             values.append(str(value))
     raw_text = " ".join(values)
@@ -5555,7 +5555,19 @@ def format_openlist_adult_code(client, category_path, queries, task=None):
 
     old_name = openlist_item_name(target_item)
     old_path = openlist_item_path(target_dir, target_item)
-    if adult_code_prefix_matches(old_name, code):
+    new_name = adult_code_formatted_name(code, old_name)
+    new_path = old_path
+    renamed_target = False
+    if new_name != old_name:
+        new_path = posixpath.join(str(target_dir).rstrip("/") or "/", new_name)
+        client.rename_path(old_path, new_name)
+        renamed_target = True
+
+    video_rename = None
+    if openlist_item_is_dir(target_item):
+        video_rename = format_openlist_adult_main_video(client, new_path, code)
+
+    if not renamed_target and not video_rename:
         return {
             "openlist_adult_format_status": "skipped",
             "openlist_adult_format_reason": "already_formatted",
@@ -5564,14 +5576,13 @@ def format_openlist_adult_code(client, category_path, queries, task=None):
             "openlist_adult_formatted_at": int(time.time()),
         }
 
-    new_name = adult_code_formatted_name(code, old_name)
-    new_path = posixpath.join(str(target_dir).rstrip("/") or "/", new_name)
-    client.rename_path(old_path, new_name)
     return {
         "openlist_adult_format_status": "success",
         "openlist_adult_code": code,
         "openlist_adult_format_old_path": old_path,
         "openlist_adult_format_new_path": new_path,
+        "openlist_adult_video_old_path": (video_rename or {}).get("old_path"),
+        "openlist_adult_video_new_path": (video_rename or {}).get("new_path"),
         "openlist_adult_formatted_at": int(time.time()),
         "openlist_adult_format_error": None,
     }
@@ -5662,15 +5673,35 @@ def adult_code_prefix_matches(name, code):
 
 
 def adult_code_formatted_name(code, old_name):
+    code = str(code or "").strip()
     old_name = str(old_name or "").strip()
-    if not old_name:
-        return code
-    suffix = adult_code_name_suffix(old_name, code)
-    if suffix is not None:
-        if not suffix:
-            return code
-        return "%s - %s" % (code, suffix)
-    return "%s - %s" % (code, old_name)
+    if not code:
+        return old_name
+    suffix = posixpath.splitext(old_name)[1].lower()
+    if suffix in VIDEO_EXTENSIONS:
+        return "%s%s" % (code, suffix)
+    return code
+
+
+def format_openlist_adult_main_video(client, target_path, code):
+    videos = []
+    for item in client.list_all(target_path, refresh=False):
+        if openlist_item_is_dir(item) or not is_openlist_video_file(item):
+            continue
+        videos.append((openlist_item_size(item), item))
+    if not videos:
+        return None
+
+    _size, item = max(videos, key=lambda pair: pair[0])
+    old_name = openlist_item_name(item)
+    new_name = adult_code_formatted_name(code, old_name)
+    if not new_name or new_name == old_name:
+        return None
+
+    old_path = openlist_item_path(target_path, item)
+    new_path = posixpath.join(str(target_path).rstrip("/") or "/", new_name)
+    client.rename_path(old_path, new_name)
+    return {"old_path": old_path, "new_path": new_path}
 
 
 def adult_code_name_suffix(name, code):
