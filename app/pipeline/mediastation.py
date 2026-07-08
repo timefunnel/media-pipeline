@@ -13,6 +13,7 @@ from pipeline.adult_metadata import (
 DEFAULT_MSG_BASE_URL = "http://127.0.0.1:18080/api"
 CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,10})[\s._-]+(\d{3,4})(?![\d-])", re.IGNORECASE)
 FC2_PPV_PATTERN = re.compile(r"(?<![A-Za-z0-9])FC2[\s._-]*PPV[\s._-]*(\d{5,10})(?!\d)", re.IGNORECASE)
+FC2_LEGACY_PATTERN = re.compile(r"(?<![A-Za-z0-9])FC2[\s._-]+(\d{5,10})(?:[\s._-]*[A-Za-z])?(?!\d)", re.IGNORECASE)
 CODE_PREFIX_DENYLIST = {
     "AAC",
     "BD",
@@ -555,6 +556,9 @@ def iter_code_matches(value):
     out = []
     occupied = []
     for match in FC2_PPV_PATTERN.finditer(text):
+        out.append("FC2-PPV-%s" % match.group(1))
+        occupied.append(match.span())
+    for match in FC2_LEGACY_PATTERN.finditer(text):
         out.append("FC2-PPV-%s" % match.group(1))
         occupied.append(match.span())
     for match in CODE_PATTERN.finditer(text):

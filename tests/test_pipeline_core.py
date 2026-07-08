@@ -51,6 +51,7 @@ from pipeline.mediastation import (
 from pipeline.adult_metadata import (
     AdultHTMLMetadataProvider,
     AdultImageProbe,
+    adult_codes_from_media as adult_metadata_codes_from_media,
     build_adult_artwork_repair,
     image_orientation,
     looks_like_cloudflare_challenge,

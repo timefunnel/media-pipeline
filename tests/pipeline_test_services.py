@@ -1843,6 +1843,57 @@ class MediaStationClientTest(unittest.TestCase):
         self.assertFalse(looks_like_cloudflare_challenge(normal_html))
         self.assertTrue(looks_like_cloudflare_challenge(challenge_html))
 
+    def test_adult_metadata_extracts_legacy_fc2_code_from_path(self):
+        self.assertEqual(
+            adult_metadata_codes_from_media({"path": "cloud://openlist/115/成人/[7sht.me]FC2-926114-C/FC2-926114-C.mp4"}),
+            ["FC2-PPV-926114"],
+        )
+
+    def test_adult_metadata_provider_searches_onejav_direct_fc2_detail(self):
+        class FakeAdultProvider(AdultHTMLMetadataProvider):
+            def __init__(self):
+                super().__init__(bases=["https://onejav.test"], timeout=1)
+                self.urls = []
+
+            def _fetch_text(self, url, referer="", allow_flaresolverr=False):
+                self.urls.append(url)
+                if url.endswith("/torrent/fc2ppv4661145"):
+                    return """
+                    <html>
+                      <title>FC2PPV4661145 - OneJAV.com - Free JAV Torrents</title>
+                      <img class="image" src="https://img.example/fc2ppv4661145.jpg">
+                    </html>
+                    """
+                return ""
+
+        provider = FakeAdultProvider()
+        match = provider.search({"title": "FC2-PPV-4661145"}, ["FC2-PPV-4661145"])
+
+        self.assertEqual(match.source, "onejav")
+        self.assertEqual(match.code, "FC2-PPV-4661145")
+        self.assertEqual(match.title, "FC2-PPV-4661145")
+        self.assertEqual(match.poster_url, "https://img.example/fc2ppv4661145.jpg")
+        self.assertEqual(provider.urls, ["https://onejav.test/torrent/fc2ppv4661145"])
+
+    def test_adult_metadata_provider_onejav_search_requires_exact_fc2_match(self):
+        class FakeAdultProvider(AdultHTMLMetadataProvider):
+            def __init__(self):
+                super().__init__(bases=["https://onejav.test"], timeout=1)
+
+            def _fetch_text(self, url, referer="", allow_flaresolverr=False):
+                if url.endswith("/torrent/fc2ppv926114"):
+                    return ""
+                return """
+                <html>
+                  <a href="/torrent/fc2ppv4661145">FC2PPV4661145</a>
+                  <a href="/torrent/fc2ppv2511471">FC2PPV2511471</a>
+                </html>
+                """
+
+        provider = FakeAdultProvider()
+
+        self.assertIsNone(provider.search({"title": "FC2-PPV-926114"}, ["FC2-PPV-926114"]))
+
     def test_adult_metadata_provider_searches_configured_javdb_source(self):
         class FakeAdultProvider(AdultHTMLMetadataProvider):
             def __init__(self):

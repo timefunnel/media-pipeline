@@ -26,6 +26,7 @@ DEFAULT_ADULT_METADATA_FLARESOLVERR_URL = ""
 DEFAULT_ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS = 20
 DEFAULT_ADULT_METADATA_BASE_URLS = (
     "https://javdb.com",
+    "https://onejav.com",
     "https://javbus.sbs",
     "https://www.javbus.com",
     "https://www.cdnbus.cyou",
@@ -37,6 +38,7 @@ GENERATED_POSTER_STRATEGY = "right-half-v1"
 CACHED_ARTWORK_STRATEGY = "cache-v1"
 CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,10})[\s._-]?(\d{2,8})(?![\d-])", re.IGNORECASE)
 FC2_PPV_PATTERN = re.compile(r"(?<![A-Za-z0-9])FC2[\s._-]*PPV[\s._-]*(\d{5,10})(?!\d)", re.IGNORECASE)
+FC2_LEGACY_PATTERN = re.compile(r"(?<![A-Za-z0-9])FC2[\s._-]+(\d{5,10})(?:[\s._-]*[A-Za-z])?(?!\d)", re.IGNORECASE)
 HEYZO_PATTERN = re.compile(r"(?<![A-Za-z0-9])HEYZO[\s._-]*(\d{3,6})(?!\d)", re.IGNORECASE)
 UNCENSORED_PATTERN = re.compile(r"(?<!\d)(\d{6})[\s._-](\d{3,5})(?!\d)", re.IGNORECASE)
 TITLE_TAG_RE = re.compile(r"(?is)<h[123][^>]*>(.*?)</h[123]>")
@@ -224,8 +226,11 @@ class AdultHTMLMetadataProvider(AdultMetadataProvider):
             last_error = None
             for base in self.bases:
                 try:
-                    if adult_source_kind(base) == "javbus":
+                    source_kind = adult_source_kind(base)
+                    if source_kind == "javbus":
                         match = self._search_javbus(base, normalized_code)
+                    elif source_kind == "onejav":
+                        match = self._search_onejav(base, normalized_code)
                     else:
                         match = self._search_javdb(base, normalized_code)
                 except RuntimeError as exc:
@@ -260,6 +265,37 @@ class AdultHTMLMetadataProvider(AdultMetadataProvider):
         detail_url = base.rstrip("/") + "/" + urllib.parse.quote(code, safe="")
         body = self._fetch_text(detail_url, referer=base)
         return parse_adult_detail_html(body, code, "javbus", detail_url)
+
+    def _search_onejav(self, base, code):
+        expected_key = onejav_code_key(code)
+        if not expected_key:
+            return None
+        seen = set()
+        for slug in onejav_slugs(code):
+            seen.add(slug)
+            detail_url = base.rstrip("/") + "/torrent/" + urllib.parse.quote(slug, safe="")
+            match = parse_onejav_detail_html(self._fetch_text(detail_url, referer=base), code, detail_url)
+            if match:
+                return match
+
+        search_url = base.rstrip("/") + "/search/" + urllib.parse.quote(code, safe="")
+        body = self._fetch_text(search_url, referer=base)
+        for raw_attrs, raw_text in ANCHOR_RE.findall(body):
+            attrs = html_attrs(raw_attrs)
+            href = attrs.get("href", "")
+            if "/torrent/" not in href:
+                continue
+            slug = href.rstrip("/").rsplit("/", 1)[-1].lower()
+            if not slug or slug in seen:
+                continue
+            text = strip_html(raw_text)
+            if onejav_code_key(text or slug) != expected_key and onejav_code_key(slug) != expected_key:
+                continue
+            detail_url = absolutize_url(base, href)
+            match = parse_onejav_detail_html(self._fetch_text(detail_url, referer=base), code, detail_url)
+            if match:
+                return match
+        return None
 
     def _fetch_text(self, url, referer="", allow_flaresolverr=False):
         try:
@@ -719,6 +755,8 @@ def iter_code_matches(value):
     text = str(value or "")
     for match in FC2_PPV_PATTERN.finditer(text):
         yield "FC2-PPV-%s" % match.group(1)
+    for match in FC2_LEGACY_PATTERN.finditer(text):
+        yield "FC2-PPV-%s" % match.group(1)
     for match in HEYZO_PATTERN.finditer(text):
         yield "HEYZO-%s" % match.group(1)
     for match in UNCENSORED_PATTERN.finditer(text):
@@ -805,10 +843,35 @@ def adult_source_kind(base):
     host = host.lower()
     if "javdb" in host:
         return "javdb"
+    if "onejav" in host:
+        return "onejav"
     for needle in ("javbus", "cdnbus", "javsee", "busjav"):
         if needle in host:
             return "javbus"
     return "javdb"
+
+
+def parse_onejav_detail_html(body, code, detail_url):
+    expected_key = onejav_code_key(code)
+    if not expected_key or not str(body or "").strip():
+        return None
+    page_title = first_html_title(body)
+    if onejav_code_key(page_title) != expected_key:
+        return None
+    poster_url = first_adult_image(body, "image")
+    if poster_url:
+        poster_url = absolutize_url(detail_url, poster_url)
+    pretty_code = onejav_pretty_code(expected_key)
+    return AdultMetadataMatch(
+        code=pretty_code,
+        source="onejav",
+        title=pretty_code,
+        detail_url=detail_url,
+        poster_url=poster_url,
+        backdrop_url="",
+        genres=("Adult", "onejav"),
+        nsfw=True,
+    )
 
 
 def parse_adult_detail_html(body, code, source, detail_url):
@@ -863,6 +926,11 @@ def first_adult_title(body, code):
 
 def strip_html(value):
     return " ".join(html.unescape(HTML_TAG_RE.sub(" ", str(value or ""))).split())
+
+
+def first_html_title(body):
+    match = re.search(r"(?is)<title[^>]*>(.*?)</title>", body or "")
+    return strip_html(match.group(1)) if match else ""
 
 
 def first_adult_image(body, *class_needles):
@@ -942,3 +1010,32 @@ def unique_strings(values):
             seen.add(key)
             out.append(text)
     return out
+
+
+def alnum_upper(value):
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+
+def onejav_code_key(value):
+    text = str(value or "")
+    match = re.search(r"(?i)FC2[\s._-]*(?:PPV)?[\s._-]*(\d{5,10})", text)
+    if match:
+        return "FC2PPV%s" % match.group(1)
+    normalized = alnum_upper(text)
+    match = re.search(r"FC2PPV(\d{5,10})", normalized)
+    if match:
+        return "FC2PPV%s" % match.group(1)
+    return ""
+
+
+def onejav_pretty_code(key):
+    match = re.match(r"FC2PPV(\d{5,10})$", str(key or "").upper())
+    if match:
+        return "FC2-PPV-%s" % match.group(1)
+    return str(key or "")
+
+
+def onejav_slugs(code):
+    key = onejav_code_key(code)
+    if key:
+        yield key.lower()
