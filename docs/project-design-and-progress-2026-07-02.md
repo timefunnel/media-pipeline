@@ -1,11 +1,13 @@
 # Media Pipeline 项目设计与当前进度
 
-记录时间：2026-07-04  
+记录时间：2026-07-08
 远端目录：`/opt/media-pipeline`  
 部署主机：`usa4c4g-1`  
-本文状态：按 2026-07-03 对服务端实际运行状态重新核验并整理。
+本文状态：按 2026-07-08 对服务端实际运行状态重新核验并整理。
 
 本文只记录架构、链路、配置位置、运行状态和已知问题，不记录任何 OpenList token、Telegram bot token、Prowlarr API key、115 access token、MediaStationGo 管理员密码等敏感明文。
+
+从零部署请优先阅读：`docs/deployment-guide.md`。本文更偏向当前实例的设计、运行状态和排障记录。
 
 ## 1. 主线目标
 
@@ -15,13 +17,14 @@
 Telegram Bot 收到影片名或磁链
 -> 搜索影片资源
 -> 返回候选并由用户选择资源
--> 用户手动选择内容分类：电影 / 剧集 / 成人 / 其他
+-> 用户手动选择内容分类：电影 / 剧集 / 动漫 / 成人 / 其他
 -> 使用 115 官方开放接口创建离线任务
 -> 查询/等待 115 离线完成
 -> OpenList 可见 115 文件
 -> 触发 MediaStationGo 扫描旧 OpenList 云盘媒体库 root
 -> 触发 MediaStationGo 单项刮削
 -> 成人内容检查并修复不可直连的 JavBus 图片
+-> 外部字幕匹配；Emby/Infuse 访问经 subtitle proxy 做兼容补丁
 ```
 
 当前服务端实际进度：
@@ -38,9 +41,10 @@ Telegram Bot 搜索/候选分页/资源选择
 -> 等待媒体出现
 -> MediaStationGo scrape_media
 -> 成人图片修复
+-> 可见性/图片/字幕后处理
 ```
 
-结论：MediaStationGo 已经接入 Bot 主线。当前使用 OpenList 云盘媒体库 root 扫描方案，MSG 保留 `电影`、`剧集`、`动漫`、`成人`、`其他媒体` 五个 pipeline active root；Bot 侧分类仍由用户手动选择。成人内容在 MSG 单项刮削后会执行图片修复，避免 JavBus 图片 403 导致封面无法加载。Bot 的 `其他` 分类在 MSG 中显示为 `其他媒体`，按普通 movie 类型处理，用于承接不适合继续留在成人库的 no_match 内容。
+结论：MediaStationGo 已经接入 Bot 主线。当前使用 OpenList 云盘媒体库 root 扫描方案，pipeline 配置内保留 `电影`、`剧集`、`动漫`、`成人`、`其他媒体` 五个 active root；Bot 侧分类由用户手动选择。成人内容在 MSG 单项刮削后会执行图片修复，避免 JavBus 图片 403 或 DMM `now_printing` 占位图导致封面不可用。Bot 的 `其他` 分类在 MSG 中显示为 `其他媒体`，按普通 movie 类型处理，用于承接不适合继续留在成人库的 no_match 内容。Emby/Infuse 访问通过 `media-pipeline-subtitle-proxy` 兼容外部字幕、文件夹封面、播放进度和成人标题番号前缀。
 
 ## 2. 总体架构
 
@@ -56,12 +60,13 @@ flowchart TD
     W --> T["读取 OpenList DB 中 115 access_token"]
     T --> O["115 Open 官方离线 API"]
     O --> Q["115 离线任务状态"]
-    Q --> L["OpenList /115/电影、/115/剧集、/115/成人 或 /115/其他 可见"]
+    Q --> L["OpenList /115/电影、/115/剧集、/115/动漫、/115/成人 或 /115/其他 可见"]
     L --> OC["OpenList 扫描前清理；成人分类执行番号格式化"]
     OC --> M["MediaStationGo 旧 OpenList 云盘 root scan"]
     M --> F["搜索/匹配入库媒体"]
     F --> R["MediaStationGo 单项 scrape"]
     R --> A["成人内容修复 JavBus 图片为 DMM/MGStage"]
+    R --> X["字幕匹配与 subtitle proxy 兼容层"]
 ```
 
 ## 3. 服务端部署状态
@@ -69,17 +74,19 @@ flowchart TD
 当前相关容器：
 
 ```text
-media-pipeline-bot                 Up, RestartCount=0
-prowlarr                           Up, 127.0.0.1:9696
-openlist                           Up, 127.0.0.1:5244
-mediastationgo-mediastation-go-1    Up healthy, 127.0.0.1:18080->8080
-mediastationgo-postgres-1           Up healthy
+media-pipeline-bot                  Up 13h
+media-pipeline-subtitle-proxy        Up 13h
+prowlarr                            Up 39h, 127.0.0.1:9696
+openlist                            Up 39h, 127.0.0.1:5244
+mediastationgo-mediastation-go-1     Up 39h healthy, 127.0.0.1:18080->8080
+mediastationgo-postgres-1            Up 39h healthy, 127.0.0.1:15432->5432
 ```
 
-`/opt/media-pipeline/docker-compose.yml` 当前包含两个 service：
+`/opt/media-pipeline/docker-compose.yml` 当前包含三个 service：
 
 - `media-pipeline`：一次性 CLI service，默认命令 `folders`。
 - `media-pipeline-bot`：常驻 Bot service，`restart: unless-stopped`。
+- `media-pipeline-subtitle-proxy`：常驻 Emby/Jellyfin 兼容代理，host network，默认监听 `18081`，上游为 MSG `127.0.0.1:18080`。
 
 当前生产交互以 `media-pipeline-bot` 为准；CLI 不再作为维护目标，不再追平 Bot 能力。Bot service 已配置以下环境变量类别：
 
@@ -101,11 +108,23 @@ OPENLIST_ADULT_CODE_FORMAT_ENABLED
 BOT_SEARCH_LIMIT / TG_API_TIMEOUT / BOT_SYNC_RECOVERY_INTERVAL_SECONDS
 OPENLIST_DB / OPENLIST_URL
 PROWLARR_URL / PROWLARR_CONFIG
+SUBTITLE_AUTO_MATCH_ENABLED / SUBTITLE_PROVIDERS / SUBTITLE_CACHE_DIR
+LLM_SEARCH_RERANK_ENABLED / LLM_SEARCH_RERANK_LIMIT
+MEDIA_PIPELINE_*_FOLDER_ID / OPENLIST_PATH / MSG_LIBRARY_ID / MSG_ROOT_ID
 ```
 
 这些值来自远端 `/opt/media-pipeline/.env` 或 compose 默认插值；`docker-compose.yml` 只保留变量引用。文档只记录变量存在，不记录任何 token/key/password。
 
 当前版本可通过 Bot 发送 `/version` 查看，返回 `media-pipeline <version>` 和 `revision`。
+
+2026-07-08 核验：
+
+```text
+git HEAD: 6dee236 Use space in adult Emby title prefix
+media-pipeline-bot MEDIA_PIPELINE_REVISION: 46a3078
+```
+
+说明：Git 工作树干净，但运行容器内 revision 标记仍停在旧值。后续部署或排障时应同时确认 Git HEAD、镜像构建时间和 Bot `/version`，不要只看其中一个。
 
 ## 4. Prowlarr
 
@@ -163,6 +182,7 @@ OpenList 路径：
 ```text
 movie -> /115/电影
 tv -> /115/剧集
+anime -> /115/动漫
 adult -> /115/成人
 other -> /115/其他
 ```
@@ -172,20 +192,22 @@ other -> /115/其他
 ```text
 movie -> 3464134653584082023
 tv -> 3465137076394001831
+anime -> 3465784028030830531
 adult -> 3464134590896014943
 other -> 3465205291639899794
 ```
 
-当前 `verify-folders` 核验结果：
+2026-07-08 OpenList 可见目录规模：
 
 ```text
-movie folder code=0 count=6
-tv folder code=0 count=2
-adult folder code=0 count=87
-other folder code=0 count=15
+/115/电影: 12
+/115/剧集: 1
+/115/动漫: 2
+/115/成人: 128
+/115/其他: 27
 ```
 
-当前 `probe` 核验结果：
+2026-07-04 历史 `probe` 核验结果：
 
 ```text
 storage_id=1
@@ -241,7 +263,7 @@ pre-upgrade backup: /opt/media-pipeline/backups/msg-upgrade-20260703225139
 当前数据库摘要：
 
 ```text
-active cloud://openlist media: 268
+active cloud://openlist media: 347
 MSG guard trigger: pipeline_guard_msg_cloud_media
 ```
 
@@ -255,12 +277,23 @@ e1333358-17ff-4b90-82f0-663cec26c0df | 动漫 | anime | cloud://openlist/115%2F%
 60067bc7-eb34-466c-8bf9-5654297a609f | 其他媒体 | movie | cloud://openlist/115%2F%E5%85%B6%E4%BB%96
 ```
 
+2026-07-08 MSG 活动库快照：
+
+```text
+电影 | movie | 44
+剧集 | tv | 24
+动漫 | anime | 100
+成人 | adult | 127
+其他媒体 | movie | 52
+成人 | adult | 0 | cloud://openlist/%E6%88%90%E4%BA%BA%2F%E6%88%90%E4%BA%BA?auto_category=1
+```
+
 说明：
 
-- 历史自动分类库和临时测试库已从 MSG `libraries/library_roots` 中物理清理；未删除 115/OpenList 文件。
-- MSG `/libraries` 当前只应看到 `成人`、`电影`、`剧集`、`动漫`、`其他媒体` 五个 pipeline active 库。
+- pipeline 配置仍只使用 `成人`、`电影`、`剧集`、`动漫`、`其他媒体` 五个云盘库。
+- MSG 当前额外存在一个 `0` 媒体的成人 auto_category 库；它不是 pipeline 配置目标，属于待清理/待确认残留。
 - Bot 的 `其他` 分类在 MSG 中显示为 `其他媒体`，当前按 MSG `movie` 类型处理；不加入 `adult.library_ids`，不执行成人番号格式化和成人图片修复。
-- 2026-07-04 已将成人库中 `scrape_status=no_match` 或确认无法刮削的存量内容迁移到 `其他媒体`：OpenList `/115/其他` 当前 15 个目录，MSG `其他媒体` 当前 24 条 no_match 媒体；成人库 no_match 当前为 0。
+- 2026-07-04 已将成人库中 `scrape_status=no_match` 或确认无法刮削的存量内容迁移到 `其他媒体`；2026-07-08 复核时 MSG `其他媒体` 当前 52 条媒体。
 
 当前 OpenList 云盘 root 映射：
 
@@ -294,6 +327,16 @@ other:
   root_id=1f889ec1-b34d-40b6-b3ca-f4372170a42b
   provider=tmdb
   media_type=movie
+```
+
+2026-07-08 OpenList 目录可见规模：
+
+```text
+/115/电影: 12
+/115/剧集: 1
+/115/动漫: 2
+/115/成人: 128
+/115/其他: 27
 ```
 
 关键设置：
@@ -384,15 +427,15 @@ description=Adult / 番号元数据（JavDB 优先；当前 MSG 内置默认源�
 - 搜索阶段使用 Prowlarr 聚合，不按普通/成人模式拆开搜索源。
 - 搜索请求按关键词类型分流：普通关键词只查通用源；番号会额外补查 `sukebei.nyaa.si`；疑似动漫关键词才额外补查 Nyaa/ACG/Mikan/Bangumi 等动漫源。
 - 搜索结果先选择资源，再手动选择内容分类；选择资源时不编辑/删除原搜索结果消息，方便同一批候选中连续入库多个资源。
-- 当前内容分类固定为四类：电影、剧集、成人、其他。
-- 电影分类走 115 电影目录和 MSG 电影云盘库；剧集分类走 115 剧集目录和 MSG 剧集云盘库；成人分类走 115 成人目录和 MSG 成人云盘库；其他分类走 115 其他目录和 MSG 其他媒体云盘库。
+- 当前内容分类固定为五类：电影、剧集、动漫、成人、其他。
+- 电影分类走 115 电影目录和 MSG 电影云盘库；剧集分类走 115 剧集目录和 MSG 剧集云盘库；动漫分类走 115 动漫目录和 MSG 动漫云盘库；成人分类走 115 成人目录和 MSG 成人云盘库；其他分类走 115 其他目录和 MSG 其他媒体云盘库。
 - callback 中只保存候选 id，不携带完整 magnet，避免 Telegram callback 64 字节限制。
 - 点击入库后使用保存的 magnet，不重新搜索，避免排序漂移。
 - 未授权用户直接拒绝。
 - 搜索无可用资源时回复“未找到可用资源”。
 - 115 提交后立即查询当前任务状态并反馈。
 - 115 提交前会先做重复作品检测，强重复拦截，弱重复需要用户确认“仍然入库”。
-- `/dedupe_refresh` 会手动刷新 `/115/电影`、`/115/剧集`、`/115/成人` 和 `/115/其他` 的 OpenList 基线索引，写入 Bot 本地状态库。
+- `/dedupe_refresh` 会手动刷新 `/115/电影`、`/115/剧集`、`/115/动漫`、`/115/成人` 和 `/115/其他` 的 OpenList 基线索引，写入 Bot 本地状态库。
 - 任务成功后可进入 MediaStationGo 同步阶段。
 - MediaStationGo 同步失败后，状态消息和 `/tasks` 会提供“重试MSG同步”按钮。
 - `/tasks` 会优先展示可重试、进行中、失败/取消任务；列表分页展示，并在每条任务中显示入库库类型、当前状态、进度、内容分类和 MSG 同步状态。
@@ -406,6 +449,7 @@ description=Adult / 番号元数据（JavDB 优先；当前 MSG 内置默认源�
 
 - `movie` 内容分类按电影库查重。
 - `tv` 内容分类按剧集库查重。
+- `anime` 内容分类按动漫库查重。
 - `adult` 内容分类按成人库查重。
 - `other` 内容分类按其他库查重。
 
@@ -553,61 +597,49 @@ Bot 状态库：
 /data/media-pipeline/bot/state.db
 container: /bot-data/state.db
 tables: candidates, search_sessions, offline_tasks, dedupe_index, sqlite_sequence
-offline_tasks count: 37
-dedupe_index count: 143
-dedupe_index category: adult=121, movie=6, other=14, tv=2
-dedupe_index identity_type: adult_code=34, normalized_title=109
-dedupe_index last refresh: 2026-07-04, by container command equivalent to /dedupe_refresh
+offline_tasks count: 105
+search_sessions count: 140
+candidates count: 1998
+dedupe_index count: 173
+dedupe_index category/source:
+  adult/openlist: adult_code=41, normalized_title=96
+  anime/openlist: normalized_title=2
+  movie/openlist: normalized_title=12
+  other/openlist: normalized_title=21
+  tv/openlist: normalized_title=1
 ```
 
-当前任务聚合：
+当前任务聚合按 `offline_tasks.task_json` 解析，旧的扁平 `status/msg_sync_status` 字段已不存在：
 
 ```text
-adult:
-  success: 22
-  cancelled: 1
-
-movie:
-  success: 7
-  cancelled: 4
-  failed: 1
-
-tv:
-  success: 2
-```
-
-MediaStationGo 同步字段聚合：
-
-```text
-adult:
-  msg_sync_status=success + msg_scan_status=success + msg_scrape_status=success: 20
-  msg_sync_status=failed: 1
-  historical task without MSG fields: 2
-
-movie:
-  msg_sync_status=success + msg_scan_status=success + msg_scrape_status=success: 6
-  historical task without MSG fields: 6
-
-tv:
-  msg_sync_status=success + msg_scan_status=success + msg_scrape_status=success: 2
+status_name=success + msg_sync_status=success: 89
+status_name=cancelled: 8
+status_name=success + msg_sync_status=failed: 5
+status_name=success + msg_sync_status empty: 2
+status_name=failed: 1
 ```
 
 说明：
 
 - 已经存在多条成功完成 MediaStationGo scan + scrape 的任务。
 - MediaStationGo 同步失败会保留失败阶段和错误信息，可通过 Bot 按钮重试。
-- 当前存量任务大多产生于手动内容分类上线前，因此历史任务未写入 `content_profile`；新任务会写入该字段并用于 115 目录和 MSG 电影/剧集/成人云盘 root 路由。
+- 当前存量任务跨越多轮功能迭代，历史任务的字段完整度不一致；排查时以 `task_json` 内的阶段状态和错误信息为准。
 
 ### 11.1 MediaStationGo 同步恢复机制
 
 同步状态保存到 Bot 状态库，每次阶段进展都会写回任务 JSON。当前阶段包括：
 
 ```text
-openlist_clean_status
 openlist_adult_format_status
+openlist_trash_hide_status
+openlist_clean_status
+openlist_adult_extra_hide_status
 msg_scan_status
 msg_scrape_status
+msg_extra_cleanup_status
+msg_visibility_repair_status
 msg_artwork_repair_status
+subtitle_match_status
 msg_sync_status
 ```
 
@@ -617,9 +649,12 @@ msg_sync_status
 - 重试不会从头无条件重跑，按阶段状态恢复：
   - OpenList 清理未完成或失败：从 OpenList 清理开始。
   - 成人番号格式化未完成或失败：从番号格式化开始。
+  - OpenList Meta Hide / 成人多余视频隐藏未完成或失败：从对应 OpenList 后处理阶段开始。
   - MSG 扫描失败：从 root scan + 媒体匹配开始。
   - MSG 刮削失败且已有 `msg_media_id`：只重试单项刮削。
+  - MSG 多余媒体清理或可见性修复失败：从对应 MSG 后处理阶段开始。
   - 成人图片修复失败且已有 `msg_media_id`：只重试图片修复。
+  - 字幕匹配失败：从字幕匹配阶段开始。
 - 阶段状态为 `success` 或 `skipped` 时视为已完成，不重复执行。
 - 异常会把当前 `running` 阶段标记为 `failed`，同时记录 `msg_error`，不伪装成功。
 
@@ -639,16 +674,16 @@ msg_sync_status
 
 ## 12. 当前测试与验证
 
-由于远端宿主机 Python 是 3.6，当前项目代码需要 Python 3.12；运行测试时使用 Python 3.12 Docker 镜像挂载项目目录。
+当前项目代码运行在容器内 Python 环境。远端生产容器默认只包含运行依赖，不包含 `pytest`；如需跑完整测试，应使用带测试依赖的镜像或 compose 临时容器挂载 `/opt/media-pipeline/tests`。
 
-测试命令：
+历史测试命令：
 
 ```bash
 cd /opt/media-pipeline
 docker compose run --rm --entrypoint python -v /opt/media-pipeline/app:/app:ro -v /opt/media-pipeline/tests:/tests:ro media-pipeline-bot -m unittest discover -s /tests
 ```
 
-当前结果：
+2026-07-04 历史结果：
 
 ```text
 Ran 168 tests
@@ -659,29 +694,33 @@ OK
 
 - `media-pipeline-bot` 镜像内没有安装 `pytest`。
 - `media-pipeline-bot` 镜像默认只 COPY `app/`，运行测试时需要显式挂载 `/opt/media-pipeline/tests`。
-- 宿主机 `python3 -m unittest` 会因 Python 3.6 缺少 `nullcontext` 等能力失败。
-- 测试完成后已清理 `/opt/media-pipeline/app` 和 `/opt/media-pipeline/tests` 下的 `__pycache__`。
+- 2026-07-08 只读核验未重跑完整单测；生产容器执行 `python -m pytest` 返回 `No module named pytest`。
+- 2026-07-08 已验证 `python -m pipeline.cli --help` 能正常加载 CLI 入口。
 
-已验证的运行状态：
+2026-07-08 已验证的运行状态：
 
 ```text
-Local unittest -> Ran 168 tests, OK
-Remote Python 3.12 Compose unittest -> Ran 168 tests, OK
-Adult artwork replacement URL probe in media-pipeline-bot -> selected DMM/MGStage URLs returned image and did not redirect to now_printing
-MSG adult DMM artwork now_printing scan -> checked 112, bad 0
-MSG adult library JavBus artwork count -> poster 0, backdrop 0
+Git worktree -> clean
+Git HEAD -> 6dee236
+media-pipeline-bot MEDIA_PIPELINE_REVISION -> 46a3078
 MediaStationGo /api/health -> 200
-MediaStationGo msg-login -> authenticated true
-Prowlarr /api/v1/health -> 0
-OpenList refresh=True /115/电影 -> openlist_refresh_ok
-115 probe -> code=0
-115 verify-folders -> code=0
-media-pipeline-bot -> Up, recent logs empty
-MSG old root scan -> 成人 root、电影 root 与剧集 root 均可触发，API 返回 queued
-MSG active libraries -> 成人, 电影, 剧集, 其他媒体
-MSG active cloud://openlist media -> 268
-MSG guard trigger backup -> /opt/media-pipeline/backups/msg-cloud-guard-20260703225811
+OpenList /api/public/settings -> 200
+Subtitle proxy /health -> 200
+Prowlarr root -> 200
+media-pipeline-bot -> Up
+media-pipeline-subtitle-proxy -> Up
+MSG active pipeline libraries -> 成人, 电影, 剧集, 动漫, 其他媒体
+MSG extra active auto_category adult library -> 0 media
+MSG active cloud://openlist media -> 347
+OpenList visible roots -> /115/电影 12, /115/剧集 1, /115/动漫 2, /115/成人 128, /115/其他 27
+Subtitle cache -> 165 files, tracks.json 82, about 5.0M
 MSG guard trigger -> pipeline_guard_msg_cloud_media installed
+```
+
+2026-07-04 历史 guard 回归验证：
+
+```text
+MSG guard trigger backup -> /opt/media-pipeline/backups/msg-cloud-guard-20260703225811
 MSG guard RED check -> no trigger allowed library/root/path update inside rolled back transaction
 MSG guard GREEN check -> trigger restored library/root/path/relative_path/file_id and allowed scrape_status update
 MSG guard scope check -> non-pipeline row updates are not intercepted
@@ -742,7 +781,7 @@ sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[
 - 真实提交必须显式 commit 或用户点击入库按钮。
 - 成人内容必须走 adult 分类和 adult 目录。
 - Bot 入库前必须由用户手动选择内容分类；自动分类只能作为内部辅助，不能作为最终入库分类依据。
-- 电影、剧集、成人、其他必须分别保存到对应 115 目录，后续扫描对应 MSG 云盘 root。
+- 电影、剧集、动漫、成人、其他必须分别保存到对应 115 目录，后续扫描对应 MSG 云盘 root。
 - MSG root 配置失败时必须显式失败。
 - 取消离线任务必须走按钮，并固定不删除 115 已产生文件。
 - MediaStationGo 同步失败必须记录错误，不伪装成功。
@@ -755,7 +794,7 @@ sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[
 - 多 indexer 启用。
 - Prowlarr 主聚合失败后的单站点降级搜索。
 - 候选筛选、排序、分页、去重。
-- Telegram Bot 授权、搜索、候选保存、资源选择、四类内容分类手动选择。
+- Telegram Bot 授权、搜索、候选保存、资源选择、五类内容分类手动选择。
 - 115 官方离线提交。
 - 115 状态查询、快速观察期轮询、长期降频轮询、超时自动取消、取消任务。
 - OpenList 115 Open 挂载与目录分流。
@@ -772,7 +811,7 @@ sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[
 - OpenList 清理失败、成人番号格式化失败的人工处理提示。
 - 提交前重复作品识别：相同 `info_hash`、成人番号、MediaStationGo 成人番号强拦截；普通标题相似弱提示。
 - `/dedupe_refresh` 手动导入 OpenList 现有库内容到 `dedupe_index`，提交前只查本地索引；当前已包含电影、剧集、动漫、成人、其他。
-- 历史自动分类库和临时测试库已从 MSG 中物理清理；当前活跃媒体库只保留成人、电影、剧集、动漫、其他媒体 5 个。
+- pipeline 配置内当前活跃媒体库只使用成人、电影、剧集、动漫、其他媒体 5 个；MSG 运行态额外存在 1 个 0 媒体成人 auto_category 残留库，待清理或确认。
 - 已关闭 MSG `scrape.auto_on_scan`，由 Bot 显式触发单项刮削。
 - 成人库历史 JavBus 图片已替换，当前 JavBus 相关海报/背景图计数为 0。
 - 成人库历史 DMM `now_printing` 占位图片已替换或清空，当前占位重定向计数为 0。
@@ -785,9 +824,13 @@ sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[
 - Prowlarr priority 已纳入 Bot 排序；后续源优先级尽量在 Prowlarr 后台调整，不在 Bot 里硬编码站点排序。
 - 强番号形态（例如 `MIDE-882`、`BDMV-001`、`FC2-PPV-1234567`）默认走成人 profile；非番号普通搜索默认不碰成人源。
 - 非番号搜索结果页提供短补查按钮：`🔞` 查成人源、`动漫` 查动漫源；点击后新发一条对应源结果消息，不覆盖原普通搜索结果。
+- 已接入 `media-pipeline-subtitle-proxy`：为 Emby/Infuse 访问提供外部字幕注入、文件夹封面补丁、成人标题番号前缀、播放进度兼容和敏感 token 日志脱敏。
+- 已接入外部字幕自动匹配，当前启用 provider 包括 `subtitlecat`、`assrt`、`opensubtitles`，成人任务默认自动匹配。
 
 需要继续完善：
 
+- 统一部署版本标记：2026-07-08 Git HEAD 为 `6dee236`，但 bot 容器 `MEDIA_PIPELINE_REVISION` 仍为 `46a3078`。
+- 清理或确认 MSG 中 0 媒体成人 auto_category 残留库。
 - 将 CLI 的 115 access token invalid 处理与 Bot 保持一致，遇到过期 token 时自动触发 OpenList `refresh=True` 后重试。
 - 需要时补充内容分类变更入口，用于已提交但分类选错的任务。
 - 需要时补充普通电影更精确的 TMDB/年份级重复识别。
