@@ -31,7 +31,6 @@ DEFAULT_ADULT_METADATA_BASE_URLS = (
 )
 DEFAULT_GENERATED_POSTER_SIZE = (600, 900)
 GENERATED_POSTER_STRATEGY = "right-half-v1"
-CACHED_ARTWORK_STRATEGY = "cache-v1"
 CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,10})[\s._-]?(\d{2,8})(?![\d-])", re.IGNORECASE)
 FC2_PPV_PATTERN = re.compile(r"(?<![A-Za-z0-9])FC2[\s._-]*PPV[\s._-]*(\d{5,10})(?!\d)", re.IGNORECASE)
 HEYZO_PATTERN = re.compile(r"(?<![A-Za-z0-9])HEYZO[\s._-]*(\d{3,6})(?!\d)", re.IGNORECASE)
@@ -412,10 +411,6 @@ def build_adult_artwork_repair(
                 content_type="image/jpeg",
                 body=b"",
             )
-    if portrait:
-        portrait = cache_artwork_probe(portrait, cache_dir=cache_dir, public_base_url=public_base_url, role="poster")
-    if landscape:
-        landscape = cache_artwork_probe(landscape, cache_dir=cache_dir, public_base_url=public_base_url, role="backdrop")
 
     current_poster = str(media.get("poster_url") or "").strip()
     current_backdrop = str(media.get("backdrop_url") or "").strip()
@@ -544,46 +539,6 @@ def generate_portrait_artwork(probe, cache_dir="", public_base_url="", size=DEFA
         "width": width,
         "height": height,
     }
-
-
-def cache_artwork_probe(probe, cache_dir="", public_base_url="", role="artwork"):
-    public_base_url = str(public_base_url or "").strip().rstrip("/")
-    if not public_base_url or artwork_url_is_local(probe.url, public_base_url):
-        return probe
-    if Image is None:
-        raise RuntimeError("Pillow is required to cache artwork")
-    cache_dir = str(cache_dir or DEFAULT_ADULT_ARTWORK_CACHE_DIR)
-    os.makedirs(cache_dir, exist_ok=True)
-    body_hash = hashlib.sha1(probe.body).hexdigest()
-    digest = hashlib.sha1(
-        ("%s\n%s\n%s\n%s" % (CACHED_ARTWORK_STRATEGY, role, probe.url, body_hash)).encode("utf-8")
-    ).hexdigest()[:20]
-    filename = "%s.jpg" % digest
-    path = os.path.join(cache_dir, filename)
-    width = int(probe.width or 0)
-    height = int(probe.height or 0)
-    if not os.path.exists(path):
-        with Image.open(io.BytesIO(probe.body)) as image:
-            source = image.convert("RGB")
-            width, height = int(source.width), int(source.height)
-            source.save(path, format="JPEG", quality=90, optimize=True)
-    return AdultImageProbe(
-        url=public_base_url + ADULT_ARTWORK_PUBLIC_PATH + "/" + urllib.parse.quote(filename, safe=""),
-        source="cached:%s" % probe.source,
-        role=probe.role,
-        priority=probe.priority,
-        width=width,
-        height=height,
-        content_type="image/jpeg",
-        body=b"",
-    )
-
-
-def artwork_url_is_local(url, public_base_url):
-    public_base_url = str(public_base_url or "").strip().rstrip("/")
-    if not public_base_url:
-        return False
-    return str(url or "").startswith(public_base_url + ADULT_ARTWORK_PUBLIC_PATH + "/")
 
 
 def adult_codes_from_media(media):
