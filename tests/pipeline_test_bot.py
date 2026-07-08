@@ -107,6 +107,8 @@ class BotConfigTest(unittest.TestCase):
                 "ADULT_ARTWORK_CACHE_DIR": "/cache/adult",
                 "ADULT_ARTWORK_PUBLIC_BASE_URL": "https://privdo.example",
                 "ADULT_ARTWORK_GENERATE_PORTRAIT_ENABLED": "0",
+                "ADULT_METADATA_BASE_URLS": "javdb.test,https://javbus.test",
+                "ADULT_METADATA_FETCH_TIMEOUT_SECONDS": "3",
             }
         )
 
@@ -114,6 +116,8 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.adult_artwork_cache_dir, "/cache/adult")
         self.assertEqual(config.adult_artwork_public_base_url, "https://privdo.example")
         self.assertFalse(config.adult_artwork_generate_portrait_enabled)
+        self.assertEqual(config.adult_metadata_base_urls, ("https://javdb.test", "https://javbus.test"))
+        self.assertEqual(config.adult_metadata_fetch_timeout_seconds, 3)
 
     def test_bot_config_reads_sync_recovery_interval(self):
         from pipeline.bot import BotConfig

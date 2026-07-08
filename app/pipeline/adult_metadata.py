@@ -1,4 +1,5 @@
 import hashlib
+import html
 import io
 import os
 import re
@@ -19,23 +20,53 @@ ADULT_ARTWORK_PUBLIC_PATH = "/pipeline-artwork/adult"
 DEFAULT_ADULT_ARTWORK_CACHE_DIR = "/artwork-cache/adult"
 DEFAULT_ADULT_ARTWORK_FETCH_TIMEOUT_SECONDS = 8
 DEFAULT_ADULT_ARTWORK_DOWNLOAD_MAX_BYTES = 6 * 1024 * 1024
+DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS = 6
+DEFAULT_ADULT_METADATA_BASE_URLS = (
+    "https://javdb.com",
+    "https://javbus.sbs",
+    "https://www.javbus.com",
+    "https://www.cdnbus.cyou",
+    "https://www.javsee.cyou",
+    "https://www.busjav.cyou",
+)
 DEFAULT_GENERATED_POSTER_SIZE = (600, 900)
-CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,10})[\s._-]+(\d{3,5})(?![\d-])", re.IGNORECASE)
+CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,10})[\s._-]?(\d{2,8})(?![\d-])", re.IGNORECASE)
 FC2_PPV_PATTERN = re.compile(r"(?<![A-Za-z0-9])FC2[\s._-]*PPV[\s._-]*(\d{5,10})(?!\d)", re.IGNORECASE)
+HEYZO_PATTERN = re.compile(r"(?<![A-Za-z0-9])HEYZO[\s._-]*(\d{3,6})(?!\d)", re.IGNORECASE)
+UNCENSORED_PATTERN = re.compile(r"(?<!\d)(\d{6})[\s._-](\d{3,5})(?!\d)", re.IGNORECASE)
+TITLE_TAG_RE = re.compile(r"(?is)<h[123][^>]*>(.*?)</h[123]>")
+HTML_TAG_RE = re.compile(r"(?is)<[^>]+>")
+ANCHOR_RE = re.compile(r"(?is)<a\b([^>]*)>(.*?)</a>")
+IMAGE_RE = re.compile(r"(?is)<img\b([^>]*)>")
+ATTR_RE = re.compile(r"""(?is)([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*["']([^"']*)["']""")
+JAVBUS_COVER_RE = re.compile(r"""(?is)class=["']bigImage["'][^>]*href=["']([^"']+)["']""")
+SAMPLE_RE = re.compile(r"""(?is)<a[^>]+class=["'][^"']*\bsample-box\b[^"']*["'][^>]+href=["']([^"']+)["']""")
+DATE_RE = re.compile(r"(?:19|20)\d{2}[-/.]\d{1,2}[-/.]\d{1,2}")
+RATING_RE = re.compile(r"(?i)(?:score|rating|評分|评分)[^0-9]{0,20}([0-9](?:\.[0-9])?)")
 CODE_PREFIX_DENYLIST = {
+    "AC",
     "AAC",
+    "AVC",
     "BD",
     "BDRIP",
     "BLURAY",
+    "CD",
+    "DDP",
     "DTS",
+    "FHD",
     "FLAC",
+    "FC2",
     "FULLHD",
+    "HD",
     "HDR",
     "HEVC",
     "H264",
     "H265",
     "IMAX",
     "MP4",
+    "MP",
+    "PPV",
+    "SD",
     "TRUEHD",
     "UHD",
     "UHDBD",
@@ -43,6 +74,12 @@ CODE_PREFIX_DENYLIST = {
     "WEBDL",
     "X264",
     "X265",
+}
+ADULT_TEXT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7",
 }
 ADULT_IMAGE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -57,6 +94,21 @@ class AdultArtworkCandidate:
     source: str
     role: str
     priority: int = 100
+
+
+@dataclass(frozen=True)
+class AdultMetadataMatch:
+    code: str
+    source: str
+    title: str = ""
+    detail_url: str = ""
+    poster_url: str = ""
+    backdrop_url: str = ""
+    year: int = 0
+    release_date: str = ""
+    rating: float = 0.0
+    genres: tuple = ()
+    nsfw: bool = True
 
 
 @dataclass(frozen=True)
@@ -84,6 +136,9 @@ class AdultMetadataProvider:
 
     def candidates(self, media, codes):
         return []
+
+    def search(self, media, codes):
+        return None
 
 
 class ExistingArtworkProvider(AdultMetadataProvider):
@@ -122,6 +177,78 @@ class DmmArtworkProvider(AdultMetadataProvider):
                 out.append(AdultArtworkCandidate(base + "%sjp-1.jpg" % cid, self.name, "backdrop", 45))
                 out.append(AdultArtworkCandidate(base + "%sjp.jpg" % cid, self.name, "backdrop", 50))
         return out
+
+
+class AdultHTMLMetadataProvider(AdultMetadataProvider):
+    name = "adult_html"
+
+    def __init__(self, bases=None, timeout=DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS, max_bytes=4 * 1024 * 1024):
+        self.bases = tuple(normalize_adult_base_urls(bases or DEFAULT_ADULT_METADATA_BASE_URLS))
+        self.timeout = max(1, int(timeout))
+        self.max_bytes = max(1024, int(max_bytes))
+
+    def search(self, media, codes):
+        for code in codes or []:
+            normalized_code = normalize_adult_code(code)
+            if not normalized_code:
+                continue
+            last_error = None
+            for base in self.bases:
+                try:
+                    if adult_source_kind(base) == "javbus":
+                        match = self._search_javbus(base, normalized_code)
+                    else:
+                        match = self._search_javdb(base, normalized_code)
+                except RuntimeError as exc:
+                    last_error = exc
+                    continue
+                if match:
+                    return match
+            if last_error:
+                continue
+        return None
+
+    def _search_javdb(self, base, code):
+        search_url = base.rstrip("/") + "/search?" + urllib.parse.urlencode({"q": code, "f": "all"})
+        body = self._fetch_text(search_url, referer=base)
+        detail_url = ""
+        for raw_attrs, raw_text in ANCHOR_RE.findall(body):
+            attrs = html_attrs(raw_attrs)
+            class_name = " " + attrs.get("class", "") + " "
+            href = attrs.get("href", "")
+            if " box " not in class_name or not href:
+                continue
+            if code in strip_html(raw_text).upper():
+                detail_url = absolutize_url(base, href)
+                break
+        if not detail_url:
+            return None
+        return parse_adult_detail_html(self._fetch_text(detail_url, referer=base), code, "javdb", detail_url)
+
+    def _search_javbus(self, base, code):
+        detail_url = base.rstrip("/") + "/" + urllib.parse.quote(code, safe="")
+        body = self._fetch_text(detail_url, referer=base)
+        return parse_adult_detail_html(body, code, "javbus", detail_url)
+
+    def _fetch_text(self, url, referer=""):
+        headers = dict(ADULT_TEXT_HEADERS)
+        if referer:
+            headers["Referer"] = referer
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                status = getattr(response, "status", 200)
+                if status == 404:
+                    return ""
+                if status >= 400:
+                    raise RuntimeError("adult source returned HTTP %s" % status)
+                return read_limited(response, self.max_bytes).decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return ""
+            raise RuntimeError("adult source returned HTTP %s" % exc.code) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError("adult source fetch failed: %s" % exc) from exc
 
 
 DEFAULT_ADULT_METADATA_PROVIDERS = (
@@ -204,11 +331,34 @@ def image_orientation(width, height):
     return "square"
 
 
-def build_adult_artwork_repair(media, cache_dir="", public_base_url="", generate_portrait=True, fetcher=None, providers=None):
+def build_adult_artwork_repair(
+    media,
+    cache_dir="",
+    public_base_url="",
+    generate_portrait=True,
+    fetcher=None,
+    providers=None,
+    metadata_provider=None,
+):
     if not isinstance(media, dict):
         return {"status": "skipped", "updated": 0, "reason": "invalid_media"}
-    candidates = collect_adult_artwork_candidates(media, providers=providers)
+    codes = adult_codes_from_media(media)
+    metadata_match = None
+    if metadata_provider is not False:
+        metadata_provider = metadata_provider or AdultHTMLMetadataProvider()
+        metadata_match = metadata_provider.search(media, codes)
+    patch = metadata_patch(media, metadata_match)
+    candidates = collect_adult_artwork_candidates(media, providers=providers, metadata_match=metadata_match)
     if not candidates:
+        if patch:
+            return {
+                "status": "success",
+                "updated": len(patch),
+                "reason": "metadata_repaired",
+                "fields": sorted(patch.keys()),
+                "patch": patch,
+                "metadata_source": metadata_match.source if metadata_match else None,
+            }
         return {"status": "skipped", "updated": 0, "reason": "candidate_not_found"}
 
     fetch = fetcher or AdultImageFetcher()
@@ -224,6 +374,16 @@ def build_adult_artwork_repair(media, cache_dir="", public_base_url="", generate
             probes.append(probe)
 
     if not probes:
+        if patch:
+            return {
+                "status": "success",
+                "updated": len(patch),
+                "reason": "metadata_repaired",
+                "fields": sorted(patch.keys()),
+                "patch": patch,
+                "metadata_source": metadata_match.source if metadata_match else None,
+                "errors": errors[:5],
+            }
         return {
             "status": "skipped",
             "updated": 0,
@@ -251,7 +411,6 @@ def build_adult_artwork_repair(media, cache_dir="", public_base_url="", generate
                 body=b"",
             )
 
-    patch = {}
     current_poster = str(media.get("poster_url") or "").strip()
     current_backdrop = str(media.get("backdrop_url") or "").strip()
     if portrait and normalize_url(current_poster) != normalize_url(portrait.url):
@@ -284,14 +443,21 @@ def build_adult_artwork_repair(media, cache_dir="", public_base_url="", generate
         "poster_source": getattr(portrait, "source", None) if portrait else None,
         "backdrop_source": getattr(landscape, "source", None) if landscape else None,
         "generated": generated,
+        "metadata_source": metadata_match.source if metadata_match else None,
     }
 
 
-def collect_adult_artwork_candidates(media, providers=None):
+def collect_adult_artwork_candidates(media, providers=None, metadata_match=None):
     providers = providers or DEFAULT_ADULT_METADATA_PROVIDERS
     codes = adult_codes_from_media(media)
     out = []
     seen = set()
+    if metadata_match:
+        for candidate in metadata_artwork_candidates(metadata_match):
+            key = normalize_url(candidate.url)
+            if key and key not in seen:
+                seen.add(key)
+                out.append(candidate)
     for provider in providers:
         for candidate in provider.candidates(media, codes):
             url = str(candidate.url or "").strip()
@@ -301,6 +467,40 @@ def collect_adult_artwork_candidates(media, providers=None):
             seen.add(key)
             out.append(candidate)
     return out
+
+
+def metadata_artwork_candidates(match):
+    out = []
+    if match.poster_url:
+        out.append(AdultArtworkCandidate(match.poster_url, match.source, "poster", 1))
+    if match.backdrop_url:
+        out.append(AdultArtworkCandidate(match.backdrop_url, match.source, "backdrop", 2))
+    return out
+
+
+def metadata_patch(media, match):
+    if not match:
+        return {}
+    patch = {}
+    for key, value in (
+        ("title", match.title),
+        ("original_name", match.code),
+        ("release_date", match.release_date),
+    ):
+        value = str(value or "").strip()
+        if value and str((media or {}).get(key) or "").strip() != value:
+            patch[key] = value
+    if match.year and int_value((media or {}).get("year")) != match.year:
+        patch["year"] = match.year
+    if match.rating and float_value((media or {}).get("rating")) != match.rating:
+        patch["rating"] = match.rating
+    if match.genres:
+        genres = ",".join(unique_strings(match.genres))
+        if genres and str((media or {}).get("genres") or "").strip() != genres:
+            patch["genres"] = genres
+    if match.nsfw and (media or {}).get("nsfw") is not True:
+        patch["nsfw"] = True
+    return patch
 
 
 def select_probe(probes, orientation):
@@ -377,11 +577,20 @@ def iter_code_matches(value):
     text = str(value or "")
     for match in FC2_PPV_PATTERN.finditer(text):
         yield "FC2-PPV-%s" % match.group(1)
+    for match in HEYZO_PATTERN.finditer(text):
+        yield "HEYZO-%s" % match.group(1)
+    for match in UNCENSORED_PATTERN.finditer(text):
+        yield "%s-%s" % (match.group(1), match.group(2))
     for match in CODE_PATTERN.finditer(text):
         prefix = match.group(1).upper()
         if prefix in CODE_PREFIX_DENYLIST:
             continue
-        yield "%s-%03d" % (prefix, int(match.group(2)))
+        yield "%s-%s" % (prefix, match.group(2))
+
+
+def normalize_adult_code(value):
+    codes = list(iter_code_matches(str(value or "").replace("_", "-").upper()))
+    return codes[0] if codes else ""
 
 
 def iter_dmm_cids(code):
@@ -416,3 +625,169 @@ def iter_mgstage_poster_candidates(value):
 
 def normalize_url(value):
     return str(value or "").strip()
+
+
+def normalize_adult_base_urls(value):
+    if isinstance(value, str):
+        raw_values = re.split(r"[,;\s]+", value)
+    else:
+        raw_values = list(value or [])
+    out = []
+    seen = set()
+    for raw in raw_values:
+        base = str(raw or "").strip()
+        if not base:
+            continue
+        if not base.startswith(("http://", "https://")):
+            base = "https://" + base
+        base = base.rstrip("/")
+        key = base.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(base)
+    return out
+
+
+def adult_source_kind(base):
+    host = urllib.parse.urlparse(str(base or "")).hostname or str(base or "")
+    host = host.lower()
+    if "javdb" in host:
+        return "javdb"
+    for needle in ("javbus", "cdnbus", "javsee", "busjav"):
+        if needle in host:
+            return "javbus"
+    return "javdb"
+
+
+def parse_adult_detail_html(body, code, source, detail_url):
+    title = first_adult_title(body, code)
+    if not title:
+        return None
+    poster_url = ""
+    if source == "javbus":
+        match = JAVBUS_COVER_RE.search(body or "")
+        if match:
+            poster_url = absolutize_url(detail_url, match.group(1))
+    else:
+        poster_url = first_adult_image(body, "video-cover", "cover", "column-video-cover")
+        if poster_url:
+            poster_url = absolutize_url(detail_url, poster_url)
+    backdrop_url = ""
+    match = SAMPLE_RE.search(body or "")
+    if match:
+        backdrop_url = absolutize_url(detail_url, match.group(1))
+    dmm_poster = dmm_poster_from_sample_url(backdrop_url)
+    if dmm_poster:
+        poster_url = dmm_poster
+    release_date = first_date(body)
+    year = int(release_date[:4]) if release_date else 0
+    return AdultMetadataMatch(
+        code=code,
+        source=source,
+        title=title,
+        detail_url=detail_url,
+        poster_url=poster_url,
+        backdrop_url=backdrop_url,
+        year=year,
+        release_date=release_date,
+        rating=first_rating(body),
+        genres=("Adult", source),
+        nsfw=True,
+    )
+
+
+def first_adult_title(body, code):
+    for raw in TITLE_TAG_RE.findall(body or ""):
+        title = strip_html(raw).strip()
+        if not title:
+            continue
+        for prefix in (str(code or ""), str(code or "").upper()):
+            if title.startswith(prefix):
+                title = title[len(prefix) :].strip()
+        if title:
+            return title
+    return ""
+
+
+def strip_html(value):
+    return " ".join(html.unescape(HTML_TAG_RE.sub(" ", str(value or ""))).split())
+
+
+def first_adult_image(body, *class_needles):
+    for raw_attrs in IMAGE_RE.findall(body or ""):
+        attrs = html_attrs(raw_attrs)
+        class_name = attrs.get("class", "").lower()
+        for needle in class_needles:
+            if needle.lower() in class_name:
+                return attrs.get("src") or attrs.get("data-src") or ""
+    return ""
+
+
+def html_attrs(raw):
+    return {key.lower(): html.unescape(value) for key, value in ATTR_RE.findall(raw or "")}
+
+
+def absolutize_url(base, raw):
+    raw = html.unescape(str(raw or "").strip())
+    if not raw:
+        return ""
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        return raw
+    return urllib.parse.urljoin(str(base or ""), raw)
+
+
+def dmm_poster_from_sample_url(raw):
+    parsed = urllib.parse.urlparse(str(raw or "").strip())
+    if not parsed.netloc or "dmm.co.jp" not in parsed.netloc.lower():
+        return ""
+    lower_path = parsed.path.lower()
+    for suffix in ("jp-1.jpg", "jp.jpg"):
+        if lower_path.endswith(suffix):
+            path = parsed.path[: -len(suffix)] + "pl.jpg"
+            return urllib.parse.urlunparse(parsed._replace(path=path))
+    return ""
+
+
+def first_date(body):
+    match = DATE_RE.search(body or "")
+    if not match:
+        return ""
+    return match.group(0).replace("/", "-").replace(".", "-")
+
+
+def first_rating(body):
+    match = RATING_RE.search(body or "")
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return 0.0
+
+
+def int_value(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def float_value(value):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def unique_strings(values):
+    out = []
+    seen = set()
+    for value in values or []:
+        text = str(value or "").strip()
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out

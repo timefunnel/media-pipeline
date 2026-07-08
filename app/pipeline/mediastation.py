@@ -146,7 +146,18 @@ class MediaStationClient:
         return self._request("GET", "/media/%s" % quote_path(media_id))
 
     def update_media_metadata(self, media_id, fields):
-        allowed = {"poster_url", "backdrop_url"}
+        allowed = {
+            "title",
+            "original_name",
+            "overview",
+            "poster_url",
+            "backdrop_url",
+            "year",
+            "release_date",
+            "rating",
+            "genres",
+            "nsfw",
+        }
         data = {key: value for key, value in (fields or {}).items() if key in allowed}
         if not data:
             raise ValueError("MediaStationGo metadata update fields missing")
@@ -161,6 +172,7 @@ class MediaStationClient:
         public_base_url="",
         generate_portrait=True,
         fetcher=None,
+        metadata_provider=None,
     ):
         media = self.get_media(media_id)
         if semantic_enabled:
@@ -170,6 +182,7 @@ class MediaStationClient:
                 public_base_url=public_base_url,
                 generate_portrait=generate_portrait,
                 fetcher=fetcher,
+                metadata_provider=metadata_provider,
             )
             if semantic_result.get("status") == "success" and semantic_result.get("patch"):
                 updated = self.update_media_metadata(media_id, semantic_result["patch"])

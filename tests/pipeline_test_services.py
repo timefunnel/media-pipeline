@@ -1781,12 +1781,65 @@ class MediaStationClientTest(unittest.TestCase):
         transport = SequenceTransport([{"tokens": {"access_token": "msg-token"}}, {"id": "media-1"}])
         client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
 
-        client.update_media_metadata("media-1", {"poster_url": "https://img/poster.jpg", "title": "ignored"})
+        client.update_media_metadata(
+            "media-1",
+            {
+                "poster_url": "https://img/poster.jpg",
+                "title": "SSIS-218 Title",
+                "nsfw": True,
+                "unexpected": "ignored",
+            },
+        )
 
         call = transport.calls[1]
         self.assertEqual(call["method"], "PATCH")
         self.assertEqual(call["url"], "http://127.0.0.1:18080/api/media/media-1/metadata")
-        self.assertEqual(call["data"], {"poster_url": "https://img/poster.jpg"})
+        self.assertEqual(call["data"], {"poster_url": "https://img/poster.jpg", "title": "SSIS-218 Title", "nsfw": True})
+
+    def test_adult_metadata_base_urls_normalizes_and_deduplicates(self):
+        self.assertEqual(
+            normalize_adult_base_urls("javdb.com, https://javdb.com ; javbus.sbs"),
+            ["https://javdb.com", "https://javbus.sbs"],
+        )
+
+    def test_adult_metadata_parse_javdb_detail(self):
+        html = """
+        <html>
+          <h2>SSIS-218 测试标题</h2>
+          <img class="video-cover" src="/covers/ssis218.jpg">
+          <a class="sample-box" href="https://pics.dmm.co.jp/digital/video/ssis00218/ssis00218jp-1.jpg">sample</a>
+          發行日期: 2024-01-02 score 8.1
+        </html>
+        """
+
+        match = parse_adult_detail_html(html, "SSIS-218", "javdb", "https://javdb.com/v/abc")
+
+        self.assertEqual(match.title, "测试标题")
+        self.assertEqual(match.poster_url, "https://pics.dmm.co.jp/digital/video/ssis00218/ssis00218pl.jpg")
+        self.assertEqual(match.backdrop_url, "https://pics.dmm.co.jp/digital/video/ssis00218/ssis00218jp-1.jpg")
+        self.assertEqual(match.release_date, "2024-01-02")
+        self.assertEqual(match.year, 2024)
+        self.assertEqual(match.rating, 8.1)
+
+    def test_adult_metadata_provider_searches_configured_javdb_source(self):
+        class FakeAdultProvider(AdultHTMLMetadataProvider):
+            def __init__(self):
+                super().__init__(bases=["https://javdb.test"], timeout=1)
+                self.urls = []
+
+            def _fetch_text(self, url, referer=""):
+                self.urls.append(url)
+                if "/search?" in url:
+                    return '<a class="box" href="/v/abc"><strong>SSIS-218</strong></a>'
+                return '<h2>SSIS-218 站点标题</h2><img class="video-cover" src="/cover.jpg">'
+
+        provider = FakeAdultProvider()
+        match = provider.search({"title": "SSIS-218"}, ["SSIS-218"])
+
+        self.assertEqual(match.title, "站点标题")
+        self.assertEqual(match.source, "javdb")
+        self.assertEqual(match.poster_url, "https://javdb.test/cover.jpg")
+        self.assertEqual(provider.urls[0], "https://javdb.test/search?q=SSIS-218&f=all")
 
     def test_adult_artwork_semantic_repair_swaps_portrait_and_landscape(self):
         class FakeFetcher:
@@ -1809,6 +1862,15 @@ class MediaStationClientTest(unittest.TestCase):
                     b"image",
                 )
 
+        class FakeMetadataProvider:
+            def search(self, media, codes):
+                return parse_adult_detail_html(
+                    '<h2>SSIS-218 新标题</h2><a class="sample-box" href="https://img/current-poster.jpg">sample</a>',
+                    "SSIS-218",
+                    "javdb",
+                    "https://javdb.test/v/abc",
+                )
+
         result = build_adult_artwork_repair(
             {
                 "title": "SSIS-218",
@@ -1816,16 +1878,14 @@ class MediaStationClientTest(unittest.TestCase):
                 "backdrop_url": "https://img/current-backdrop.jpg",
             },
             fetcher=FakeFetcher(),
+            metadata_provider=FakeMetadataProvider(),
         )
 
         self.assertEqual(result["status"], "success")
-        self.assertEqual(
-            result["patch"],
-            {
-                "poster_url": "https://img/current-backdrop.jpg",
-                "backdrop_url": "https://img/current-poster.jpg",
-            },
-        )
+        self.assertEqual(result["patch"]["title"], "新标题")
+        self.assertEqual(result["patch"]["original_name"], "SSIS-218")
+        self.assertEqual(result["patch"]["poster_url"], "https://img/current-backdrop.jpg")
+        self.assertEqual(result["patch"]["backdrop_url"], "https://img/current-poster.jpg")
 
     def test_adult_artwork_semantic_repair_generates_portrait_from_landscape(self):
         from PIL import Image
@@ -1856,6 +1916,7 @@ class MediaStationClientTest(unittest.TestCase):
                 cache_dir=tmp,
                 public_base_url="https://privdo.example",
                 fetcher=FakeFetcher(),
+                metadata_provider=False,
             )
 
             self.assertEqual(result["status"], "success")
@@ -1887,6 +1948,7 @@ class MediaStationClientTest(unittest.TestCase):
             },
             public_base_url="",
             fetcher=FakeFetcher(),
+            metadata_provider=False,
         )
 
         self.assertEqual(result["status"], "skipped")

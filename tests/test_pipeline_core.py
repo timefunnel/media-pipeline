@@ -49,9 +49,12 @@ from pipeline.mediastation import (
     reachable_image_url,
 )
 from pipeline.adult_metadata import (
+    AdultHTMLMetadataProvider,
     AdultImageProbe,
     build_adult_artwork_repair,
     image_orientation,
+    normalize_adult_base_urls,
+    parse_adult_detail_html,
 )
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes, normalize_task, task_can_cancel, wait_for_task
 from pipeline.openlist import OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider, extract_openlist_login_token
