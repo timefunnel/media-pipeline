@@ -733,7 +733,8 @@ class TelegramBotTest(unittest.TestCase):
         self.assertIn("直接发送关键词、番号或磁链即可", telegram.messages[0]["text"])
         self.assertIn("/tasks 查看最近任务", telegram.messages[0]["text"])
         self.assertIn("/diag <info_hash|media_id>", telegram.messages[0]["text"])
-        self.assertIn("/migrate <关键词>", telegram.messages[0]["text"])
+        self.assertIn("/migrate 迁移已有媒体到其他库", telegram.messages[0]["text"])
+        self.assertIn("/cancel 退出当前等待输入", telegram.messages[0]["text"])
         self.assertIn("搜索统计会显示来源、耗时、返回/展示数量和 LLM 重排状态", telegram.messages[0]["text"])
 
     def test_migrate_command_searches_msg_and_prompts_candidates(self):
@@ -766,6 +767,94 @@ class TelegramBotTest(unittest.TestCase):
         self.assertIn("/115/剧集/成龙历险记", telegram.messages[0]["text"])
         self.assertEqual(button["text"], "迁移 1")
         self.assertEqual(stored["candidate"]["title"], "成龙历险记")
+
+    def test_migrate_command_accepts_non_ascii_and_newline_whitespace(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        migration_candidate = {
+            "title": "成龙历险记",
+            "category": "tv",
+            "library_name": "剧集",
+            "source_openlist_path": "/115/剧集/成龙历险记",
+            "source_kind": "folder",
+            "media_count": 95,
+            "total_size": 10 * 1024 * 1024 * 1024,
+        }
+        for text in ("/migrate\u3000成龙历险记", "/migrate\n成龙历险记"):
+            with tempfile.TemporaryDirectory() as tmp:
+                store = CandidateStore(str(Path(tmp) / "state.db"))
+                telegram = FakeTelegram()
+                service = FakeBotService(migration_candidates=[migration_candidate])
+                bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+                bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": text}})
+
+                self.assertEqual(service.migration_search_calls, [("成龙历险记", 20)])
+                self.assertEqual(service.search_calls, [])
+                self.assertIn("媒体迁移搜索：成龙历险记", telegram.messages[0]["text"])
+
+    def test_migrate_command_without_argument_waits_for_next_keyword(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        migration_candidate = {
+            "title": "成龙历险记",
+            "category": "tv",
+            "library_name": "剧集",
+            "source_openlist_path": "/115/剧集/成龙历险记",
+            "source_kind": "folder",
+            "media_count": 95,
+            "total_size": 10 * 1024 * 1024 * 1024,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService(migration_candidates=[migration_candidate])
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/migrate"}})
+            self.assertIn("请发送要迁移的媒体关键词", telegram.messages[0]["text"])
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "成龙历险记"}})
+
+            self.assertEqual(service.migration_search_calls, [("成龙历险记", 20)])
+            self.assertEqual(service.search_calls, [])
+            self.assertIn("媒体迁移搜索：成龙历险记", telegram.messages[1]["text"])
+            self.assertIsNone(store.load_pending_action(700656624, 9001))
+
+    def test_migrate_pending_can_be_cancelled(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        for cancel_text in ("取消", "/cancel"):
+            with tempfile.TemporaryDirectory() as tmp:
+                store = CandidateStore(str(Path(tmp) / "state.db"))
+                telegram = FakeTelegram()
+                service = FakeBotService()
+                bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+                bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/migrate"}})
+                bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": cancel_text}})
+
+                self.assertEqual(service.migration_search_calls, [])
+                self.assertEqual(service.search_calls, [])
+                self.assertIn("已退出当前等待输入", telegram.messages[1]["text"])
+                self.assertIsNone(store.load_pending_action(700656624, 9001))
+
+    def test_migrate_pending_is_interrupted_by_other_command(self):
+        from pipeline.bot import BotConfig, CandidateStore, TelegramBot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            telegram = FakeTelegram()
+            service = FakeBotService()
+            bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
+
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/migrate"}})
+            bot.handle_update({"message": {"chat": {"id": 9001}, "from": {"id": 700656624}, "text": "/help"}})
+
+            self.assertEqual(service.migration_search_calls, [])
+            self.assertEqual(service.search_calls, [])
+            self.assertIn("直接发送关键词、番号或磁链即可", telegram.messages[1]["text"])
+            self.assertIsNone(store.load_pending_action(700656624, 9001))
 
     def test_migrate_callbacks_confirm_and_execute(self):
         from pipeline.bot import BotConfig, CandidateStore, TelegramBot

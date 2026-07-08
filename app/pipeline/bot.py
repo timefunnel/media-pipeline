@@ -249,10 +249,11 @@ HELP_TEXT = """直接发送关键词、番号或磁链即可。
 /tasks 查看最近任务
 /status <info_hash> 查询任务状态
 /diag <info_hash|media_id> 查看任务或MSG媒体诊断
-/migrate <关键词> 迁移已有媒体到其他库
+/migrate 迁移已有媒体到其他库，下一条消息输入关键词
 /subtitle_report 查看成人库字幕补齐统计
 /subtitle_find <番号或标题> 查找成人库影片并重配字幕
 /dedupe_refresh 刷新已入库记录（需二次确认）
+/cancel 退出当前等待输入
 /version 查看当前版本
 
 搜索统计会显示来源、耗时、返回/展示数量和 LLM 重排状态。
@@ -267,8 +268,16 @@ BOT_COMMANDS = [
     {"command": "subtitle_report", "description": "查看成人库字幕补齐统计"},
     {"command": "subtitle_find", "description": "按番号或标题查找字幕影片"},
     {"command": "dedupe_refresh", "description": "刷新重复判断索引（需二次确认）"},
+    {"command": "cancel", "description": "退出当前等待输入"},
     {"command": "version", "description": "查看当前版本"},
 ]
+
+PENDING_ACTION_MIGRATE_QUERY = "migrate_query"
+MIGRATE_PROMPT_TEXT = """媒体迁移
+
+请发送要迁移的媒体关键词。
+发送 取消、退出、q 或 /cancel 退出迁移。"""
+PENDING_CANCEL_TEXTS = {"取消", "退出", "q", "Q"}
 
 SUBTITLE_FIND_PROMPT_TEXT = """字幕影片查找
 
@@ -646,6 +655,18 @@ class CandidateStore:
             )
             conn.execute(
                 """
+                create table if not exists pending_actions (
+                    user_id integer not null,
+                    chat_id integer not null,
+                    action text not null,
+                    payload_json text not null,
+                    created_at integer not null,
+                    primary key (user_id, chat_id)
+                )
+                """
+            )
+            conn.execute(
+                """
                 create table if not exists dedupe_index (
                     id integer primary key autoincrement,
                     category text not null,
@@ -928,6 +949,54 @@ class CandidateStore:
             "query": row[2],
             "candidate": json.loads(row[3]),
         }
+
+    def save_pending_action(self, user_id, chat_id, action, payload=None):
+        payload_json = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                insert into pending_actions (user_id, chat_id, action, payload_json, created_at)
+                values (?, ?, ?, ?, ?)
+                on conflict(user_id, chat_id) do update set
+                    action = excluded.action,
+                    payload_json = excluded.payload_json,
+                    created_at = excluded.created_at
+                """,
+                (int(user_id), int(chat_id), action, payload_json, int(time.time())),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load_pending_action(self, user_id, chat_id):
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                select action, payload_json, created_at
+                from pending_actions
+                where user_id = ? and chat_id = ?
+                """,
+                (int(user_id), int(chat_id)),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {"action": row[0], "payload": json.loads(row[1]), "created_at": row[2]}
+
+    def clear_pending_action(self, user_id, chat_id):
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                "delete from pending_actions where user_id = ? and chat_id = ?",
+                (int(user_id), int(chat_id)),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
 
     def save_task(self, user_id, chat_id, category, title, task):
         info_hash = str((task or {}).get("info_hash") or "").strip()
@@ -2566,6 +2635,17 @@ class TelegramBot:
             return
 
         command, argument = split_command(text)
+        is_command = command.startswith("/")
+        if command == "/cancel":
+            self._handle_cancel_command(chat_id, user_id)
+            return
+        if is_command and command != "/migrate":
+            self.store.clear_pending_action(user_id, chat_id)
+        if not is_command:
+            pending = self.store.load_pending_action(user_id, chat_id)
+            if pending is not None:
+                self._handle_pending_message(chat_id, user_id, text, pending)
+                return
         if command == "/start":
             self.telegram.send_message(chat_id, START_TEXT)
             return
@@ -3523,8 +3603,10 @@ class TelegramBot:
     def _handle_migrate_command(self, chat_id, user_id, argument):
         query = str(argument or "").strip()
         if not query:
-            self.telegram.send_message(chat_id, "请输入要迁移的媒体关键词，例如：/migrate 成龙历险记")
+            self.store.save_pending_action(user_id, chat_id, PENDING_ACTION_MIGRATE_QUERY)
+            self.telegram.send_message(chat_id, MIGRATE_PROMPT_TEXT)
             return
+        self.store.clear_pending_action(user_id, chat_id)
         try:
             candidates = self.service.search_migration_candidates(query, limit=20)
         except (RuntimeError, ValueError) as exc:
@@ -3543,6 +3625,25 @@ class TelegramBot:
             format_migration_search_message(query, saved),
             reply_markup=migration_search_reply_markup(saved),
         )
+
+    def _handle_pending_message(self, chat_id, user_id, text, pending):
+        if text in PENDING_CANCEL_TEXTS:
+            self.store.clear_pending_action(user_id, chat_id)
+            self.telegram.send_message(chat_id, "已退出当前等待输入")
+            return
+        action = pending.get("action")
+        self.store.clear_pending_action(user_id, chat_id)
+        if action == PENDING_ACTION_MIGRATE_QUERY:
+            with self._typing_action(chat_id):
+                self._handle_migrate_command(chat_id, user_id, text)
+            return
+        self.telegram.send_message(chat_id, "已退出未知等待输入")
+
+    def _handle_cancel_command(self, chat_id, user_id):
+        if self.store.clear_pending_action(user_id, chat_id):
+            self.telegram.send_message(chat_id, "已退出当前等待输入")
+            return
+        self.telegram.send_message(chat_id, "当前没有等待输入的操作")
 
     def _handle_migrate_select_callback(self, user_id, chat_id, message_id, callback_id, candidate_id):
         record = self._load_owned_migration_candidate(user_id, callback_id, candidate_id)
@@ -4583,7 +4684,11 @@ class TypingActionPulse:
 
 
 def split_command(text):
-    command, _, argument = text.partition(" ")
+    parts = str(text or "").strip().split(None, 1)
+    if not parts:
+        return "", ""
+    command = parts[0]
+    argument = parts[1] if len(parts) > 1 else ""
     command = command.split("@", 1)[0]
     return command, argument.strip()
 
