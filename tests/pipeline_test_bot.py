@@ -52,6 +52,8 @@ class BotConfigTest(unittest.TestCase):
         self.assertTrue(config.openlist_pre_scan_clean_enabled)
         self.assertEqual(config.openlist_pre_scan_clean_max_bytes, 20 * 1024 * 1024)
         self.assertTrue(config.openlist_adult_code_format_enabled)
+        self.assertTrue(config.adult_external_scraper_enabled)
+        self.assertTrue(config.adult_artwork_generate_portrait_enabled)
 
     def test_bot_config_reads_openlist_pre_scan_clean_switch(self):
         from pipeline.bot import BotConfig
@@ -93,6 +95,25 @@ class BotConfigTest(unittest.TestCase):
         )
 
         self.assertFalse(config.openlist_adult_code_format_enabled)
+
+    def test_bot_config_reads_adult_artwork_switches(self):
+        from pipeline.bot import BotConfig
+
+        config = BotConfig.from_env(
+            {
+                "TG_BOT_TOKEN": "123:token",
+                "TG_ALLOWED_USER_IDS": "700656624",
+                "ADULT_EXTERNAL_SCRAPER_ENABLED": "0",
+                "ADULT_ARTWORK_CACHE_DIR": "/cache/adult",
+                "ADULT_ARTWORK_PUBLIC_BASE_URL": "https://privdo.example",
+                "ADULT_ARTWORK_GENERATE_PORTRAIT_ENABLED": "0",
+            }
+        )
+
+        self.assertFalse(config.adult_external_scraper_enabled)
+        self.assertEqual(config.adult_artwork_cache_dir, "/cache/adult")
+        self.assertEqual(config.adult_artwork_public_base_url, "https://privdo.example")
+        self.assertFalse(config.adult_artwork_generate_portrait_enabled)
 
     def test_bot_config_reads_sync_recovery_interval(self):
         from pipeline.bot import BotConfig

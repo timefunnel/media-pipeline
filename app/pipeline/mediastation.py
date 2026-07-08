@@ -4,6 +4,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from pipeline.adult_metadata import (
+    DEFAULT_ADULT_ARTWORK_CACHE_DIR,
+    build_adult_artwork_repair,
+)
+
 
 DEFAULT_MSG_BASE_URL = "http://127.0.0.1:18080/api"
 CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,10})[\s._-]+(\d{3,4})(?![\d-])", re.IGNORECASE)
@@ -147,8 +152,33 @@ class MediaStationClient:
             raise ValueError("MediaStationGo metadata update fields missing")
         return self._request("PATCH", "/media/%s/metadata" % quote_path(media_id), data=data)
 
-    def repair_adult_artwork(self, media_id, verifier=None):
+    def repair_adult_artwork(
+        self,
+        media_id,
+        verifier=None,
+        semantic_enabled=True,
+        cache_dir=DEFAULT_ADULT_ARTWORK_CACHE_DIR,
+        public_base_url="",
+        generate_portrait=True,
+        fetcher=None,
+    ):
         media = self.get_media(media_id)
+        if semantic_enabled:
+            semantic_result = build_adult_artwork_repair(
+                media,
+                cache_dir=cache_dir,
+                public_base_url=public_base_url,
+                generate_portrait=generate_portrait,
+                fetcher=fetcher,
+            )
+            if semantic_result.get("status") == "success" and semantic_result.get("patch"):
+                updated = self.update_media_metadata(media_id, semantic_result["patch"])
+                return {
+                    **semantic_result,
+                    "media": updated,
+                }
+            if semantic_result.get("reason") not in ("candidate_not_found", "usable_image_not_found"):
+                return semantic_result
         if not adult_media_artwork_needs_repair(media):
             return {"status": "skipped", "updated": 0, "reason": "not_needed"}
         patch = adult_artwork_repair_patch(media, verifier=verifier)

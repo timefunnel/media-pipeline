@@ -50,6 +50,7 @@ from pipeline.external_subtitles import (
     DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS,
     build_subtitle_matcher_from_config,
 )
+from pipeline.adult_metadata import DEFAULT_ADULT_ARTWORK_CACHE_DIR
 from pipeline.openlist_utils import (
     is_openlist_video_file,
     normalize_openlist_path,
@@ -381,6 +382,10 @@ class BotConfig:
     subtitle_search_timeout_seconds: int = DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS
     subtitle_download_max_bytes: int = DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES
     subtitle_backfill_default_limit: int = DEFAULT_SUBTITLE_BACKFILL_LIMIT
+    adult_external_scraper_enabled: bool = True
+    adult_artwork_cache_dir: str = DEFAULT_ADULT_ARTWORK_CACHE_DIR
+    adult_artwork_public_base_url: str = ""
+    adult_artwork_generate_portrait_enabled: bool = True
     assrt_api_token: str = ""
     opensubtitles_api_key: str = ""
     opensubtitles_username: str = ""
@@ -493,6 +498,10 @@ class BotConfig:
             subtitle_backfill_default_limit=normalize_subtitle_backfill_limit(
                 env.get("SUBTITLE_BACKFILL_DEFAULT_LIMIT", str(DEFAULT_SUBTITLE_BACKFILL_LIMIT))
             ),
+            adult_external_scraper_enabled=parse_bool(env.get("ADULT_EXTERNAL_SCRAPER_ENABLED"), True),
+            adult_artwork_cache_dir=env.get("ADULT_ARTWORK_CACHE_DIR", DEFAULT_ADULT_ARTWORK_CACHE_DIR),
+            adult_artwork_public_base_url=(env.get("ADULT_ARTWORK_PUBLIC_BASE_URL") or "").strip(),
+            adult_artwork_generate_portrait_enabled=parse_bool(env.get("ADULT_ARTWORK_GENERATE_PORTRAIT_ENABLED"), True),
             assrt_api_token=env.get("ASSRT_API_TOKEN", ""),
             opensubtitles_api_key=env.get("OPENSUBTITLES_API_KEY", ""),
             opensubtitles_username=env.get("OPENSUBTITLES_USERNAME", ""),
@@ -2245,7 +2254,13 @@ class PipelineBotService:
         }
 
     def _repair_msg_adult_artwork(self, client, media_id):
-        result = client.repair_adult_artwork(media_id)
+        result = client.repair_adult_artwork(
+            media_id,
+            semantic_enabled=self.config.adult_external_scraper_enabled,
+            cache_dir=self.config.adult_artwork_cache_dir,
+            public_base_url=self.config.adult_artwork_public_base_url,
+            generate_portrait=self.config.adult_artwork_generate_portrait_enabled,
+        )
         if not isinstance(result, dict):
             raise RuntimeError("MediaStationGo adult artwork repair returned invalid response")
         status = result.get("status")
@@ -2256,6 +2271,8 @@ class PipelineBotService:
             "msg_artwork_repair_updated": int(result.get("updated") or 0),
             "msg_artwork_repair_reason": result.get("reason"),
             "msg_artwork_repair_fields": ",".join(result.get("fields") or []),
+            "msg_artwork_repair_poster_source": result.get("poster_source"),
+            "msg_artwork_repair_backdrop_source": result.get("backdrop_source"),
             "msg_artwork_repair_error": None,
         }
 

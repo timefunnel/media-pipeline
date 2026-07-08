@@ -1788,6 +1788,133 @@ class MediaStationClientTest(unittest.TestCase):
         self.assertEqual(call["url"], "http://127.0.0.1:18080/api/media/media-1/metadata")
         self.assertEqual(call["data"], {"poster_url": "https://img/poster.jpg"})
 
+    def test_adult_artwork_semantic_repair_swaps_portrait_and_landscape(self):
+        class FakeFetcher:
+            def fetch(self, candidate):
+                dimensions_by_url = {
+                    "https://img/current-poster.jpg": (800, 540),
+                    "https://img/current-backdrop.jpg": (600, 900),
+                }
+                if candidate.url not in dimensions_by_url:
+                    raise RuntimeError("not found")
+                dimensions = dimensions_by_url[candidate.url]
+                return AdultImageProbe(
+                    candidate.url,
+                    candidate.source,
+                    candidate.role,
+                    candidate.priority,
+                    dimensions[0],
+                    dimensions[1],
+                    "image/jpeg",
+                    b"image",
+                )
+
+        result = build_adult_artwork_repair(
+            {
+                "title": "SSIS-218",
+                "poster_url": "https://img/current-poster.jpg",
+                "backdrop_url": "https://img/current-backdrop.jpg",
+            },
+            fetcher=FakeFetcher(),
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(
+            result["patch"],
+            {
+                "poster_url": "https://img/current-backdrop.jpg",
+                "backdrop_url": "https://img/current-poster.jpg",
+            },
+        )
+
+    def test_adult_artwork_semantic_repair_generates_portrait_from_landscape(self):
+        from PIL import Image
+
+        source = io.BytesIO()
+        Image.new("RGB", (800, 540), (120, 80, 40)).save(source, format="JPEG")
+
+        class FakeFetcher:
+            def fetch(self, candidate):
+                return AdultImageProbe(
+                    candidate.url,
+                    candidate.source,
+                    candidate.role,
+                    candidate.priority,
+                    800,
+                    540,
+                    "image/jpeg",
+                    source.getvalue(),
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = build_adult_artwork_repair(
+                {
+                    "title": "SSIS-218",
+                    "poster_url": "https://img/current-poster.jpg",
+                    "backdrop_url": "",
+                },
+                cache_dir=tmp,
+                public_base_url="https://privdo.example",
+                fetcher=FakeFetcher(),
+            )
+
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["reason"], "portrait_generated")
+            self.assertIn("https://privdo.example/pipeline-artwork/adult/", result["patch"]["poster_url"])
+            self.assertEqual(result["patch"]["backdrop_url"], "https://img/current-poster.jpg")
+            self.assertTrue(os.path.exists(result["generated"]["path"]))
+            self.assertEqual(image_orientation(result["generated"]["width"], result["generated"]["height"]), "portrait")
+
+    def test_adult_artwork_semantic_repair_requires_public_base_url_to_generate(self):
+        class FakeFetcher:
+            def fetch(self, candidate):
+                return AdultImageProbe(
+                    candidate.url,
+                    candidate.source,
+                    candidate.role,
+                    candidate.priority,
+                    800,
+                    540,
+                    "image/jpeg",
+                    b"image",
+                )
+
+        result = build_adult_artwork_repair(
+            {
+                "title": "SSIS-218",
+                "poster_url": "https://img/current-poster.jpg",
+                "backdrop_url": "https://img/current-poster.jpg",
+            },
+            public_base_url="",
+            fetcher=FakeFetcher(),
+        )
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "public_base_url_missing")
+
+    def test_adult_artwork_cache_serves_safe_generated_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cover.jpg")
+            with open(path, "wb") as handle:
+                handle.write(b"jpeg-body")
+
+            handler = object.__new__(SubtitleProxyHandler)
+            handler.path = "/pipeline-artwork/adult/cover.jpg"
+            handler.adult_artwork_cache_dir = tmp
+            written = io.BytesIO()
+            sent_headers = []
+            handler.wfile = written
+            handler.send_response = lambda status: sent_headers.append(("status", status))
+            handler.send_header = lambda key, value: sent_headers.append((key, value))
+            handler.end_headers = lambda: sent_headers.append(("end", None))
+            handler._mark_timing = lambda timing, name: None
+            handler._log_timing = lambda timing, status, request_path: None
+
+            self.assertTrue(handler._serve_adult_artwork_cache())
+            self.assertEqual(written.getvalue(), b"jpeg-body")
+            self.assertIn(("status", 200), sent_headers)
+            self.assertIn(("Content-Type", "image/jpeg"), sent_headers)
+
     def test_adult_artwork_repair_patch_prefers_mgstage_poster(self):
         media = {
             "title": "ABF-159",

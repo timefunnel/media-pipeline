@@ -362,6 +362,12 @@ def append_task_lines(lines, task, category=None):
             lines.append("成人图片修复：进行中")
         elif task.get("msg_artwork_repair_reason") == "replacement_not_found":
             lines.append("成人图片修复：未完成（未找到可直连替代图源）")
+        elif task.get("msg_artwork_repair_reason") == "public_base_url_missing":
+            lines.append("成人图片修复：未完成（未配置公开图片地址）")
+        elif task.get("msg_artwork_repair_reason") == "usable_image_not_found":
+            lines.append("成人图片修复：未完成（候选图不可用）")
+        elif task.get("msg_artwork_repair_reason") == "not_needed":
+            lines.append("成人图片修复：无需处理")
         elif task.get("msg_artwork_repair_status") != "skipped":
             lines.append("成人图片修复：失败")
             if task.get("msg_artwork_repair_error"):

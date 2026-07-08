@@ -48,6 +48,11 @@ from pipeline.mediastation import (
     iter_mgstage_poster_candidates,
     reachable_image_url,
 )
+from pipeline.adult_metadata import (
+    AdultImageProbe,
+    build_adult_artwork_repair,
+    image_orientation,
+)
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes, normalize_task, task_can_cancel, wait_for_task
 from pipeline.openlist import OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider, extract_openlist_login_token
 from pipeline.openlist_tokens import OpenListTokenStore
@@ -406,7 +411,7 @@ class FakeMediaStationClient:
         self.scrape_apply_calls.append((media_id, match))
         return {"ok": True}
 
-    def repair_adult_artwork(self, media_id):
+    def repair_adult_artwork(self, media_id, **kwargs):
         self.artwork_repair_calls.append(media_id)
         if self.events is not None:
             self.events.append(("artwork_repair",))

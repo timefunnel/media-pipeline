@@ -88,6 +88,10 @@ services:
       SUBTITLE_SEARCH_TIMEOUT_SECONDS: "${SUBTITLE_SEARCH_TIMEOUT_SECONDS:-12}"
       SUBTITLE_DOWNLOAD_MAX_BYTES: "${SUBTITLE_DOWNLOAD_MAX_BYTES:-2097152}"
       SUBTITLE_BACKFILL_DEFAULT_LIMIT: "${SUBTITLE_BACKFILL_DEFAULT_LIMIT:-20}"
+      ADULT_EXTERNAL_SCRAPER_ENABLED: "${ADULT_EXTERNAL_SCRAPER_ENABLED:-1}"
+      ADULT_ARTWORK_CACHE_DIR: "${ADULT_ARTWORK_CACHE_DIR:-/artwork-cache/adult}"
+      ADULT_ARTWORK_PUBLIC_BASE_URL: "${ADULT_ARTWORK_PUBLIC_BASE_URL:-}"
+      ADULT_ARTWORK_GENERATE_PORTRAIT_ENABLED: "${ADULT_ARTWORK_GENERATE_PORTRAIT_ENABLED:-1}"
       ASSRT_API_TOKEN: "${ASSRT_API_TOKEN:-}"
       OPENSUBTITLES_API_KEY: "${OPENSUBTITLES_API_KEY:-}"
       OPENSUBTITLES_USERNAME: "${OPENSUBTITLES_USERNAME:-}"
@@ -138,6 +142,7 @@ services:
       - /data/Prowlarr/config:/prowlarr-config:ro
       - /data/media-pipeline/bot:/bot-data
       - /data/media-pipeline/subtitles:/subtitle-cache
+      - /data/media-pipeline/artwork:/artwork-cache
 
   media-pipeline-subtitle-proxy:
     build:
@@ -160,7 +165,9 @@ services:
       MSG_ADMIN_USER: "${MSG_ADMIN_USER:-admin}"
       MSG_ADMIN_PASSWORD: "${MSG_ADMIN_PASSWORD:?MSG_ADMIN_PASSWORD missing}"
       SUBTITLE_CACHE_DIR: "${SUBTITLE_CACHE_DIR:-/subtitle-cache}"
+      ADULT_ARTWORK_CACHE_DIR: "${ADULT_ARTWORK_CACHE_DIR:-/artwork-cache/adult}"
     restart: unless-stopped
     command: ["subtitle-proxy"]
     volumes:
       - /data/media-pipeline/subtitles:/subtitle-cache
+      - /data/media-pipeline/artwork:/artwork-cache:ro

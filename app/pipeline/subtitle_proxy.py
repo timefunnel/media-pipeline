@@ -19,6 +19,7 @@ except ImportError:
     Image = None
     ImageOps = None
 
+from pipeline.adult_metadata import ADULT_ARTWORK_PUBLIC_PATH, DEFAULT_ADULT_ARTWORK_CACHE_DIR
 from pipeline.config import category_to_msg_library_root
 from pipeline.mediastation import iter_code_matches
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider
@@ -1033,6 +1034,25 @@ def unique_values(values):
     return out
 
 
+def safe_artwork_filename(filename):
+    filename = str(filename or "")
+    if not filename or "/" in filename or "\\" in filename or filename in (".", ".."):
+        return False
+    lowered = filename.lower()
+    if not lowered.endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return False
+    return bool(re.match(r"^[A-Za-z0-9._-]+$", filename))
+
+
+def artwork_content_type(filename):
+    lowered = str(filename or "").lower()
+    if lowered.endswith(".png"):
+        return "image/png"
+    if lowered.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
+
+
 class OpenListSubtitleProvider:
     def __init__(self, base_url=DEFAULT_OPENLIST_URL, username="", password="", timeout=30):
         self.base_url = str(base_url or DEFAULT_OPENLIST_URL).rstrip("/")
@@ -1361,6 +1381,7 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
     msg_api_auth = None
     openlist_subtitle_provider = None
     local_subtitle_provider = None
+    adult_artwork_cache_dir = DEFAULT_ADULT_ARTWORK_CACHE_DIR
     folder_cover_cache = {}
     folder_image_cache = {}
     folder_id_cache = {}
@@ -1394,6 +1415,8 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             for key, value in self.headers.items()
             if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() not in ("host", "content-length")
         }
+        if method in ("GET", "HEAD") and self._serve_adult_artwork_cache(head_only=head_only):
+            return
         if method == "GET" and not head_only and self._serve_emby_folder_image(headers):
             return
         if method == "GET" and not head_only and self._serve_emby_subtitle_stream(headers, timing=timing):
@@ -1420,6 +1443,58 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(("subtitle proxy upstream error: %s\n" % exc).encode("utf-8"))
             self._mark_timing(timing, "upstream_error")
             self._log_timing(timing, 502, self.path)
+
+    def _serve_adult_artwork_cache(self, head_only=False):
+        parsed = urllib.parse.urlparse(self.path)
+        public_prefix = ADULT_ARTWORK_PUBLIC_PATH.rstrip("/") + "/"
+        if not parsed.path.startswith(public_prefix):
+            return False
+        raw_name = urllib.parse.unquote(parsed.path[len(public_prefix) :])
+        filename = posixpath.basename(raw_name)
+        if filename != raw_name or not safe_artwork_filename(filename):
+            self._write_response(
+                404,
+                {"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"},
+                b"",
+                head_only=head_only,
+                request_path=self.path,
+            )
+            return True
+        root = os.path.abspath(self.adult_artwork_cache_dir)
+        path = os.path.abspath(os.path.join(root, filename))
+        if not path.startswith(root + os.sep):
+            self._write_response(
+                404,
+                {"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"},
+                b"",
+                head_only=head_only,
+                request_path=self.path,
+            )
+            return True
+        if not os.path.isfile(path):
+            self._write_response(
+                404,
+                {"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"},
+                b"",
+                head_only=head_only,
+                request_path=self.path,
+            )
+            return True
+        with open(path, "rb") as handle:
+            body = handle.read()
+        self._write_response(
+            200,
+            {
+                "Content-Type": artwork_content_type(filename),
+                "Cache-Control": "public, max-age=31536000",
+                "Accept-Ranges": "bytes",
+                "Access-Control-Allow-Origin": "*",
+            },
+            body,
+            head_only=head_only,
+            request_path=self.path,
+        )
+        return True
 
     def _serve_emby_folder_image(self, request_headers):
         image_request = parse_emby_item_image_request(self.path)
@@ -2085,8 +2160,13 @@ def run_subtitle_proxy(
     openlist_username=None,
     openlist_password=None,
     subtitle_cache_dir=None,
+    adult_artwork_cache_dir=None,
 ):
     SubtitleProxyHandler.upstream_base_url = upstream
+    SubtitleProxyHandler.adult_artwork_cache_dir = adult_artwork_cache_dir or os.environ.get(
+        "ADULT_ARTWORK_CACHE_DIR",
+        DEFAULT_ADULT_ARTWORK_CACHE_DIR,
+    )
     SubtitleProxyHandler.msg_api_auth = MsgApiAuthenticator(
         msg_api_base_url or os.environ.get("MSG_BASE_URL") or DEFAULT_MSG_API_BASE_URL,
         msg_admin_user if msg_admin_user is not None else os.environ.get("MSG_ADMIN_USER", ""),
