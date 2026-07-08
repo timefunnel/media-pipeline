@@ -3,7 +3,7 @@ import re
 import urllib.parse
 from collections import OrderedDict
 
-from pipeline.config import MSG_LIBRARY_ROOTS, category_to_msg_library_root, category_to_openlist_path
+from pipeline.config import category_to_msg_library_root, category_to_openlist_path, msg_library_roots
 
 
 DEFAULT_MSG_DATABASE_DSN = "postgresql://mediastation:mediastation@127.0.0.1:15432/mediastation"
@@ -510,8 +510,9 @@ class MediaStationDbClient:
                 raise RuntimeError("MediaStationGo migration strm_url validation failed")
 
     def _ensure_cloud_media_guard(self, conn):
-        library_ids = [root["library_id"] for root in MSG_LIBRARY_ROOTS.values()]
-        root_ids = [root["root_id"] for root in MSG_LIBRARY_ROOTS.values()]
+        roots = msg_library_roots()
+        library_ids = [root["library_id"] for root in roots.values()]
+        root_ids = [root["root_id"] for root in roots.values()]
         library_ids_sql = sql_varchar_array(library_ids)
         root_ids_sql = sql_varchar_array(root_ids)
         conn.execute(
@@ -887,7 +888,7 @@ def cloud_relative_path(path, root_cloud_path):
 
 
 def library_id_to_category(library_id):
-    for category, root in MSG_LIBRARY_ROOTS.items():
+    for category, root in msg_library_roots().items():
         if root.get("library_id") == library_id:
             return category
     return ""

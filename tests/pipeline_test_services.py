@@ -1,3 +1,4 @@
+import copy
 import threading
 
 from tests.test_pipeline_core import *
@@ -9,6 +10,29 @@ from pipeline.subtitle_proxy import (
 
 
 class SubtitleProxyTest(unittest.TestCase):
+    def test_adult_msg_library_id_resolves_lazily_and_caches(self):
+        from pipeline import subtitle_proxy
+
+        original_id = subtitle_proxy._ADULT_MSG_LIBRARY_ID
+        original_resolver = subtitle_proxy.category_to_msg_library_root
+        calls = []
+
+        def fake_resolver(category):
+            calls.append(category)
+            return {"library_id": "adult-library"}
+
+        try:
+            subtitle_proxy._ADULT_MSG_LIBRARY_ID = None
+            subtitle_proxy.category_to_msg_library_root = fake_resolver
+
+            self.assertTrue(subtitle_proxy.emby_item_is_adult_media({"LibraryId": "adult-library"}))
+            self.assertTrue(subtitle_proxy.emby_item_is_adult_media({"LibraryId": "adult-library"}))
+        finally:
+            subtitle_proxy._ADULT_MSG_LIBRARY_ID = original_id
+            subtitle_proxy.category_to_msg_library_root = original_resolver
+
+        self.assertEqual(calls, ["adult"])
+
     def test_subtitle_cache_saves_and_lists_local_tracks(self):
         from pipeline.external_subtitles import SubtitleCache, SubtitleDownload
 
@@ -1159,8 +1183,8 @@ class CategoryConfigTest(unittest.TestCase):
         rows = [
             {
                 "id": "m1",
-                "library_id": "REPLACE_WITH_MSG_TV_LIBRARY_ID",
-                "library_root_id": "REPLACE_WITH_MSG_TV_ROOT_ID",
+                "library_id": "test-tv-library",
+                "library_root_id": "test-tv-root",
                 "title": "成龙历险记",
                 "path": "cloud://openlist/115/剧集/成龙历险记/成龙历险记 第01集.mp4",
                 "root_path": "cloud://openlist/115%2F%E5%89%A7%E9%9B%86",
@@ -1170,8 +1194,8 @@ class CategoryConfigTest(unittest.TestCase):
             },
             {
                 "id": "m2",
-                "library_id": "REPLACE_WITH_MSG_TV_LIBRARY_ID",
-                "library_root_id": "REPLACE_WITH_MSG_TV_ROOT_ID",
+                "library_id": "test-tv-library",
+                "library_root_id": "test-tv-root",
                 "title": "成龙历险记",
                 "path": "cloud://openlist/115/剧集/成龙历险记/成龙历险记 第02集.mp4",
                 "root_path": "cloud://openlist/115%2F%E5%89%A7%E9%9B%86",
@@ -1428,6 +1452,92 @@ class CategoryConfigTest(unittest.TestCase):
         self.assertEqual(msg_roots["anime"]["library_id"], "anime-library-json")
         self.assertEqual(msg_roots["anime"]["root_id"], "anime-root-json")
 
+    def test_discovers_missing_msg_root_ids_from_database(self):
+        from pipeline.config import MSG_LIBRARY_ROOTS, category_to_msg_library_root
+
+        class FakeConn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, _sql):
+                return self
+
+            def fetchall(self):
+                return [
+                    {
+                        "library_id": "movie-library-db",
+                        "root_id": "movie-root-db",
+                        "library_name": "电影",
+                        "media_type": "movie",
+                        "root_path": "cloud://openlist/115%2F%E7%94%B5%E5%BD%B1",
+                    },
+                    {
+                        "library_id": "adult-library-db",
+                        "root_id": "adult-root-db",
+                        "library_name": "成人",
+                        "media_type": "adult",
+                        "root_path": "cloud://openlist/115%2F%E6%88%90%E4%BA%BA",
+                    },
+                ]
+
+        original_roots = copy.deepcopy(MSG_LIBRARY_ROOTS)
+        try:
+            MSG_LIBRARY_ROOTS["movie"]["library_id"] = "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID"
+            MSG_LIBRARY_ROOTS["movie"]["root_id"] = "REPLACE_WITH_MSG_MOVIE_ROOT_ID"
+            root = category_to_msg_library_root("movie", connect=lambda _dsn: FakeConn(), env={})
+        finally:
+            MSG_LIBRARY_ROOTS.clear()
+            MSG_LIBRARY_ROOTS.update(original_roots)
+
+        self.assertEqual(root["library_id"], "movie-library-db")
+        self.assertEqual(root["root_id"], "movie-root-db")
+        self.assertEqual(root["provider"], "tmdb")
+        self.assertEqual(root["media_type"], "movie")
+
+    def test_discovering_missing_msg_root_ids_rejects_ambiguous_matches(self):
+        from pipeline.config import MSG_LIBRARY_ROOTS, category_to_msg_library_root
+
+        class FakeConn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, _sql):
+                return self
+
+            def fetchall(self):
+                return [
+                    {
+                        "library_id": "movie-library-1",
+                        "root_id": "movie-root-1",
+                        "library_name": "电影",
+                        "media_type": "movie",
+                        "root_path": "cloud://openlist/115%2F%E7%94%B5%E5%BD%B1",
+                    },
+                    {
+                        "library_id": "movie-library-2",
+                        "root_id": "movie-root-2",
+                        "library_name": "电影",
+                        "media_type": "movie",
+                        "root_path": "cloud://openlist/115%2F%E7%94%B5%E5%BD%B1",
+                    },
+                ]
+
+        original_roots = copy.deepcopy(MSG_LIBRARY_ROOTS)
+        try:
+            MSG_LIBRARY_ROOTS["movie"]["library_id"] = "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID"
+            MSG_LIBRARY_ROOTS["movie"]["root_id"] = "REPLACE_WITH_MSG_MOVIE_ROOT_ID"
+            with self.assertRaisesRegex(RuntimeError, "multiple MediaStationGo roots matched"):
+                category_to_msg_library_root("movie", connect=lambda _dsn: FakeConn(), env={})
+        finally:
+            MSG_LIBRARY_ROOTS.clear()
+            MSG_LIBRARY_ROOTS.update(original_roots)
+
     def test_load_category_config_rejects_conflicting_external_sources(self):
         from pipeline.config import load_category_config
 
@@ -1463,7 +1573,7 @@ class OpenListTokenStoreTest(unittest.TestCase):
                         {
                             "access_token": "access-token-value",
                             "refresh_token": "refresh-token-value",
-                            "root_folder_id": "3462843402402399378",
+                            "root_folder_id": "test-root-folder-id",
                         }
                     ),
                 ),

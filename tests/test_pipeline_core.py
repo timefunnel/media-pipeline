@@ -2,6 +2,7 @@ import base64
 import json
 import hashlib
 import io
+import os
 import sqlite3
 import sys
 import tempfile
@@ -12,6 +13,21 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
+
+for _category, _prefix in {
+    "movie": "MEDIA_PIPELINE_MOVIE",
+    "tv": "MEDIA_PIPELINE_TV",
+    "anime": "MEDIA_PIPELINE_ANIME",
+    "adult": "MEDIA_PIPELINE_ADULT",
+    "other": "MEDIA_PIPELINE_OTHER",
+}.items():
+    for _suffix, _value in {
+        "MSG_LIBRARY_ID": "test-%s-library" % _category,
+        "MSG_ROOT_ID": "test-%s-root" % _category,
+    }.items():
+        _key = _prefix + "_" + _suffix
+        if not os.environ.get(_key):
+            os.environ[_key] = _value
 
 from pipeline.client115 import Client115
 from pipeline.cli import public_resource_summary
@@ -404,8 +420,8 @@ class MediaStationDbHelperTest(unittest.TestCase):
         candidate = deleted_openlist_media_hide_candidate(
             {
                 "id": "media-1",
-                "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID",
-                "library_root_id": "REPLACE_WITH_MSG_MOVIE_ROOT_ID",
+                "library_id": "test-movie-library",
+                "library_root_id": "test-movie-root",
                 "path": "cloud://openlist/115/电影/Movie/Movie.mkv",
                 "deleted_at": "2026-07-05T22:00:00+08:00",
             }
@@ -422,8 +438,8 @@ class MediaStationDbHelperTest(unittest.TestCase):
         candidate = deleted_openlist_media_hide_candidate(
             {
                 "id": "media-1",
-                "library_id": "REPLACE_WITH_MSG_ANIME_LIBRARY_ID",
-                "library_root_id": "REPLACE_WITH_MSG_ANIME_ROOT_ID",
+                "library_id": "test-anime-library",
+                "library_root_id": "test-anime-root",
                 "path": "cloud://openlist/115/动漫/秋色之空/01.associated.mkv",
                 "deleted_at": "2026-07-05T22:00:00+08:00",
             }

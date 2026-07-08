@@ -113,7 +113,7 @@ LLM_SEARCH_RERANK_ENABLED / LLM_SEARCH_RERANK_LIMIT
 MEDIA_PIPELINE_*_FOLDER_ID / OPENLIST_PATH / MSG_LIBRARY_ID / MSG_ROOT_ID
 ```
 
-这些值来自远端 `/opt/media-pipeline/.env` 或 compose 默认插值；`docker-compose.yml` 只保留变量引用。文档只记录变量存在，不记录任何 token/key/password。
+这些值来自远端 `/opt/media-pipeline/.env` 或 compose 默认插值；`docker-compose.yml` 只保留变量引用。`MEDIA_PIPELINE_*_MSG_LIBRARY_ID` 和 `MEDIA_PIPELINE_*_MSG_ROOT_ID` 通常留空，由 pipeline 通过 `MSG_DATABASE_DSN` 按 `media_type + OpenList root path` 自动发现；只有 MSG root 歧义时才手动覆盖。文档只记录变量存在，不记录任何 token/key/password。
 
 当前版本可通过 Bot 发送 `/version` 查看，返回 `media-pipeline <version>` 和 `revision`。
 
@@ -279,7 +279,7 @@ REPLACE_WITH_MSG_ANIME_LIBRARY_ID | 动漫 | anime | cloud://openlist/115%2F%E5%
 REPLACE_WITH_MSG_OTHER_LIBRARY_ID | 其他媒体 | movie | cloud://openlist/115%2F%E5%85%B6%E4%BB%96
 ```
 
-说明：表中的 library/root id 均为占位符。当前服务器真实值维护在 `.env`，新设备必须按 `docs/deployment-guide.md` 重新创建 MSG 媒体库后填写自己的 id。
+说明：表中的 library/root id 均为占位符。当前代码会在这些值留空或仍是 `REPLACE_WITH_` 占位时，通过 `MSG_DATABASE_DSN` 查询 MSG PostgreSQL，并用 `media_type + OpenList root path` 自动发现当前设备的真实 `library_id/root_id`；新设备只需要按 `docs/deployment-guide.md` 创建对应 MSG 媒体库，通常不需要手动抄 id。
 
 2026-07-08 MSG 活动库快照：
 
@@ -303,32 +303,27 @@ REPLACE_WITH_MSG_OTHER_LIBRARY_ID | 其他媒体 | movie | cloud://openlist/115%
 
 ```text
 movie:
-  library_id=REPLACE_WITH_MSG_MOVIE_LIBRARY_ID
-  root_id=REPLACE_WITH_MSG_MOVIE_ROOT_ID
+  library_id/root_id=auto-discovered
   provider=tmdb
   media_type=movie
 
 tv:
-  library_id=REPLACE_WITH_MSG_TV_LIBRARY_ID
-  root_id=REPLACE_WITH_MSG_TV_ROOT_ID
+  library_id/root_id=auto-discovered
   provider=tmdb
   media_type=tv
 
 anime:
-  library_id=REPLACE_WITH_MSG_ANIME_LIBRARY_ID
-  root_id=REPLACE_WITH_MSG_ANIME_ROOT_ID
+  library_id/root_id=auto-discovered
   provider=tmdb
   media_type=anime
 
 adult:
-  library_id=REPLACE_WITH_MSG_ADULT_LIBRARY_ID
-  root_id=REPLACE_WITH_MSG_ADULT_ROOT_ID
+  library_id/root_id=auto-discovered
   provider=adult
   media_type=adult
 
 other:
-  library_id=REPLACE_WITH_MSG_OTHER_LIBRARY_ID
-  root_id=REPLACE_WITH_MSG_OTHER_ROOT_ID
+  library_id/root_id=auto-discovered
   provider=tmdb
   media_type=movie
 ```

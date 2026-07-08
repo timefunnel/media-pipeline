@@ -4315,7 +4315,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         events = []
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "title": "Sintel"}]}}
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-movie-library", "title": "Sintel"}]}}
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -4340,7 +4340,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             )
 
         self.assertEqual(events, [("openlist", "/115/电影", True)])
-        self.assertEqual(fake_msg.scan_calls, [("REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "REPLACE_WITH_MSG_MOVIE_ROOT_ID")])
+        self.assertEqual(fake_msg.scan_calls, [("test-movie-library", "test-movie-root")])
         self.assertEqual(fake_msg.scrape_calls, ["media-1"])
         self.assertEqual(fake_msg.artwork_repair_calls, [])
         self.assertEqual(task["msg_sync_status"], "success")
@@ -4354,7 +4354,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         title = "[DBD-Raws][4K_SDR][哥斯拉之终极战役][正片+特典映像][2160P][UHDBDRip][HEVC-10bit][简繁外挂][FLACx3][MKV]"
         media = {
             "id": "media-1",
-            "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID",
+            "library_id": "test-movie-library",
             "title": title,
             "path": "cloud://openlist/115/电影/%s/[DBD-Raws][4K_SDR][Godzilla Final Wars][Ver.A][2160P].mkv" % title,
         }
@@ -4393,7 +4393,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         events = []
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_ANIME_LIBRARY_ID", "title": "Aki Sora"}]}}
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-anime-library", "title": "Aki Sora"}]}}
         )
 
         class FakeMsgDb:
@@ -4457,7 +4457,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "title": "Movie"}]}},
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-movie-library", "title": "Movie"}]}},
             events=events,
         )
 
@@ -4513,7 +4513,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "title": "Movie"}]}},
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-movie-library", "title": "Movie"}]}},
             events=events,
         )
 
@@ -4594,7 +4594,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         fake_openlist = CleaningOpenList({"/115/电影": [{"name": "Other", "is_dir": True, "size": 0}]})
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "title": "Movie"}]}}
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-movie-library", "title": "Movie"}]}}
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -4619,7 +4619,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             )
 
         self.assertEqual(fake_openlist.meta_hide_calls, [])
-        self.assertEqual(fake_msg.scan_calls, [("REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "REPLACE_WITH_MSG_MOVIE_ROOT_ID")])
+        self.assertEqual(fake_msg.scan_calls, [("test-movie-library", "test-movie-root")])
         self.assertEqual(task["openlist_clean_status"], "failed")
         self.assertIn("target not found", task["openlist_clean_error"])
         self.assertEqual(task["msg_sync_status"], "success")
@@ -4638,7 +4638,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             }
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "title": "Movie"}]}}
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-movie-library", "title": "Movie"}]}}
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -4662,7 +4662,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"info_hash": "ABC", "status_name": "success", "name": "Movie"},
             )
 
-        self.assertEqual(fake_msg.scan_calls, [("REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "REPLACE_WITH_MSG_MOVIE_ROOT_ID")])
+        self.assertEqual(fake_msg.scan_calls, [("test-movie-library", "test-movie-root")])
         self.assertEqual(task["openlist_clean_status"], "failed")
         self.assertIn("timed out", task["openlist_clean_error"])
         self.assertEqual(task["msg_sync_status"], "success")
@@ -4796,7 +4796,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_ADULT_LIBRARY_ID", "title": "MIDA-304"}]}},
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-adult-library", "title": "MIDA-304"}]}},
             events=events,
             artwork_repair_response={"status": "success", "updated": 1, "fields": ["poster_url"]},
         )
@@ -4877,7 +4877,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_ADULT_LIBRARY_ID", "title": "SSIS-218"}]}},
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-adult-library", "title": "SSIS-218"}]}},
             events=events,
         )
 
@@ -4959,7 +4959,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             }
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_ADULT_LIBRARY_ID", "title": "downloaded folder"}]}}
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-adult-library", "title": "downloaded folder"}]}}
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -5492,7 +5492,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         fake_openlist = CleaningOpenList({"/115/电影": [{"name": "Movie", "is_dir": True, "size": 0}]})
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "title": "Movie"}]}}
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-movie-library", "title": "Movie"}]}}
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -5537,7 +5537,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "items": [
                         {
                             "id": "media-wrong",
-                            "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID",
+                            "library_id": "test-movie-library",
                             "title": "秋色之空",
                             "path": "cloud://openlist/115/动漫/成龙历险记/01.mp4",
                         }
@@ -5549,7 +5549,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "items": [
                         {
                             "id": "media-correct",
-                            "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID",
+                            "library_id": "test-movie-library",
                             "title": "秋色之空",
                             "path": "cloud://openlist/115/电影/秋色之空/01.mkv",
                             "size_bytes": 900 * 1024 * 1024,
@@ -5615,7 +5615,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         fake_openlist = CleaningOpenList({"/115/其他": [{"name": "Unmatched", "is_dir": True, "size": 0}]})
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_OTHER_LIBRARY_ID", "title": "Unmatched"}]}},
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-other-library", "title": "Unmatched"}]}},
             artwork_repair_response={"status": "skipped", "updated": 0, "reason": "not_needed"},
         )
 
@@ -5641,12 +5641,12 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"info_hash": "ABC", "status_name": "success", "name": "Unmatched"},
             )
 
-        self.assertEqual(fake_msg.scan_calls, [("REPLACE_WITH_MSG_OTHER_LIBRARY_ID", "REPLACE_WITH_MSG_OTHER_ROOT_ID")])
+        self.assertEqual(fake_msg.scan_calls, [("test-other-library", "test-other-root")])
         self.assertEqual(fake_msg.artwork_repair_calls, [])
         self.assertEqual(fake_openlist.rename_calls, [])
         self.assertNotIn("openlist_adult_format_status", task)
-        self.assertEqual(task["msg_library_id"], "REPLACE_WITH_MSG_OTHER_LIBRARY_ID")
-        self.assertEqual(task["msg_root_id"], "REPLACE_WITH_MSG_OTHER_ROOT_ID")
+        self.assertEqual(task["msg_library_id"], "test-other-library")
+        self.assertEqual(task["msg_root_id"], "test-other-root")
         self.assertEqual(task["msg_sync_status"], "success")
 
     def test_sync_completed_task_skips_when_already_synced(self):
@@ -5777,7 +5777,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "items": [
                         {
                             "id": "media-1",
-                            "library_id": "REPLACE_WITH_MSG_ADULT_LIBRARY_ID",
+                            "library_id": "test-adult-library",
                             "title": "SSIS-450",
                         }
                     ]
@@ -5813,7 +5813,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "items": [
                         {
                             "id": "media-1",
-                            "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID",
+                            "library_id": "test-movie-library",
                             "title": "Sintel",
                         }
                     ]
@@ -5850,7 +5850,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "items": [
                         {
                             "id": "media-adult",
-                            "library_id": "REPLACE_WITH_MSG_ADULT_LIBRARY_ID",
+                            "library_id": "test-adult-library",
                             "title": "無防備すぎる幼馴染のノーブラぽろりに胸キュン勃起！ びんびんビーチクに我慢できず乳首こねくりラブ 石川澪",
                         }
                     ]
@@ -5889,7 +5889,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "items": [
                         {
                             "id": "media-1",
-                            "library_id": "REPLACE_WITH_MSG_ANIME_LIBRARY_ID",
+                            "library_id": "test-anime-library",
                             "title": "成龙历险记",
                         }
                     ]
@@ -6169,13 +6169,12 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         queries = media_search_queries(
             "[DBD-Raws][4K_HDR][流浪地球2][IMAX版][正片+花絮][2160P][UHDBDRip][HEVC-10bit][简体内封][FLAC][MKV]",
-            {"info_hash": "ABC", "status_name": "success", "file_id": "3464429394146100471"},
+            {"info_hash": "ABC", "status_name": "success", "file_id": "test-file-id"},
         )
 
         self.assertIn("流浪地球2", queries)
-        self.assertIn("3464429394146100471", queries)
+        self.assertIn("test-file-id", queries)
         self.assertNotIn("HEVC-10", queries)
-
 
     def test_media_search_queries_ignores_single_character_chinese_fragment(self):
         from pipeline.bot import media_search_queries

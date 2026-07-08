@@ -29,7 +29,8 @@ DEFAULT_SUBTITLE_PROXY_HOST = "127.0.0.1"
 DEFAULT_SUBTITLE_PROXY_PORT = 18081
 DEFAULT_SUBTITLE_PROXY_UPSTREAM = "http://127.0.0.1:18080"
 DEFAULT_MSG_API_BASE_URL = "http://127.0.0.1:18080/api"
-ADULT_MSG_LIBRARY_ID = category_to_msg_library_root("adult")["library_id"]
+_ADULT_MSG_LIBRARY_ID = None
+_ADULT_MSG_LIBRARY_ID_LOCK = threading.Lock()
 EMBY_TICKS_PER_SECOND = 10_000_000
 MIN_SYNTHETIC_RUNTIME_TICKS = 10 * 60 * EMBY_TICKS_PER_SECOND
 SYNTHETIC_RUNTIME_PADDING_TICKS = 60 * 60 * EMBY_TICKS_PER_SECOND
@@ -688,12 +689,22 @@ def emby_item_is_adult_media(item):
     if not isinstance(item, dict) or emby_item_is_collection_folder(item):
         return False
     library_id = str(item.get("LibraryId") or item.get("library_id") or item.get("libraryId") or "").strip()
-    if library_id and library_id == ADULT_MSG_LIBRARY_ID:
+    if library_id and library_id == adult_msg_library_id():
         return True
     for path in emby_item_path_values(item):
         if openlist_path_is_adult(path):
             return True
     return False
+
+
+def adult_msg_library_id():
+    global _ADULT_MSG_LIBRARY_ID
+    if _ADULT_MSG_LIBRARY_ID is not None:
+        return _ADULT_MSG_LIBRARY_ID
+    with _ADULT_MSG_LIBRARY_ID_LOCK:
+        if _ADULT_MSG_LIBRARY_ID is None:
+            _ADULT_MSG_LIBRARY_ID = category_to_msg_library_root("adult")["library_id"]
+    return _ADULT_MSG_LIBRARY_ID
 
 
 def emby_item_adult_code(item):

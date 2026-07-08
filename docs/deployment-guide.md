@@ -361,7 +361,7 @@ cloud.boot_scan_enabled=false
 
 当前链路由 Bot 显式触发 root scan 和单项 scrape，不依赖 MSG 全局自动扫描/刮削。
 
-获取 MSG library/root id：
+验证 MSG 媒体库 root：
 
 ```bash
 DSN=$(docker exec mediastationgo-mediastation-go-1 printenv MEDIASTATION_DATABASE_DSN | tr -d '\r')
@@ -369,22 +369,7 @@ docker exec -e DSN="$DSN" mediastationgo-postgres-1 sh -lc \
   'psql "$DSN" -tAc "select l.name,l.id,l.type,r.id,r.path from libraries l join library_roots r on r.library_id=l.id and r.deleted_at is null where l.deleted_at is null order by l.name,l.type;"'
 ```
 
-把输出填入 `/opt/media-pipeline/.env`：
-
-```text
-MEDIA_PIPELINE_MOVIE_MSG_LIBRARY_ID=...
-MEDIA_PIPELINE_MOVIE_MSG_ROOT_ID=...
-MEDIA_PIPELINE_TV_MSG_LIBRARY_ID=...
-MEDIA_PIPELINE_TV_MSG_ROOT_ID=...
-MEDIA_PIPELINE_ANIME_MSG_LIBRARY_ID=...
-MEDIA_PIPELINE_ANIME_MSG_ROOT_ID=...
-MEDIA_PIPELINE_ADULT_MSG_LIBRARY_ID=...
-MEDIA_PIPELINE_ADULT_MSG_ROOT_ID=...
-MEDIA_PIPELINE_OTHER_MSG_LIBRARY_ID=...
-MEDIA_PIPELINE_OTHER_MSG_ROOT_ID=...
-```
-
-不要使用其他设备的 library/root id。
+正常情况下不需要把 `library_id/root_id` 手动填入 `.env`。pipeline 会通过 `MSG_DATABASE_DSN` 查询 MSG PostgreSQL，并按 `media_type + OpenList root path` 自动发现。只有同一 `media_type + root path` 出现多条匹配，或你需要强制指定某个 root 时，才手动覆盖 `MEDIA_PIPELINE_*_MSG_LIBRARY_ID` 和 `MEDIA_PIPELINE_*_MSG_ROOT_ID`。
 
 ## 8. 部署 media-pipeline
 
@@ -434,7 +419,7 @@ MEDIA_PIPELINE_*_FOLDER_ID
   115 目录 cid
 
 MEDIA_PIPELINE_*_MSG_LIBRARY_ID / MSG_ROOT_ID
-  MediaStationGo PostgreSQL 查询得到
+  通常留空，由 pipeline 根据 MSG_DATABASE_DSN 自动发现；仅在自动发现歧义时手动覆盖
 ```
 
 构建并启动：
@@ -561,19 +546,23 @@ curl -fsS http://127.0.0.1:9696/api/v1/health -H "X-Api-Key: $(sed -n 's#.*<ApiK
 
 ### 12.3 MSG 入库失败
 
-先确认 `.env` 中 library/root id 是当前设备的：
+先确认 pipeline 能自动发现当前设备的 MSG root：
 
 ```bash
 docker exec media-pipeline-bot python -m pipeline.cli folders
 ```
 
-再查 MSG 当前库：
+再查 MSG 当前库是否存在唯一的 `media_type + OpenList root path` 匹配：
 
 ```bash
 DSN=$(docker exec mediastationgo-mediastation-go-1 printenv MEDIASTATION_DATABASE_DSN | tr -d '\r')
 docker exec -e DSN="$DSN" mediastationgo-postgres-1 sh -lc \
   'psql "$DSN" -tAc "select l.name,l.id,l.type,r.id,r.path from libraries l join library_roots r on r.library_id=l.id and r.deleted_at is null where l.deleted_at is null order by l.name,l.type;"'
 ```
+
+如果报 `root not found`，优先检查 MSG 媒体库 root path 是否仍是 `/115/电影`、`/115/剧集`、`/115/动漫`、`/115/成人`、`/115/其他` 对应的 OpenList 路径。
+
+如果报 `multiple MediaStationGo roots matched`，说明同一类型和路径存在重复 root。先清理 MSG 内重复媒体库；确实需要保留重复项时，再在 `.env` 中手动覆盖对应分类的 `MEDIA_PIPELINE_*_MSG_LIBRARY_ID` 和 `MEDIA_PIPELINE_*_MSG_ROOT_ID`。
 
 ### 12.4 第三方客户端没有字幕或文件夹封面
 
