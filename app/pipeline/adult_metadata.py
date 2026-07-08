@@ -93,9 +93,10 @@ ADULT_IMAGE_HEADERS = {
 }
 FLARESOLVERR_FALLBACK_HTTP_STATUSES = {403, 429, 503, 521, 522, 523, 524, 525, 526}
 CF_CHALLENGE_NEEDLES = (
-    "cf-chl",
-    "challenge-platform",
-    "/cdn-cgi/challenge-platform/",
+    "cf-browser-verification",
+    "cf-chl-widget",
+    "cf_chl_opt",
+    "cf-chl-bypass",
     "checking if the site connection is secure",
 )
 

@@ -53,6 +53,7 @@ from pipeline.adult_metadata import (
     AdultImageProbe,
     build_adult_artwork_repair,
     image_orientation,
+    looks_like_cloudflare_challenge,
     normalize_adult_base_urls,
     parse_adult_detail_html,
 )

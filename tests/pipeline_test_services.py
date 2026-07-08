@@ -1823,6 +1823,26 @@ class MediaStationClientTest(unittest.TestCase):
         self.assertEqual(match.year, 2024)
         self.assertEqual(match.rating, 8.1)
 
+    def test_cloudflare_script_on_normal_adult_page_is_not_challenge(self):
+        normal_html = """
+        <html>
+          <head>
+            <title>JavDB, Online information source for adult movies</title>
+            <script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>
+          </head>
+          <body>GANA-2525</body>
+        </html>
+        """
+        challenge_html = """
+        <html>
+          <head><title>Just a moment...</title></head>
+          <body>Cloudflare checking if the site connection is secure</body>
+        </html>
+        """
+
+        self.assertFalse(looks_like_cloudflare_challenge(normal_html))
+        self.assertTrue(looks_like_cloudflare_challenge(challenge_html))
+
     def test_adult_metadata_provider_searches_configured_javdb_source(self):
         class FakeAdultProvider(AdultHTMLMetadataProvider):
             def __init__(self):
