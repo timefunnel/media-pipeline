@@ -54,6 +54,8 @@ from pipeline.adult_metadata import (
     DEFAULT_ADULT_ARTWORK_CACHE_DIR,
     DEFAULT_ADULT_METADATA_BASE_URLS,
     DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS,
+    DEFAULT_ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS,
+    DEFAULT_ADULT_METADATA_FLARESOLVERR_URL,
     AdultHTMLMetadataProvider,
     normalize_adult_base_urls,
 )
@@ -394,6 +396,8 @@ class BotConfig:
     adult_artwork_generate_portrait_enabled: bool = True
     adult_metadata_base_urls: tuple = DEFAULT_ADULT_METADATA_BASE_URLS
     adult_metadata_fetch_timeout_seconds: int = DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS
+    adult_metadata_flaresolverr_url: str = DEFAULT_ADULT_METADATA_FLARESOLVERR_URL
+    adult_metadata_flaresolverr_timeout_seconds: int = DEFAULT_ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS
     assrt_api_token: str = ""
     opensubtitles_api_key: str = ""
     opensubtitles_username: str = ""
@@ -516,6 +520,16 @@ class BotConfig:
             adult_metadata_fetch_timeout_seconds=max(
                 1,
                 int(env.get("ADULT_METADATA_FETCH_TIMEOUT_SECONDS", str(DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS))),
+            ),
+            adult_metadata_flaresolverr_url=(env.get("ADULT_METADATA_FLARESOLVERR_URL") or "").strip(),
+            adult_metadata_flaresolverr_timeout_seconds=max(
+                1,
+                int(
+                    env.get(
+                        "ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS",
+                        str(DEFAULT_ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS),
+                    )
+                ),
             ),
             assrt_api_token=env.get("ASSRT_API_TOKEN", ""),
             opensubtitles_api_key=env.get("OPENSUBTITLES_API_KEY", ""),
@@ -2278,6 +2292,8 @@ class PipelineBotService:
             metadata_provider=AdultHTMLMetadataProvider(
                 bases=self.config.adult_metadata_base_urls,
                 timeout=self.config.adult_metadata_fetch_timeout_seconds,
+                flaresolverr_url=self.config.adult_metadata_flaresolverr_url,
+                flaresolverr_timeout=self.config.adult_metadata_flaresolverr_timeout_seconds,
             )
             if self.config.adult_external_scraper_enabled
             else False,

@@ -1,6 +1,7 @@
 import hashlib
 import html
 import io
+import json
 import os
 import re
 import urllib.error
@@ -21,6 +22,8 @@ DEFAULT_ADULT_ARTWORK_CACHE_DIR = "/artwork-cache/adult"
 DEFAULT_ADULT_ARTWORK_FETCH_TIMEOUT_SECONDS = 8
 DEFAULT_ADULT_ARTWORK_DOWNLOAD_MAX_BYTES = 6 * 1024 * 1024
 DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS = 6
+DEFAULT_ADULT_METADATA_FLARESOLVERR_URL = ""
+DEFAULT_ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS = 20
 DEFAULT_ADULT_METADATA_BASE_URLS = (
     "https://javdb.com",
     "https://javbus.sbs",
@@ -88,6 +91,20 @@ ADULT_IMAGE_HEADERS = {
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
     "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
 }
+FLARESOLVERR_FALLBACK_HTTP_STATUSES = {403, 429, 503, 521, 522, 523, 524, 525, 526}
+CF_CHALLENGE_NEEDLES = (
+    "cf-chl",
+    "challenge-platform",
+    "/cdn-cgi/challenge-platform/",
+    "checking if the site connection is secure",
+)
+
+
+class AdultSourceFetchError(RuntimeError):
+    def __init__(self, message, status=0, retryable=False):
+        super().__init__(message)
+        self.status = int(status or 0)
+        self.retryable = bool(retryable)
 
 
 @dataclass(frozen=True)
@@ -184,10 +201,19 @@ class DmmArtworkProvider(AdultMetadataProvider):
 class AdultHTMLMetadataProvider(AdultMetadataProvider):
     name = "adult_html"
 
-    def __init__(self, bases=None, timeout=DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS, max_bytes=4 * 1024 * 1024):
+    def __init__(
+        self,
+        bases=None,
+        timeout=DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS,
+        max_bytes=4 * 1024 * 1024,
+        flaresolverr_url=DEFAULT_ADULT_METADATA_FLARESOLVERR_URL,
+        flaresolverr_timeout=DEFAULT_ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS,
+    ):
         self.bases = tuple(normalize_adult_base_urls(bases or DEFAULT_ADULT_METADATA_BASE_URLS))
         self.timeout = max(1, int(timeout))
         self.max_bytes = max(1024, int(max_bytes))
+        self.flaresolverr_url = str(flaresolverr_url or "").strip().rstrip("/")
+        self.flaresolverr_timeout = max(1, int(flaresolverr_timeout))
 
     def search(self, media, codes):
         for code in codes or []:
@@ -212,7 +238,7 @@ class AdultHTMLMetadataProvider(AdultMetadataProvider):
 
     def _search_javdb(self, base, code):
         search_url = base.rstrip("/") + "/search?" + urllib.parse.urlencode({"q": code, "f": "all"})
-        body = self._fetch_text(search_url, referer=base)
+        body = self._fetch_text(search_url, referer=base, allow_flaresolverr=True)
         detail_url = ""
         for raw_attrs, raw_text in ANCHOR_RE.findall(body):
             attrs = html_attrs(raw_attrs)
@@ -225,14 +251,24 @@ class AdultHTMLMetadataProvider(AdultMetadataProvider):
                 break
         if not detail_url:
             return None
-        return parse_adult_detail_html(self._fetch_text(detail_url, referer=base), code, "javdb", detail_url)
+        return parse_adult_detail_html(
+            self._fetch_text(detail_url, referer=base, allow_flaresolverr=True), code, "javdb", detail_url
+        )
 
     def _search_javbus(self, base, code):
         detail_url = base.rstrip("/") + "/" + urllib.parse.quote(code, safe="")
         body = self._fetch_text(detail_url, referer=base)
         return parse_adult_detail_html(body, code, "javbus", detail_url)
 
-    def _fetch_text(self, url, referer=""):
+    def _fetch_text(self, url, referer="", allow_flaresolverr=False):
+        try:
+            return self._fetch_text_direct(url, referer=referer)
+        except AdultSourceFetchError as exc:
+            if allow_flaresolverr and self.flaresolverr_url and exc.retryable:
+                return self._fetch_text_flaresolverr(url, referer=referer, direct_error=exc)
+            raise
+
+    def _fetch_text_direct(self, url, referer=""):
         headers = dict(ADULT_TEXT_HEADERS)
         if referer:
             headers["Referer"] = referer
@@ -243,14 +279,80 @@ class AdultHTMLMetadataProvider(AdultMetadataProvider):
                 if status == 404:
                     return ""
                 if status >= 400:
-                    raise RuntimeError("adult source returned HTTP %s" % status)
-                return read_limited(response, self.max_bytes).decode("utf-8", "replace")
+                    raise AdultSourceFetchError(
+                        "adult source returned HTTP %s" % status,
+                        status=status,
+                        retryable=status in FLARESOLVERR_FALLBACK_HTTP_STATUSES,
+                    )
+                body = read_limited(response, self.max_bytes).decode("utf-8", "replace")
+                if looks_like_cloudflare_challenge(body):
+                    raise AdultSourceFetchError("adult source returned Cloudflare challenge", retryable=True)
+                return body
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return ""
-            raise RuntimeError("adult source returned HTTP %s" % exc.code) from exc
+            raise AdultSourceFetchError(
+                "adult source returned HTTP %s" % exc.code,
+                status=exc.code,
+                retryable=exc.code in FLARESOLVERR_FALLBACK_HTTP_STATUSES,
+            ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError("adult source fetch failed: %s" % exc) from exc
+            raise AdultSourceFetchError("adult source fetch failed: %s" % exc, retryable=True) from exc
+
+    def _fetch_text_flaresolverr(self, url, referer="", direct_error=None):
+        api_url = self.flaresolverr_url.rstrip("/")
+        if not api_url.endswith("/v1"):
+            api_url += "/v1"
+        payload = {
+            "cmd": "request.get",
+            "url": url,
+            "maxTimeout": int(self.flaresolverr_timeout * 1000),
+        }
+        request = urllib.request.Request(
+            api_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.flaresolverr_timeout) as response:
+                status = getattr(response, "status", 200)
+                if status < 200 or status >= 300:
+                    raise RuntimeError("FlareSolverr returned HTTP %s" % status)
+                raw = read_limited(response, self.max_bytes + 1024 * 1024).decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError("FlareSolverr returned HTTP %s after direct error: %s" % (exc.code, direct_error)) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError("FlareSolverr request failed after direct error: %s" % exc) from exc
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("FlareSolverr returned invalid JSON after direct error: %s" % direct_error) from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("FlareSolverr returned invalid response type after direct error: %s" % direct_error)
+        if data.get("status") != "ok":
+            message = str(data.get("message") or data.get("status") or "unknown")
+            raise RuntimeError("FlareSolverr returned status %s after direct error: %s" % (message, direct_error))
+        solution = data.get("solution")
+        if not isinstance(solution, dict):
+            raise RuntimeError("FlareSolverr returned invalid solution after direct error: %s" % direct_error)
+        try:
+            solution_status = int(solution.get("status") or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("FlareSolverr solution returned invalid HTTP status after direct error: %s" % direct_error) from exc
+        if solution_status < 200 or solution_status >= 300:
+            raise RuntimeError(
+                "FlareSolverr solution returned HTTP %s after direct error: %s" % (solution_status, direct_error)
+            )
+        body = str(solution.get("response") or "")
+        if not body.strip():
+            raise RuntimeError("FlareSolverr returned empty response after direct error: %s" % direct_error)
+        if len(body.encode("utf-8")) > self.max_bytes:
+            raise RuntimeError("FlareSolverr response exceeds max bytes")
+        if looks_like_cloudflare_challenge(body):
+            raise RuntimeError("FlareSolverr returned Cloudflare challenge page after direct error: %s" % direct_error)
+        return body
 
 
 DEFAULT_ADULT_METADATA_PROVIDERS = (
@@ -306,7 +408,7 @@ def read_limited(response, max_bytes):
             break
         total += len(chunk)
         if total > max_bytes:
-            raise RuntimeError("image exceeds max bytes")
+            raise RuntimeError("response exceeds max bytes")
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -664,6 +766,15 @@ def iter_mgstage_poster_candidates(value):
 
 def normalize_url(value):
     return str(value or "").strip()
+
+
+def looks_like_cloudflare_challenge(value):
+    lower = str(value or "").lower()
+    if not lower:
+        return False
+    if "cloudflare" in lower and ("just a moment" in lower or "attention required" in lower):
+        return True
+    return any(needle in lower for needle in CF_CHALLENGE_NEEDLES)
 
 
 def normalize_adult_base_urls(value):

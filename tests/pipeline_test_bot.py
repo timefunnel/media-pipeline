@@ -109,6 +109,8 @@ class BotConfigTest(unittest.TestCase):
                 "ADULT_ARTWORK_GENERATE_PORTRAIT_ENABLED": "0",
                 "ADULT_METADATA_BASE_URLS": "javdb.test,https://javbus.test",
                 "ADULT_METADATA_FETCH_TIMEOUT_SECONDS": "3",
+                "ADULT_METADATA_FLARESOLVERR_URL": "http://flaresolverr:8191",
+                "ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS": "12",
             }
         )
 
@@ -118,6 +120,8 @@ class BotConfigTest(unittest.TestCase):
         self.assertFalse(config.adult_artwork_generate_portrait_enabled)
         self.assertEqual(config.adult_metadata_base_urls, ("https://javdb.test", "https://javbus.test"))
         self.assertEqual(config.adult_metadata_fetch_timeout_seconds, 3)
+        self.assertEqual(config.adult_metadata_flaresolverr_url, "http://flaresolverr:8191")
+        self.assertEqual(config.adult_metadata_flaresolverr_timeout_seconds, 12)
 
     def test_bot_config_reads_sync_recovery_interval(self):
         from pipeline.bot import BotConfig

@@ -1,5 +1,7 @@
 import copy
+import json
 import threading
+import urllib.error
 
 from tests.test_pipeline_core import *
 from pipeline.subtitle_proxy import (
@@ -1827,7 +1829,7 @@ class MediaStationClientTest(unittest.TestCase):
                 super().__init__(bases=["https://javdb.test"], timeout=1)
                 self.urls = []
 
-            def _fetch_text(self, url, referer=""):
+            def _fetch_text(self, url, referer="", allow_flaresolverr=False):
                 self.urls.append(url)
                 if "/search?" in url:
                     return '<a class="box" href="/v/abc"><strong>SSIS-218</strong></a>'
@@ -1840,6 +1842,142 @@ class MediaStationClientTest(unittest.TestCase):
         self.assertEqual(match.source, "javdb")
         self.assertEqual(match.poster_url, "https://javdb.test/cover.jpg")
         self.assertEqual(provider.urls[0], "https://javdb.test/search?q=SSIS-218&f=all")
+
+    def test_adult_metadata_provider_does_not_call_flaresolverr_when_direct_fetch_succeeds(self):
+        class FakeResponse:
+            def __init__(self, body, status=200):
+                self.body = body.encode("utf-8")
+                self.status = status
+                self.headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self, size=-1):
+                if size is None or size < 0:
+                    size = len(self.body)
+                chunk = self.body[:size]
+                self.body = self.body[size:]
+                return chunk
+
+        calls = []
+
+        def fake_urlopen(request, timeout=None):
+            url = request.full_url
+            calls.append(url)
+            if url == "http://flaresolverr.test/v1":
+                raise AssertionError("FlareSolverr should not be called")
+            if "/search?" in url:
+                return FakeResponse('<a class="box" href="/v/abc"><strong>SSIS-218</strong></a>')
+            return FakeResponse('<h2>SSIS-218 direct title</h2><img class="video-cover" src="/cover.jpg">')
+
+        provider = AdultHTMLMetadataProvider(
+            bases=["https://javdb.test"],
+            timeout=1,
+            flaresolverr_url="http://flaresolverr.test",
+            flaresolverr_timeout=2,
+        )
+
+        with patch("pipeline.adult_metadata.urllib.request.urlopen", side_effect=fake_urlopen):
+            match = provider.search({"title": "SSIS-218"}, ["SSIS-218"])
+
+        self.assertEqual(match.title, "direct title")
+        self.assertEqual(calls, ["https://javdb.test/search?q=SSIS-218&f=all", "https://javdb.test/v/abc"])
+
+    def test_adult_metadata_provider_uses_flaresolverr_after_javdb_403(self):
+        class FakeResponse:
+            def __init__(self, payload, status=200):
+                self.body = json.dumps(payload).encode("utf-8")
+                self.status = status
+                self.headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self, size=-1):
+                if size is None or size < 0:
+                    size = len(self.body)
+                chunk = self.body[:size]
+                self.body = self.body[size:]
+                return chunk
+
+        flaresolverr_payloads = []
+
+        def fake_urlopen(request, timeout=None):
+            url = request.full_url
+            if url == "http://flaresolverr.test/v1":
+                payload = json.loads(request.data.decode("utf-8"))
+                flaresolverr_payloads.append(payload)
+                if "/search?" in payload["url"]:
+                    body = '<a class="box" href="/v/abc"><strong>SSIS-218</strong></a>'
+                else:
+                    body = '<h2>SSIS-218 fallback title</h2><img class="video-cover" src="/cover.jpg">'
+                return FakeResponse({"status": "ok", "solution": {"status": 200, "response": body}})
+            raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+
+        provider = AdultHTMLMetadataProvider(
+            bases=["https://javdb.test"],
+            timeout=1,
+            flaresolverr_url="http://flaresolverr.test",
+            flaresolverr_timeout=2,
+        )
+
+        with patch("pipeline.adult_metadata.urllib.request.urlopen", side_effect=fake_urlopen):
+            match = provider.search({"title": "SSIS-218"}, ["SSIS-218"])
+
+        self.assertEqual(match.title, "fallback title")
+        self.assertEqual(match.poster_url, "https://javdb.test/cover.jpg")
+        self.assertEqual([payload["cmd"] for payload in flaresolverr_payloads], ["request.get", "request.get"])
+        self.assertEqual([payload["maxTimeout"] for payload in flaresolverr_payloads], [2000, 2000])
+        self.assertEqual(flaresolverr_payloads[0]["url"], "https://javdb.test/search?q=SSIS-218&f=all")
+        self.assertEqual(flaresolverr_payloads[1]["url"], "https://javdb.test/v/abc")
+
+    def test_adult_metadata_flaresolverr_error_is_explicit(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.body = json.dumps(payload).encode("utf-8")
+                self.status = 200
+                self.headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self, size=-1):
+                if size is None or size < 0:
+                    size = len(self.body)
+                chunk = self.body[:size]
+                self.body = self.body[size:]
+                return chunk
+
+        def fake_urlopen(request, timeout=None):
+            url = request.full_url
+            if url == "http://flaresolverr.test/v1":
+                return FakeResponse({"status": "error", "message": "blocked"})
+            raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+
+        provider = AdultHTMLMetadataProvider(
+            bases=["https://javdb.test"],
+            timeout=1,
+            flaresolverr_url="http://flaresolverr.test",
+            flaresolverr_timeout=2,
+        )
+
+        with patch("pipeline.adult_metadata.urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaisesRegex(RuntimeError, "FlareSolverr returned status blocked"):
+                provider._fetch_text(
+                    "https://javdb.test/search?q=SSIS-218&f=all",
+                    referer="https://javdb.test",
+                    allow_flaresolverr=True,
+                )
 
     def test_adult_artwork_semantic_repair_swaps_portrait_and_landscape(self):
         class FakeFetcher:
