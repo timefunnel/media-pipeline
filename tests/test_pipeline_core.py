@@ -404,8 +404,8 @@ class MediaStationDbHelperTest(unittest.TestCase):
         candidate = deleted_openlist_media_hide_candidate(
             {
                 "id": "media-1",
-                "library_id": "d150a96c-b467-4c60-82f1-207ae5949045",
-                "library_root_id": "0c1dda42-29ef-4069-b051-c9549a8d4440",
+                "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID",
+                "library_root_id": "REPLACE_WITH_MSG_MOVIE_ROOT_ID",
                 "path": "cloud://openlist/115/电影/Movie/Movie.mkv",
                 "deleted_at": "2026-07-05T22:00:00+08:00",
             }
@@ -422,8 +422,8 @@ class MediaStationDbHelperTest(unittest.TestCase):
         candidate = deleted_openlist_media_hide_candidate(
             {
                 "id": "media-1",
-                "library_id": "e1333358-17ff-4b90-82f0-663cec26c0df",
-                "library_root_id": "fc7058d6-0b32-4536-bb92-4755c488be55",
+                "library_id": "REPLACE_WITH_MSG_ANIME_LIBRARY_ID",
+                "library_root_id": "REPLACE_WITH_MSG_ANIME_ROOT_ID",
                 "path": "cloud://openlist/115/动漫/秋色之空/01.associated.mkv",
                 "deleted_at": "2026-07-05T22:00:00+08:00",
             }

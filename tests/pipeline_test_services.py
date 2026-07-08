@@ -1159,8 +1159,8 @@ class CategoryConfigTest(unittest.TestCase):
         rows = [
             {
                 "id": "m1",
-                "library_id": "b6c58f40-76dc-46b5-8f27-9e74d22e5e3d",
-                "library_root_id": "3d2e0cb4-3537-4f7d-8d79-9d4d5f1800df",
+                "library_id": "REPLACE_WITH_MSG_TV_LIBRARY_ID",
+                "library_root_id": "REPLACE_WITH_MSG_TV_ROOT_ID",
                 "title": "成龙历险记",
                 "path": "cloud://openlist/115/剧集/成龙历险记/成龙历险记 第01集.mp4",
                 "root_path": "cloud://openlist/115%2F%E5%89%A7%E9%9B%86",
@@ -1170,8 +1170,8 @@ class CategoryConfigTest(unittest.TestCase):
             },
             {
                 "id": "m2",
-                "library_id": "b6c58f40-76dc-46b5-8f27-9e74d22e5e3d",
-                "library_root_id": "3d2e0cb4-3537-4f7d-8d79-9d4d5f1800df",
+                "library_id": "REPLACE_WITH_MSG_TV_LIBRARY_ID",
+                "library_root_id": "REPLACE_WITH_MSG_TV_ROOT_ID",
                 "title": "成龙历险记",
                 "path": "cloud://openlist/115/剧集/成龙历险记/成龙历险记 第02集.mp4",
                 "root_path": "cloud://openlist/115%2F%E5%89%A7%E9%9B%86",
@@ -1326,39 +1326,50 @@ class CategoryConfigTest(unittest.TestCase):
         self.assertEqual(result["openlist_hide_patterns"], ["^PV$"])
 
     def test_routes_movie_tv_anime_adult_and_other_to_separate_115_folders(self):
-        self.assertEqual(category_to_folder_id("movie"), "3464134653584082023")
-        self.assertEqual(category_to_folder_id("tv"), "3465137076394001831")
-        self.assertEqual(category_to_folder_id("anime"), "3465784028030830531")
-        self.assertEqual(category_to_folder_id("adult"), "3464134590896014943")
-        self.assertEqual(category_to_folder_id("other"), "3465205291639899794")
+        from pipeline.config import category_maps, load_category_config
+
+        folder_ids, _openlist_paths, _msg_roots = category_maps(load_category_config({}))
+
+        self.assertEqual(folder_ids["movie"], "REPLACE_WITH_115_MOVIE_CID")
+        self.assertEqual(folder_ids["tv"], "REPLACE_WITH_115_TV_CID")
+        self.assertEqual(folder_ids["anime"], "REPLACE_WITH_115_ANIME_CID")
+        self.assertEqual(folder_ids["adult"], "REPLACE_WITH_115_ADULT_CID")
+        self.assertEqual(folder_ids["other"], "REPLACE_WITH_115_OTHER_CID")
 
     def test_routes_movie_tv_anime_adult_and_other_to_openlist_paths(self):
-        self.assertEqual(category_to_openlist_path("movie"), "/115/电影")
-        self.assertEqual(category_to_openlist_path("tv"), "/115/剧集")
-        self.assertEqual(category_to_openlist_path("anime"), "/115/动漫")
-        self.assertEqual(category_to_openlist_path("adult"), "/115/成人")
-        self.assertEqual(category_to_openlist_path("other"), "/115/其他")
+        from pipeline.config import category_maps, load_category_config
+
+        _folder_ids, openlist_paths, _msg_roots = category_maps(load_category_config({}))
+
+        self.assertEqual(openlist_paths["movie"], "/115/电影")
+        self.assertEqual(openlist_paths["tv"], "/115/剧集")
+        self.assertEqual(openlist_paths["anime"], "/115/动漫")
+        self.assertEqual(openlist_paths["adult"], "/115/成人")
+        self.assertEqual(openlist_paths["other"], "/115/其他")
 
     def test_routes_movie_tv_anime_adult_and_other_to_mediastation_roots(self):
-        movie = category_to_msg_library_root("movie")
-        tv = category_to_msg_library_root("tv")
-        anime = category_to_msg_library_root("anime")
-        adult = category_to_msg_library_root("adult")
-        other = category_to_msg_library_root("other")
+        from pipeline.config import category_maps, load_category_config
 
-        self.assertEqual(movie["library_id"], "d150a96c-b467-4c60-82f1-207ae5949045")
-        self.assertEqual(movie["root_id"], "0c1dda42-29ef-4069-b051-c9549a8d4440")
-        self.assertEqual(tv["library_id"], "b6c58f40-76dc-46b5-8f27-9e74d22e5e3d")
-        self.assertEqual(tv["root_id"], "3d2e0cb4-3537-4f7d-8d79-9d4d5f1800df")
+        _folder_ids, _openlist_paths, msg_roots = category_maps(load_category_config({}))
+        movie = msg_roots["movie"]
+        tv = msg_roots["tv"]
+        anime = msg_roots["anime"]
+        adult = msg_roots["adult"]
+        other = msg_roots["other"]
+
+        self.assertEqual(movie["library_id"], "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID")
+        self.assertEqual(movie["root_id"], "REPLACE_WITH_MSG_MOVIE_ROOT_ID")
+        self.assertEqual(tv["library_id"], "REPLACE_WITH_MSG_TV_LIBRARY_ID")
+        self.assertEqual(tv["root_id"], "REPLACE_WITH_MSG_TV_ROOT_ID")
         self.assertEqual(tv["media_type"], "tv")
-        self.assertEqual(anime["library_id"], "e1333358-17ff-4b90-82f0-663cec26c0df")
-        self.assertEqual(anime["root_id"], "fc7058d6-0b32-4536-bb92-4755c488be55")
+        self.assertEqual(anime["library_id"], "REPLACE_WITH_MSG_ANIME_LIBRARY_ID")
+        self.assertEqual(anime["root_id"], "REPLACE_WITH_MSG_ANIME_ROOT_ID")
         self.assertEqual(anime["provider"], "tmdb")
         self.assertEqual(anime["media_type"], "anime")
-        self.assertEqual(adult["library_id"], "26768071-73bb-4b5c-85f3-ad0dd84f9fd9")
-        self.assertEqual(adult["root_id"], "3fe479e8-4a96-4e61-9f69-fa802e448446")
-        self.assertEqual(other["library_id"], "60067bc7-eb34-466c-8bf9-5654297a609f")
-        self.assertEqual(other["root_id"], "1f889ec1-b34d-40b6-b3ca-f4372170a42b")
+        self.assertEqual(adult["library_id"], "REPLACE_WITH_MSG_ADULT_LIBRARY_ID")
+        self.assertEqual(adult["root_id"], "REPLACE_WITH_MSG_ADULT_ROOT_ID")
+        self.assertEqual(other["library_id"], "REPLACE_WITH_MSG_OTHER_LIBRARY_ID")
+        self.assertEqual(other["root_id"], "REPLACE_WITH_MSG_OTHER_ROOT_ID")
         self.assertEqual(other["provider"], "tmdb")
         self.assertEqual(other["media_type"], "movie")
 
@@ -1381,7 +1392,14 @@ class CategoryConfigTest(unittest.TestCase):
         self.assertEqual(openlist_paths["movie"], "/115/电影新")
         self.assertEqual(msg_roots["movie"]["library_id"], "library-override")
         self.assertEqual(msg_roots["movie"]["root_id"], "root-override")
-        self.assertEqual(folder_ids["adult"], "3464134590896014943")
+        self.assertEqual(folder_ids["adult"], "REPLACE_WITH_115_ADULT_CID")
+
+    def test_default_category_config_does_not_embed_instance_ids(self):
+        from pipeline.config import DEFAULT_CATEGORY_CONFIG
+
+        raw = json.dumps(DEFAULT_CATEGORY_CONFIG, ensure_ascii=False)
+        self.assertNotRegex(raw, r"\b\d{16,22}\b")
+        self.assertNotRegex(raw, r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 
     def test_load_category_config_allows_inline_json_overrides(self):
         from pipeline.config import category_maps, load_category_config
@@ -2221,7 +2239,7 @@ class Client115Test(unittest.TestCase):
         transport = FakeTransport({"state": True, "data": [{"info_hash": "abc", "url": "magnet:?xt=urn:btih:abc"}]})
         client = Client115("access-token-value", transport=transport)
 
-        result = client.add_offline_urls(["magnet:?xt=urn:btih:abc"], "3464134653584082023")
+        result = client.add_offline_urls(["magnet:?xt=urn:btih:abc"], "REPLACE_WITH_115_MOVIE_CID")
 
         self.assertEqual(result["state"], True)
         self.assertEqual(len(transport.calls), 1)
@@ -2229,7 +2247,7 @@ class Client115Test(unittest.TestCase):
         self.assertEqual(call["method"], "POST")
         self.assertEqual(call["url"], "https://proapi.115.com/open/offline/add_task_urls")
         self.assertEqual(call["headers"]["Authorization"], "Bearer access-token-value")
-        self.assertEqual(call["data"], {"urls": "magnet:?xt=urn:btih:abc", "wp_path_id": "3464134653584082023"})
+        self.assertEqual(call["data"], {"urls": "magnet:?xt=urn:btih:abc", "wp_path_id": "REPLACE_WITH_115_MOVIE_CID"})
 
     def test_delete_offline_task_uses_official_endpoint_without_deleting_files(self):
         transport = FakeTransport({"state": True, "data": []})
@@ -2254,17 +2272,17 @@ class Client115Test(unittest.TestCase):
         self.assertNotIn("refreshToken", transport.calls[0]["url"])
 
     def test_get_folder_info_uses_official_folder_info_endpoint(self):
-        transport = FakeTransport({"state": True, "data": {"file_id": "3464134653584082023", "file_name": "影视库-电影"}})
+        transport = FakeTransport({"state": True, "data": {"file_id": "REPLACE_WITH_115_MOVIE_CID", "file_name": "影视库-电影"}})
         client = Client115("access-token-value", transport=transport)
 
-        result = client.get_folder_info("3464134653584082023")
+        result = client.get_folder_info("REPLACE_WITH_115_MOVIE_CID")
 
         self.assertEqual(result["state"], True)
         call = transport.calls[0]
         self.assertEqual(call["method"], "GET")
         self.assertEqual(
             call["url"],
-            "https://proapi.115.com/open/folder/get_info?file_id=3464134653584082023",
+            "https://proapi.115.com/open/folder/get_info?file_id=REPLACE_WITH_115_MOVIE_CID",
         )
 
 
@@ -2978,7 +2996,7 @@ class CliSubmitSearchTest(unittest.TestCase):
         self.assertEqual(fake_openlist.paths, ["/115/电影"])
         self.assertEqual(fake_token_store.load_count, 1)
         self.assertEqual(fake_115.urls, ["magnet:?xt=urn:btih:ABC"])
-        self.assertEqual(fake_115.folder_id, "3464134653584082023")
+        self.assertEqual(fake_115.folder_id, "REPLACE_WITH_115_MOVIE_CID")
         self.assertEqual(payload["submit"]["tasks"][0]["info_hash"], "ABC")
         self.assertNotIn("url", payload["submit"]["tasks"][0])
 

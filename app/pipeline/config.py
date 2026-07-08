@@ -5,51 +5,51 @@ import os
 
 DEFAULT_CATEGORY_CONFIG = {
     "movie": {
-        "folder_id": "3464134653584082023",
+        "folder_id": "REPLACE_WITH_115_MOVIE_CID",
         "openlist_path": "/115/\u7535\u5f71",
         "msg": {
-            "library_id": "d150a96c-b467-4c60-82f1-207ae5949045",
-            "root_id": "0c1dda42-29ef-4069-b051-c9549a8d4440",
+            "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID",
+            "root_id": "REPLACE_WITH_MSG_MOVIE_ROOT_ID",
             "provider": "tmdb",
             "media_type": "movie",
         },
     },
     "tv": {
-        "folder_id": "3465137076394001831",
+        "folder_id": "REPLACE_WITH_115_TV_CID",
         "openlist_path": "/115/\u5267\u96c6",
         "msg": {
-            "library_id": "b6c58f40-76dc-46b5-8f27-9e74d22e5e3d",
-            "root_id": "3d2e0cb4-3537-4f7d-8d79-9d4d5f1800df",
+            "library_id": "REPLACE_WITH_MSG_TV_LIBRARY_ID",
+            "root_id": "REPLACE_WITH_MSG_TV_ROOT_ID",
             "provider": "tmdb",
             "media_type": "tv",
         },
     },
     "anime": {
-        "folder_id": "3465784028030830531",
+        "folder_id": "REPLACE_WITH_115_ANIME_CID",
         "openlist_path": "/115/\u52a8\u6f2b",
         "msg": {
-            "library_id": "e1333358-17ff-4b90-82f0-663cec26c0df",
-            "root_id": "fc7058d6-0b32-4536-bb92-4755c488be55",
+            "library_id": "REPLACE_WITH_MSG_ANIME_LIBRARY_ID",
+            "root_id": "REPLACE_WITH_MSG_ANIME_ROOT_ID",
             "provider": "tmdb",
             "media_type": "anime",
         },
     },
     "adult": {
-        "folder_id": "3464134590896014943",
+        "folder_id": "REPLACE_WITH_115_ADULT_CID",
         "openlist_path": "/115/\u6210\u4eba",
         "msg": {
-            "library_id": "26768071-73bb-4b5c-85f3-ad0dd84f9fd9",
-            "root_id": "3fe479e8-4a96-4e61-9f69-fa802e448446",
+            "library_id": "REPLACE_WITH_MSG_ADULT_LIBRARY_ID",
+            "root_id": "REPLACE_WITH_MSG_ADULT_ROOT_ID",
             "provider": "adult",
             "media_type": "adult",
         },
     },
     "other": {
-        "folder_id": "3465205291639899794",
+        "folder_id": "REPLACE_WITH_115_OTHER_CID",
         "openlist_path": "/115/\u5176\u4ed6",
         "msg": {
-            "library_id": "60067bc7-eb34-466c-8bf9-5654297a609f",
-            "root_id": "1f889ec1-b34d-40b6-b3ca-f4372170a42b",
+            "library_id": "REPLACE_WITH_MSG_OTHER_LIBRARY_ID",
+            "root_id": "REPLACE_WITH_MSG_OTHER_ROOT_ID",
             "provider": "tmdb",
             "media_type": "movie",
         },

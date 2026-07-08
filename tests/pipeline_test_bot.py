@@ -2593,7 +2593,7 @@ class TelegramBotTest(unittest.TestCase):
                 submit_response={
                     "state": True,
                     "tasks": [{"info_hash": "BBB", "state": True, "code": 0}],
-                    "task_status": {"status_name": "downloading", "percent_done": 0, "file_id": "", "wp_path_id": "3464134653584082023"},
+                    "task_status": {"status_name": "downloading", "percent_done": 0, "file_id": "", "wp_path_id": "REPLACE_WITH_115_MOVIE_CID"},
                 }
             )
             bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
@@ -4315,7 +4315,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         events = []
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "d150a96c-b467-4c60-82f1-207ae5949045", "title": "Sintel"}]}}
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "title": "Sintel"}]}}
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -4340,7 +4340,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             )
 
         self.assertEqual(events, [("openlist", "/115/电影", True)])
-        self.assertEqual(fake_msg.scan_calls, [("d150a96c-b467-4c60-82f1-207ae5949045", "0c1dda42-29ef-4069-b051-c9549a8d4440")])
+        self.assertEqual(fake_msg.scan_calls, [("REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "REPLACE_WITH_MSG_MOVIE_ROOT_ID")])
         self.assertEqual(fake_msg.scrape_calls, ["media-1"])
         self.assertEqual(fake_msg.artwork_repair_calls, [])
         self.assertEqual(task["msg_sync_status"], "success")
@@ -4354,7 +4354,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         title = "[DBD-Raws][4K_SDR][哥斯拉之终极战役][正片+特典映像][2160P][UHDBDRip][HEVC-10bit][简繁外挂][FLACx3][MKV]"
         media = {
             "id": "media-1",
-            "library_id": "d150a96c-b467-4c60-82f1-207ae5949045",
+            "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID",
             "title": title,
             "path": "cloud://openlist/115/电影/%s/[DBD-Raws][4K_SDR][Godzilla Final Wars][Ver.A][2160P].mkv" % title,
         }
@@ -4393,7 +4393,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         events = []
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "e1333358-17ff-4b90-82f0-663cec26c0df", "title": "Aki Sora"}]}}
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_ANIME_LIBRARY_ID", "title": "Aki Sora"}]}}
         )
 
         class FakeMsgDb:
@@ -4457,7 +4457,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "d150a96c-b467-4c60-82f1-207ae5949045", "title": "Movie"}]}},
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "title": "Movie"}]}},
             events=events,
         )
 
@@ -4513,7 +4513,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "d150a96c-b467-4c60-82f1-207ae5949045", "title": "Movie"}]}},
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "title": "Movie"}]}},
             events=events,
         )
 
@@ -4594,7 +4594,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         fake_openlist = CleaningOpenList({"/115/电影": [{"name": "Other", "is_dir": True, "size": 0}]})
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "d150a96c-b467-4c60-82f1-207ae5949045", "title": "Movie"}]}}
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "title": "Movie"}]}}
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -4619,7 +4619,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             )
 
         self.assertEqual(fake_openlist.meta_hide_calls, [])
-        self.assertEqual(fake_msg.scan_calls, [("d150a96c-b467-4c60-82f1-207ae5949045", "0c1dda42-29ef-4069-b051-c9549a8d4440")])
+        self.assertEqual(fake_msg.scan_calls, [("REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "REPLACE_WITH_MSG_MOVIE_ROOT_ID")])
         self.assertEqual(task["openlist_clean_status"], "failed")
         self.assertIn("target not found", task["openlist_clean_error"])
         self.assertEqual(task["msg_sync_status"], "success")
@@ -4638,7 +4638,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             }
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "d150a96c-b467-4c60-82f1-207ae5949045", "title": "Movie"}]}}
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "title": "Movie"}]}}
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -4662,7 +4662,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"info_hash": "ABC", "status_name": "success", "name": "Movie"},
             )
 
-        self.assertEqual(fake_msg.scan_calls, [("d150a96c-b467-4c60-82f1-207ae5949045", "0c1dda42-29ef-4069-b051-c9549a8d4440")])
+        self.assertEqual(fake_msg.scan_calls, [("REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "REPLACE_WITH_MSG_MOVIE_ROOT_ID")])
         self.assertEqual(task["openlist_clean_status"], "failed")
         self.assertIn("timed out", task["openlist_clean_error"])
         self.assertEqual(task["msg_sync_status"], "success")
@@ -4796,7 +4796,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "26768071-73bb-4b5c-85f3-ad0dd84f9fd9", "title": "MIDA-304"}]}},
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_ADULT_LIBRARY_ID", "title": "MIDA-304"}]}},
             events=events,
             artwork_repair_response={"status": "success", "updated": 1, "fields": ["poster_url"]},
         )
@@ -4877,7 +4877,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "26768071-73bb-4b5c-85f3-ad0dd84f9fd9", "title": "SSIS-218"}]}},
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_ADULT_LIBRARY_ID", "title": "SSIS-218"}]}},
             events=events,
         )
 
@@ -4959,7 +4959,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             }
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "26768071-73bb-4b5c-85f3-ad0dd84f9fd9", "title": "downloaded folder"}]}}
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_ADULT_LIBRARY_ID", "title": "downloaded folder"}]}}
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -5492,7 +5492,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         fake_openlist = CleaningOpenList({"/115/电影": [{"name": "Movie", "is_dir": True, "size": 0}]})
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "d150a96c-b467-4c60-82f1-207ae5949045", "title": "Movie"}]}}
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID", "title": "Movie"}]}}
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -5537,7 +5537,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "items": [
                         {
                             "id": "media-wrong",
-                            "library_id": "d150a96c-b467-4c60-82f1-207ae5949045",
+                            "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID",
                             "title": "秋色之空",
                             "path": "cloud://openlist/115/动漫/成龙历险记/01.mp4",
                         }
@@ -5549,7 +5549,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "items": [
                         {
                             "id": "media-correct",
-                            "library_id": "d150a96c-b467-4c60-82f1-207ae5949045",
+                            "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID",
                             "title": "秋色之空",
                             "path": "cloud://openlist/115/电影/秋色之空/01.mkv",
                             "size_bytes": 900 * 1024 * 1024,
@@ -5615,7 +5615,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         fake_openlist = CleaningOpenList({"/115/其他": [{"name": "Unmatched", "is_dir": True, "size": 0}]})
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "60067bc7-eb34-466c-8bf9-5654297a609f", "title": "Unmatched"}]}},
+            search_response={"data": {"items": [{"id": "media-1", "library_id": "REPLACE_WITH_MSG_OTHER_LIBRARY_ID", "title": "Unmatched"}]}},
             artwork_repair_response={"status": "skipped", "updated": 0, "reason": "not_needed"},
         )
 
@@ -5641,12 +5641,12 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"info_hash": "ABC", "status_name": "success", "name": "Unmatched"},
             )
 
-        self.assertEqual(fake_msg.scan_calls, [("60067bc7-eb34-466c-8bf9-5654297a609f", "1f889ec1-b34d-40b6-b3ca-f4372170a42b")])
+        self.assertEqual(fake_msg.scan_calls, [("REPLACE_WITH_MSG_OTHER_LIBRARY_ID", "REPLACE_WITH_MSG_OTHER_ROOT_ID")])
         self.assertEqual(fake_msg.artwork_repair_calls, [])
         self.assertEqual(fake_openlist.rename_calls, [])
         self.assertNotIn("openlist_adult_format_status", task)
-        self.assertEqual(task["msg_library_id"], "60067bc7-eb34-466c-8bf9-5654297a609f")
-        self.assertEqual(task["msg_root_id"], "1f889ec1-b34d-40b6-b3ca-f4372170a42b")
+        self.assertEqual(task["msg_library_id"], "REPLACE_WITH_MSG_OTHER_LIBRARY_ID")
+        self.assertEqual(task["msg_root_id"], "REPLACE_WITH_MSG_OTHER_ROOT_ID")
         self.assertEqual(task["msg_sync_status"], "success")
 
     def test_sync_completed_task_skips_when_already_synced(self):
@@ -5777,7 +5777,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "items": [
                         {
                             "id": "media-1",
-                            "library_id": "26768071-73bb-4b5c-85f3-ad0dd84f9fd9",
+                            "library_id": "REPLACE_WITH_MSG_ADULT_LIBRARY_ID",
                             "title": "SSIS-450",
                         }
                     ]
@@ -5813,7 +5813,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "items": [
                         {
                             "id": "media-1",
-                            "library_id": "d150a96c-b467-4c60-82f1-207ae5949045",
+                            "library_id": "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID",
                             "title": "Sintel",
                         }
                     ]
@@ -5850,7 +5850,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "items": [
                         {
                             "id": "media-adult",
-                            "library_id": "26768071-73bb-4b5c-85f3-ad0dd84f9fd9",
+                            "library_id": "REPLACE_WITH_MSG_ADULT_LIBRARY_ID",
                             "title": "無防備すぎる幼馴染のノーブラぽろりに胸キュン勃起！ びんびんビーチクに我慢できず乳首こねくりラブ 石川澪",
                         }
                     ]
@@ -5889,7 +5889,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "items": [
                         {
                             "id": "media-1",
-                            "library_id": "e1333358-17ff-4b90-82f0-663cec26c0df",
+                            "library_id": "REPLACE_WITH_MSG_ANIME_LIBRARY_ID",
                             "title": "成龙历险记",
                         }
                     ]

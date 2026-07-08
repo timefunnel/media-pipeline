@@ -190,12 +190,14 @@ other -> /115/其他
 115 目录：
 
 ```text
-movie -> 3464134653584082023
-tv -> 3465137076394001831
-anime -> 3465784028030830531
-adult -> 3464134590896014943
-other -> 3465205291639899794
+movie -> REPLACE_WITH_115_MOVIE_CID
+tv -> REPLACE_WITH_115_TV_CID
+anime -> REPLACE_WITH_115_ANIME_CID
+adult -> REPLACE_WITH_115_ADULT_CID
+other -> REPLACE_WITH_115_OTHER_CID
 ```
+
+说明：为便于上传个人仓库，文档和代码不再记录当前服务器的 115 目录 cid；真实运行值维护在远端 `.env`，由 compose 注入容器环境。
 
 2026-07-08 OpenList 可见目录规模：
 
@@ -270,12 +272,14 @@ MSG guard trigger: pipeline_guard_msg_cloud_media
 当前 pipeline 使用的 MediaStationGo 云盘媒体库：
 
 ```text
-26768071-73bb-4b5c-85f3-ad0dd84f9fd9 | 成人 | adult | cloud://openlist/115%2F%E6%88%90%E4%BA%BA
-d150a96c-b467-4c60-82f1-207ae5949045 | 电影 | movie | cloud://openlist/115%2F%E7%94%B5%E5%BD%B1
-b6c58f40-76dc-46b5-8f27-9e74d22e5e3d | 剧集 | tv | cloud://openlist/115%2F%E5%89%A7%E9%9B%86
-e1333358-17ff-4b90-82f0-663cec26c0df | 动漫 | anime | cloud://openlist/115%2F%E5%8A%A8%E6%BC%AB
-60067bc7-eb34-466c-8bf9-5654297a609f | 其他媒体 | movie | cloud://openlist/115%2F%E5%85%B6%E4%BB%96
+REPLACE_WITH_MSG_ADULT_LIBRARY_ID | 成人 | adult | cloud://openlist/115%2F%E6%88%90%E4%BA%BA
+REPLACE_WITH_MSG_MOVIE_LIBRARY_ID | 电影 | movie | cloud://openlist/115%2F%E7%94%B5%E5%BD%B1
+REPLACE_WITH_MSG_TV_LIBRARY_ID | 剧集 | tv | cloud://openlist/115%2F%E5%89%A7%E9%9B%86
+REPLACE_WITH_MSG_ANIME_LIBRARY_ID | 动漫 | anime | cloud://openlist/115%2F%E5%8A%A8%E6%BC%AB
+REPLACE_WITH_MSG_OTHER_LIBRARY_ID | 其他媒体 | movie | cloud://openlist/115%2F%E5%85%B6%E4%BB%96
 ```
+
+说明：表中的 library/root id 均为占位符。当前服务器真实值维护在 `.env`，新设备必须按 `docs/deployment-guide.md` 重新创建 MSG 媒体库后填写自己的 id。
 
 2026-07-08 MSG 活动库快照：
 
@@ -299,32 +303,32 @@ e1333358-17ff-4b90-82f0-663cec26c0df | 动漫 | anime | cloud://openlist/115%2F%
 
 ```text
 movie:
-  library_id=d150a96c-b467-4c60-82f1-207ae5949045
-  root_id=0c1dda42-29ef-4069-b051-c9549a8d4440
+  library_id=REPLACE_WITH_MSG_MOVIE_LIBRARY_ID
+  root_id=REPLACE_WITH_MSG_MOVIE_ROOT_ID
   provider=tmdb
   media_type=movie
 
 tv:
-  library_id=b6c58f40-76dc-46b5-8f27-9e74d22e5e3d
-  root_id=3d2e0cb4-3537-4f7d-8d79-9d4d5f1800df
+  library_id=REPLACE_WITH_MSG_TV_LIBRARY_ID
+  root_id=REPLACE_WITH_MSG_TV_ROOT_ID
   provider=tmdb
   media_type=tv
 
 anime:
-  library_id=e1333358-17ff-4b90-82f0-663cec26c0df
-  root_id=fc7058d6-0b32-4536-bb92-4755c488be55
+  library_id=REPLACE_WITH_MSG_ANIME_LIBRARY_ID
+  root_id=REPLACE_WITH_MSG_ANIME_ROOT_ID
   provider=tmdb
   media_type=anime
 
 adult:
-  library_id=26768071-73bb-4b5c-85f3-ad0dd84f9fd9
-  root_id=3fe479e8-4a96-4e61-9f69-fa802e448446
+  library_id=REPLACE_WITH_MSG_ADULT_LIBRARY_ID
+  root_id=REPLACE_WITH_MSG_ADULT_ROOT_ID
   provider=adult
   media_type=adult
 
 other:
-  library_id=60067bc7-eb34-466c-8bf9-5654297a609f
-  root_id=1f889ec1-b34d-40b6-b3ca-f4372170a42b
+  library_id=REPLACE_WITH_MSG_OTHER_LIBRARY_ID
+  root_id=REPLACE_WITH_MSG_OTHER_ROOT_ID
   provider=tmdb
   media_type=movie
 ```
@@ -518,10 +522,11 @@ OpenList 基线索引：
 
 当前策略：
 
-- 电影内容保存到 `3464134653584082023`。
-- 剧集内容保存到 `3465137076394001831`。
-- 成人内容保存到 `3464134590896014943`。
-- 其他内容保存到 `3465205291639899794`。
+- 电影内容保存到 `REPLACE_WITH_115_MOVIE_CID`。
+- 剧集内容保存到 `REPLACE_WITH_115_TV_CID`。
+- 动漫内容保存到 `REPLACE_WITH_115_ANIME_CID`。
+- 成人内容保存到 `REPLACE_WITH_115_ADULT_CID`。
+- 其他内容保存到 `REPLACE_WITH_115_OTHER_CID`。
 - 真实提交必须由 CLI `--commit` 或用户点击 Bot 入库按钮触发。
 - dry-run 不创建 115 任务。
 - 不做失败后自动切换其他 rank。
