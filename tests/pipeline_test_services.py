@@ -1926,8 +1926,11 @@ class MediaStationClientTest(unittest.TestCase):
             self.assertEqual(result["status"], "success")
             self.assertEqual(result["reason"], "portrait_generated")
             self.assertIn("https://privdo.example/pipeline-artwork/adult/", result["patch"]["poster_url"])
-            self.assertEqual(result["patch"]["backdrop_url"], "https://img/current-poster.jpg")
+            self.assertIn("https://privdo.example/pipeline-artwork/adult/", result["patch"]["backdrop_url"])
+            self.assertNotEqual(result["patch"]["backdrop_url"], result["patch"]["poster_url"])
             self.assertTrue(os.path.exists(result["generated"]["path"]))
+            backdrop_file = os.path.join(tmp, result["patch"]["backdrop_url"].rsplit("/", 1)[-1])
+            self.assertTrue(os.path.exists(backdrop_file))
             self.assertEqual(image_orientation(result["generated"]["width"], result["generated"]["height"]), "portrait")
             with Image.open(result["generated"]["path"]) as generated:
                 red, green, blue = generated.resize((1, 1)).getpixel((0, 0))
