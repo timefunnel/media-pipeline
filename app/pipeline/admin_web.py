@@ -5,8 +5,11 @@ import html
 import json
 import os
 import sqlite3
+import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -16,6 +19,10 @@ from pipeline.task_state import STATUS_FAILED, STATUS_RUNNING, STATUS_SUCCESS, T
 DEFAULT_ADMIN_WEB_HOST = "127.0.0.1"
 DEFAULT_ADMIN_WEB_PORT = 18082
 DEFAULT_ADMIN_WEB_MAX_TASKS = 2000
+DEFAULT_ADMIN_WEB_BASE_PATH = ""
+DEFAULT_ADMIN_WEB_AUTH_MODE = "none"
+DEFAULT_ADMIN_WEB_MSG_BASE_URL = "http://127.0.0.1:18080/api"
+DEFAULT_ADMIN_WEB_MSG_AUTH_CACHE_SECONDS = 60
 
 CATEGORY_LABELS = {
     "movie": "电影",
@@ -55,6 +62,131 @@ ERROR_FIELDS = (
     ("msg_artwork_repair_error", "图片修复"),
     ("subtitle_match_error", "字幕匹配"),
 )
+
+
+class AdminAuthError(Exception):
+    def __init__(self, message, status=HTTPStatus.UNAUTHORIZED):
+        super().__init__(message)
+        self.status = status
+
+
+class MsgTokenValidator:
+    def __init__(
+        self,
+        base_url=DEFAULT_ADMIN_WEB_MSG_BASE_URL,
+        timeout=5,
+        require_admin=True,
+        cache_seconds=DEFAULT_ADMIN_WEB_MSG_AUTH_CACHE_SECONDS,
+    ):
+        self.base_url = str(base_url or DEFAULT_ADMIN_WEB_MSG_BASE_URL).rstrip("/")
+        self.timeout = max(1, int(timeout or 5))
+        self.require_admin = bool(require_admin)
+        self.cache_seconds = max(0, int(cache_seconds or 0))
+        self._cache = {}
+        self._lock = threading.Lock()
+
+    def validate(self, token):
+        token = str(token or "").strip()
+        if not token:
+            raise AdminAuthError("MSG token missing", HTTPStatus.UNAUTHORIZED)
+        cached = self._cached(token)
+        if cached is not None:
+            return cached
+        permissions = self._fetch_permissions(token)
+        if self.require_admin and not msg_permissions_allow_admin(permissions):
+            raise AdminAuthError("MSG admin permission required", HTTPStatus.FORBIDDEN)
+        self._store_cache(token, permissions)
+        return permissions
+
+    def _cached(self, token):
+        if self.cache_seconds <= 0:
+            return None
+        now = time.time()
+        with self._lock:
+            cached = self._cache.get(token)
+            if cached and cached[0] > now:
+                return cached[1]
+            if cached:
+                self._cache.pop(token, None)
+        return None
+
+    def _store_cache(self, token, permissions):
+        if self.cache_seconds <= 0:
+            return
+        with self._lock:
+            self._cache[token] = (time.time() + self.cache_seconds, permissions)
+
+    def _fetch_permissions(self, token):
+        url = self.base_url + "/auth/permissions"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "Authorization": "Bearer %s" % token,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise AdminAuthError("MSG token rejected", HTTPStatus.UNAUTHORIZED) from exc
+            raise AdminAuthError("MSG auth check failed: HTTP %s" % exc.code, HTTPStatus.BAD_GATEWAY) from exc
+        except urllib.error.URLError as exc:
+            raise AdminAuthError("MSG auth check failed: %s" % exc.reason, HTTPStatus.BAD_GATEWAY) from exc
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise AdminAuthError("MSG auth response is not valid JSON", HTTPStatus.BAD_GATEWAY) from exc
+        return normalize_msg_permissions(payload)
+
+
+def normalize_msg_permissions(payload):
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, dict):
+        payload = data
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "permissions": payload.get("permissions") if isinstance(payload.get("permissions"), dict) else {},
+        "role": str(payload.get("role") or ""),
+        "tier": str(payload.get("tier") or ""),
+        "is_super": bool(payload.get("is_super")),
+    }
+
+
+def msg_permissions_allow_admin(permissions):
+    permissions = permissions or {}
+    if permissions.get("is_super"):
+        return True
+    if permissions.get("role") == "admin":
+        return True
+    permission_map = permissions.get("permissions") or {}
+    return bool(permission_map.get("admin") or permission_map.get("system.admin"))
+
+
+def extract_bearer_token(header):
+    value = str(header or "").strip()
+    prefix = "Bearer "
+    if not value.startswith(prefix):
+        return ""
+    return value[len(prefix) :].strip()
+
+
+def normalize_base_path(value):
+    value = str(value or "").strip()
+    if not value or value == "/":
+        return ""
+    value = "/" + value.strip("/")
+    return value
+
+
+def admin_url(base_path, path="/"):
+    base_path = normalize_base_path(base_path)
+    path = "/" + str(path or "/").lstrip("/")
+    if path == "/":
+        return base_path + "/" if base_path else "/"
+    return base_path + path
 
 
 class AdminTaskStore:
@@ -338,7 +470,7 @@ def build_query(params, **updates):
     return urllib.parse.urlencode(merged)
 
 
-def render_dashboard(records, subtitle_summary, params, revision="unknown"):
+def render_dashboard(records, subtitle_summary, params, revision="unknown", base_path=""):
     summary = summarize_tasks(records["all"])
     page = records["page"]
     page_items = records["items"]
@@ -352,7 +484,7 @@ def render_dashboard(records, subtitle_summary, params, revision="unknown"):
     <h1>任务控制台</h1>
   </div>
   <div class="top-actions">
-    <a class="button ghost" href="/api/tasks">JSON</a>
+    <a class="button ghost" href="{api_url}">JSON</a>
     <span class="revision">rev {revision}</span>
   </div>
 </header>
@@ -361,13 +493,13 @@ def render_dashboard(records, subtitle_summary, params, revision="unknown"):
 </section>
 <main class="layout">
   <aside class="panel filters">
-    <form method="get" action="/">
+    <form method="get" action="{home_url}">
       <label>关键词<input name="q" value="{query}" placeholder="标题 / 番号 / info_hash"></label>
       <label>媒体库{category_select}</label>
       <label>状态{status_select}</label>
       <label>每页{page_size_select}</label>
       <button class="button" type="submit">筛选</button>
-      <a class="button ghost" href="/">重置</a>
+      <a class="button ghost" href="{home_url}">重置</a>
     </form>
   </aside>
   <section class="task-section">
@@ -385,6 +517,8 @@ def render_dashboard(records, subtitle_summary, params, revision="unknown"):
   </section>
 </main>
 """.format(
+            api_url=escape(admin_url(base_path, "/api/tasks")),
+            home_url=escape(admin_url(base_path, "/")),
             revision=escape(revision),
             metric_cards=render_metric_cards(summary, subtitle_summary),
             query=escape(filters.get("q")),
@@ -394,18 +528,18 @@ def render_dashboard(records, subtitle_summary, params, revision="unknown"):
             total=page["total"],
             page_no=page["page"],
             page_count=page["page_count"],
-            pager_top=render_pager(params, page),
-            task_cards=render_task_cards(page_items),
-            pager_bottom=render_pager(params, page),
+            pager_top=render_pager(params, page, base_path=base_path),
+            task_cards=render_task_cards(page_items, base_path=base_path),
+            pager_bottom=render_pager(params, page, base_path=base_path),
         ),
     )
 
 
-def render_task_detail(record, revision="unknown"):
+def render_task_detail(record, revision="unknown", base_path=""):
     if record is None:
         return html_page(
             title="任务不存在",
-            body='<main class="single"><section class="panel"><h1>任务不存在</h1><a class="button" href="/">返回</a></section></main>',
+            body='<main class="single"><section class="panel"><h1>任务不存在</h1><a class="button" href="%s">返回</a></section></main>' % escape(admin_url(base_path, "/")),
             status=HTTPStatus.NOT_FOUND,
         )
     task = record.get("task") or {}
@@ -420,7 +554,7 @@ def render_task_detail(record, revision="unknown"):
     <h1>{title}</h1>
   </div>
   <div class="top-actions">
-    <a class="button ghost" href="/">返回</a>
+    <a class="button ghost" href="{home_url}">返回</a>
     <span class="revision">rev {revision}</span>
   </div>
 </header>
@@ -450,6 +584,7 @@ def render_task_detail(record, revision="unknown"):
   </section>
 </main>
 """.format(
+            home_url=escape(admin_url(base_path, "/")),
             category=escape(category_label(record.get("category"))),
             title=escape(display_task_title(record)),
             revision=escape(revision),
@@ -486,16 +621,16 @@ def render_metric_cards(summary, subtitle_summary):
     )
 
 
-def render_task_cards(records):
+def render_task_cards(records, base_path=""):
     if not records:
         return '<div class="empty">没有符合条件的任务</div>'
-    return "\n".join(render_task_card(record) for record in records)
+    return "\n".join(render_task_card(record, base_path=base_path) for record in records)
 
 
-def render_task_card(record):
+def render_task_card(record, base_path=""):
     task = record.get("task") or {}
     info_hash = str(record.get("info_hash") or "")
-    detail_url = "/tasks/%s" % urllib.parse.quote(info_hash)
+    detail_url = admin_url(base_path, "/tasks/%s" % urllib.parse.quote(info_hash))
     errors = task_errors(task)
     error_line = ""
     if errors:
@@ -558,14 +693,14 @@ def page_size_options():
     return [("10", "10"), ("20", "20"), ("50", "50"), ("100", "100")]
 
 
-def render_pager(params, page):
+def render_pager(params, page, base_path=""):
     if page["page_count"] <= 1:
         return ""
     current = page["page"]
     prev_disabled = current <= 1
     next_disabled = current >= page["page_count"]
-    prev_href = "/?%s" % build_query(params, page=current - 1)
-    next_href = "/?%s" % build_query(params, page=current + 1)
+    prev_href = "%s?%s" % (admin_url(base_path, "/"), build_query(params, page=current - 1))
+    next_href = "%s?%s" % (admin_url(base_path, "/"), build_query(params, page=current + 1))
     return """
 <nav class="pager" aria-label="分页">
   {prev}
@@ -635,6 +770,32 @@ def render_msg_media(task):
     return escape(title)
 
 
+def render_msg_auth_shell(base_path="", revision="unknown"):
+    script = (
+        MSG_AUTH_APP_JS.replace("__BASE_PATH__", json.dumps(normalize_base_path(base_path)))
+        .replace("__REVISION__", json.dumps(str(revision or "unknown")))
+        .replace("__AUTH_KEY__", json.dumps("mediastationgo-auth"))
+    )
+    return html_page(
+        title="Media Pipeline",
+        body="""
+<header class="topbar">
+  <div>
+    <p class="eyebrow">Media Pipeline</p>
+    <h1>任务控制台</h1>
+  </div>
+  <div class="top-actions">
+    <span class="revision">rev {revision}</span>
+  </div>
+</header>
+<div id="admin-app" class="single">
+  <section class="panel"><p class="loading-text">正在读取 MSG 登录态</p></section>
+</div>
+<script>{script}</script>
+""".format(revision=escape(revision), script=script),
+    )
+
+
 def html_page(title, body, status=HTTPStatus.OK):
     return {
         "status": int(status),
@@ -674,12 +835,14 @@ class PipelineAdminHandler(BaseHTTPRequestHandler):
     server_version = "MediaPipelineAdmin/1.0"
 
     def do_GET(self):
-        if not self._authorized():
+        if self.server.auth_mode == "basic" and not self._authorized():
             self._send_auth_required()
             return
         parsed = urllib.parse.urlparse(self.path)
         try:
             response = self._route(parsed)
+        except AdminAuthError as exc:
+            response = self._auth_error_response(exc)
         except Exception as exc:
             response = html_page(
                 "管理页面错误",
@@ -694,13 +857,19 @@ class PipelineAdminHandler(BaseHTTPRequestHandler):
         super().log_message(fmt, *args)
 
     def _route(self, parsed):
-        path = parsed.path or "/"
+        path = self._strip_base_path(parsed.path or "/")
         params = first_query_values(urllib.parse.parse_qs(parsed.query, keep_blank_values=True))
         if path == "/healthz":
             return json_page({"ok": True, "time": int(time.time())})
+        if self.server.auth_mode == "msg" and path in ("/", ""):
+            return render_msg_auth_shell(base_path=self.server.base_path, revision=self.server.revision)
+        if self.server.auth_mode == "msg" and path.startswith("/tasks/"):
+            return render_msg_auth_shell(base_path=self.server.base_path, revision=self.server.revision)
         if path == "/api/tasks":
+            self._require_msg_auth_if_needed()
             return self._api_tasks(params)
         if path.startswith("/api/tasks/"):
+            self._require_msg_auth_if_needed()
             info_hash = urllib.parse.unquote(path[len("/api/tasks/") :])
             record = self.server.store.load_task(info_hash)
             if record is None:
@@ -708,7 +877,7 @@ class PipelineAdminHandler(BaseHTTPRequestHandler):
             return json_page(task_public_summary(record) | {"task": record.get("task") or {}})
         if path.startswith("/tasks/"):
             info_hash = urllib.parse.unquote(path[len("/tasks/") :])
-            return render_task_detail(self.server.store.load_task(info_hash), revision=self.server.revision)
+            return render_task_detail(self.server.store.load_task(info_hash), revision=self.server.revision, base_path=self.server.base_path)
         if path == "/":
             return self._dashboard(params)
         return html_page(
@@ -736,7 +905,7 @@ class PipelineAdminHandler(BaseHTTPRequestHandler):
                 "q": params.get("q", ""),
             },
         }
-        return render_dashboard(records, self.server.store.subtitle_summary(), params, revision=self.server.revision)
+        return render_dashboard(records, self.server.store.subtitle_summary(), params, revision=self.server.revision, base_path=self.server.base_path)
 
     def _api_tasks(self, params):
         all_records = self.server.store.list_tasks(limit=self.server.max_tasks)
@@ -773,6 +942,35 @@ class PipelineAdminHandler(BaseHTTPRequestHandler):
             return False
         return hmac.compare_digest(supplied_user, username) and hmac.compare_digest(supplied_password, password)
 
+    def _require_msg_auth_if_needed(self):
+        if self.server.auth_mode != "msg":
+            return None
+        token = extract_bearer_token(self.headers.get("Authorization"))
+        return self.server.msg_validator.validate(token)
+
+    def _strip_base_path(self, path):
+        base_path = self.server.base_path
+        if not base_path:
+            return path or "/"
+        if path == base_path:
+            return "/"
+        if path.startswith(base_path + "/"):
+            return path[len(base_path) :] or "/"
+        if path == "/" and self.server.auth_mode == "msg":
+            return "/"
+        raise AdminAuthError("admin web path not found", HTTPStatus.NOT_FOUND)
+
+    def _auth_error_response(self, exc):
+        status = getattr(exc, "status", HTTPStatus.UNAUTHORIZED)
+        payload = {"error": str(exc)}
+        if self.path.startswith(admin_url(self.server.base_path, "/api/")) or "/api/" in self.path:
+            return json_page(payload, status=status)
+        return html_page(
+            "访问受限",
+            '<main class="single"><section class="panel"><h1>访问受限</h1><p>%s</p></section></main>' % escape(exc),
+            status=status,
+        )
+
     def _send_auth_required(self):
         response = {
             "status": HTTPStatus.UNAUTHORIZED,
@@ -796,7 +994,20 @@ class PipelineAdminHandler(BaseHTTPRequestHandler):
 class PipelineAdminServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, server_address, RequestHandlerClass, store, revision="unknown", username="", password="", max_tasks=DEFAULT_ADMIN_WEB_MAX_TASKS, quiet=False):
+    def __init__(
+        self,
+        server_address,
+        RequestHandlerClass,
+        store,
+        revision="unknown",
+        username="",
+        password="",
+        max_tasks=DEFAULT_ADMIN_WEB_MAX_TASKS,
+        quiet=False,
+        base_path=DEFAULT_ADMIN_WEB_BASE_PATH,
+        auth_mode=DEFAULT_ADMIN_WEB_AUTH_MODE,
+        msg_validator=None,
+    ):
         super().__init__(server_address, RequestHandlerClass)
         self.store = store
         self.revision = revision
@@ -804,10 +1015,22 @@ class PipelineAdminServer(ThreadingHTTPServer):
         self.password = password
         self.max_tasks = max(1, int(max_tasks or DEFAULT_ADMIN_WEB_MAX_TASKS))
         self.quiet = quiet
+        self.base_path = normalize_base_path(base_path)
+        self.auth_mode = normalize_auth_mode(auth_mode, username=username, password=password)
+        self.msg_validator = msg_validator or MsgTokenValidator()
 
 
 def first_query_values(query):
     return {key: values[-1] if values else "" for key, values in (query or {}).items()}
+
+
+def normalize_auth_mode(value, username="", password=""):
+    value = str(value or "").strip().lower()
+    if value in ("msg", "basic", "none"):
+        return value
+    if username or password:
+        return "basic"
+    return "none"
 
 
 def run_admin_web(
@@ -819,7 +1042,12 @@ def run_admin_web(
     max_tasks=DEFAULT_ADMIN_WEB_MAX_TASKS,
     revision="unknown",
     quiet=False,
+    base_path=DEFAULT_ADMIN_WEB_BASE_PATH,
+    auth_mode=DEFAULT_ADMIN_WEB_AUTH_MODE,
+    msg_base_url=DEFAULT_ADMIN_WEB_MSG_BASE_URL,
+    msg_auth_cache_seconds=DEFAULT_ADMIN_WEB_MSG_AUTH_CACHE_SECONDS,
 ):
+    auth_mode = normalize_auth_mode(auth_mode, username=username, password=password)
     server = PipelineAdminServer(
         (host, int(port)),
         PipelineAdminHandler,
@@ -829,8 +1057,15 @@ def run_admin_web(
         password=password,
         max_tasks=max_tasks,
         quiet=quiet,
+        base_path=base_path,
+        auth_mode=auth_mode,
+        msg_validator=MsgTokenValidator(base_url=msg_base_url, cache_seconds=msg_auth_cache_seconds),
     )
-    print("media-pipeline admin web listening on http://%s:%s" % (host, int(port)), flush=True)
+    print(
+        "media-pipeline admin web listening on http://%s:%s%s auth=%s"
+        % (host, int(port), normalize_base_path(base_path) or "/", auth_mode),
+        flush=True,
+    )
     server.serve_forever()
 
 
@@ -1124,4 +1359,248 @@ pre {
   .task-side { grid-template-columns: 1fr; }
   .button { width: 100%; }
 }
+"""
+
+
+MSG_AUTH_APP_JS = r"""
+(() => {
+  const BASE_PATH = __BASE_PATH__;
+  const REVISION = __REVISION__;
+  const AUTH_KEY = __AUTH_KEY__;
+  const app = document.getElementById("admin-app");
+
+  function pathOf(route) {
+    const clean = "/" + String(route || "/").replace(/^\/+/, "");
+    if (clean === "/") return BASE_PATH ? BASE_PATH + "/" : "/";
+    return BASE_PATH + clean;
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;"
+    }[ch]));
+  }
+
+  function readToken() {
+    const raw = window.localStorage.getItem(AUTH_KEY);
+    if (!raw) return "";
+    try {
+      const parsed = JSON.parse(raw);
+      const state = parsed && parsed.state ? parsed.state : parsed;
+      return state && state.token ? String(state.token) : "";
+    } catch {
+      return "";
+    }
+  }
+
+  async function apiJson(route) {
+    const token = readToken();
+    if (!token) {
+      throw new Error("请先登录 MediaStationGo 管理账号");
+    }
+    const response = await fetch(pathOf(route), {
+      headers: { "Authorization": "Bearer " + token, "Accept": "application/json" },
+      cache: "no-store"
+    });
+    if (response.status === 401) throw new Error("MSG 登录态已失效，请刷新 MSG 后重新登录");
+    if (response.status === 403) throw new Error("当前 MSG 用户没有管理权限");
+    if (!response.ok) throw new Error("请求失败：HTTP " + response.status);
+    return response.json();
+  }
+
+  function statusBadge(status) {
+    const labels = { running: "进行中", failed: "失败", success: "已完成", pending: "待处理" };
+    return `<span class="badge ${escapeHtml(status || "pending")}">${escapeHtml(labels[status] || status || "-")}</span>`;
+  }
+
+  function metric(label, value, tone) {
+    return `<article class="metric ${tone}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`;
+  }
+
+  function renderMetrics(summary) {
+    return [
+      metric("全部任务", summary.total || 0, "neutral"),
+      metric("进行中", summary.running || 0, "running"),
+      metric("失败", summary.failed || 0, "failed"),
+      metric("已完成", summary.success || 0, "success"),
+      metric("图片失败", summary.adult_artwork_failed || 0, "failed"),
+      metric("字幕失败", summary.subtitle_failed || 0, "failed")
+    ].join("");
+  }
+
+  function currentPath() {
+    const path = window.location.pathname;
+    if (BASE_PATH && path.startsWith(BASE_PATH)) return path.slice(BASE_PATH.length) || "/";
+    return path || "/";
+  }
+
+  function formValue(params, key) {
+    return escapeHtml(params.get(key) || "");
+  }
+
+  function renderFilters(params) {
+    const category = params.get("category") || "";
+    const status = params.get("status") || "";
+    const pageSize = params.get("page_size") || "20";
+    const option = (value, label, current) => `<option value="${escapeHtml(value)}"${value === current ? " selected" : ""}>${escapeHtml(label)}</option>`;
+    return `
+      <aside class="panel filters">
+        <form id="filter-form">
+          <label>关键词<input name="q" value="${formValue(params, "q")}" placeholder="标题 / 番号 / info_hash"></label>
+          <label>媒体库<select name="category">
+            ${option("", "全部", category)}
+            ${option("movie", "电影", category)}
+            ${option("tv", "剧集", category)}
+            ${option("anime", "动漫", category)}
+            ${option("adult", "成人", category)}
+            ${option("other", "其他", category)}
+          </select></label>
+          <label>状态<select name="status">
+            ${option("", "全部", status)}
+            ${option("running", "进行中", status)}
+            ${option("failed", "失败", status)}
+            ${option("pending", "待处理", status)}
+            ${option("success", "已完成", status)}
+          </select></label>
+          <label>每页<select name="page_size">
+            ${["10", "20", "50", "100"].map(v => option(v, v, pageSize)).join("")}
+          </select></label>
+          <button class="button" type="submit">筛选</button>
+          <a class="button ghost" href="${pathOf("/")}">重置</a>
+        </form>
+      </aside>`;
+  }
+
+  function renderPager(page, params) {
+    if (!page || page.page_count <= 1) return "";
+    const prev = new URLSearchParams(params);
+    const next = new URLSearchParams(params);
+    prev.set("page", String(Math.max(1, page.page - 1)));
+    next.set("page", String(Math.min(page.page_count, page.page + 1)));
+    const prevHtml = page.page <= 1 ? '<span class="button disabled">上一页</span>' : `<a class="button ghost" href="${pathOf("/")}?${prev.toString()}">上一页</a>`;
+    const nextHtml = page.page >= page.page_count ? '<span class="button disabled">下一页</span>' : `<a class="button ghost" href="${pathOf("/")}?${next.toString()}">下一页</a>`;
+    return `<nav class="pager" aria-label="分页">${prevHtml}<span>${page.page}/${page.page_count}</span>${nextHtml}</nav>`;
+  }
+
+  function renderTaskCard(item) {
+    const detailUrl = pathOf("/tasks/" + encodeURIComponent(item.info_hash || ""));
+    const errors = Array.isArray(item.errors) ? item.errors : [];
+    const error = errors.length ? `<p class="task-error">${escapeHtml(errors[0].stage)}：${escapeHtml(errors[0].error)}</p>` : "";
+    const shortHash = String(item.info_hash || "").length > 14 ? String(item.info_hash).slice(0, 8) + "..." + String(item.info_hash).slice(-6) : String(item.info_hash || "");
+    return `
+      <article class="task-card">
+        <div class="task-main">
+          <div class="task-title-row"><h3>${escapeHtml(item.title || "-")}</h3>${statusBadge(item.status)}</div>
+          <p class="task-meta">${escapeHtml(item.category_label || item.category || "-")} · ${escapeHtml(item.content_profile || "-")} · ${escapeHtml(formatTime(item.updated_at))}</p>
+          <p class="task-sub">115：${escapeHtml(item.offline_status || "-")} · 进度：${escapeHtml(formatPercent(item.percent_done))} · MSG：${escapeHtml(item.msg_sync_status || "-")}</p>
+          ${error}
+        </div>
+        <div class="task-side">
+          <span class="mono">${escapeHtml(shortHash)}</span>
+          <a class="button ghost" href="${detailUrl}">详情</a>
+        </div>
+      </article>`;
+  }
+
+  function formatPercent(value) {
+    if (value === null || value === undefined || value === "") return "-";
+    const number = Number(value);
+    if (!Number.isFinite(number)) return String(value);
+    return (number <= 1 ? number * 100 : number).toFixed(1) + "%";
+  }
+
+  function formatTime(value) {
+    const number = Number(value || 0);
+    if (!number) return "-";
+    return new Date(number * 1000).toLocaleString();
+  }
+
+  async function loadDashboard() {
+    const params = new URLSearchParams(window.location.search);
+    const data = await apiJson("/api/tasks" + (params.toString() ? "?" + params.toString() : ""));
+    const page = data.page || { page: 1, page_count: 1, total: 0 };
+    const items = Array.isArray(data.items) ? data.items : [];
+    app.className = "";
+    app.innerHTML = `
+      <section class="metrics" aria-label="任务统计">${renderMetrics(data.summary || {})}</section>
+      <main class="layout">
+        ${renderFilters(params)}
+        <section class="task-section">
+          <div class="section-head">
+            <div><h2>最近任务</h2><p>${escapeHtml(page.total || 0)} 条结果，第 ${escapeHtml(page.page || 1)}/${escapeHtml(page.page_count || 1)} 页</p></div>
+            ${renderPager(page, params)}
+          </div>
+          <div class="task-list">${items.length ? items.map(renderTaskCard).join("") : '<div class="empty">没有符合条件的任务</div>'}</div>
+          ${renderPager(page, params)}
+        </section>
+      </main>`;
+    document.getElementById("filter-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const next = new URLSearchParams(new FormData(event.currentTarget));
+      next.delete("page");
+      for (const key of Array.from(next.keys())) {
+        if (!next.get(key)) next.delete(key);
+      }
+      window.location.assign(pathOf("/") + (next.toString() ? "?" + next.toString() : ""));
+    });
+  }
+
+  function renderStageList(task) {
+    const labels = [
+      ["openlist_adult_format_status", "番号格式化"],
+      ["openlist_trash_hide_status", "回收站隐藏"],
+      ["openlist_clean_status", "OpenList隐藏"],
+      ["openlist_adult_extra_hide_status", "成人附加隐藏"],
+      ["msg_scan_status", "MSG扫描"],
+      ["msg_scrape_status", "MSG刮削"],
+      ["msg_extra_cleanup_status", "特典隐藏"],
+      ["msg_visibility_repair_status", "可见性修复"],
+      ["msg_artwork_repair_status", "图片修复"],
+      ["subtitle_match_status", "字幕匹配"]
+    ];
+    const rows = labels.filter(([key]) => task && task[key]).map(([key, label]) => `<div class="stage"><span>${escapeHtml(label)}</span>${statusBadge(task[key])}</div>`);
+    return rows.length ? rows.join("") : '<div class="empty inline">暂无阶段记录</div>';
+  }
+
+  async function loadDetail(infoHash) {
+    const data = await apiJson("/api/tasks/" + encodeURIComponent(infoHash));
+    const task = data.task || {};
+    const errors = Array.isArray(data.errors) ? data.errors : [];
+    app.className = "detail-grid";
+    app.innerHTML = `
+      <section class="panel">
+        <h2>基本信息</h2>
+        <dl class="kv">
+          <div><dt>状态</dt><dd>${statusBadge(data.status)}</dd></div>
+          <div><dt>115进度</dt><dd>${escapeHtml(data.offline_status || "-")} / ${escapeHtml(formatPercent(data.percent_done))}</dd></div>
+          <div><dt>info_hash</dt><dd class="mono">${escapeHtml(data.info_hash || "")}</dd></div>
+          <div><dt>MSG媒体</dt><dd>${escapeHtml(data.msg_media_id || "-")} ${escapeHtml(data.msg_media_title || "")}</dd></div>
+          <div><dt>更新时间</dt><dd>${escapeHtml(formatTime(data.updated_at))}</dd></div>
+        </dl>
+      </section>
+      <section class="panel"><h2>阶段</h2><div class="stage-list">${renderStageList(task)}</div></section>
+      <section class="panel detail-wide"><h2>错误</h2>${errors.length ? errors.map(e => `<div class="error-item"><strong>${escapeHtml(e.stage)}</strong><p>${escapeHtml(e.error)}</p></div>`).join("") : '<div class="empty inline">暂无错误</div>'}</section>
+      <section class="panel detail-wide"><h2>原始任务</h2><pre>${escapeHtml(JSON.stringify(task, null, 2))}</pre></section>`;
+  }
+
+  async function main() {
+    try {
+      const path = currentPath();
+      if (path.startsWith("/tasks/")) {
+        await loadDetail(decodeURIComponent(path.slice("/tasks/".length)));
+      } else {
+        await loadDashboard();
+      }
+    } catch (error) {
+      app.className = "single";
+      app.innerHTML = `<section class="panel"><h2>无法加载</h2><p class="task-error">${escapeHtml(error.message || error)}</p><a class="button ghost" href="/">返回 MSG</a></section>`;
+    }
+  }
+
+  main();
+})();
 """

@@ -11,8 +11,12 @@ from pipeline.subtitle_proxy import (
 )
 from pipeline.admin_web import (
     AdminTaskStore,
+    admin_url,
+    extract_bearer_token,
     filter_task_records,
+    msg_permissions_allow_admin,
     render_dashboard,
+    render_msg_auth_shell,
     render_task_detail,
     summarize_tasks,
     task_status_group,
@@ -158,12 +162,15 @@ class AdminWebTest(unittest.TestCase):
                 store.subtitle_summary(),
                 {},
                 revision="testrev",
+                base_path="/pipeline",
             )["body"].decode("utf-8")
 
         self.assertIn("任务控制台", html)
         self.assertIn("@media (max-width: 900px)", html)
         self.assertIn("MIDE-605", html)
         self.assertIn("rev testrev", html)
+        self.assertIn('href="/pipeline/api/tasks"', html)
+        self.assertIn('action="/pipeline/"', html)
 
     def test_admin_detail_shows_stages_and_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -175,6 +182,24 @@ class AdminWebTest(unittest.TestCase):
         self.assertIn("Godzilla", html)
         self.assertIn("MSG刮削", html)
         self.assertIn("MediaStationGo media not found", html)
+
+    def test_admin_msg_auth_shell_uses_msg_local_storage_token(self):
+        html = render_msg_auth_shell(base_path="/pipeline", revision="testrev")["body"].decode("utf-8")
+
+        self.assertIn("mediastationgo-auth", html)
+        self.assertIn("Bearer", html)
+        self.assertIn("/pipeline", html)
+        self.assertIn("rev testrev", html)
+        self.assertNotIn("MIDE-605", html)
+
+    def test_admin_url_and_msg_permission_helpers(self):
+        self.assertEqual(admin_url("/pipeline", "/api/tasks"), "/pipeline/api/tasks")
+        self.assertEqual(admin_url("", "/api/tasks"), "/api/tasks")
+        self.assertEqual(extract_bearer_token("Bearer token-1"), "token-1")
+        self.assertEqual(extract_bearer_token("Basic token-1"), "")
+        self.assertTrue(msg_permissions_allow_admin({"role": "admin", "permissions": {}, "is_super": False}))
+        self.assertTrue(msg_permissions_allow_admin({"role": "user", "permissions": {}, "is_super": True}))
+        self.assertFalse(msg_permissions_allow_admin({"role": "user", "permissions": {}, "is_super": False}))
 
 
 class SubtitleProxyTest(unittest.TestCase):

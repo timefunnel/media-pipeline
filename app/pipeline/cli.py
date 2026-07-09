@@ -4,7 +4,15 @@ import os
 import sys
 import urllib.parse
 
-from pipeline.admin_web import DEFAULT_ADMIN_WEB_HOST, DEFAULT_ADMIN_WEB_PORT, run_admin_web
+from pipeline.admin_web import (
+    DEFAULT_ADMIN_WEB_AUTH_MODE,
+    DEFAULT_ADMIN_WEB_BASE_PATH,
+    DEFAULT_ADMIN_WEB_HOST,
+    DEFAULT_ADMIN_WEB_MSG_AUTH_CACHE_SECONDS,
+    DEFAULT_ADMIN_WEB_MSG_BASE_URL,
+    DEFAULT_ADMIN_WEB_PORT,
+    run_admin_web,
+)
 from pipeline.client115 import Client115
 from pipeline.bot import (
     DEFAULT_UPSTREAM_SEARCH_LIMIT,
@@ -58,6 +66,17 @@ def build_parser():
     admin_web_parser.add_argument("--username", default=os.environ.get("ADMIN_WEB_USERNAME", ""))
     admin_web_parser.add_argument("--password", default=os.environ.get("ADMIN_WEB_PASSWORD", ""))
     admin_web_parser.add_argument("--max-tasks", type=int, default=int(os.environ.get("ADMIN_WEB_MAX_TASKS", "2000")))
+    admin_web_parser.add_argument("--base-path", default=os.environ.get("ADMIN_WEB_BASE_PATH", DEFAULT_ADMIN_WEB_BASE_PATH))
+    admin_web_parser.add_argument("--auth-mode", default=os.environ.get("ADMIN_WEB_AUTH_MODE", DEFAULT_ADMIN_WEB_AUTH_MODE))
+    admin_web_parser.add_argument(
+        "--msg-base-url",
+        default=os.environ.get("ADMIN_WEB_MSG_BASE_URL") or os.environ.get("MSG_BASE_URL", DEFAULT_ADMIN_WEB_MSG_BASE_URL),
+    )
+    admin_web_parser.add_argument(
+        "--msg-auth-cache-seconds",
+        type=int,
+        default=int(os.environ.get("ADMIN_WEB_MSG_AUTH_CACHE_SECONDS", str(DEFAULT_ADMIN_WEB_MSG_AUTH_CACHE_SECONDS))),
+    )
 
     subtitle_proxy_parser = subparsers.add_parser("subtitle-proxy")
     subtitle_proxy_parser.add_argument("--listen-host", default=os.environ.get("MSG_SUBTITLE_PROXY_HOST", DEFAULT_SUBTITLE_PROXY_HOST))
@@ -125,6 +144,10 @@ def main(argv=None):
             password=args.password,
             max_tasks=args.max_tasks,
             revision=os.environ.get("MEDIA_PIPELINE_REVISION", "unknown"),
+            base_path=args.base_path,
+            auth_mode=args.auth_mode,
+            msg_base_url=args.msg_base_url,
+            msg_auth_cache_seconds=args.msg_auth_cache_seconds,
         )
         return 0
 
