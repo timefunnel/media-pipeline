@@ -4506,6 +4506,48 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["msg_scrape_mode"], "apply")
         self.assertEqual(task["msg_scrape_query"], "Godzilla Final Wars")
 
+    def test_adult_scrape_applies_unique_code_match(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            scrape_search_responses={
+                "MIDE-949": {
+                    "items": [
+                        {
+                            "media_type": "adult",
+                            "title": "小悪魔シスコン妹ロリィタちゃんに二人きりで誘惑密着されてじっくりねっちょり着衣のまま犯●れる！ 七沢みあ",
+                            "year": 2021,
+                        }
+                    ]
+                }
+            }
+        )
+        service = PipelineBotService(
+            BotConfig(
+                "token",
+                {700656624},
+                "/tmp/state.db",
+                msg_admin_user="admin",
+                msg_admin_password="secret",
+                msg_enabled=True,
+            )
+        )
+
+        result = service._scrape_msg_media(
+            fake_msg,
+            "adult",
+            "media-1",
+            "mide 949",
+            {"openlist_adult_code": "MIDE-949"},
+            {"id": "media-1", "path": "cloud://openlist/115/成人/MIDE-949/MIDE-949.mp4"},
+        )
+
+        self.assertEqual(fake_msg.scrape_calls, [])
+        self.assertEqual(fake_msg.scrape_search_calls[0], ("media-1", "MIDE-949", "adult", "adult"))
+        self.assertEqual(fake_msg.scrape_apply_calls[0][0], "media-1")
+        self.assertEqual(result["msg_scrape_mode"], "apply")
+        self.assertEqual(result["msg_scrape_query"], "MIDE-949")
+
     def test_sync_completed_anime_task_repairs_episode_visibility_after_scrape(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
@@ -4575,7 +4617,18 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-movie-library", "title": "Movie"}]}},
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-1",
+                            "library_id": "test-movie-library",
+                            "title": "Movie",
+                            "path": "cloud://openlist/115/电影/Movie/Movie.mkv",
+                        }
+                    ]
+                }
+            },
             events=events,
         )
 
@@ -4921,7 +4974,18 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-adult-library", "title": "MIDA-304"}]}},
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-1",
+                            "library_id": "test-adult-library",
+                            "title": "MIDA-304",
+                            "path": "cloud://openlist/115/成人/MIDA-304/MIDA-304.mp4",
+                        }
+                    ]
+                }
+            },
             events=events,
             artwork_repair_response={"status": "success", "updated": 1, "fields": ["poster_url"]},
         )
@@ -5001,7 +5065,18 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-adult-library", "title": "SSIS-218"}]}},
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-1",
+                            "library_id": "test-adult-library",
+                            "title": "SSIS-218",
+                            "path": "cloud://openlist/115/成人/SSIS-218/SSIS-218.mp4",
+                        }
+                    ]
+                }
+            },
             events=events,
         )
 
@@ -5086,7 +5161,18 @@ class PipelineBotServiceTest(unittest.TestCase):
             }
         )
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-adult-library", "title": "downloaded folder"}]}}
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-1",
+                            "library_id": "test-adult-library",
+                            "title": "downloaded folder",
+                            "path": "cloud://openlist/115/成人/downloaded folder/main.mp4",
+                        }
+                    ]
+                }
+            }
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -5619,7 +5705,18 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         fake_openlist = CleaningOpenList({"/115/电影": [{"name": "Movie", "is_dir": True, "size": 0}]})
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-movie-library", "title": "Movie"}]}}
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-1",
+                            "library_id": "test-movie-library",
+                            "title": "Movie",
+                            "path": "cloud://openlist/115/电影/Movie",
+                        }
+                    ]
+                }
+            }
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -5737,12 +5834,108 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(media["_pipeline_match_mode"], "path")
         self.assertEqual(media["_pipeline_match_path"], "cloud://openlist/115/电影/Sintel/main.mkv")
 
+    def test_wait_for_msg_media_rejects_query_match_when_target_path_is_missing(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "wrong-media",
+                            "library_id": "test-adult-library",
+                            "title": "MIDE-949",
+                            "original_name": "MIRD-268",
+                            "path": "cloud://openlist/115/成人/MIRD-268/MIRD-268.mp4",
+                        }
+                    ]
+                }
+            },
+            list_response={"data": {"items": []}},
+        )
+        service = PipelineBotService(
+            BotConfig(
+                "token",
+                {700656624},
+                "/tmp/state.db",
+                msg_admin_user="admin",
+                msg_admin_password="secret",
+                msg_enabled=True,
+                msg_sync_poll_seconds=0,
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "path=/115/成人/MIDE-949"):
+            service._wait_for_msg_media(
+                fake_msg,
+                "test-adult-library",
+                ["MIDE-949"],
+                target_openlist_paths=["/115/成人/MIDE-949"],
+                require_target_path=True,
+            )
+
+        self.assertEqual(fake_msg.search_calls, [("MIDE-949", 20)])
+
+    def test_wait_for_msg_media_accepts_search_result_with_target_path(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "right-media",
+                            "library_id": "test-adult-library",
+                            "title": "mide 949",
+                            "original_name": "MIDE-949",
+                            "path": "cloud://openlist/115/成人/MIDE-949/MIDE-949.mp4",
+                        }
+                    ]
+                }
+            },
+            list_response={"data": {"items": []}},
+        )
+        service = PipelineBotService(
+            BotConfig(
+                "token",
+                {700656624},
+                "/tmp/state.db",
+                msg_admin_user="admin",
+                msg_admin_password="secret",
+                msg_enabled=True,
+                msg_sync_poll_seconds=0,
+            )
+        )
+
+        media = service._wait_for_msg_media(
+            fake_msg,
+            "test-adult-library",
+            ["MIDE-949"],
+            target_openlist_paths=["/115/成人/MIDE-949"],
+            require_target_path=True,
+        )
+
+        self.assertEqual(media["id"], "right-media")
+        self.assertEqual(media["_pipeline_match_mode"], "path")
+        self.assertEqual(media["_pipeline_match_path"], "cloud://openlist/115/成人/MIDE-949/MIDE-949.mp4")
+
     def test_sync_completed_other_task_uses_other_root_without_adult_code_format(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
         fake_openlist = CleaningOpenList({"/115/其他": [{"name": "Unmatched", "is_dir": True, "size": 0}]})
         fake_msg = FakeMediaStationClient(
-            search_response={"data": {"items": [{"id": "media-1", "library_id": "test-other-library", "title": "Unmatched"}]}},
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-1",
+                            "library_id": "test-other-library",
+                            "title": "Unmatched",
+                            "path": "cloud://openlist/115/其他/Unmatched",
+                        }
+                    ]
+                }
+            },
             artwork_repair_response={"status": "skipped", "updated": 0, "reason": "not_needed"},
         )
 

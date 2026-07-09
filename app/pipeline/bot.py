@@ -2100,6 +2100,7 @@ class PipelineBotService:
                 apply_progress(adult_extra_hide_result)
 
         target_openlist_paths = msg_target_openlist_paths(category, progress)
+        require_target_path = bool(msg_authoritative_openlist_paths(progress))
         media_id = progress.get("msg_media_id")
         media_title = progress.get("msg_media_title")
         root = category_to_msg_library_root(category)
@@ -2110,7 +2111,13 @@ class PipelineBotService:
             client = get_msg_client()
             emit({"msg_scan_status": "running", "msg_error": None})
             client.scan_root(root["library_id"], root["root_id"])
-            media = self._wait_for_msg_media(client, root["library_id"], queries, target_openlist_paths=target_openlist_paths)
+            media = self._wait_for_msg_media(
+                client,
+                root["library_id"],
+                queries,
+                target_openlist_paths=target_openlist_paths,
+                require_target_path=require_target_path,
+            )
             media_id = extract_media_id(media)
             if not media_id:
                 raise RuntimeError("MediaStationGo media id missing after scan")
@@ -2213,7 +2220,7 @@ class PipelineBotService:
         root = category_to_msg_library_root(category)
         provider = root.get("provider")
         media_type = root.get("media_type")
-        if category != "adult" and provider and media_type:
+        if provider and media_type:
             if media is None:
                 try:
                     media = client.get_media(media_id)
@@ -2383,7 +2390,7 @@ class PipelineBotService:
             "msg_artwork_repair_error": None,
         }
 
-    def _wait_for_msg_media(self, client, library_id, queries, target_openlist_paths=None):
+    def _wait_for_msg_media(self, client, library_id, queries, target_openlist_paths=None, require_target_path=False):
         deadline = time.monotonic() + max(0, int(self.config.msg_sync_poll_seconds))
         interval = max(1, int(self.config.msg_sync_poll_interval_seconds))
         while True:
@@ -2393,18 +2400,24 @@ class PipelineBotService:
                 if media:
                     return media
 
-            for query in queries:
-                items = extract_media_items(client.search_media(query, limit=20))
+                for query in queries:
+                    items = extract_media_items(client.search_media(query, limit=20))
+                    media = find_media_by_openlist_paths(items, target_openlist_paths, library_id=library_id)
+                    if media:
+                        return media
+            if not require_target_path:
+                for query in queries:
+                    items = extract_media_items(client.search_media(query, limit=20))
+                    media = find_matching_media(items, queries, library_id=library_id)
+                    if media:
+                        media["_pipeline_match_mode"] = "query"
+                        return media
+
+                items = extract_media_items(client.list_library_media(library_id, page=1, page_size=200, group_versions=0))
                 media = find_matching_media(items, queries, library_id=library_id)
                 if media:
                     media["_pipeline_match_mode"] = "query"
                     return media
-
-            items = extract_media_items(client.list_library_media(library_id, page=1, page_size=200, group_versions=0))
-            media = find_matching_media(items, queries, library_id=library_id)
-            if media:
-                media["_pipeline_match_mode"] = "query"
-                return media
 
             if time.monotonic() >= deadline:
                 break
@@ -2489,6 +2502,21 @@ def msg_target_openlist_paths(category, task):
     if root_path:
         for name in task_openlist_target_names(task):
             paths.append(posixpath.join(root_path.rstrip("/") or "/", name))
+    return unique_openlist_paths(paths)
+
+
+def msg_authoritative_openlist_paths(task):
+    task = task or {}
+    paths = []
+    for key in (
+        "openlist_adult_format_new_path",
+        "openlist_adult_format_path",
+        "openlist_clean_target",
+        "openlist_adult_extra_hide_path",
+    ):
+        value = normalize_openlist_path(task.get(key))
+        if value:
+            paths.append(value)
     return unique_openlist_paths(paths)
 
 
@@ -4832,7 +4860,7 @@ def media_search_queries(title, task):
 
 def msg_scrape_queries(title, task, media=None):
     values = []
-    for value in (title, (task or {}).get("name"), (task or {}).get("file_name")):
+    for value in ((task or {}).get("openlist_adult_code"), title, (task or {}).get("name"), (task or {}).get("file_name")):
         if value:
             values.append(str(value))
     if isinstance(media, dict):
