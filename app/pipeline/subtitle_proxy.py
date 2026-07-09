@@ -684,6 +684,103 @@ def patch_emby_adult_code_titles(payload):
     return changed
 
 
+def patch_emby_client_title_fields(payload):
+    changed = False
+    for item in iter_emby_items(payload):
+        if patch_emby_movie_non_episode_fields(item):
+            changed = True
+        if patch_emby_release_series_title(item):
+            changed = True
+    return changed
+
+
+def patch_emby_movie_non_episode_fields(item):
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("Type") or item.get("type") or "").strip().casefold() != "movie":
+        return False
+    changed = False
+    for key in ("SeasonId", "SeasonName", "SeriesId", "SeriesName"):
+        if key in item:
+            item.pop(key, None)
+            changed = True
+    for key in ("ParentIndexNumber", "IndexNumber"):
+        if key in item and int_value(item.get(key), -1) <= 0:
+            item.pop(key, None)
+            changed = True
+    return changed
+
+
+def patch_emby_release_series_title(item):
+    if not isinstance(item, dict):
+        return False
+    item_type = str(item.get("Type") or item.get("type") or "").strip().casefold()
+    changed = False
+    if item_type == "episode":
+        series_name = str(item.get("SeriesName") or "").strip()
+        cleaned = clean_emby_release_series_name(series_name)
+        if cleaned and cleaned != series_name:
+            item["SeriesName"] = cleaned
+            changed = True
+    elif item_type == "series":
+        name = str(item.get("Name") or "").strip()
+        cleaned = clean_emby_release_series_name(name)
+        if cleaned and cleaned != name:
+            item["Name"] = cleaned
+            changed = True
+    return changed
+
+
+def clean_emby_release_series_name(value):
+    text = str(value or "").strip()
+    if not text or not looks_like_release_series_name(text):
+        return ""
+    candidate = re.sub(r"^(?:\s*(?:【[^】]*】|\[[^\]]*\]|\([^)]*\)))+", "", text).strip()
+    if not candidate:
+        return ""
+    for marker in ("[", "【", "(", "（"):
+        index = candidate.find(marker)
+        if index > 0:
+            candidate = candidate[:index].strip()
+            break
+    dot_index = candidate.find(".")
+    if dot_index > 0 and contains_cjk(candidate[:dot_index]):
+        candidate = candidate[:dot_index].strip()
+    candidate = candidate.strip(" ._-")
+    if len(candidate) < 2 or not contains_cjk(candidate):
+        return ""
+    return candidate
+
+
+def looks_like_release_series_name(value):
+    text = str(value or "")
+    lowered = text.casefold()
+    if contains_cjk(text) and re.search(r"[\[【(（]", text):
+        return True
+    release_markers = (
+        "web-dl",
+        "webrip",
+        "bluray",
+        "h.264",
+        "h264",
+        "h.265",
+        "h265",
+        "x264",
+        "x265",
+        "aac",
+        "blacktv",
+        "pthdtv",
+        "www.",
+    )
+    if contains_cjk(text) and any(marker in lowered for marker in release_markers):
+        return True
+    return bool(contains_cjk(text) and re.search(r"\bS\d{1,2}\b", text, re.IGNORECASE))
+
+
+def contains_cjk(value):
+    return bool(re.search(r"[\u3400-\u9fff]", str(value or "")))
+
+
 def patch_emby_adult_code_title(item):
     if not isinstance(item, dict) or not emby_item_is_adult_media(item):
         return False
@@ -2310,6 +2407,9 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                 if patch_emby_adult_code_titles(payload):
                     no_store = True
                     self._mark_timing(timing, "adult_code_title_patch")
+                if patch_emby_client_title_fields(payload):
+                    no_store = True
+                    self._mark_timing(timing, "client_title_patch")
                 if patch_emby_image_item_ids(payload):
                     no_store = True
                     self._mark_timing(timing, "image_item_id_patch")

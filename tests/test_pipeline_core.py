@@ -71,6 +71,7 @@ from pipeline.subtitle_proxy import (
     iter_emby_items,
     normalize_webvtt_timestamps,
     patch_emby_adult_code_titles,
+    patch_emby_client_title_fields,
     patch_emby_image_item_ids,
     patch_emby_playback_info_runtime,
     patch_emby_resume_runtime_fields,
@@ -511,6 +512,44 @@ class EmbyImageItemIdCompatTest(unittest.TestCase):
         self.assertFalse(patch_emby_image_item_ids(payload))
         self.assertNotIn("PrimaryImageItemId", payload)
         self.assertNotIn("BackdropImageItemId", payload)
+
+
+class EmbyClientTitleCompatTest(unittest.TestCase):
+    def test_movie_drops_episode_only_fields(self):
+        payload = {
+            "Id": "movie-1",
+            "Type": "Movie",
+            "Name": "寻秦记",
+            "SeasonName": "特别篇",
+            "ParentIndexNumber": 0,
+            "IndexNumber": 0,
+        }
+
+        self.assertTrue(patch_emby_client_title_fields(payload))
+
+        self.assertEqual(payload["Name"], "寻秦记")
+        self.assertNotIn("SeasonName", payload)
+        self.assertNotIn("ParentIndexNumber", payload)
+        self.assertNotIn("IndexNumber", payload)
+
+    def test_episode_cleans_release_series_name(self):
+        payload = {
+            "Id": "episode-1",
+            "Type": "Episode",
+            "Name": "第 1 集",
+            "SeriesName": "【高清剧集网发布 www.PTHDTV.com】模范出租车3[全16集][中文字幕].Taxi.Driver.S03.1080p.WEB-DL.AAC2.0.H.264-BlackTV",
+        }
+
+        self.assertTrue(patch_emby_client_title_fields(payload))
+
+        self.assertEqual(payload["SeriesName"], "模范出租车3")
+        self.assertEqual(payload["Name"], "第 1 集")
+
+    def test_plain_series_name_is_unchanged(self):
+        payload = {"Id": "episode-1", "Type": "Episode", "SeriesName": "灵魂摆渡"}
+
+        self.assertFalse(patch_emby_client_title_fields(payload))
+        self.assertEqual(payload["SeriesName"], "灵魂摆渡")
 
 
 class EmbySyntheticChapterCompatTest(unittest.TestCase):
