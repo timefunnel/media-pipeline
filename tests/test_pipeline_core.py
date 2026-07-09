@@ -71,6 +71,7 @@ from pipeline.subtitle_proxy import (
     iter_emby_items,
     normalize_webvtt_timestamps,
     patch_emby_adult_code_titles,
+    patch_emby_image_item_ids,
     patch_emby_playback_info_runtime,
     patch_emby_resume_runtime_fields,
     parse_emby_item_image_request,
@@ -464,6 +465,50 @@ class EmbyHideFromResumeCompatTest(unittest.TestCase):
         self.assertEqual(payload["IsFavorite"], True)
         self.assertEqual(payload["Played"], False)
         self.assertEqual(payload["PlayedPercentage"], 12.5)
+
+
+class EmbyImageItemIdCompatTest(unittest.TestCase):
+    def test_movie_image_tags_add_image_item_ids(self):
+        payload = {
+            "Items": [
+                {
+                    "Id": "movie-1",
+                    "Type": "Movie",
+                    "ImageTags": {"Primary": "primary-tag"},
+                    "BackdropImageTags": ["backdrop-tag"],
+                }
+            ]
+        }
+
+        self.assertTrue(patch_emby_image_item_ids(payload))
+        item = payload["Items"][0]
+        self.assertEqual(item["PrimaryImageItemId"], "movie-1")
+        self.assertEqual(item["PrimaryImageTag"], "primary-tag")
+        self.assertEqual(item["BackdropImageItemId"], "movie-1")
+        self.assertEqual(item["ParentBackdropItemId"], "movie-1")
+        self.assertEqual(item["ParentBackdropImageTags"], ["backdrop-tag"])
+
+    def test_episode_without_own_image_uses_series_image_owner(self):
+        payload = {
+            "Id": "episode-1",
+            "Type": "Episode",
+            "SeriesId": "series-1",
+            "ImageTags": {},
+            "BackdropImageTags": [],
+        }
+
+        self.assertTrue(patch_emby_image_item_ids(payload))
+        self.assertEqual(payload["PrimaryImageItemId"], "series-1")
+        self.assertEqual(payload["BackdropImageItemId"], "series-1")
+        self.assertEqual(payload["ParentBackdropItemId"], "series-1")
+        self.assertNotIn("PrimaryImageTag", payload)
+
+    def test_movie_without_any_image_source_is_unchanged(self):
+        payload = {"Id": "movie-1", "Type": "Movie", "ImageTags": {}, "BackdropImageTags": []}
+
+        self.assertFalse(patch_emby_image_item_ids(payload))
+        self.assertNotIn("PrimaryImageItemId", payload)
+        self.assertNotIn("BackdropImageItemId", payload)
 
 
 class MediaStationDbHelperTest(unittest.TestCase):

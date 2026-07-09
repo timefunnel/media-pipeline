@@ -900,6 +900,48 @@ def clear_emby_collection_folder_item_cover(item):
     return changed
 
 
+def patch_emby_image_item_ids(payload):
+    changed = False
+    for item in iter_emby_items(payload):
+        if patch_emby_image_item_id(item):
+            changed = True
+    return changed
+
+
+def patch_emby_image_item_id(item):
+    if not isinstance(item, dict) or emby_item_is_collection_folder(item):
+        return False
+    item_id = str(item.get("Id") or item.get("id") or item.get("ItemId") or "").strip()
+    if not item_id:
+        return False
+    image_tags = item.get("ImageTags")
+    image_tags = image_tags if isinstance(image_tags, dict) else {}
+    primary_tag = str(image_tags.get("Primary") or "").strip()
+    backdrop_tags = item.get("BackdropImageTags")
+    backdrop_tags = [str(tag).strip() for tag in backdrop_tags if str(tag).strip()] if isinstance(backdrop_tags, list) else []
+    series_id = str(item.get("SeriesId") or "").strip()
+    item_type = str(item.get("Type") or "").strip().casefold()
+    primary_owner_id = item_id if primary_tag else (series_id if item_type in ("episode", "season") else "")
+    backdrop_owner_id = item_id if (backdrop_tags or primary_tag) else (series_id if item_type in ("episode", "season") else "")
+
+    changed = False
+    if primary_owner_id and str(item.get("PrimaryImageItemId") or "").strip() != primary_owner_id:
+        item["PrimaryImageItemId"] = primary_owner_id
+        changed = True
+    if primary_tag and str(item.get("PrimaryImageTag") or "").strip() != primary_tag:
+        item["PrimaryImageTag"] = primary_tag
+        changed = True
+    if backdrop_owner_id:
+        for key in ("BackdropImageItemId", "ParentBackdropItemId"):
+            if str(item.get(key) or "").strip() != backdrop_owner_id:
+                item[key] = backdrop_owner_id
+                changed = True
+    if backdrop_tags and item.get("ParentBackdropImageTags") != backdrop_tags:
+        item["ParentBackdropImageTags"] = backdrop_tags
+        changed = True
+    return changed
+
+
 def is_emby_placeholder_image_body(body):
     if not body or len(body) > 128:
         return False
@@ -2149,6 +2191,9 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                 if patch_emby_adult_code_titles(payload):
                     no_store = True
                     self._mark_timing(timing, "adult_code_title_patch")
+                if patch_emby_image_item_ids(payload):
+                    no_store = True
+                    self._mark_timing(timing, "image_item_id_patch")
                 if self._patch_emby_collection_folder_covers(payload, request_headers, request_path or ""):
                     no_store = True
                     self._mark_timing(timing, "folder_cover_patch")
