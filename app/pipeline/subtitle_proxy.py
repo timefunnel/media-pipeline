@@ -36,6 +36,7 @@ _ADULT_MSG_LIBRARY_ID_LOCK = threading.Lock()
 EMBY_TICKS_PER_SECOND = 10_000_000
 MIN_SYNTHETIC_RUNTIME_TICKS = 10 * 60 * EMBY_TICKS_PER_SECOND
 SYNTHETIC_RUNTIME_PADDING_TICKS = 60 * 60 * EMBY_TICKS_PER_SECOND
+STREAM_PROXY_CHUNK_SIZE = 256 * 1024
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -47,6 +48,15 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+BODY_REWRITE_CONTENT_TYPES = (
+    "application/json",
+    "text/html",
+    "text/vtt",
+    "application/x-subrip",
+    "text/x-ass",
+    "text/x-ssa",
+)
+BODY_REWRITE_EXTENSIONS = (".vtt", ".srt", ".ass", ".ssa")
 
 WEBVTT_TIMESTAMP_RE = re.compile(r"(?P<time>\d{2}:\d{2}:\d{2})\.(?P<fraction>\d{1,2})(?=\s|$)")
 SRT_TIMESTAMP_RE = re.compile(r"(?P<time>\d{2}:\d{2}:\d{2}),(?P<fraction>\d{1,3})(?=\s|$)")
@@ -308,6 +318,14 @@ def should_normalize_subtitle(content_type, body):
     if "text/vtt" in (content_type or "").lower():
         return True
     return body.lstrip().startswith(b"WEBVTT")
+
+
+def response_needs_body_rewrite(content_type, request_path=""):
+    lower_content_type = (content_type or "").lower()
+    if any(value in lower_content_type for value in BODY_REWRITE_CONTENT_TYPES):
+        return True
+    path = urllib.parse.urlparse(str(request_path or "")).path.lower()
+    return path.endswith(BODY_REWRITE_EXTENSIONS)
 
 
 def subtitle_body_to_vtt(body, path="", content_type=""):
@@ -1719,9 +1737,12 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         request = urllib.request.Request(upstream_url, data=request_body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                body = b"" if head_only else response.read()
                 self._mark_timing(timing, "upstream")
-                self._write_response(response.status, response.headers, body, head_only=head_only, request_headers=headers, request_path=self.path, timing=timing)
+                if response_needs_body_rewrite(response.headers.get("Content-Type", ""), self.path):
+                    body = b"" if head_only else response.read()
+                    self._write_response(response.status, response.headers, body, head_only=head_only, request_headers=headers, request_path=self.path, timing=timing)
+                    return
+                self._stream_response(response.status, response.headers, response, head_only=head_only, request_path=self.path, timing=timing)
         except urllib.error.HTTPError as exc:
             body = b"" if head_only else exc.read()
             self._mark_timing(timing, "upstream_http_error")
@@ -2445,6 +2466,29 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                 return response.status, response.headers, response.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.headers, exc.read()
+
+    def _stream_response(self, status, headers, response, head_only=False, request_path=None, timing=None):
+        self.send_response(status)
+        for key, value in headers.items():
+            if key.lower() in HOP_BY_HOP_HEADERS:
+                continue
+            self.send_header(key, value)
+        self.end_headers()
+        self._mark_timing(timing, "stream_headers")
+        if not head_only:
+            try:
+                while True:
+                    chunk = response.read(STREAM_PROXY_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                self._mark_timing(timing, "stream_client_closed")
+            except OSError as exc:
+                print("subtitle proxy stream error: %s" % exc, flush=True)
+                self._mark_timing(timing, "stream_error")
+        self._mark_timing(timing, "stream_response")
+        self._log_timing(timing, status, request_path)
 
     def _write_response(self, status, headers, body, head_only=False, request_headers=None, request_path=None, timing=None):
         content_type = headers.get("Content-Type", "")

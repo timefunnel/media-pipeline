@@ -67,6 +67,7 @@ from pipeline.prowlarr import ProwlarrClient, ProwlarrConfig, torrent_bytes_to_m
 from pipeline.resource_selector import ResourceSelector
 from pipeline.subtitle_proxy import (
     MsgApiAuthenticator,
+    STREAM_PROXY_CHUNK_SIZE,
     SubtitleProxyHandler,
     inject_emby_subtitle_streams,
     inject_subtitle_track_bootstrap,
@@ -84,6 +85,7 @@ from pipeline.subtitle_proxy import (
     parse_emby_hide_from_resume_request,
     parse_emby_subtitle_stream_path,
     parse_emby_item_media_id,
+    response_needs_body_rewrite,
     build_emby_folder_cover_grid,
     emby_folder_cover_response_headers,
     emby_folder_cover_grid_dimensions,
@@ -429,6 +431,95 @@ class FakeMediaStationClient:
         if self.events is not None:
             self.events.append(("artwork_repair",))
         return self.artwork_repair_response
+
+
+class FakeStreamResponse:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.read_sizes = []
+
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        if not self.chunks:
+            return b""
+        return self.chunks.pop(0)
+
+
+class FakeSubtitleProxyHandler(SubtitleProxyHandler):
+    def __init__(self):
+        self.status = None
+        self.headers = []
+        self.ended = False
+        self.wfile = io.BytesIO()
+        self.timing_marks = []
+        self.logged_timing = None
+
+    def send_response(self, status, message=None):
+        self.status = status
+
+    def send_header(self, key, value):
+        self.headers.append((key, value))
+
+    def end_headers(self):
+        self.ended = True
+
+    def _mark_timing(self, timing, label):
+        self.timing_marks.append(label)
+
+    def _log_timing(self, timing, status, request_path):
+        self.logged_timing = (status, request_path)
+
+
+class EmbyStreamProxyCompatTest(unittest.TestCase):
+    def test_video_response_does_not_need_body_rewrite(self):
+        self.assertFalse(response_needs_body_rewrite("video/mp4", "/Videos/media-1/stream.mp4"))
+        self.assertTrue(response_needs_body_rewrite("application/json", "/emby/Items/media-1/PlaybackInfo"))
+        self.assertTrue(response_needs_body_rewrite("text/vtt; charset=utf-8", "/Videos/media-1/Subtitles/1/Stream.vtt"))
+
+    def test_stream_response_forwards_video_in_chunks(self):
+        handler = FakeSubtitleProxyHandler()
+        response = FakeStreamResponse([b"abc", b"def"])
+
+        handler._stream_response(
+            206,
+            {
+                "Content-Type": "video/mp4",
+                "Content-Length": "6",
+                "Content-Range": "bytes 0-5/6",
+                "Accept-Ranges": "bytes",
+                "Connection": "close",
+            },
+            response,
+            head_only=False,
+            request_path="/Videos/media-1/stream.mp4",
+        )
+
+        self.assertEqual(handler.status, 206)
+        self.assertTrue(handler.ended)
+        self.assertEqual(handler.wfile.getvalue(), b"abcdef")
+        self.assertIn(("Content-Type", "video/mp4"), handler.headers)
+        self.assertIn(("Content-Length", "6"), handler.headers)
+        self.assertIn(("Content-Range", "bytes 0-5/6"), handler.headers)
+        self.assertIn(("Accept-Ranges", "bytes"), handler.headers)
+        self.assertNotIn(("Connection", "close"), handler.headers)
+        self.assertEqual(response.read_sizes, [STREAM_PROXY_CHUNK_SIZE, STREAM_PROXY_CHUNK_SIZE, STREAM_PROXY_CHUNK_SIZE])
+
+    def test_stream_response_head_preserves_headers_without_reading_body(self):
+        handler = FakeSubtitleProxyHandler()
+        response = FakeStreamResponse([b"abc"])
+
+        handler._stream_response(
+            200,
+            {"Content-Type": "video/mp4", "Content-Length": "3"},
+            response,
+            head_only=True,
+            request_path="/Videos/media-1/stream.mp4",
+        )
+
+        self.assertEqual(handler.status, 200)
+        self.assertEqual(handler.wfile.getvalue(), b"")
+        self.assertIn(("Content-Length", "3"), handler.headers)
+        self.assertEqual(response.read_sizes, [])
 
 
 class EmbyHideFromResumeCompatTest(unittest.TestCase):
