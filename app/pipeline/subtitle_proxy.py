@@ -71,6 +71,10 @@ EMBY_ITEM_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 EMBY_USER_ITEMS_RE = re.compile(r"^%s/Users/(?P<user_id>[^/]+)/Items/?$" % EMBY_PATH_PREFIX_PATTERN, re.IGNORECASE)
+EMBY_HIDE_FROM_RESUME_RE = re.compile(
+    r"^%s/Users/(?P<user_id>[^/]+)/Items/(?P<media_id>[^/]+)/HideFromResume/?$" % EMBY_PATH_PREFIX_PATTERN,
+    re.IGNORECASE,
+)
 EMBY_FOLDER_COVER_CACHE_TTL_SECONDS = 300
 EMBY_FOLDER_COVER_GRID_LIMIT = 4
 EMBY_FOLDER_COVER_ASPECT_RATIO = 16 / 9
@@ -1318,6 +1322,30 @@ def parse_emby_user_items_search_request(path):
     }
 
 
+def parse_emby_hide_from_resume_request(path):
+    parsed = urllib.parse.urlparse(path)
+    match = EMBY_HIDE_FROM_RESUME_RE.match(parsed.path)
+    if not match:
+        return None
+    query = urllib.parse.parse_qs(parsed.query)
+    return {
+        "user_id": urllib.parse.unquote(match.group("user_id")),
+        "media_id": urllib.parse.unquote(match.group("media_id")),
+        "hide": query_first_value(query, "Hide") or query_first_value(query, "hide"),
+    }
+
+
+def emby_hide_from_resume_user_data_payload(item, media_id):
+    user_data = item.get("UserData") if isinstance(item, dict) else None
+    payload = dict(user_data) if isinstance(user_data, dict) else {}
+    payload["ItemId"] = str(media_id or payload.get("ItemId") or "")
+    payload.setdefault("PlaybackPositionTicks", 0)
+    payload.setdefault("PlayCount", 0)
+    payload.setdefault("IsFavorite", False)
+    payload.setdefault("Played", False)
+    return payload
+
+
 class MsgApiAuthenticator:
     def __init__(self, base_url=DEFAULT_MSG_API_BASE_URL, username="", password=""):
         self.base_url = str(base_url or DEFAULT_MSG_API_BASE_URL).rstrip("/")
@@ -1417,6 +1445,8 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         }
         if method in ("GET", "HEAD") and self._serve_adult_artwork_cache(head_only=head_only):
             return
+        if method == "POST" and self._serve_emby_hide_from_resume(headers, timing=timing):
+            return
         if method == "GET" and not head_only and self._serve_emby_folder_image(headers):
             return
         if method == "GET" and not head_only and self._serve_emby_subtitle_stream(headers, timing=timing):
@@ -1493,6 +1523,60 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             body,
             head_only=head_only,
             request_path=self.path,
+        )
+        return True
+
+    def _serve_emby_hide_from_resume(self, request_headers, timing=None):
+        hide_request = parse_emby_hide_from_resume_request(self.path)
+        if not hide_request:
+            return False
+        # Filmly iOS 2.15 calls this during refresh without Hide=. MSG has no
+        # hide-from-resume state, so this compatibility endpoint is read-only:
+        # acknowledge the Emby route and return current UserData without
+        # deleting or zeroing playback history.
+        query_items = []
+        token = emby_auth_token(self.path, request_headers)
+        if token:
+            query_items.append(("api_key", token))
+        upstream_path = "/emby/Users/%s/Items/%s" % (
+            urllib.parse.quote(str(hide_request["user_id"]), safe=""),
+            urllib.parse.quote(str(hide_request["media_id"]), safe=""),
+        )
+        if query_items:
+            upstream_path += "?" + urllib.parse.urlencode(query_items)
+        status, headers, body = self._read_upstream(upstream_path, request_headers)
+        self._mark_timing(timing, "hide_from_resume_item")
+        if status < 200 or status >= 300 or not body:
+            self._write_response(
+                status,
+                headers,
+                body,
+                request_headers=request_headers,
+                request_path=self.path,
+                timing=timing,
+            )
+            return True
+        try:
+            item = json.loads(body.decode("utf-8"))
+        except (TypeError, ValueError):
+            self._write_response(
+                502,
+                {"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"},
+                b"invalid upstream item JSON\n",
+                request_headers=request_headers,
+                request_path=self.path,
+                timing=timing,
+            )
+            return True
+        payload = emby_hide_from_resume_user_data_payload(item, hide_request["media_id"])
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._write_response(
+            200,
+            {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"},
+            body,
+            request_headers=request_headers,
+            request_path=self.path,
+            timing=timing,
         )
         return True
 

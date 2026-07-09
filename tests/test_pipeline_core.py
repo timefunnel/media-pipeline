@@ -75,6 +75,7 @@ from pipeline.subtitle_proxy import (
     patch_emby_resume_runtime_fields,
     parse_emby_item_image_request,
     parse_emby_user_items_search_request,
+    parse_emby_hide_from_resume_request,
     parse_emby_subtitle_stream_path,
     parse_emby_item_media_id,
     build_emby_folder_cover_grid,
@@ -87,6 +88,7 @@ from pipeline.subtitle_proxy import (
     redact_sensitive_query_values,
     should_normalize_subtitle,
     subtitle_body_to_vtt,
+    emby_hide_from_resume_user_data_payload,
 )
 
 
@@ -421,6 +423,47 @@ class FakeMediaStationClient:
         if self.events is not None:
             self.events.append(("artwork_repair",))
         return self.artwork_repair_response
+
+
+class EmbyHideFromResumeCompatTest(unittest.TestCase):
+    def test_parse_hide_from_resume_request_with_optional_emby_prefix(self):
+        request = parse_emby_hide_from_resume_request(
+            "/emby/Users/user-1/Items/media-1/HideFromResume?Hide=true"
+        )
+
+        self.assertEqual(
+            request,
+            {"user_id": "user-1", "media_id": "media-1", "hide": "true"},
+        )
+
+    def test_parse_hide_from_resume_request_without_hide_query(self):
+        request = parse_emby_hide_from_resume_request("/Users/user-1/Items/media-1/HideFromResume")
+
+        self.assertEqual(
+            request,
+            {"user_id": "user-1", "media_id": "media-1", "hide": ""},
+        )
+
+    def test_hide_from_resume_payload_preserves_current_position(self):
+        payload = emby_hide_from_resume_user_data_payload(
+            {
+                "UserData": {
+                    "PlaybackPositionTicks": 120000000,
+                    "PlayCount": 2,
+                    "IsFavorite": True,
+                    "Played": False,
+                    "PlayedPercentage": 12.5,
+                }
+            },
+            "media-1",
+        )
+
+        self.assertEqual(payload["ItemId"], "media-1")
+        self.assertEqual(payload["PlaybackPositionTicks"], 120000000)
+        self.assertEqual(payload["PlayCount"], 2)
+        self.assertEqual(payload["IsFavorite"], True)
+        self.assertEqual(payload["Played"], False)
+        self.assertEqual(payload["PlayedPercentage"], 12.5)
 
 
 class MediaStationDbHelperTest(unittest.TestCase):
