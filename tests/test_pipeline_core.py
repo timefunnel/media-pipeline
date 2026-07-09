@@ -75,7 +75,6 @@ from pipeline.subtitle_proxy import (
     patch_emby_image_item_ids,
     patch_emby_playback_info_runtime,
     patch_emby_resume_runtime_fields,
-    patch_emby_synthetic_chapters,
     parse_emby_item_image_request,
     parse_emby_user_items_search_request,
     parse_emby_hide_from_resume_request,
@@ -85,7 +84,6 @@ from pipeline.subtitle_proxy import (
     emby_folder_cover_response_headers,
     emby_folder_cover_grid_dimensions,
     patch_emby_collection_folder_item_cover,
-    emby_item_image_request_path,
     select_emby_folder_cover_items,
     emby_image_proxy_path,
     emby_request_user_id_from_auth,
@@ -550,66 +548,6 @@ class EmbyClientTitleCompatTest(unittest.TestCase):
 
         self.assertFalse(patch_emby_client_title_fields(payload))
         self.assertEqual(payload["SeriesName"], "灵魂摆渡")
-
-
-class EmbySyntheticChapterCompatTest(unittest.TestCase):
-    def test_patch_item_detail_adds_synthetic_chapters(self):
-        payload = {
-            "Id": "11111111-1111-1111-1111-111111111111",
-            "Type": "Movie",
-            "RunTimeTicks": 7200 * 10000000,
-            "Chapters": None,
-        }
-
-        self.assertTrue(patch_emby_synthetic_chapters(payload, media_id=payload["Id"]))
-
-        chapters = payload["Chapters"]
-        self.assertEqual(len(chapters), 12)
-        self.assertEqual(chapters[0]["StartPositionTicks"], 0)
-        self.assertEqual(chapters[0]["Name"], "00:00:00")
-        self.assertEqual(chapters[1]["Name"], "00:10:00")
-        self.assertEqual(chapters[0]["MarkerType"], "Chapter")
-        self.assertTrue(chapters[0]["ImageTag"])
-
-    def test_existing_chapters_are_not_overwritten(self):
-        payload = {
-            "Id": "11111111-1111-1111-1111-111111111111",
-            "Type": "Movie",
-            "RunTimeTicks": 7200 * 10000000,
-            "Chapters": [{"StartPositionTicks": 0, "Name": "original"}],
-        }
-
-        self.assertFalse(patch_emby_synthetic_chapters(payload, media_id=payload["Id"]))
-        self.assertEqual(payload["Chapters"], [{"StartPositionTicks": 0, "Name": "original"}])
-
-    def test_collection_folder_does_not_get_synthetic_chapters(self):
-        payload = {
-            "Id": "folder-1",
-            "Type": "CollectionFolder",
-            "RunTimeTicks": 7200 * 10000000,
-        }
-
-        self.assertFalse(patch_emby_synthetic_chapters(payload, media_id="folder-1"))
-        self.assertNotIn("Chapters", payload)
-
-    def test_parse_chapter_image_request(self):
-        request = parse_emby_item_image_request(
-            "/emby/Items/media-1/Images/Chapter/3?tag=synthetic&maxWidth=640"
-        )
-
-        self.assertEqual(request["item_id"], "media-1")
-        self.assertEqual(request["image_type"], "Chapter")
-        self.assertEqual(request["image_index"], 3)
-        self.assertEqual(request["query"], "tag=synthetic&maxWidth=640")
-
-    def test_chapter_image_fallback_path_strips_synthetic_tag(self):
-        path = emby_item_image_request_path(
-            "media-1",
-            "Backdrop",
-            "tag=synthetic&maxWidth=640&quality=90",
-        )
-
-        self.assertEqual(path, "/emby/Items/media-1/Images/Backdrop?maxWidth=640&quality=90")
 
 
 class MediaStationDbHelperTest(unittest.TestCase):

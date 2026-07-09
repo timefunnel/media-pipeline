@@ -67,8 +67,7 @@ EMBY_SUBTITLE_STREAM_RE = re.compile(
     re.IGNORECASE,
 )
 EMBY_ITEM_IMAGE_RE = re.compile(
-    r"^%s/Items/(?P<item_id>[^/]+)/Images/(?P<image_type>Primary|Backdrop|Thumb|Chapter)(?:/(?P<image_index>\d+))?/?$"
-    % EMBY_PATH_PREFIX_PATTERN,
+    r"^%s/Items/(?P<item_id>[^/]+)/Images/(?P<image_type>Primary|Backdrop|Thumb)(?:/\d+)?/?$" % EMBY_PATH_PREFIX_PATTERN,
     re.IGNORECASE,
 )
 EMBY_USER_ITEMS_RE = re.compile(r"^%s/Users/(?P<user_id>[^/]+)/Items/?$" % EMBY_PATH_PREFIX_PATTERN, re.IGNORECASE)
@@ -84,8 +83,6 @@ EMBY_FOLDER_COVER_MIN_WIDTH = 160
 EMBY_FOLDER_COVER_MAX_WIDTH = 1200
 EMBY_FOLDER_COVER_TAG_LENGTH = 32
 EMBY_FOLDER_COVER_TAG_VERSION = "folder-cover-grid-v6-jellyfin-shape"
-EMBY_SYNTHETIC_CHAPTER_COUNT = 12
-EMBY_SYNTHETIC_CHAPTER_TAG_VERSION = "synthetic-chapter-v1"
 SUBTITLE_PROXY_TIMING_LOG_ENV = "MSG_SUBTITLE_PROXY_TIMING_LOG"
 SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
 VIDEO_EXTENSIONS = {
@@ -528,11 +525,9 @@ def parse_emby_item_image_request(path):
     match = EMBY_ITEM_IMAGE_RE.match(parsed.path)
     if not match:
         return None
-    image_index = match.group("image_index")
     return {
         "item_id": urllib.parse.unquote(match.group("item_id")),
         "image_type": image_type_value(match.group("image_type")),
-        "image_index": int(image_index) if image_index is not None else None,
         "query": parsed.query,
     }
 
@@ -543,8 +538,6 @@ def image_type_value(value):
         return "Backdrop"
     if normalized == "thumb":
         return "Thumb"
-    if normalized == "chapter":
-        return "Chapter"
     return "Primary"
 
 
@@ -1109,20 +1102,6 @@ def emby_image_proxy_path(cover, original_query=""):
     )
 
 
-def emby_item_image_request_path(item_id, image_type, original_query=""):
-    query_items = []
-    for key, value in urllib.parse.parse_qsl(original_query or "", keep_blank_values=True):
-        if key.lower() == "tag":
-            continue
-        query_items.append((key, value))
-    query = urllib.parse.urlencode(query_items)
-    path = "/emby/Items/%s/Images/%s" % (
-        urllib.parse.quote(str(item_id or ""), safe=""),
-        urllib.parse.quote(image_type_value(image_type), safe=""),
-    )
-    return path + ("?" + query if query else "")
-
-
 def emby_image_request_tag(query=""):
     for key, value in urllib.parse.parse_qsl(query or "", keep_blank_values=True):
         if key.lower() == "tag":
@@ -1359,86 +1338,6 @@ def synthetic_runtime_ticks(position_ticks):
         position_ticks * 2,
         position_ticks + SYNTHETIC_RUNTIME_PADDING_TICKS,
     )
-
-
-def emby_item_runtime_ticks(item, fallback=0):
-    if not isinstance(item, dict):
-        return int_value(fallback)
-    runtime_ticks = int_value(item.get("RunTimeTicks"))
-    if runtime_ticks > 0:
-        return runtime_ticks
-    media_sources = item.get("MediaSources")
-    if isinstance(media_sources, list):
-        for source in media_sources:
-            if not isinstance(source, dict):
-                continue
-            runtime_ticks = int_value(source.get("RunTimeTicks"))
-            if runtime_ticks > 0:
-                return runtime_ticks
-    return int_value(fallback)
-
-
-def emby_ticks_to_hms(ticks):
-    total_seconds = max(0, int_value(ticks) // EMBY_TICKS_PER_SECOND)
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    seconds = total_seconds % 60
-    return "%02d:%02d:%02d" % (hours, minutes, seconds)
-
-
-def emby_synthetic_chapter_tag(item_id, index):
-    return hashlib.sha1(
-        json.dumps(
-            [EMBY_SYNTHETIC_CHAPTER_TAG_VERSION, str(item_id or ""), int_value(index)],
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()[:32]
-
-
-def build_emby_synthetic_chapters(item_id, runtime_ticks, count=EMBY_SYNTHETIC_CHAPTER_COUNT):
-    item_id = str(item_id or "").strip()
-    runtime_ticks = int_value(runtime_ticks)
-    if not item_id or runtime_ticks <= 0:
-        return []
-    count = max(1, int_value(count, EMBY_SYNTHETIC_CHAPTER_COUNT))
-    max_by_seconds = max(1, runtime_ticks // EMBY_TICKS_PER_SECOND)
-    count = min(count, max_by_seconds)
-    chapters = []
-    for index in range(count):
-        start_ticks = int(runtime_ticks * index / count)
-        chapters.append(
-            {
-                "StartPositionTicks": start_ticks,
-                "Name": emby_ticks_to_hms(start_ticks),
-                "ImageTag": emby_synthetic_chapter_tag(item_id, index),
-                "MarkerType": "Chapter",
-            }
-        )
-    return chapters
-
-
-def patch_emby_synthetic_chapters(payload, media_id="", runtime_ticks=0):
-    if not isinstance(payload, dict):
-        return False
-    chapters = payload.get("Chapters")
-    if isinstance(chapters, list) and chapters:
-        return False
-    if emby_item_is_collection_folder(payload) or payload.get("IsFolder") is True:
-        return False
-    item_type = str(payload.get("Type") or payload.get("type") or "").strip().casefold()
-    if item_type in ("collectionfolder", "folder", "series", "season", "boxset"):
-        return False
-    item_id = str(payload.get("Id") or payload.get("id") or payload.get("ItemId") or media_id or "").strip()
-    media_id = str(media_id or "").strip()
-    if not item_id or (media_id and item_id != media_id):
-        return False
-    runtime_ticks = emby_item_runtime_ticks(payload, fallback=runtime_ticks)
-    synthetic_chapters = build_emby_synthetic_chapters(item_id, runtime_ticks)
-    if not synthetic_chapters:
-        return False
-    payload["Chapters"] = synthetic_chapters
-    return True
 
 
 def patch_emby_resume_runtime_fields(payload):
@@ -1687,8 +1586,6 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             return
         if method == "POST" and self._serve_emby_hide_from_resume(headers, timing=timing):
             return
-        if method == "GET" and not head_only and self._serve_emby_synthetic_chapter_image(headers):
-            return
         if method == "GET" and not head_only and self._serve_emby_folder_image(headers):
             return
         if method == "GET" and not head_only and self._serve_emby_subtitle_stream(headers, timing=timing):
@@ -1872,22 +1769,6 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         headers = emby_folder_cover_response_headers(tag)
         self._write_response(200, headers, body, request_headers=request_headers, request_path=self.path)
         return True
-
-    def _serve_emby_synthetic_chapter_image(self, request_headers):
-        image_request = parse_emby_item_image_request(self.path)
-        if not image_request or image_request["image_type"] != "Chapter":
-            return False
-        for image_type in ("Backdrop", "Primary"):
-            upstream_path = emby_item_image_request_path(
-                image_request["item_id"],
-                image_type,
-                image_request["query"],
-            )
-            status, headers, body = self._read_upstream(upstream_path, request_headers)
-            if status >= 200 and status < 300 and body and not is_emby_placeholder_image_body(body):
-                self._write_response(status, headers, body, request_headers=request_headers, request_path=self.path)
-                return True
-        return False
 
     def _serve_emby_subtitle_stream(self, request_headers, timing=None):
         stream_request = parse_emby_subtitle_stream_path(self.path)
@@ -2422,9 +2303,6 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                     if patch_emby_playback_info_runtime(payload, runtime_ticks, media_id=media_id):
                         no_store = True
                         self._mark_timing(timing, "playback_runtime_patch")
-                    if patch_emby_synthetic_chapters(payload, media_id=media_id, runtime_ticks=runtime_ticks):
-                        no_store = True
-                        self._mark_timing(timing, "synthetic_chapters_patch")
                     tracks = self._fetch_msg_subtitle_tracks(media_id, timing=timing)
                     if inject_emby_subtitle_streams(payload, media_id, tracks):
                         no_store = True
