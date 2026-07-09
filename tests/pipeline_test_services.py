@@ -9,6 +9,172 @@ from pipeline.subtitle_proxy import (
     emby_folder_cover_grid_tag,
     is_emby_placeholder_image_body,
 )
+from pipeline.admin_web import (
+    AdminTaskStore,
+    filter_task_records,
+    render_dashboard,
+    render_task_detail,
+    summarize_tasks,
+    task_status_group,
+)
+
+
+class AdminWebTest(unittest.TestCase):
+    def create_state_db(self, path):
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                """
+                create table offline_tasks (
+                    info_hash text primary key,
+                    user_id integer not null,
+                    chat_id integer not null,
+                    category text not null,
+                    title text not null,
+                    task_json text not null,
+                    created_at integer not null,
+                    updated_at integer not null
+                )
+                """
+            )
+            conn.execute(
+                """
+                create table subtitle_backfill_index (
+                    media_id text primary key,
+                    adult_code text,
+                    title text,
+                    status text not null,
+                    source text,
+                    reason text,
+                    error text,
+                    attempt_count integer not null default 0,
+                    created_at integer not null,
+                    updated_at integer not null
+                )
+                """
+            )
+            now = int(time.time())
+            rows = [
+                (
+                    "AAA",
+                    1,
+                    1,
+                    "adult",
+                    "MIDE-605",
+                    {
+                        "info_hash": "AAA",
+                        "status_name": "success",
+                        "percent_done": 1,
+                        "msg_sync_status": "success",
+                        "msg_scrape_status": "success",
+                        "msg_artwork_repair_status": "success",
+                        "subtitle_match_status": "success",
+                        "msg_media_id": "media-aaa",
+                    },
+                ),
+                (
+                    "BBB",
+                    1,
+                    1,
+                    "movie",
+                    "Godzilla",
+                    {
+                        "info_hash": "BBB",
+                        "status_name": "success",
+                        "msg_sync_status": "failed",
+                        "msg_scrape_status": "failed",
+                        "msg_error": "MediaStationGo media not found",
+                    },
+                ),
+                (
+                    "CCC",
+                    1,
+                    1,
+                    "anime",
+                    "Anime",
+                    {
+                        "info_hash": "CCC",
+                        "status_name": "downloading",
+                        "percent_done": 0.2,
+                    },
+                ),
+            ]
+            for offset, (info_hash, user_id, chat_id, category, title, task) in enumerate(rows):
+                conn.execute(
+                    """
+                    insert into offline_tasks (
+                        info_hash, user_id, chat_id, category, title, task_json, created_at, updated_at
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (info_hash, user_id, chat_id, category, title, json.dumps(task), now - offset, now - offset),
+                )
+            conn.execute(
+                """
+                insert into subtitle_backfill_index (
+                    media_id, adult_code, title, status, source, reason, error, attempt_count, created_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("media-aaa", "MIDE-605", "MIDE-605", "success", "subtitlecat", "", "", 1, now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_admin_store_filters_and_summarizes_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "state.db")
+            self.create_state_db(db_path)
+            store = AdminTaskStore(db_path)
+            records = store.list_tasks(limit=10)
+
+        self.assertEqual(len(records), 3)
+        by_hash = {record["info_hash"]: record for record in records}
+        self.assertEqual(task_status_group(by_hash["AAA"]["task"]), "success")
+        self.assertEqual(task_status_group(by_hash["BBB"]["task"]), "failed")
+        self.assertEqual(task_status_group(by_hash["CCC"]["task"]), "running")
+        self.assertEqual(len(filter_task_records(records, category="adult")), 1)
+        self.assertEqual(len(filter_task_records(records, status="failed")), 1)
+        self.assertEqual(len(filter_task_records(records, query="mide")), 1)
+        summary = summarize_tasks(records)
+        self.assertEqual(summary["success"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["running"], 1)
+
+    def test_admin_dashboard_is_responsive_and_escapes_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "state.db")
+            self.create_state_db(db_path)
+            store = AdminTaskStore(db_path)
+            all_records = store.list_tasks(limit=10)
+            page = {
+                "items": all_records,
+                "page": 1,
+                "page_size": 20,
+                "page_count": 1,
+                "total": len(all_records),
+            }
+            html = render_dashboard(
+                {"all": all_records, "items": all_records, "page": page, "filters": {"q": "", "category": "", "status": ""}},
+                store.subtitle_summary(),
+                {},
+                revision="testrev",
+            )["body"].decode("utf-8")
+
+        self.assertIn("任务控制台", html)
+        self.assertIn("@media (max-width: 900px)", html)
+        self.assertIn("MIDE-605", html)
+        self.assertIn("rev testrev", html)
+
+    def test_admin_detail_shows_stages_and_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "state.db")
+            self.create_state_db(db_path)
+            record = AdminTaskStore(db_path).load_task("BBB")
+            html = render_task_detail(record, revision="testrev")["body"].decode("utf-8")
+
+        self.assertIn("Godzilla", html)
+        self.assertIn("MSG刮削", html)
+        self.assertIn("MediaStationGo media not found", html)
 
 
 class SubtitleProxyTest(unittest.TestCase):

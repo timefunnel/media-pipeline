@@ -4,6 +4,7 @@ import os
 import sys
 import urllib.parse
 
+from pipeline.admin_web import DEFAULT_ADMIN_WEB_HOST, DEFAULT_ADMIN_WEB_PORT, run_admin_web
 from pipeline.client115 import Client115
 from pipeline.bot import (
     DEFAULT_UPSTREAM_SEARCH_LIMIT,
@@ -49,6 +50,14 @@ def build_parser():
     subparsers.add_parser("probe")
     subparsers.add_parser("bot")
     subparsers.add_parser("msg-login")
+
+    admin_web_parser = subparsers.add_parser("admin-web")
+    admin_web_parser.add_argument("--host", default=os.environ.get("ADMIN_WEB_HOST", DEFAULT_ADMIN_WEB_HOST))
+    admin_web_parser.add_argument("--port", type=int, default=int(os.environ.get("ADMIN_WEB_PORT", str(DEFAULT_ADMIN_WEB_PORT))))
+    admin_web_parser.add_argument("--state-db", default=os.environ.get("BOT_STATE_DB", "/bot-data/state.db"))
+    admin_web_parser.add_argument("--username", default=os.environ.get("ADMIN_WEB_USERNAME", ""))
+    admin_web_parser.add_argument("--password", default=os.environ.get("ADMIN_WEB_PASSWORD", ""))
+    admin_web_parser.add_argument("--max-tasks", type=int, default=int(os.environ.get("ADMIN_WEB_MAX_TASKS", "2000")))
 
     subtitle_proxy_parser = subparsers.add_parser("subtitle-proxy")
     subtitle_proxy_parser.add_argument("--listen-host", default=os.environ.get("MSG_SUBTITLE_PROXY_HOST", DEFAULT_SUBTITLE_PROXY_HOST))
@@ -105,6 +114,18 @@ def main(argv=None):
     if args.command == "msg-login":
         build_msg_client(args).login()
         print(json.dumps({"authenticated": True}, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.command == "admin-web":
+        run_admin_web(
+            host=args.host,
+            port=args.port,
+            state_db_path=args.state_db,
+            username=args.username,
+            password=args.password,
+            max_tasks=args.max_tasks,
+            revision=os.environ.get("MEDIA_PIPELINE_REVISION", "unknown"),
+        )
         return 0
 
     if args.command == "subtitle-proxy":

@@ -148,6 +148,28 @@ services:
       - /data/media-pipeline/subtitles:/subtitle-cache
       - /data/media-pipeline/artwork:/artwork-cache
 
+  media-pipeline-admin-web:
+    build:
+      context: .
+      args:
+        MEDIA_PIPELINE_VERSION: "${MEDIA_PIPELINE_VERSION:-0.1.0}"
+        MEDIA_PIPELINE_REVISION: "${MEDIA_PIPELINE_REVISION:-unknown}"
+    container_name: media-pipeline-admin-web
+    network_mode: host
+    environment:
+      MEDIA_PIPELINE_VERSION: "${MEDIA_PIPELINE_VERSION:-0.1.0}"
+      MEDIA_PIPELINE_REVISION: "${MEDIA_PIPELINE_REVISION:-unknown}"
+      BOT_STATE_DB: /bot-data/state.db
+      ADMIN_WEB_HOST: "${ADMIN_WEB_HOST:-127.0.0.1}"
+      ADMIN_WEB_PORT: "${ADMIN_WEB_PORT:-18082}"
+      ADMIN_WEB_USERNAME: "${ADMIN_WEB_USERNAME:-}"
+      ADMIN_WEB_PASSWORD: "${ADMIN_WEB_PASSWORD:-}"
+      ADMIN_WEB_MAX_TASKS: "${ADMIN_WEB_MAX_TASKS:-2000}"
+    restart: unless-stopped
+    command: ["admin-web"]
+    volumes:
+      - /data/media-pipeline/bot:/bot-data
+
   media-pipeline-subtitle-proxy:
     build:
       context: .
