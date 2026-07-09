@@ -462,14 +462,18 @@ class EmbyHideFromResumeCompatTest(unittest.TestCase):
                 }
             },
             "media-1",
+            watched_at=datetime.datetime(2026, 7, 9, 12, 0, tzinfo=datetime.timezone.utc),
         )
 
         self.assertEqual(payload["ItemId"], "media-1")
+        self.assertEqual(payload["Key"], "media-1")
         self.assertEqual(payload["PlaybackPositionTicks"], 120000000)
         self.assertEqual(payload["PlayCount"], 2)
         self.assertEqual(payload["IsFavorite"], True)
         self.assertEqual(payload["Played"], False)
         self.assertEqual(payload["PlayedPercentage"], 12.5)
+        self.assertEqual(payload["HideFromResume"], False)
+        self.assertEqual(payload["LastPlayedDate"], "2026-07-09T12:00:00.000Z")
 
 
 class EmbyImageItemIdCompatTest(unittest.TestCase):

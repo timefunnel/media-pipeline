@@ -1587,14 +1587,21 @@ def parse_emby_hide_from_resume_request(path):
     }
 
 
-def emby_hide_from_resume_user_data_payload(item, media_id):
+def emby_hide_from_resume_user_data_payload(item, media_id, watched_at=None):
     user_data = item.get("UserData") if isinstance(item, dict) else None
     payload = dict(user_data) if isinstance(user_data, dict) else {}
-    payload["ItemId"] = str(media_id or payload.get("ItemId") or "")
+    item_id = str(media_id or payload.get("ItemId") or "")
+    payload["ItemId"] = item_id
+    payload.setdefault("Key", item_id)
     payload.setdefault("PlaybackPositionTicks", 0)
     payload.setdefault("PlayCount", 0)
     payload.setdefault("IsFavorite", False)
     payload.setdefault("Played", False)
+    payload.setdefault("PlayedPercentage", 0)
+    payload["HideFromResume"] = False
+    formatted = emby_datetime_value(watched_at)
+    if formatted:
+        payload["LastPlayedDate"] = formatted
     return payload
 
 
@@ -1822,7 +1829,12 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                 timing=timing,
             )
             return True
-        payload = emby_hide_from_resume_user_data_payload(item, hide_request["media_id"])
+        try:
+            watched_at = self._fetch_emby_media_watched_at(hide_request["user_id"], hide_request["media_id"])
+        except Exception as exc:
+            watched_at = None
+            print("subtitle proxy hide-from-resume history lookup error: %s" % exc, flush=True)
+        payload = emby_hide_from_resume_user_data_payload(item, hide_request["media_id"], watched_at=watched_at)
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._write_response(
             200,
@@ -2191,6 +2203,32 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                 (user_id, max(1, int_value(limit, EMBY_RESUME_PAGE_LIMIT))),
             ).fetchall()
         return {str(row["media_id"]): row["watched_at"] for row in rows if row.get("media_id")}
+
+    def _fetch_emby_media_watched_at(self, user_id, media_id):
+        user_id = str(user_id or "").strip()
+        media_id = str(media_id or "").strip()
+        if not user_id or not media_id:
+            return None
+        dsn = str(os.environ.get("MSG_DATABASE_DSN") or self.msg_database_dsn or DEFAULT_MSG_DATABASE_DSN).strip()
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError("psycopg missing; rebuild media-pipeline image with Postgres support") from exc
+        with psycopg.connect(dsn, row_factory=dict_row) as conn:
+            row = conn.execute(
+                """
+                select watched_at
+                from playback_histories
+                where user_id = %s
+                  and media_id = %s
+                  and deleted_at is null
+                order by watched_at desc
+                limit 1
+                """,
+                (user_id, media_id),
+            ).fetchone()
+        return row["watched_at"] if row else None
 
     def _patch_emby_collection_folder_covers(self, payload, request_headers, request_path):
         user_id = emby_request_user_id_from_auth(request_path or "", request_headers)
