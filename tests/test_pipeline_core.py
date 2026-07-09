@@ -1,4 +1,5 @@
 import base64
+import datetime
 import json
 import hashlib
 import io
@@ -7,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import urllib.parse
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -70,8 +72,10 @@ from pipeline.subtitle_proxy import (
     inject_subtitle_track_bootstrap,
     iter_emby_items,
     normalize_webvtt_timestamps,
+    normalize_emby_resume_limit_path,
     patch_emby_adult_code_titles,
     patch_emby_client_title_fields,
+    patch_emby_resume_history_fields,
     patch_emby_image_item_ids,
     patch_emby_playback_info_runtime,
     patch_emby_resume_runtime_fields,
@@ -548,6 +552,62 @@ class EmbyClientTitleCompatTest(unittest.TestCase):
 
         self.assertFalse(patch_emby_client_title_fields(payload))
         self.assertEqual(payload["SeriesName"], "灵魂摆渡")
+
+
+class EmbyResumeCompatTest(unittest.TestCase):
+    def test_resume_first_page_limit_is_normalized_to_ten(self):
+        path = normalize_emby_resume_limit_path(
+            "/emby/Users/user-1/Items/Resume?Fields=MediaSources&Limit=6&MediaTypes=Video&StartIndex=0"
+        )
+
+        parsed = urllib.parse.urlparse(path)
+        query = urllib.parse.parse_qs(parsed.query)
+        self.assertEqual(parsed.path, "/emby/Users/user-1/Items/Resume")
+        self.assertEqual(query["Limit"], ["10"])
+        self.assertEqual(query["StartIndex"], ["0"])
+
+    def test_resume_first_page_limit_twelve_is_normalized_to_ten(self):
+        path = "/emby/Users/user-1/Items/Resume?Limit=12&StartIndex=0"
+
+        self.assertEqual(normalize_emby_resume_limit_path(path), "/emby/Users/user-1/Items/Resume?Limit=10&StartIndex=0")
+
+    def test_resume_first_page_missing_limit_adds_ten(self):
+        path = normalize_emby_resume_limit_path("/emby/Users/user-1/Items/Resume?Fields=MediaSources&StartIndex=0")
+
+        parsed = urllib.parse.urlparse(path)
+        query = urllib.parse.parse_qs(parsed.query)
+        self.assertEqual(query["Limit"], ["10"])
+
+    def test_resume_later_page_is_unchanged(self):
+        path = "/emby/Users/user-1/Items/Resume?Limit=6&StartIndex=6"
+
+        self.assertEqual(normalize_emby_resume_limit_path(path), path)
+
+    def test_non_resume_path_is_unchanged(self):
+        path = "/emby/Users/user-1/Items?Limit=6&StartIndex=0"
+
+        self.assertEqual(normalize_emby_resume_limit_path(path), path)
+
+    def test_resume_history_fields_add_last_played_and_sort(self):
+        payload = {
+            "Items": [
+                {"Id": "b", "UserData": {}},
+                {"Id": "a", "UserData": {}},
+                {"Id": "c", "UserData": {}},
+            ],
+            "TotalRecordCount": 3,
+        }
+        watched_at = {
+            "a": datetime.datetime(2026, 7, 9, 10, 0, tzinfo=datetime.timezone.utc),
+            "b": datetime.datetime(2026, 7, 9, 12, 0, tzinfo=datetime.timezone.utc),
+            "c": datetime.datetime(2026, 7, 9, 11, 0, tzinfo=datetime.timezone.utc),
+        }
+
+        self.assertTrue(patch_emby_resume_history_fields(payload, watched_at, limit=2))
+
+        self.assertEqual([item["Id"] for item in payload["Items"]], ["b", "c"])
+        self.assertEqual(payload["Items"][0]["UserData"]["LastPlayedDate"], "2026-07-09T12:00:00.000Z")
+        self.assertEqual(payload["TotalRecordCount"], 2)
 
 
 class MediaStationDbHelperTest(unittest.TestCase):

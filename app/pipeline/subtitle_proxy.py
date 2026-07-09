@@ -1,4 +1,5 @@
 import base64
+import datetime
 import hashlib
 import http.server
 import io
@@ -20,7 +21,7 @@ except ImportError:
     ImageOps = None
 
 from pipeline.adult_metadata import ADULT_ARTWORK_PUBLIC_PATH, DEFAULT_ADULT_ARTWORK_CACHE_DIR
-from pipeline.config import category_to_msg_library_root
+from pipeline.config import DEFAULT_MSG_DATABASE_DSN, category_to_msg_library_root
 from pipeline.mediastation import iter_code_matches
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider
 from pipeline.external_subtitles import DEFAULT_SUBTITLE_CACHE_DIR, LocalSubtitleProvider, local_subtitle_uri_valid
@@ -71,10 +72,15 @@ EMBY_ITEM_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 EMBY_USER_ITEMS_RE = re.compile(r"^%s/Users/(?P<user_id>[^/]+)/Items/?$" % EMBY_PATH_PREFIX_PATTERN, re.IGNORECASE)
+EMBY_RESUME_ITEMS_RE = re.compile(
+    r"^%s/(?:Users/[^/]+/)?Items/Resume/?$" % EMBY_PATH_PREFIX_PATTERN,
+    re.IGNORECASE,
+)
 EMBY_HIDE_FROM_RESUME_RE = re.compile(
     r"^%s/Users/(?P<user_id>[^/]+)/Items/(?P<media_id>[^/]+)/HideFromResume/?$" % EMBY_PATH_PREFIX_PATTERN,
     re.IGNORECASE,
 )
+EMBY_RESUME_PAGE_LIMIT = 10
 EMBY_FOLDER_COVER_CACHE_TTL_SECONDS = 300
 EMBY_FOLDER_COVER_GRID_LIMIT = 4
 EMBY_FOLDER_COVER_ASPECT_RATIO = 16 / 9
@@ -520,6 +526,36 @@ def parse_emby_item_media_id(path):
     return urllib.parse.unquote(match.group("media_id"))
 
 
+def normalize_emby_resume_limit_path(path, page_limit=EMBY_RESUME_PAGE_LIMIT):
+    parsed = urllib.parse.urlparse(path)
+    if not EMBY_RESUME_ITEMS_RE.match(parsed.path):
+        return path
+    query_items = urllib.parse.parse_qsl(parsed.query or "", keep_blank_values=True)
+    start_index = 0
+    limit_index = -1
+    for index, (key, value) in enumerate(query_items):
+        normalized_key = key.lower()
+        if normalized_key == "startindex":
+            start_index = int_value(value)
+        elif normalized_key == "limit" and limit_index < 0:
+            limit_index = index
+    if start_index != 0:
+        return path
+    if limit_index < 0:
+        query_items.append(("Limit", str(page_limit)))
+    else:
+        query_items[limit_index] = (query_items[limit_index][0], str(page_limit))
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query_items)))
+
+
+def is_emby_resume_first_page_request(path):
+    parsed = urllib.parse.urlparse(path)
+    if not EMBY_RESUME_ITEMS_RE.match(parsed.path):
+        return False
+    query = urllib.parse.parse_qs(parsed.query or "")
+    return int_query_value(query, "StartIndex", 0) == 0
+
+
 def parse_emby_item_image_request(path):
     parsed = urllib.parse.urlparse(path)
     match = EMBY_ITEM_IMAGE_RE.match(parsed.path)
@@ -772,6 +808,83 @@ def looks_like_release_series_name(value):
 
 def contains_cjk(value):
     return bool(re.search(r"[\u3400-\u9fff]", str(value or "")))
+
+
+def patch_emby_resume_history_fields(payload, watched_at_by_id, limit=EMBY_RESUME_PAGE_LIMIT):
+    if not isinstance(payload, dict) or not isinstance(watched_at_by_id, dict):
+        return False
+    items = payload.get("Items")
+    if not isinstance(items, list):
+        return False
+    changed = False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        media_id = str(item.get("Id") or "").strip()
+        watched_at = watched_at_by_id.get(media_id)
+        if watched_at is None:
+            continue
+        user_data = item.get("UserData")
+        if not isinstance(user_data, dict):
+            user_data = {}
+            item["UserData"] = user_data
+            changed = True
+        formatted = emby_datetime_value(watched_at)
+        if formatted and user_data.get("LastPlayedDate") != formatted:
+            user_data["LastPlayedDate"] = formatted
+            changed = True
+    sorted_items = sorted(
+        [item for item in items if isinstance(item, dict)],
+        key=lambda item: emby_resume_sort_key(item, watched_at_by_id),
+    )
+    page_limit = max(1, int_value(limit, EMBY_RESUME_PAGE_LIMIT))
+    if sorted_items != items or len(sorted_items) > page_limit:
+        payload["Items"] = sorted_items[:page_limit]
+        payload["TotalRecordCount"] = len(payload["Items"])
+        changed = True
+    return changed
+
+
+def emby_resume_sort_key(item, watched_at_by_id):
+    media_id = str((item or {}).get("Id") or "").strip()
+    watched_at = watched_at_by_id.get(media_id)
+    return (-datetime_epoch_seconds(watched_at), media_id)
+
+
+def datetime_epoch_seconds(value):
+    if isinstance(value, datetime.datetime):
+        dt = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return 0.0
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.datetime.fromisoformat(text)
+        except ValueError:
+            return 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+def emby_datetime_value(value):
+    if isinstance(value, datetime.datetime):
+        dt = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.datetime.fromisoformat(text)
+        except ValueError:
+            return text
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def patch_emby_adult_code_title(item):
@@ -1546,6 +1659,7 @@ class MsgApiAuthenticator:
 class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
     upstream_base_url = DEFAULT_SUBTITLE_PROXY_UPSTREAM
     msg_api_auth = None
+    msg_database_dsn = DEFAULT_MSG_DATABASE_DSN
     openlist_subtitle_provider = None
     local_subtitle_provider = None
     adult_artwork_cache_dir = DEFAULT_ADULT_ARTWORK_CACHE_DIR
@@ -1592,7 +1706,8 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
             return
         if method == "GET" and not head_only and self._serve_emby_items_search(headers):
             return
-        upstream_url = urllib.parse.urljoin(self.upstream_base_url.rstrip("/") + "/", self.path.lstrip("/"))
+        upstream_path = normalize_emby_resume_limit_path(self.path)
+        upstream_url = urllib.parse.urljoin(self.upstream_base_url.rstrip("/") + "/", upstream_path.lstrip("/"))
         headers["Accept-Encoding"] = "identity"
         request = urllib.request.Request(upstream_url, data=request_body, headers=headers, method=method)
         try:
@@ -2051,6 +2166,32 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
         patch_emby_media_item_runtime(payload)
         return int_value(payload.get("RunTimeTicks"))
 
+    def _fetch_emby_resume_watched_at(self, user_id, limit=EMBY_RESUME_PAGE_LIMIT):
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return {}
+        dsn = str(os.environ.get("MSG_DATABASE_DSN") or self.msg_database_dsn or DEFAULT_MSG_DATABASE_DSN).strip()
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError("psycopg missing; rebuild media-pipeline image with Postgres support") from exc
+        with psycopg.connect(dsn, row_factory=dict_row) as conn:
+            rows = conn.execute(
+                """
+                select media_id, watched_at
+                from playback_histories
+                where user_id = %s
+                  and completed = false
+                  and position_ms > 0
+                  and deleted_at is null
+                order by watched_at desc, media_id asc
+                limit %s
+                """,
+                (user_id, max(1, int_value(limit, EMBY_RESUME_PAGE_LIMIT))),
+            ).fetchall()
+        return {str(row["media_id"]): row["watched_at"] for row in rows if row.get("media_id")}
+
     def _patch_emby_collection_folder_covers(self, payload, request_headers, request_path):
         user_id = emby_request_user_id_from_auth(request_path or "", request_headers)
         if not user_id:
@@ -2297,6 +2438,16 @@ class SubtitleProxyHandler(http.server.BaseHTTPRequestHandler):
                 if self._patch_emby_collection_folder_covers(payload, request_headers, request_path or ""):
                     no_store = True
                     self._mark_timing(timing, "folder_cover_patch")
+                if isinstance(payload, dict) and is_emby_resume_first_page_request(request_path or ""):
+                    user_id = emby_request_user_id_from_auth(request_path or "", request_headers)
+                    try:
+                        watched_at_by_id = self._fetch_emby_resume_watched_at(user_id, EMBY_RESUME_PAGE_LIMIT)
+                    except Exception as exc:
+                        watched_at_by_id = {}
+                        print("subtitle proxy resume history lookup error: %s" % exc, flush=True)
+                    if patch_emby_resume_history_fields(payload, watched_at_by_id, EMBY_RESUME_PAGE_LIMIT):
+                        no_store = True
+                        self._mark_timing(timing, "resume_history_patch")
                 if isinstance(payload, dict) and media_id:
                     runtime_ticks = self._fetch_emby_resume_runtime_ticks(media_id, request_headers, request_path or "")
                     self._mark_timing(timing, "runtime_ticks")
