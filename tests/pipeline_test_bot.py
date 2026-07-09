@@ -6088,6 +6088,130 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["msg_artwork_repair_status"], "success")
         self.assertEqual(task["msg_artwork_repair_updated"], 2)
 
+    def test_sync_completed_task_rescans_when_saved_msg_media_was_deleted(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+        from pipeline.msgdb import openlist_path_to_cloud_path
+
+        adult_root = category_to_openlist_path("adult")
+        target_path = adult_root + "/ABF-363"
+        events = []
+        fake_openlist = CleaningOpenList(
+            {
+                adult_root: [{"name": "ABF-363", "is_dir": True, "size": 0}],
+                target_path: [
+                    {"name": "ABF-363.mp4", "is_dir": False, "size": 3 * 1024 * 1024 * 1024, "hash_info": {"sha1": "SHA1"}}
+                ],
+            },
+            events=events,
+        )
+        fake_msg = FakeMediaStationClient(
+            get_response=MediaStationApiError(404, "not found"),
+            search_response={"data": {"items": []}},
+            list_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-new",
+                            "library_id": "test-adult-library",
+                            "title": "ABF-363",
+                            "path": openlist_path_to_cloud_path(target_path) + "/ABF-363.mp4",
+                            "size_bytes": 3 * 1024 * 1024 * 1024,
+                        }
+                    ]
+                }
+            },
+            artwork_repair_response={"status": "success", "updated": 1, "fields": ["poster_url"]},
+        )
+
+        class FakeMsgDb:
+            def __init__(self):
+                self.calls = []
+
+            def purge_deleted_media_under_openlist_paths(self, category, openlist_paths):
+                self.calls.append((category, list(openlist_paths)))
+                return {"status": "success", "deleted": 1, "reason": "deleted_media_pruned", "media_ids": ["media-old"]}
+
+            def create_temporary_library_root(self, category, openlist_path):
+                self.calls.append(("create_root", category, openlist_path))
+                return {"root_id": "temp-root", "path": openlist_path_to_cloud_path(openlist_path)}
+
+            def reassign_media_root(self, media_id, root_id):
+                self.calls.append(("reassign_root", media_id, root_id))
+
+            def delete_library_root(self, root_id):
+                self.calls.append(("delete_root", root_id))
+
+        fake_db = FakeMsgDb()
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
+        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist), patch(
+            "pipeline.bot.MediaStationDbClient", return_value=fake_db
+        ):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    msg_sync_poll_seconds=0,
+                    openlist_pre_scan_clean_enabled=False,
+                    adult_external_scraper_enabled=False,
+                )
+            )
+            task = service.sync_completed_task(
+                "adult",
+                "ABF-363",
+                {
+                    "info_hash": "ABC",
+                    "status_name": "success",
+                    "name": "ABF-363",
+                    "msg_sync_status": "failed",
+                    "msg_scan_status": "success",
+                    "msg_media_id": "media-old",
+                    "msg_media_title": "ABF-363 old",
+                    "msg_match_mode": "path",
+                    "msg_match_path": openlist_path_to_cloud_path(target_path) + "/ABF-363.mp4",
+                    "msg_scrape_status": "success",
+                    "msg_artwork_repair_status": "failed",
+                    "msg_artwork_repair_error": "MediaStationGo API failed: HTTP 404 not found",
+                    "openlist_adult_format_status": "success",
+                    "openlist_adult_code": "ABF-363",
+                    "openlist_adult_format_new_path": target_path,
+                    "openlist_clean_status": "success",
+                    "openlist_clean_target": target_path,
+                },
+            )
+
+        self.assertEqual(fake_msg.get_calls, ["media-old"])
+        self.assertIn(("openlist", target_path, True), events)
+        self.assertEqual(
+            fake_db.calls,
+            [
+                ("adult", [target_path]),
+                ("create_root", "adult", target_path),
+                ("reassign_root", "media-new", "test-adult-root"),
+                ("delete_root", "temp-root"),
+            ],
+        )
+        self.assertEqual(fake_msg.scan_calls, [("test-adult-library", "temp-root")])
+        self.assertEqual(fake_msg.scrape_calls, ["media-new"])
+        self.assertEqual(fake_msg.artwork_repair_calls, ["media-new"])
+        self.assertEqual(task["msg_sync_status"], "success")
+        self.assertEqual(task["msg_media_id"], "media-new")
+        self.assertEqual(task["msg_stale_media_id"], "media-old")
+        self.assertEqual(task["msg_stale_media_reason"], "not_found")
+        self.assertEqual(task["msg_deleted_media_prune_status"], "success")
+        self.assertEqual(task["msg_deleted_media_prune_deleted"], 1)
+        self.assertEqual(task["msg_target_scan_status"], "success")
+        self.assertEqual(task["msg_target_scan_path"], target_path)
+        self.assertEqual(task["msg_match_mode"], "path")
+        self.assertEqual(task["msg_scrape_status"], "success")
+        self.assertEqual(task["msg_artwork_repair_status"], "success")
+        self.assertIsNone(task["msg_error"])
+
     def test_check_duplicate_marks_adult_code_match_as_strong(self):
         from pipeline.bot import BotConfig, PipelineBotService
 

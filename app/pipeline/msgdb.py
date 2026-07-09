@@ -1,6 +1,7 @@
 import posixpath
 import re
 import urllib.parse
+import uuid
 from collections import OrderedDict
 
 from pipeline.config import category_to_msg_library_root, category_to_openlist_path, msg_library_roots
@@ -8,6 +9,10 @@ from pipeline.config import category_to_msg_library_root, category_to_openlist_p
 
 DEFAULT_MSG_DATABASE_DSN = "postgresql://mediastation:mediastation@127.0.0.1:15432/mediastation"
 MSG_CLOUD_PREFIX = "cloud://openlist"
+
+
+def new_uuid():
+    return str(uuid.uuid4())
 
 SXX_EXX_RE = re.compile(r"(?i)(?:^|[^a-z0-9])S(?P<season>\d{1,2})\s*E(?P<episode>\d{1,4})(?:[^a-z0-9]|$)")
 CHINESE_EPISODE_RE = re.compile(r"第\s*(?P<episode>\d{1,4})\s*[集話话]")
@@ -313,6 +318,73 @@ class MediaStationDbClient:
                 (MSG_CLOUD_PREFIX + "/%", max(1, int(limit))),
             ).fetchall()
         return [candidate for candidate in (deleted_openlist_media_hide_candidate(row) for row in rows) if candidate]
+
+    def purge_deleted_media_under_openlist_paths(self, category, openlist_paths):
+        root = category_to_msg_library_root(category)
+        seen = set()
+        cloud_paths = []
+        for path in (openlist_path_to_cloud_path(path) for path in openlist_paths or []):
+            if path and path not in seen:
+                seen.add(path)
+                cloud_paths.append(path)
+        if not cloud_paths:
+            return {"status": "skipped", "deleted": 0, "reason": "target_missing", "media_ids": []}
+        conditions = []
+        params = [root["library_id"]]
+        for path in cloud_paths:
+            conditions.append("(path = %s or path like %s)")
+            params.extend([path, path.rstrip("/") + "/%"])
+        with self._connect() as conn:
+            with conn.transaction():
+                rows = conn.execute(
+                    """
+                    select id, path
+                    from media
+                    where deleted_at is not null
+                      and library_id = %s
+                      and (""" + " or ".join(conditions) + """)
+                    order by deleted_at asc nulls last, updated_at asc nulls last
+                    """,
+                    tuple(params),
+                ).fetchall()
+                media_ids = [row["id"] for row in rows]
+                if media_ids:
+                    conn.execute("delete from media where id = any(%s)", (media_ids,))
+        return {
+            "status": "success" if media_ids else "skipped",
+            "deleted": len(media_ids),
+            "reason": "deleted_media_pruned" if media_ids else "no_deleted_media",
+            "media_ids": media_ids,
+        }
+
+    def create_temporary_library_root(self, category, openlist_path):
+        root = category_to_msg_library_root(category)
+        openlist_path = normalize_openlist_path(openlist_path)
+        if not openlist_path:
+            raise ValueError("temporary library root path must not be empty")
+        root_id = new_uuid()
+        cloud_path = openlist_path_to_cloud_path(openlist_path)
+        with self._connect() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    insert into library_roots (
+                        id, created_at, updated_at, deleted_at, library_id, name, path, enabled, sort_order
+                    ) values (%s, now(), now(), null, %s, %s, %s, true, 9999)
+                    """,
+                    (root_id, root["library_id"], posixpath.basename(openlist_path.rstrip("/")) or "target", cloud_path),
+                )
+        return {"root_id": root_id, "path": cloud_path}
+
+    def reassign_media_root(self, media_id, root_id):
+        with self._connect() as conn:
+            with conn.transaction():
+                conn.execute("update media set library_root_id = %s, updated_at = now() where id = %s", (root_id, media_id))
+
+    def delete_library_root(self, root_id):
+        with self._connect() as conn:
+            with conn.transaction():
+                conn.execute("delete from library_roots where id = %s", (root_id,))
 
     def _connect(self):
         if self._connect_override is not None:

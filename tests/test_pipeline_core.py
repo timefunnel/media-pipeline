@@ -39,6 +39,7 @@ from pipeline.cli import summarize_offline_submit
 from pipeline.config import category_to_folder_id, category_to_msg_library_root, category_to_openlist_path
 from pipeline.mediastation import (
     MediaStationClient,
+    MediaStationApiError,
     adult_artwork_repair_patch,
     extract_codes,
     extract_library_items,
@@ -383,7 +384,7 @@ class FakeMediaStationClient:
     ):
         self.search_response = search_response or {"data": {"items": []}}
         self.list_response = list_response or {"data": {"items": []}}
-        self.get_response = get_response or {}
+        self.get_response = get_response
         self.events = events
         self.artwork_repair_response = artwork_repair_response or {"status": "skipped", "updated": 0, "reason": "not_needed"}
         self.scrape_search_responses = scrape_search_responses or {}
@@ -416,6 +417,10 @@ class FakeMediaStationClient:
 
     def get_media(self, media_id):
         self.get_calls.append(media_id)
+        if isinstance(self.get_response, Exception):
+            raise self.get_response
+        if self.get_response is None:
+            return {"id": media_id}
         return self.get_response
 
     def search_scrape_matches(self, media_id, query, provider, media_type):

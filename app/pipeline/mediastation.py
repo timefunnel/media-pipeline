@@ -70,10 +70,17 @@ class MediaStationTransport:
                 message = payload.get("error") or payload.get("message") or payload.get("msg") or raw
             except ValueError:
                 pass
-            raise RuntimeError("MediaStationGo API failed: HTTP %s %s" % (exc.code, message))
+            raise MediaStationApiError(exc.code, message)
         if not raw:
             return {}
         return json.loads(raw)
+
+
+class MediaStationApiError(RuntimeError):
+    def __init__(self, status_code, message):
+        self.status_code = int(status_code)
+        self.response_message = str(message or "")
+        super().__init__("MediaStationGo API failed: HTTP %s %s" % (self.status_code, self.response_message))
 
 
 class MediaStationClient:
@@ -213,8 +220,8 @@ class MediaStationClient:
         headers = {"Authorization": "Bearer " + self.access_token}
         try:
             return self.transport.request(method, self._url(path), headers=headers, data=data, timeout=self.timeout)
-        except RuntimeError as exc:
-            if retry and "HTTP 401" in str(exc):
+        except MediaStationApiError as exc:
+            if retry and exc.status_code == 401:
                 self.access_token = None
                 self.login()
                 return self._request(method, path, data=data, retry=False)
