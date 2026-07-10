@@ -30,13 +30,6 @@ from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListToke
 from pipeline.openlist_tokens import OpenListTokenStore
 from pipeline.prowlarr import DEFAULT_PROWLARR_CONFIG, DEFAULT_PROWLARR_URL, ProwlarrClient, ProwlarrConfig, is_prowlarr_download_uri
 from pipeline.resource_selector import ResourceSelector
-from pipeline.subtitle_proxy import (
-    DEFAULT_SUBTITLE_CACHE_DIR,
-    DEFAULT_SUBTITLE_PROXY_HOST,
-    DEFAULT_SUBTITLE_PROXY_PORT,
-    DEFAULT_SUBTITLE_PROXY_UPSTREAM,
-    run_subtitle_proxy,
-)
 
 
 DEFAULT_OPENLIST_DB = "/openlist-data/data.db"
@@ -78,14 +71,6 @@ def build_parser():
         default=int(os.environ.get("ADMIN_WEB_MSG_AUTH_CACHE_SECONDS", str(DEFAULT_ADMIN_WEB_MSG_AUTH_CACHE_SECONDS))),
     )
 
-    subtitle_proxy_parser = subparsers.add_parser("subtitle-proxy")
-    subtitle_proxy_parser.add_argument("--listen-host", default=os.environ.get("MSG_SUBTITLE_PROXY_HOST", DEFAULT_SUBTITLE_PROXY_HOST))
-    subtitle_proxy_parser.add_argument("--listen-port", type=int, default=int(os.environ.get("MSG_SUBTITLE_PROXY_PORT", DEFAULT_SUBTITLE_PROXY_PORT)))
-    subtitle_proxy_parser.add_argument("--upstream", default=os.environ.get("MSG_SUBTITLE_PROXY_UPSTREAM", DEFAULT_SUBTITLE_PROXY_UPSTREAM))
-    subtitle_proxy_parser.add_argument("--msg-base-url", default=os.environ.get("MSG_BASE_URL", DEFAULT_MSG_BASE_URL))
-    subtitle_proxy_parser.add_argument("--msg-admin-user", default=os.environ.get("MSG_ADMIN_USER", ""))
-    subtitle_proxy_parser.add_argument("--msg-admin-password", default=os.environ.get("MSG_ADMIN_PASSWORD", ""))
-    subtitle_proxy_parser.add_argument("--subtitle-cache-dir", default=os.environ.get("SUBTITLE_CACHE_DIR", DEFAULT_SUBTITLE_CACHE_DIR))
 
     msg_scan_parser = subparsers.add_parser("msg-scan")
     msg_scan_parser.add_argument("--category", choices=sorted(FOLDER_IDS.keys()), required=True)
@@ -151,17 +136,6 @@ def main(argv=None):
         )
         return 0
 
-    if args.command == "subtitle-proxy":
-        run_subtitle_proxy(
-            host=args.listen_host,
-            port=args.listen_port,
-            upstream=args.upstream,
-            msg_api_base_url=args.msg_base_url,
-            msg_admin_user=args.msg_admin_user,
-            msg_admin_password=args.msg_admin_password,
-            subtitle_cache_dir=args.subtitle_cache_dir,
-        )
-        return 0
 
     if args.command == "msg-scan":
         root = category_to_msg_library_root(args.category)

@@ -175,30 +175,16 @@ services:
     volumes:
       - /data/media-pipeline/bot:/bot-data
 
-  media-pipeline-subtitle-proxy:
+  media-pipeline-artwork-static:
     build:
       context: .
       args:
         MEDIA_PIPELINE_VERSION: "${MEDIA_PIPELINE_VERSION:-0.1.0}"
         MEDIA_PIPELINE_REVISION: "${MEDIA_PIPELINE_REVISION:-unknown}"
-    container_name: media-pipeline-subtitle-proxy
+    container_name: media-pipeline-artwork-static
     network_mode: host
-    environment:
-      MSG_SUBTITLE_PROXY_HOST: "${MSG_SUBTITLE_PROXY_HOST:-127.0.0.1}"
-      MSG_SUBTITLE_PROXY_PORT: "${MSG_SUBTITLE_PROXY_PORT:-18081}"
-      MSG_SUBTITLE_PROXY_UPSTREAM: "${MSG_SUBTITLE_PROXY_UPSTREAM:-http://127.0.0.1:18080}"
-      MSG_SUBTITLE_PROXY_TIMING_LOG: "${MSG_SUBTITLE_PROXY_TIMING_LOG:-0}"
-      OPENLIST_URL: "${OPENLIST_URL:-http://127.0.0.1:5244}"
-      OPENLIST_MEDIA_SCAN_USERNAME: "${OPENLIST_MEDIA_SCAN_USERNAME:?OPENLIST_MEDIA_SCAN_USERNAME missing}"
-      OPENLIST_MEDIA_SCAN_PASSWORD: "${OPENLIST_MEDIA_SCAN_PASSWORD:?OPENLIST_MEDIA_SCAN_PASSWORD missing}"
-      MSG_BASE_URL: "${MSG_BASE_URL:-http://127.0.0.1:18080/api}"
-      MSG_DATABASE_DSN: "${MSG_DATABASE_DSN:-postgresql://mediastation:mediastation@127.0.0.1:15432/mediastation}"
-      MSG_ADMIN_USER: "${MSG_ADMIN_USER:-admin}"
-      MSG_ADMIN_PASSWORD: "${MSG_ADMIN_PASSWORD:?MSG_ADMIN_PASSWORD missing}"
-      SUBTITLE_CACHE_DIR: "${SUBTITLE_CACHE_DIR:-/subtitle-cache}"
-      ADULT_ARTWORK_CACHE_DIR: "${ADULT_ARTWORK_CACHE_DIR:-/artwork-cache/adult}"
     restart: unless-stopped
-    command: ["subtitle-proxy"]
+    entrypoint: ["python"]
+    command: ["-m", "http.server", "18083", "--bind", "127.0.0.1", "--directory", "/artwork"]
     volumes:
-      - /data/media-pipeline/subtitles:/subtitle-cache
-      - /data/media-pipeline/artwork:/artwork-cache:ro
+      - /data/media-pipeline/artwork:/artwork:ro
