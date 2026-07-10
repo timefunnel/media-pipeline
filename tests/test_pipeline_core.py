@@ -40,26 +40,11 @@ from pipeline.config import category_to_folder_id, category_to_msg_library_root,
 from pipeline.mediastation import (
     MediaStationClient,
     MediaStationApiError,
-    adult_artwork_repair_patch,
     extract_codes,
     extract_library_items,
     extract_media_id,
     extract_media_items,
     find_matching_media,
-    is_bad_adult_artwork_url,
-    iter_dmm_cids,
-    iter_mgstage_poster_candidates,
-    reachable_image_url,
-)
-from pipeline.adult_metadata import (
-    AdultHTMLMetadataProvider,
-    AdultImageProbe,
-    adult_codes_from_media as adult_metadata_codes_from_media,
-    build_adult_artwork_repair,
-    image_orientation,
-    looks_like_cloudflare_challenge,
-    normalize_adult_base_urls,
-    parse_adult_detail_html,
 )
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes, normalize_task, task_can_cancel, wait_for_task
 from pipeline.openlist import OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider, extract_openlist_login_token
@@ -379,14 +364,12 @@ class FakeMediaStationClient:
         list_response=None,
         get_response=None,
         events=None,
-        artwork_repair_response=None,
         scrape_search_responses=None,
     ):
         self.search_response = search_response or {"data": {"items": []}}
         self.list_response = list_response or {"data": {"items": []}}
         self.get_response = get_response
         self.events = events
-        self.artwork_repair_response = artwork_repair_response or {"status": "skipped", "updated": 0, "reason": "not_needed"}
         self.scrape_search_responses = scrape_search_responses or {}
         self.scan_calls = []
         self.search_calls = []
@@ -395,7 +378,6 @@ class FakeMediaStationClient:
         self.scrape_calls = []
         self.scrape_search_calls = []
         self.scrape_apply_calls = []
-        self.artwork_repair_calls = []
 
     def scan_root(self, library_id, root_id):
         self.scan_calls.append((library_id, root_id))
@@ -431,11 +413,6 @@ class FakeMediaStationClient:
         self.scrape_apply_calls.append((media_id, match))
         return {"ok": True}
 
-    def repair_adult_artwork(self, media_id, **kwargs):
-        self.artwork_repair_calls.append(media_id)
-        if self.events is not None:
-            self.events.append(("artwork_repair",))
-        return self.artwork_repair_response
 
 
 class FakeStreamResponse:

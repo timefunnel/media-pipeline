@@ -50,15 +50,6 @@ from pipeline.external_subtitles import (
     DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS,
     build_subtitle_matcher_from_config,
 )
-from pipeline.adult_metadata import (
-    DEFAULT_ADULT_ARTWORK_CACHE_DIR,
-    DEFAULT_ADULT_METADATA_BASE_URLS,
-    DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS,
-    DEFAULT_ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS,
-    DEFAULT_ADULT_METADATA_FLARESOLVERR_URL,
-    AdultHTMLMetadataProvider,
-    normalize_adult_base_urls,
-)
 from pipeline.openlist_utils import (
     is_openlist_video_file,
     normalize_openlist_path,
@@ -400,14 +391,6 @@ class BotConfig:
     subtitle_search_timeout_seconds: int = DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS
     subtitle_download_max_bytes: int = DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES
     subtitle_backfill_default_limit: int = DEFAULT_SUBTITLE_BACKFILL_LIMIT
-    adult_external_scraper_enabled: bool = True
-    adult_artwork_cache_dir: str = DEFAULT_ADULT_ARTWORK_CACHE_DIR
-    adult_artwork_public_base_url: str = ""
-    adult_artwork_generate_portrait_enabled: bool = True
-    adult_metadata_base_urls: tuple = DEFAULT_ADULT_METADATA_BASE_URLS
-    adult_metadata_fetch_timeout_seconds: int = DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS
-    adult_metadata_flaresolverr_url: str = DEFAULT_ADULT_METADATA_FLARESOLVERR_URL
-    adult_metadata_flaresolverr_timeout_seconds: int = DEFAULT_ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS
     assrt_api_token: str = ""
     opensubtitles_api_key: str = ""
     opensubtitles_username: str = ""
@@ -519,27 +502,6 @@ class BotConfig:
             ),
             subtitle_backfill_default_limit=normalize_subtitle_backfill_limit(
                 env.get("SUBTITLE_BACKFILL_DEFAULT_LIMIT", str(DEFAULT_SUBTITLE_BACKFILL_LIMIT))
-            ),
-            adult_external_scraper_enabled=parse_bool(env.get("ADULT_EXTERNAL_SCRAPER_ENABLED"), True),
-            adult_artwork_cache_dir=env.get("ADULT_ARTWORK_CACHE_DIR", DEFAULT_ADULT_ARTWORK_CACHE_DIR),
-            adult_artwork_public_base_url=(env.get("ADULT_ARTWORK_PUBLIC_BASE_URL") or "").strip(),
-            adult_artwork_generate_portrait_enabled=parse_bool(env.get("ADULT_ARTWORK_GENERATE_PORTRAIT_ENABLED"), True),
-            adult_metadata_base_urls=tuple(
-                normalize_adult_base_urls(env.get("ADULT_METADATA_BASE_URLS") or DEFAULT_ADULT_METADATA_BASE_URLS)
-            ),
-            adult_metadata_fetch_timeout_seconds=max(
-                1,
-                int(env.get("ADULT_METADATA_FETCH_TIMEOUT_SECONDS", str(DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS))),
-            ),
-            adult_metadata_flaresolverr_url=(env.get("ADULT_METADATA_FLARESOLVERR_URL") or "").strip(),
-            adult_metadata_flaresolverr_timeout_seconds=max(
-                1,
-                int(
-                    env.get(
-                        "ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS",
-                        str(DEFAULT_ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS),
-                    )
-                ),
             ),
             assrt_api_token=env.get("ASSRT_API_TOKEN", ""),
             opensubtitles_api_key=env.get("OPENSUBTITLES_API_KEY", ""),
@@ -2197,17 +2159,6 @@ class PipelineBotService:
                     emit(visibility_result)
             else:
                 apply_progress(visibility_result)
-        artwork_result = prefixed_task_fields(progress, "msg_artwork_repair_")
-        if root.get("media_type") == "adult":
-            if not stage_is_complete(progress.get("msg_artwork_repair_status")):
-                emit({"msg_artwork_repair_status": "running", "msg_artwork_repair_error": None})
-                artwork_result = self._repair_msg_adult_artwork(get_msg_client(), media_id)
-                if artwork_result.get("msg_artwork_repair_status") == "skipped":
-                    apply_progress(artwork_result)
-                else:
-                    emit(artwork_result)
-            else:
-                apply_progress(artwork_result)
         msg_library_id = (root or {}).get("library_id") or progress.get("msg_library_id")
         msg_root_id = (root or {}).get("root_id") or progress.get("msg_root_id")
         subtitle_result = prefixed_task_fields(progress, "subtitle_match_")
@@ -2242,7 +2193,6 @@ class PipelineBotService:
             **adult_extra_hide_result,
             **extras_result,
             **visibility_result,
-            **artwork_result,
             **deleted_media_prune_result,
             **target_scan_result,
             **subtitle_result,
@@ -2408,38 +2358,6 @@ class PipelineBotService:
             "msg_visibility_repair_media_count": int(result.get("media_count") or 0),
             "msg_visibility_repair_reason": result.get("reason"),
             "msg_visibility_repair_error": None,
-        }
-
-    def _repair_msg_adult_artwork(self, client, media_id):
-        result = client.repair_adult_artwork(
-            media_id,
-            semantic_enabled=self.config.adult_external_scraper_enabled,
-            cache_dir=self.config.adult_artwork_cache_dir,
-            public_base_url=self.config.adult_artwork_public_base_url,
-            generate_portrait=self.config.adult_artwork_generate_portrait_enabled,
-            metadata_provider=AdultHTMLMetadataProvider(
-                bases=self.config.adult_metadata_base_urls,
-                timeout=self.config.adult_metadata_fetch_timeout_seconds,
-                flaresolverr_url=self.config.adult_metadata_flaresolverr_url,
-                flaresolverr_timeout=self.config.adult_metadata_flaresolverr_timeout_seconds,
-            )
-            if self.config.adult_external_scraper_enabled
-            else False,
-        )
-        if not isinstance(result, dict):
-            raise RuntimeError("MediaStationGo adult artwork repair returned invalid response")
-        status = result.get("status")
-        if status not in ("success", "skipped"):
-            raise RuntimeError("MediaStationGo adult artwork repair returned invalid status: %s" % (status or "-"))
-        return {
-            "msg_artwork_repair_status": status,
-            "msg_artwork_repair_updated": int(result.get("updated") or 0),
-            "msg_artwork_repair_reason": result.get("reason"),
-            "msg_artwork_repair_fields": ",".join(result.get("fields") or []),
-            "msg_artwork_repair_metadata_source": result.get("metadata_source"),
-            "msg_artwork_repair_poster_source": result.get("poster_source"),
-            "msg_artwork_repair_backdrop_source": result.get("backdrop_source"),
-            "msg_artwork_repair_error": None,
         }
 
     def _prune_msg_deleted_media_for_targets(self, category, openlist_paths):
@@ -4981,14 +4899,6 @@ STALE_MSG_MEDIA_RESET_KEYS = (
     "msg_visibility_repair_media_count",
     "msg_visibility_repair_reason",
     "msg_visibility_repair_error",
-    "msg_artwork_repair_status",
-    "msg_artwork_repair_updated",
-    "msg_artwork_repair_reason",
-    "msg_artwork_repair_fields",
-    "msg_artwork_repair_metadata_source",
-    "msg_artwork_repair_poster_source",
-    "msg_artwork_repair_backdrop_source",
-    "msg_artwork_repair_error",
     "subtitle_match_status",
     "subtitle_match_source",
     "subtitle_match_reason",
@@ -6622,7 +6532,6 @@ def format_task_diagnostics_message(record):
         ("msg_error", "MSG错误"),
         ("msg_extra_cleanup_error", "特典隐藏错误"),
         ("msg_visibility_repair_error", "可见性修复错误"),
-        ("msg_artwork_repair_error", "图片修复错误"),
     ):
         if task.get(key):
             lines.append("%s：%s" % (label, task.get(key)))
