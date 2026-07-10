@@ -174,17 +174,3 @@ services:
     command: ["admin-web"]
     volumes:
       - /data/media-pipeline/bot:/bot-data
-
-  media-pipeline-artwork-static:
-    build:
-      context: .
-      args:
-        MEDIA_PIPELINE_VERSION: "${MEDIA_PIPELINE_VERSION:-0.1.0}"
-        MEDIA_PIPELINE_REVISION: "${MEDIA_PIPELINE_REVISION:-unknown}"
-    container_name: media-pipeline-artwork-static
-    network_mode: host
-    restart: unless-stopped
-    entrypoint: ["python"]
-    command: ["-m", "http.server", "18083", "--bind", "127.0.0.1", "--directory", "/artwork"]
-    volumes:
-      - /data/media-pipeline/artwork:/artwork:ro
