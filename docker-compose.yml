@@ -138,4 +138,3 @@ services:
       - /data/Prowlarr/config:/prowlarr-config:ro
       - /data/media-pipeline/bot:/bot-data
       - /data/media-pipeline/subtitles:/subtitle-cache
-      - /data/media-pipeline/artwork:/artwork-cache

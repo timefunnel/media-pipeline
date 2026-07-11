@@ -8,7 +8,7 @@ Telegram query or magnet
 -> 115 Open offline task
 -> OpenList 115 mount
 -> MediaStationGo cloud root scan and scrape
--> optional cleanup, artwork repair, subtitle matching and Emby-compatible proxy
+-> optional OpenList cleanup and subtitle matching
 ```
 
 ## Documentation
