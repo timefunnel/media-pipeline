@@ -151,6 +151,29 @@ class MediaStationClient:
             raise ValueError("MediaStationGo metadata update fields missing")
         return self._request("PATCH", "/media/%s/metadata" % quote_path(media_id), data=data)
 
+    def repair_movie_extras(self, media_id, category, library_id=None, root_id=None, root_openlist_path=None):
+        return extract_response_data(
+            self._request(
+                "POST",
+                "/pipeline/media/%s/repair-movie-extras" % quote_path(media_id),
+                data=build_pipeline_maintenance_payload(category, library_id, root_id, root_openlist_path),
+            )
+        )
+
+    def repair_episode_visibility(self, media_id, category, library_id=None, root_id=None, root_openlist_path=None):
+        return extract_response_data(
+            self._request(
+                "POST",
+                "/pipeline/media/%s/repair-episode-visibility" % quote_path(media_id),
+                data=build_pipeline_maintenance_payload(category, library_id, root_id, root_openlist_path),
+            )
+        )
+
+    def prune_deleted_media(self, category, openlist_paths, library_id=None, root_id=None, root_openlist_path=None):
+        data = build_pipeline_maintenance_payload(category, library_id, root_id, root_openlist_path)
+        data["openlist_paths"] = list(openlist_paths or [])
+        return extract_response_data(self._request("POST", "/pipeline/deleted-media/prune", data=data))
+
     def _request(self, method, path, data=None, retry=True):
         if not self.access_token:
             self.login()
@@ -186,6 +209,25 @@ def extract_access_token(response):
 
 def quote_path(value):
     return urllib.parse.quote(str(value), safe="")
+
+
+def build_pipeline_maintenance_payload(category, library_id=None, root_id=None, root_openlist_path=None):
+    data = {"category": str(category or "").strip()}
+    for key, value in (
+        ("library_id", library_id),
+        ("root_id", root_id),
+        ("root_openlist_path", root_openlist_path),
+    ):
+        value = str(value or "").strip()
+        if value:
+            data[key] = value
+    return data
+
+
+def extract_response_data(response):
+    if isinstance(response, dict) and isinstance(response.get("data"), dict):
+        return response["data"]
+    return response
 
 
 def extract_media_items(response):

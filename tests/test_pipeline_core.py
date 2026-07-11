@@ -374,6 +374,12 @@ class FakeMediaStationClient:
         self.scrape_calls = []
         self.scrape_search_calls = []
         self.scrape_apply_calls = []
+        self.repair_movie_extras_calls = []
+        self.repair_episode_visibility_calls = []
+        self.prune_deleted_media_calls = []
+        self.repair_movie_extras_response = {"status": "success", "updated": 0, "media_count": 1}
+        self.repair_episode_visibility_response = {"status": "success", "updated": 0, "media_count": 1}
+        self.prune_deleted_media_response = {"status": "skipped", "deleted": 0, "reason": "no_deleted_media", "media_ids": []}
 
     def scan_root(self, library_id, root_id):
         self.scan_calls.append((library_id, root_id))
@@ -408,6 +414,18 @@ class FakeMediaStationClient:
     def apply_scrape_match(self, media_id, match):
         self.scrape_apply_calls.append((media_id, match))
         return {"ok": True}
+
+    def repair_movie_extras(self, media_id, category, library_id=None, root_id=None, root_openlist_path=None):
+        self.repair_movie_extras_calls.append((media_id, category, library_id, root_id, root_openlist_path))
+        return dict(self.repair_movie_extras_response)
+
+    def repair_episode_visibility(self, media_id, category, library_id=None, root_id=None, root_openlist_path=None):
+        self.repair_episode_visibility_calls.append((media_id, category, library_id, root_id, root_openlist_path))
+        return dict(self.repair_episode_visibility_response)
+
+    def prune_deleted_media(self, category, openlist_paths, library_id=None, root_id=None, root_openlist_path=None):
+        self.prune_deleted_media_calls.append((category, list(openlist_paths or []), library_id, root_id, root_openlist_path))
+        return dict(self.prune_deleted_media_response)
 
 
 
