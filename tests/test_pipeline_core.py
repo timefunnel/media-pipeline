@@ -32,10 +32,6 @@ for _category, _prefix in {
             os.environ[_key] = _value
 
 from pipeline.client115 import Client115
-from pipeline.cli import public_resource_summary
-from pipeline.cli import main as cli_main
-from pipeline.cli import run as cli_run
-from pipeline.cli import summarize_offline_submit
 from pipeline.config import category_to_folder_id, category_to_msg_library_root, category_to_openlist_path
 from pipeline.mediastation import (
     MediaStationClient,

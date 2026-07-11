@@ -466,7 +466,6 @@ pipeline CLI：
 cd /opt/media-pipeline
 docker exec media-pipeline-bot python -m pipeline.cli folders
 docker exec media-pipeline-bot python -m pipeline.cli verify-folders
-docker exec media-pipeline-bot python -m pipeline.cli probe
 docker exec media-pipeline-bot python -m pipeline.cli msg-login
 ```
 
@@ -475,9 +474,8 @@ docker exec media-pipeline-bot python -m pipeline.cli msg-login
 ```text
 folders 输出为当前设备自己的 115 folder id
 verify-folders 中 movie/tv/anime/adult/other 均 code=0
-probe 能读取 OpenList 中的 115 Open storage_id 和 quota
+verify-folders 能读取各媒体目录的 115 文件夹信息
 msg-login 返回 {"authenticated": true}
-subtitle proxy /health 返回 200
 ```
 
 Bot 验证：
@@ -531,7 +529,7 @@ pipeline 不主动刷新 115 refresh token。115 Open token 以 OpenList 为准�
 2. 再重跑：
 
 ```bash
-docker exec media-pipeline-bot python -m pipeline.cli probe
+docker exec media-pipeline-bot python -m pipeline.cli verify-folders
 ```
 
 ### 12.2 搜索结果少或超时
