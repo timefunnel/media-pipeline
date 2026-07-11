@@ -2076,7 +2076,6 @@ class PipelineBotService:
         target_openlist_paths = msg_target_openlist_paths(category, progress)
         require_target_path = bool(msg_authoritative_openlist_paths(progress))
         deleted_media_prune_result = prefixed_task_fields(progress, "msg_deleted_media_prune_")
-        target_scan_result = prefixed_task_fields(progress, "msg_target_scan_")
 
         if progress.get("msg_scan_status") != "success" or not media_id:
             openlist = get_openlist_client()
@@ -2089,33 +2088,16 @@ class PipelineBotService:
                     emit({"msg_deleted_media_prune_status": "running", "msg_deleted_media_prune_error": None})
                     deleted_media_prune_result = self._prune_msg_deleted_media_for_targets(category, authoritative_paths)
                     emit(deleted_media_prune_result)
-                    emit({"msg_target_scan_status": "running", "msg_target_scan_error": None})
-                    target_scan_result = self._scan_msg_openlist_target_root(client, category, authoritative_paths, queries)
-                    media = target_scan_result.pop("_media", None)
-                    emit(target_scan_result)
             if media is None:
                 emit({"msg_scan_status": "running", "msg_error": None})
                 client.scan_root(root["library_id"], root["root_id"])
-                try:
-                    media = self._wait_for_msg_media(
-                        client,
-                        root["library_id"],
-                        queries,
-                        target_openlist_paths=target_openlist_paths,
-                        require_target_path=require_target_path,
-                    )
-                except RuntimeError as exc:
-                    if (
-                        isinstance(exc, MediaStationApiError)
-                        or not require_target_path
-                        or not authoritative_paths
-                        or not str(exc).startswith("MediaStationGo media not found after root scan:")
-                    ):
-                        raise
-                    emit({"msg_target_scan_status": "running", "msg_target_scan_error": None})
-                    target_scan_result = self._scan_msg_openlist_target_root(client, category, authoritative_paths, queries)
-                    media = target_scan_result.pop("_media", None)
-                    emit(target_scan_result)
+                media = self._wait_for_msg_media(
+                    client,
+                    root["library_id"],
+                    queries,
+                    target_openlist_paths=target_openlist_paths,
+                    require_target_path=require_target_path,
+                )
             media_id = extract_media_id(media)
             if not media_id:
                 raise RuntimeError("MediaStationGo media id missing after scan")
@@ -2194,7 +2176,6 @@ class PipelineBotService:
             **extras_result,
             **visibility_result,
             **deleted_media_prune_result,
-            **target_scan_result,
             **subtitle_result,
         }
 
@@ -2374,48 +2355,6 @@ class PipelineBotService:
             "msg_deleted_media_prune_error": None,
         }
 
-    def _scan_msg_openlist_target_root(self, client, category, openlist_paths, queries):
-        target_path = next((path for path in unique_openlist_paths(openlist_paths) if path), "")
-        if not target_path:
-            return {"msg_target_scan_status": "skipped", "msg_target_scan_reason": "target_missing", "msg_target_scan_error": None}
-        scan_root_path = openlist_scan_root_for_msg_target(target_path)
-        db = self._build_msg_db_client()
-        temp_root = db.create_temporary_library_root(category, scan_root_path)
-        root = category_to_msg_library_root(category)
-        cleanup_error = None
-        try:
-            client.scan_root(root["library_id"], temp_root["root_id"])
-            media = self._wait_for_msg_media(
-                client,
-                root["library_id"],
-                queries,
-                target_openlist_paths=[target_path],
-                require_target_path=True,
-            )
-            media_id = extract_media_id(media)
-            if not media_id:
-                raise RuntimeError("MediaStationGo media id missing after target scan")
-            db.reassign_media_root(media_id, root["root_id"])
-            media["library_root_id"] = root["root_id"]
-            media["_pipeline_match_mode"] = "path"
-            media["_pipeline_match_path"] = media.get("_pipeline_match_path") or media.get("path")
-            result = {
-                "msg_target_scan_status": "success",
-                "msg_target_scan_root_id": temp_root["root_id"],
-                "msg_target_scan_path": scan_root_path,
-                "msg_target_scan_match_path": target_path,
-                "msg_target_scan_error": None,
-                "_media": media,
-            }
-        finally:
-            try:
-                db.delete_library_root(temp_root["root_id"])
-            except Exception as exc:
-                cleanup_error = str(exc)
-        if cleanup_error:
-            raise RuntimeError("MediaStationGo temporary root cleanup failed: %s" % cleanup_error)
-        return result
-
     def _wait_for_msg_media(self, client, library_id, queries, target_openlist_paths=None, require_target_path=False):
         deadline = time.monotonic() + max(0, int(self.config.msg_sync_poll_seconds))
         interval = max(1, int(self.config.msg_sync_poll_interval_seconds))
@@ -2581,17 +2520,6 @@ def unique_openlist_paths(paths):
             seen.add(key)
             out.append(normalized)
     return out
-
-
-def openlist_scan_root_for_msg_target(path):
-    path = normalize_openlist_path(path)
-    if not path:
-        return ""
-    suffix = posixpath.splitext(path)[1].lower()
-    if suffix in VIDEO_EXTENSIONS:
-        parent = posixpath.dirname(path.rstrip("/"))
-        return normalize_openlist_path(parent or "/")
-    return path
 
 
 def find_media_by_openlist_paths(items, openlist_paths, library_id=None):
@@ -4904,6 +4832,11 @@ STALE_MSG_MEDIA_RESET_KEYS = (
     "subtitle_match_reason",
     "subtitle_match_error",
     "subtitle_match_path",
+    "msg_target_scan_status",
+    "msg_target_scan_root_id",
+    "msg_target_scan_path",
+    "msg_target_scan_match_path",
+    "msg_target_scan_error",
 )
 
 
