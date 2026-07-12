@@ -2081,25 +2081,40 @@ class PipelineBotService:
             openlist = get_openlist_client()
             client = get_msg_client()
             authoritative_paths = []
+            prune_deleted_paths = []
             if require_target_path:
                 authoritative_paths = msg_authoritative_openlist_paths(progress)
                 self._refresh_openlist_targets_for_msg(openlist, authoritative_paths)
                 if progress.get("msg_stale_media_id"):
                     emit({"msg_deleted_media_prune_status": "running", "msg_deleted_media_prune_error": None})
-                    deleted_media_prune_result = self._prune_msg_deleted_media_for_targets(
-                        category, authoritative_paths, client
-                    )
-                    emit(deleted_media_prune_result)
+                    prune_deleted_paths = authoritative_paths
             if media is None:
                 emit({"msg_scan_status": "running", "msg_error": None})
-                client.scan_root(root["library_id"], root["root_id"])
-                media = self._wait_for_msg_media(
+                movie_cleanup_touched_openlist = int(clean_result.get("openlist_hidden_count") or 0) > 0 or int(
+                    clean_result.get("openlist_cleaned_count") or 0
+                ) > 0
+                ingest_result = self._run_msg_pipeline_ingest(
                     client,
-                    root["library_id"],
+                    category,
+                    title,
                     queries,
+                    scan=True,
                     target_openlist_paths=target_openlist_paths,
                     require_target_path=require_target_path,
+                    prune_deleted_openlist_paths=prune_deleted_paths,
+                    repair_movie_extras=category == "movie" and movie_cleanup_touched_openlist,
+                    repair_episode_visibility=category in ("tv", "anime"),
                 )
+                ingest_updates = ingest_result["updates"]
+                if ingest_updates.get("msg_deleted_media_prune_status"):
+                    deleted_media_prune_result = prefixed_task_fields(ingest_updates, "msg_deleted_media_prune_")
+                if ingest_updates.get("msg_extra_cleanup_status"):
+                    extras_result = prefixed_task_fields(ingest_updates, "msg_extra_cleanup_")
+                    self._apply_msg_movie_extras_hide(ingest_result.get("movie_extras"), get_openlist_client)
+                if ingest_updates.get("msg_visibility_repair_status"):
+                    visibility_result = prefixed_task_fields(ingest_updates, "msg_visibility_repair_")
+                emit(ingest_updates)
+                media = ingest_result["media"]
             media_id = extract_media_id(media)
             if not media_id:
                 raise RuntimeError("MediaStationGo media id missing after scan")
@@ -2109,8 +2124,8 @@ class PipelineBotService:
                     "msg_scan_status": "success",
                     "msg_media_id": media_id,
                     "msg_media_title": media_title,
-                    "msg_match_mode": media.get("_pipeline_match_mode") or "query",
-                    "msg_match_path": media.get("_pipeline_match_path"),
+                    "msg_match_mode": media.get("_pipeline_match_mode") or media.get("match_mode") or "query",
+                    "msg_match_path": media.get("_pipeline_match_path") or media.get("match_path"),
                 }
             )
 
@@ -2229,6 +2244,10 @@ class PipelineBotService:
             root_id=root.get("root_id"),
             root_openlist_path=category_to_openlist_path(category),
         )
+        self._apply_msg_movie_extras_hide(result, openlist_client)
+        return self._msg_movie_extras_progress_fields(result)
+
+    def _apply_msg_movie_extras_hide(self, result, openlist_client=None):
         if not isinstance(result, dict):
             raise RuntimeError("MediaStationGo movie extra cleanup returned invalid response")
         status = result.get("status")
@@ -2239,14 +2258,20 @@ class PipelineBotService:
         if hide_patterns:
             if not hide_path:
                 raise RuntimeError("MediaStationGo movie extra cleanup returned hide patterns without path")
-            client = openlist_client or OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
+            if callable(openlist_client):
+                client = openlist_client()
+            else:
+                client = openlist_client or OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
             client.upsert_meta_hide(hide_path, hide_patterns, h_sub=True)
+
+    def _msg_movie_extras_progress_fields(self, result):
+        hide_patterns = [str(pattern) for pattern in (result or {}).get("openlist_hide_patterns") or [] if str(pattern or "").strip()]
         return {
-            "msg_extra_cleanup_status": status,
-            "msg_extra_cleanup_updated": int(result.get("updated") or 0),
-            "msg_extra_cleanup_media_count": int(result.get("media_count") or 0),
+            "msg_extra_cleanup_status": (result or {}).get("status"),
+            "msg_extra_cleanup_updated": int((result or {}).get("updated") or 0),
+            "msg_extra_cleanup_media_count": int((result or {}).get("media_count") or 0),
             "msg_extra_cleanup_hidden_count": len(hide_patterns),
-            "msg_extra_cleanup_reason": result.get("reason"),
+            "msg_extra_cleanup_reason": (result or {}).get("reason"),
             "msg_extra_cleanup_error": None,
         }
 
@@ -2358,6 +2383,95 @@ class PipelineBotService:
             "msg_visibility_repair_reason": result.get("reason"),
             "msg_visibility_repair_error": None,
         }
+
+    def _run_msg_pipeline_ingest(
+        self,
+        client,
+        category,
+        title,
+        queries,
+        scan=True,
+        target_openlist_paths=None,
+        require_target_path=False,
+        prune_deleted_openlist_paths=None,
+        repair_movie_extras=False,
+        repair_episode_visibility=False,
+    ):
+        root = category_to_msg_library_root(category)
+        payload = {
+            "category": category,
+            "library_id": root.get("library_id"),
+            "root_id": root.get("root_id"),
+            "root_openlist_path": category_to_openlist_path(category),
+            "title": title,
+            "queries": list(queries or []),
+            "target_openlist_paths": list(target_openlist_paths or []),
+            "require_target_path": bool(require_target_path),
+            "prune_deleted_openlist_paths": list(prune_deleted_openlist_paths or []),
+            "scan": bool(scan),
+            "repair_movie_extras": bool(repair_movie_extras),
+            "repair_episode_visibility": bool(repair_episode_visibility),
+        }
+        job = client.start_pipeline_ingest(payload)
+        job_id = str((job or {}).get("id") or "").strip()
+        if not job_id:
+            raise RuntimeError("MediaStationGo pipeline ingest job id missing")
+        interval = max(1, int(self.config.msg_sync_poll_interval_seconds))
+        deadline = time.monotonic() + max(interval, int(self.config.msg_sync_poll_seconds))
+        while str((job or {}).get("status") or "") == "running":
+            if time.monotonic() >= deadline:
+                raise RuntimeError("MediaStationGo pipeline ingest timed out: %s" % job_id)
+            time.sleep(interval)
+            job = client.get_pipeline_ingest(job_id)
+        status = str((job or {}).get("status") or "")
+        if status != "completed":
+            raise RuntimeError((job or {}).get("error") or "MediaStationGo pipeline ingest failed: %s" % status)
+        result = (job or {}).get("result") or {}
+        media = result.get("media") or {}
+        media_id = extract_media_id(media)
+        if not media_id:
+            raise RuntimeError("MediaStationGo pipeline ingest media id missing")
+        updates = self._msg_pipeline_ingest_progress_fields(result)
+        media["_pipeline_match_mode"] = updates.get("msg_match_mode")
+        media["_pipeline_match_path"] = updates.get("msg_match_path")
+        return {"job": job, "result": result, "media": media, "updates": updates, "movie_extras": result.get("movie_extras")}
+
+    def _msg_pipeline_ingest_progress_fields(self, result):
+        result = result or {}
+        media = result.get("media") or {}
+        updates = {
+            "msg_scan_status": "success",
+            "msg_media_id": extract_media_id(media),
+            "msg_media_title": media_display_title(media),
+            "msg_match_mode": media.get("match_mode") or "query",
+            "msg_match_path": media.get("match_path"),
+            "msg_error": None,
+        }
+        prune = result.get("deleted_media_prune")
+        if isinstance(prune, dict):
+            updates.update(
+                {
+                    "msg_deleted_media_prune_status": prune.get("status"),
+                    "msg_deleted_media_prune_deleted": int(prune.get("deleted") or 0),
+                    "msg_deleted_media_prune_reason": prune.get("reason"),
+                    "msg_deleted_media_prune_error": None,
+                }
+            )
+        movie_extras = result.get("movie_extras")
+        if isinstance(movie_extras, dict):
+            updates.update(self._msg_movie_extras_progress_fields(movie_extras))
+        visibility = result.get("episode_visibility")
+        if isinstance(visibility, dict):
+            updates.update(
+                {
+                    "msg_visibility_repair_status": visibility.get("status"),
+                    "msg_visibility_repair_updated": int(visibility.get("updated") or 0),
+                    "msg_visibility_repair_media_count": int(visibility.get("media_count") or 0),
+                    "msg_visibility_repair_reason": visibility.get("reason"),
+                    "msg_visibility_repair_error": None,
+                }
+            )
+        return updates
 
     def _prune_msg_deleted_media_for_targets(self, category, openlist_paths, msg_client=None):
         root = category_to_msg_library_root(category)

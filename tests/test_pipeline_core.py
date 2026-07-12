@@ -377,6 +377,9 @@ class FakeMediaStationClient:
         self.repair_movie_extras_calls = []
         self.repair_episode_visibility_calls = []
         self.prune_deleted_media_calls = []
+        self.pipeline_ingest_start_calls = []
+        self.pipeline_ingest_get_calls = []
+        self.pipeline_ingest_jobs = {}
         self.repair_movie_extras_response = {"status": "success", "updated": 0, "media_count": 1}
         self.repair_episode_visibility_response = {"status": "success", "updated": 0, "media_count": 1}
         self.prune_deleted_media_response = {"status": "skipped", "deleted": 0, "reason": "no_deleted_media", "media_ids": []}
@@ -426,6 +429,102 @@ class FakeMediaStationClient:
     def prune_deleted_media(self, category, openlist_paths, library_id=None, root_id=None, root_openlist_path=None):
         self.prune_deleted_media_calls.append((category, list(openlist_paths or []), library_id, root_id, root_openlist_path))
         return dict(self.prune_deleted_media_response)
+
+    def start_pipeline_ingest(self, payload):
+        payload = dict(payload or {})
+        self.pipeline_ingest_start_calls.append(payload)
+        library_id = payload.get("library_id")
+        root_id = payload.get("root_id")
+        category = payload.get("category")
+        root_openlist_path = payload.get("root_openlist_path")
+        result = {}
+        if payload.get("prune_deleted_openlist_paths"):
+            result["deleted_media_prune"] = self.prune_deleted_media(
+                category,
+                payload.get("prune_deleted_openlist_paths"),
+                library_id=library_id,
+                root_id=root_id,
+                root_openlist_path=root_openlist_path,
+            )
+        if payload.get("scan"):
+            self.scan_root(library_id, root_id)
+            result["scan"] = {"library_id": library_id, "visited": 1, "added": 0, "updated": 1, "skipped": 0, "probed": 0, "removed": 0}
+        media = self._pipeline_ingest_media(payload)
+        if not media:
+            job = {"id": "ingest-1", "status": "failed", "error": "MediaStationGo media not found after root scan", "result": result}
+            self.pipeline_ingest_jobs[job["id"]] = job
+            return job
+        result["media"] = media
+        if payload.get("repair_movie_extras"):
+            result["movie_extras"] = self.repair_movie_extras(
+                media.get("id"),
+                category,
+                library_id=library_id,
+                root_id=root_id,
+                root_openlist_path=root_openlist_path,
+            )
+        if payload.get("repair_episode_visibility"):
+            result["episode_visibility"] = self.repair_episode_visibility(
+                media.get("id"),
+                category,
+                library_id=library_id,
+                root_id=root_id,
+                root_openlist_path=root_openlist_path,
+            )
+        job = {"id": "ingest-1", "status": "completed", "result": result}
+        self.pipeline_ingest_jobs[job["id"]] = job
+        return job
+
+    def get_pipeline_ingest(self, job_id):
+        self.pipeline_ingest_get_calls.append(job_id)
+        return self.pipeline_ingest_jobs[job_id]
+
+    def _pipeline_ingest_media(self, payload):
+        targets = list(payload.get("target_openlist_paths") or [])
+        if targets:
+            self.list_calls.append((payload.get("library_id"), 1, 200, 0))
+            media = self._pipeline_ingest_match_target(extract_media_items(self.list_response), targets)
+            if media:
+                return media
+            for query in payload.get("queries") or []:
+                self.search_calls.append((query, 20))
+                media = self._pipeline_ingest_match_target(extract_media_items(self.search_response), targets)
+                if media:
+                    return media
+            if payload.get("require_target_path"):
+                return None
+            items = extract_media_items(self.search_response)
+            if items:
+                media = dict(items[0])
+                media.setdefault("match_mode", "query")
+                return media
+        for query in payload.get("queries") or []:
+            self.search_calls.append((query, 20))
+            items = extract_media_items(self.search_response)
+            if items:
+                media = dict(items[0])
+                media.setdefault("match_mode", "query")
+                return media
+        items = extract_media_items(self.list_response)
+        if items:
+            media = dict(items[0])
+            media.setdefault("match_mode", "query")
+            return media
+        return None
+
+    def _pipeline_ingest_match_target(self, items, targets):
+        from pipeline.msgdb import cloud_path_to_openlist_path, normalize_openlist_path
+
+        for item in items or []:
+            path = cloud_path_to_openlist_path((item or {}).get("path"))
+            for target in targets:
+                target = normalize_openlist_path(target)
+                if path == target or path.startswith(target.rstrip("/") + "/"):
+                    media = dict(item)
+                    media["match_mode"] = "path"
+                    media["match_path"] = item.get("path")
+                    return media
+        return None
 
 
 

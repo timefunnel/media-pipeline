@@ -174,6 +174,14 @@ class MediaStationClient:
         data["openlist_paths"] = list(openlist_paths or [])
         return extract_response_data(self._request("POST", "/pipeline/deleted-media/prune", data=data))
 
+    def start_pipeline_ingest(self, payload):
+        if not isinstance(payload, dict):
+            raise ValueError("MediaStationGo pipeline ingest payload must be an object")
+        return extract_response_data(self._request("POST", "/pipeline/ingest", data=payload))
+
+    def get_pipeline_ingest(self, job_id):
+        return extract_response_data(self._request("GET", "/pipeline/ingest/%s" % quote_path(job_id)))
+
     def _request(self, method, path, data=None, retry=True):
         if not self.access_token:
             self.login()
