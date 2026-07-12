@@ -46,6 +46,7 @@ from pipeline.mediastation import (
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes, normalize_task, task_can_cancel, wait_for_task
 from pipeline.openlist import OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider, extract_openlist_login_token
 from pipeline.openlist_tokens import OpenListTokenStore
+from pipeline.bot import msg_target_openlist_paths
 from pipeline.prowlarr import ProwlarrClient, ProwlarrConfig, torrent_bytes_to_magnet
 from pipeline.resource_selector import ResourceSelector
 from pipeline.subtitle_proxy import (
@@ -578,6 +579,22 @@ class FakeSubtitleProxyHandler(SubtitleProxyHandler):
 
     def _log_timing(self, timing, status, request_path):
         self.logged_timing = (status, request_path)
+
+
+class MsgTargetOpenListPathsTest(unittest.TestCase):
+    def test_authoritative_path_omits_stale_task_name(self):
+        task = {
+            "name": "ABF-246-U",
+            "openlist_adult_format_new_path": "/115/成人/ABF-246",
+            "openlist_adult_format_old_path": "/115/成人/ABF-246-U",
+        }
+
+        self.assertEqual(msg_target_openlist_paths("adult", task), ["/115/成人/ABF-246"])
+
+    def test_falls_back_to_task_name_without_authoritative_path(self):
+        task = {"name": "ABF-246-U"}
+
+        self.assertEqual(msg_target_openlist_paths("adult", task), ["/115/成人/ABF-246-U"])
 
 
 class EmbyStreamProxyCompatTest(unittest.TestCase):

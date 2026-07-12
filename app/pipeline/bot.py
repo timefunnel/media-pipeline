@@ -2614,7 +2614,7 @@ class PipelineBotService:
 
 def msg_target_openlist_paths(category, task):
     task = task or {}
-    paths = []
+    authoritative_paths = []
     for key in (
         "openlist_adult_format_new_path",
         "openlist_adult_format_path",
@@ -2623,8 +2623,13 @@ def msg_target_openlist_paths(category, task):
     ):
         value = normalize_openlist_path(task.get(key))
         if value:
-            paths.append(value)
+            authoritative_paths.append(value)
 
+    authoritative_paths = unique_openlist_paths(authoritative_paths)
+    if authoritative_paths:
+        return authoritative_paths
+
+    paths = []
     root_path = normalize_openlist_path(category_to_openlist_path(category))
     if root_path:
         for name in task_openlist_target_names(task):
