@@ -108,6 +108,13 @@ class MediaStationClient:
         params = urllib.parse.urlencode({"q": query, "limit": int(limit)})
         return self._request("GET", "/media?%s" % params)
 
+    def pipeline_scrape_media(self, media_id, payload):
+        if not isinstance(payload, dict):
+            raise ValueError("MediaStationGo pipeline scrape payload must be an object")
+        return extract_response_data(
+            self._request("POST", "/pipeline/media/%s/scrape" % quote_path(media_id), data=payload)
+        )
+
     def scrape_media(self, media_id):
         return self._request(
             "POST",

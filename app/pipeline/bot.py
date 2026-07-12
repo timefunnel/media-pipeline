@@ -116,7 +116,6 @@ from pipeline.mediastation import (
     extract_codes,
     extract_media_id,
     extract_media_items,
-    extract_scrape_matches,
     find_matching_media,
     media_belongs_to_library,
     media_haystack,
@@ -2220,19 +2219,30 @@ class PipelineBotService:
         root = category_to_msg_library_root(category)
         provider = root.get("provider")
         media_type = root.get("media_type")
-        if provider and media_type:
-            if media is None:
-                try:
-                    media = client.get_media(media_id)
-                except RuntimeError:
-                    media = None
-            for query in msg_scrape_queries(title, task, media):
-                matches = extract_scrape_matches(client.search_scrape_matches(media_id, query, provider, media_type))
-                if len(matches) == 1:
-                    client.apply_scrape_match(media_id, matches[0])
-                    return {"msg_scrape_mode": "apply", "msg_scrape_query": query}
-        client.scrape_media(media_id)
-        return {"msg_scrape_mode": "smart", "msg_scrape_query": None}
+        if media is None and provider and media_type:
+            try:
+                media = client.get_media(media_id)
+            except RuntimeError:
+                media = None
+        result = client.pipeline_scrape_media(
+            media_id,
+            {
+                "category": category,
+                "title": title,
+                "queries": msg_scrape_queries(title, task, media),
+                "provider": provider,
+                "media_type": media_type,
+            },
+        )
+        mode = str((result or {}).get("mode") or "").strip()
+        if mode not in ("apply", "smart"):
+            raise RuntimeError("MediaStationGo pipeline scrape returned invalid mode: %s" % (mode or "-"))
+        return {
+            "msg_scrape_mode": mode,
+            "msg_scrape_query": (result or {}).get("query"),
+            "msg_scrape_match_count": int((result or {}).get("match_count") or 0),
+            "msg_scrape_reclassified": int((result or {}).get("reclassified") or 0),
+        }
 
     def _repair_msg_movie_extras(self, category, media_id, openlist_client=None, msg_client=None):
         root = category_to_msg_library_root(category)

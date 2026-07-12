@@ -4430,7 +4430,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         self.assertEqual(events, [("openlist", "/115/电影", True)])
         self.assertEqual(fake_msg.scan_calls, [("test-movie-library", "test-movie-root")])
-        self.assertEqual(fake_msg.scrape_calls, ["media-1"])
+        self.assertEqual([call[0] for call in fake_msg.pipeline_scrape_calls], ["media-1"])
         self.assertEqual(task["msg_sync_status"], "success")
         self.assertEqual(task["msg_scrape_status"], "success")
         self.assertEqual(task["msg_media_id"], "media-1")
@@ -4469,7 +4469,9 @@ class PipelineBotServiceTest(unittest.TestCase):
             task = service.sync_completed_task("movie", title, {"info_hash": "ABC", "status_name": "success", "name": title})
 
         self.assertEqual(fake_msg.scrape_calls, [])
-        self.assertEqual(fake_msg.scrape_apply_calls[0][0], "media-1")
+        self.assertEqual(fake_msg.scrape_apply_calls, [])
+        self.assertEqual(fake_msg.pipeline_scrape_calls[0][0], "media-1")
+        self.assertIn("Godzilla Final Wars", fake_msg.pipeline_scrape_calls[0][1]["queries"])
         self.assertEqual(task["msg_scrape_mode"], "apply")
         self.assertEqual(task["msg_scrape_query"], "Godzilla Final Wars")
 
@@ -4510,8 +4512,12 @@ class PipelineBotServiceTest(unittest.TestCase):
         )
 
         self.assertEqual(fake_msg.scrape_calls, [])
-        self.assertEqual(fake_msg.scrape_search_calls[0], ("media-1", "MIDE-949", "adult", "adult"))
-        self.assertEqual(fake_msg.scrape_apply_calls[0][0], "media-1")
+        self.assertEqual(fake_msg.scrape_search_calls, [])
+        self.assertEqual(fake_msg.scrape_apply_calls, [])
+        self.assertEqual(fake_msg.pipeline_scrape_calls[0][0], "media-1")
+        self.assertEqual(fake_msg.pipeline_scrape_calls[0][1]["provider"], "adult")
+        self.assertEqual(fake_msg.pipeline_scrape_calls[0][1]["media_type"], "adult")
+        self.assertEqual(fake_msg.pipeline_scrape_calls[0][1]["queries"][0], "MIDE-949")
         self.assertEqual(result["msg_scrape_mode"], "apply")
         self.assertEqual(result["msg_scrape_query"], "MIDE-949")
 
@@ -4552,7 +4558,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"info_hash": "ABC", "status_name": "success", "name": "Aki Sora.mkv"},
             )
 
-        self.assertEqual(fake_msg.scrape_calls, ["media-1"])
+        self.assertEqual([call[0] for call in fake_msg.pipeline_scrape_calls], ["media-1"])
         self.assertEqual(
             fake_msg.repair_episode_visibility_calls,
             [("media-1", "anime", "test-anime-library", "test-anime-root", category_to_openlist_path("anime"))],
@@ -6000,7 +6006,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertFalse(openlist_cls.called)
         self.assertEqual(fake_msg.scan_calls, [])
         self.assertEqual(fake_msg.search_calls, [])
-        self.assertEqual(fake_msg.scrape_calls, ["media-1"])
+        self.assertEqual([call[0] for call in fake_msg.pipeline_scrape_calls], ["media-1"])
         self.assertEqual(task["msg_sync_status"], "success")
         self.assertEqual(task["msg_scrape_status"], "success")
         self.assertIsNone(task["msg_error"])
@@ -6129,7 +6135,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             [("adult", [target_path], "test-adult-library", "test-adult-root", category_to_openlist_path("adult"))],
         )
         self.assertEqual(fake_msg.scan_calls, [("test-adult-library", "test-adult-root")])
-        self.assertEqual(fake_msg.scrape_calls, ["media-new"])
+        self.assertEqual([call[0] for call in fake_msg.pipeline_scrape_calls], ["media-new"])
         self.assertEqual(task["msg_sync_status"], "success")
         self.assertEqual(task["msg_media_id"], "media-new")
         self.assertEqual(task["msg_stale_media_id"], "media-old")

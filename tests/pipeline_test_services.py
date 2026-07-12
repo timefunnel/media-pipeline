@@ -1969,6 +1969,18 @@ class MediaStationClientTest(unittest.TestCase):
             },
         )
 
+    def test_pipeline_scrape_media_uses_pipeline_endpoint(self):
+        transport = SequenceTransport([{"tokens": {"access_token": "msg-token"}}, {"data": {"mode": "smart"}}])
+        client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
+
+        result = client.pipeline_scrape_media("media-1", {"category": "adult", "queries": ["MIDE-949"]})
+
+        self.assertEqual(result, {"mode": "smart"})
+        call = transport.calls[1]
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(call["url"], "http://127.0.0.1:18080/api/pipeline/media/media-1/scrape")
+        self.assertEqual(call["data"], {"category": "adult", "queries": ["MIDE-949"]})
+
     def test_update_media_metadata_patches_artwork_fields(self):
         transport = SequenceTransport([{"tokens": {"access_token": "msg-token"}}, {"id": "media-1"}])
         client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)

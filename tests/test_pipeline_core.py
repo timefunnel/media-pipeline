@@ -33,6 +33,7 @@ for _category, _prefix in {
 
 from pipeline.client115 import Client115
 from pipeline.config import category_to_folder_id, category_to_msg_library_root, category_to_openlist_path
+from pipeline.mediastation import extract_scrape_matches
 from pipeline.mediastation import (
     MediaStationClient,
     MediaStationApiError,
@@ -361,12 +362,14 @@ class FakeMediaStationClient:
         get_response=None,
         events=None,
         scrape_search_responses=None,
+        pipeline_scrape_response=None,
     ):
         self.search_response = search_response or {"data": {"items": []}}
         self.list_response = list_response or {"data": {"items": []}}
         self.get_response = get_response
         self.events = events
         self.scrape_search_responses = scrape_search_responses or {}
+        self.pipeline_scrape_response = pipeline_scrape_response
         self.scan_calls = []
         self.search_calls = []
         self.list_calls = []
@@ -374,6 +377,7 @@ class FakeMediaStationClient:
         self.scrape_calls = []
         self.scrape_search_calls = []
         self.scrape_apply_calls = []
+        self.pipeline_scrape_calls = []
         self.repair_movie_extras_calls = []
         self.repair_episode_visibility_calls = []
         self.prune_deleted_media_calls = []
@@ -397,6 +401,17 @@ class FakeMediaStationClient:
     def list_library_media(self, library_id, page=1, page_size=200, group_versions=0):
         self.list_calls.append((library_id, page, page_size, group_versions))
         return self.list_response
+
+    def pipeline_scrape_media(self, media_id, payload):
+        payload = dict(payload or {})
+        self.pipeline_scrape_calls.append((media_id, payload))
+        if self.pipeline_scrape_response is not None:
+            return dict(self.pipeline_scrape_response)
+        for query in payload.get("queries") or []:
+            matches = extract_scrape_matches(self.scrape_search_responses.get(query, {"items": []}))
+            if len(matches) == 1:
+                return {"mode": "apply", "query": query, "match_count": 1, "reclassified": 0}
+        return {"mode": "smart", "query": None, "match_count": 0, "reclassified": 0}
 
     def scrape_media(self, media_id):
         self.scrape_calls.append(media_id)
