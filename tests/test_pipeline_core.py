@@ -410,8 +410,8 @@ class FakeMediaStationClient:
         for query in payload.get("queries") or []:
             matches = extract_scrape_matches(self.scrape_search_responses.get(query, {"items": []}))
             if len(matches) == 1:
-                return {"mode": "apply", "query": query, "match_count": 1, "reclassified": 0}
-        return {"mode": "smart", "query": None, "match_count": 0, "reclassified": 0}
+                return {"mode": "apply", "query": query, "match_count": 1}
+        return {"mode": "smart", "query": None, "match_count": 0}
 
     def scrape_media(self, media_id):
         self.scrape_calls.append(media_id)

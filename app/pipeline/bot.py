@@ -2241,7 +2241,6 @@ class PipelineBotService:
             "msg_scrape_mode": mode,
             "msg_scrape_query": (result or {}).get("query"),
             "msg_scrape_match_count": int((result or {}).get("match_count") or 0),
-            "msg_scrape_reclassified": int((result or {}).get("reclassified") or 0),
         }
 
     def _repair_msg_movie_extras(self, category, media_id, openlist_client=None, msg_client=None):
