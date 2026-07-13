@@ -21,10 +21,9 @@ Telegram Bot 收到影片名或磁链
 -> 使用 115 官方开放接口创建离线任务
 -> 查询/等待 115 离线完成
 -> OpenList 可见 115 文件
--> 触发 MediaStationGo 扫描旧 OpenList 云盘媒体库 root
--> 触发 MediaStationGo 单项刮削
--> 成人内容检查并修复不可直连的 JavBus 图片
--> 外部字幕匹配；Emby/Infuse 访问经 subtitle proxy 做兼容补丁
+-> 调用 MediaStationGo 持久化 ingest 完成扫描、定位和单项刮削
+-> 成人元数据、横竖图和 Emby/Jellyfin 兼容由 MSG 原生处理
+-> Bot 自动匹配字幕；MSG 从共享只读缓存输出字幕流
 ```
 
 当前服务端实际进度：
@@ -37,14 +36,12 @@ Telegram Bot 搜索/候选分页/资源选择
 -> OpenList 刷新与可见性验证
 -> OpenList 清理/成人番号格式化
 -> MediaStationGo 登录
--> MediaStationGo 旧 OpenList 云盘 root scan
--> 等待媒体出现
--> MediaStationGo scrape_media
--> 成人图片修复
--> 可见性/图片/字幕后处理
+-> MediaStationGo 持久化 ingest（扫描、媒体定位、单项刮削）
+-> MSG 内部处理成人元数据、横竖图和 Emby/Jellyfin 兼容
+-> Bot 自动字幕匹配；MSG 原生字幕接口读取共享缓存
 ```
 
-结论：MediaStationGo 已经接入 Bot 主线。当前使用 OpenList 云盘媒体库 root 扫描方案，pipeline 配置内保留 `电影`、`剧集`、`动漫`、`成人`、`其他媒体` 五个 active root；Bot 侧分类由用户手动选择。成人内容在 MSG 单项刮削后会执行图片修复，避免 JavBus 图片 403 或 DMM `now_printing` 占位图导致封面不可用。Bot 的 `其他` 分类在 MSG 中显示为 `其他媒体`，按普通 movie 类型处理，用于承接不适合继续留在成人库的 no_match 内容。Emby/Infuse 访问通过 `media-pipeline-subtitle-proxy` 兼容外部字幕、文件夹封面、播放进度和成人标题番号前缀。
+结论：MediaStationGo 已经接入 Bot 主线。pipeline 配置内保留 `电影`、`剧集`、`动漫`、`成人`、`其他媒体` 五个 active root；Bot 侧分类由用户手动选择。扫描、媒体定位、单项刮削、成人元数据与图片处理、播放和 Emby/Jellyfin 兼容均由 MSG 承接。Bot 保留资源搜索、115 入库编排、OpenList 清理/格式化和自动字幕匹配；Infuse/VidHub 直接访问 MSG，不再经过独立 subtitle proxy。
 
 ## 2. 总体架构
 
@@ -62,11 +59,10 @@ flowchart TD
     O --> Q["115 离线任务状态"]
     Q --> L["OpenList /115/电影、/115/剧集、/115/动漫、/115/成人 或 /115/其他 可见"]
     L --> OC["OpenList 扫描前清理；成人分类执行番号格式化"]
-    OC --> M["MediaStationGo 旧 OpenList 云盘 root scan"]
-    M --> F["搜索/匹配入库媒体"]
-    F --> R["MediaStationGo 单项 scrape"]
-    R --> A["成人内容修复 JavBus 图片为 DMM/MGStage"]
-    R --> X["字幕匹配与 subtitle proxy 兼容层"]
+    OC --> M["MediaStationGo 持久化 ingest"]
+    M --> R["MSG 扫描、定位和单项刮削"]
+    R --> A["MSG 成人元数据与横竖图处理"]
+    R --> X["Bot 字幕匹配与 MSG 原生字幕流"]
 ```
 
 ## 3. 服务端部署状态
@@ -74,19 +70,19 @@ flowchart TD
 当前相关容器：
 
 ```text
-media-pipeline-bot                  Up 13h
-media-pipeline-subtitle-proxy        Up 13h
-prowlarr                            Up 39h, 127.0.0.1:9696
-openlist                            Up 39h, 127.0.0.1:5244
-mediastationgo-mediastation-go-1     Up 39h healthy, 127.0.0.1:18080->8080
-mediastationgo-postgres-1            Up 39h healthy, 127.0.0.1:15432->5432
+media-pipeline-bot
+pansou                              127.0.0.1:8888
+prowlarr                            127.0.0.1:9696
+openlist                            127.0.0.1:5244
+mediastationgo-mediastation-go-1     127.0.0.1:18080->8080
+mediastationgo-postgres-1            127.0.0.1:15432->5432
 ```
 
 `/opt/media-pipeline/docker-compose.yml` 当前包含三个 service：
 
 - `media-pipeline`：一次性 CLI service，默认命令 `folders`。
 - `media-pipeline-bot`：常驻 Bot service，`restart: unless-stopped`。
-- `media-pipeline-subtitle-proxy`：常驻 Emby/Jellyfin 兼容代理，host network，默认监听 `18081`，上游为 MSG `127.0.0.1:18080`。
+- `pansou`：可选的 115 网盘资源搜索补充服务，只绑定本机端口。
 
 当前生产交互以 `media-pipeline-bot` 为准；CLI 不再作为维护目标，不再追平 Bot 能力。Bot service 已配置以下环境变量类别：
 
@@ -705,10 +701,8 @@ Git HEAD -> 6dee236
 media-pipeline-bot MEDIA_PIPELINE_REVISION -> 46a3078
 MediaStationGo /api/health -> 200
 OpenList /api/public/settings -> 200
-Subtitle proxy /health -> 200
 Prowlarr root -> 200
 media-pipeline-bot -> Up
-media-pipeline-subtitle-proxy -> Up
 MSG active pipeline libraries -> 成人, 电影, 剧集, 动漫, 其他媒体
 MSG extra active auto_category adult library -> 0 media
 MSG active cloud://openlist media -> 347
@@ -824,7 +818,7 @@ sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[
 - Prowlarr priority 已纳入 Bot 排序；后续源优先级尽量在 Prowlarr 后台调整，不在 Bot 里硬编码站点排序。
 - 强番号形态（例如 `MIDE-882`、`BDMV-001`、`FC2-PPV-1234567`）默认走成人 profile；非番号普通搜索默认不碰成人源。
 - 非番号搜索结果页提供短补查按钮：`🔞` 查成人源、`动漫` 查动漫源；点击后新发一条对应源结果消息，不覆盖原普通搜索结果。
-- 已接入 `media-pipeline-subtitle-proxy`：为 Emby/Infuse 访问提供外部字幕注入、文件夹封面补丁、成人标题番号前缀、播放进度兼容和敏感 token 日志脱敏。
+- 原 `media-pipeline-subtitle-proxy` 能力已迁入 MSG；生产反代和 Emby/Infuse 客户端均直连 MSG `18080`，Pipeline 不再维护协议代理。
 - 已接入外部字幕自动匹配，当前启用 provider 包括 `subtitlecat`、`assrt`、`opensubtitles`，成人任务默认自动匹配。
 
 需要继续完善：

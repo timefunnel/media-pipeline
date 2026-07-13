@@ -199,24 +199,6 @@ class MediaStationClient:
     def get_media(self, media_id):
         return self._request("GET", "/media/%s" % quote_path(media_id))
 
-    def update_media_metadata(self, media_id, fields):
-        allowed = {
-            "title",
-            "original_name",
-            "overview",
-            "poster_url",
-            "backdrop_url",
-            "year",
-            "release_date",
-            "rating",
-            "genres",
-            "nsfw",
-        }
-        data = {key: value for key, value in (fields or {}).items() if key in allowed}
-        if not data:
-            raise ValueError("MediaStationGo metadata update fields missing")
-        return self._request("PATCH", "/media/%s/metadata" % quote_path(media_id), data=data)
-
     def _request(self, method, path, data=None, retry=True):
         if not self.access_token:
             self.login()

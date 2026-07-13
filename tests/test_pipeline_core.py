@@ -1,5 +1,3 @@
-import base64
-import datetime
 import json
 import hashlib
 import io
@@ -8,7 +6,6 @@ import sqlite3
 import sys
 import tempfile
 import time
-import urllib.parse
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -47,41 +44,6 @@ from pipeline.openlist import OpenListClient, OpenListPasswordTokenProvider, Ope
 from pipeline.openlist_tokens import OpenListTokenStore
 from pipeline.prowlarr import ProwlarrClient, ProwlarrConfig, torrent_bytes_to_magnet
 from pipeline.resource_selector import ResourceSelector
-from pipeline.subtitle_proxy import (
-    MsgApiAuthenticator,
-    STREAM_PROXY_CHUNK_SIZE,
-    SubtitleProxyHandler,
-    inject_emby_subtitle_streams,
-    inject_subtitle_track_bootstrap,
-    iter_emby_items,
-    normalize_webvtt_timestamps,
-    normalize_emby_resume_limit_path,
-    patch_emby_adult_code_titles,
-    patch_emby_client_title_fields,
-    patch_emby_resume_history_fields,
-    patch_emby_image_item_ids,
-    patch_emby_playback_info_runtime,
-    patch_emby_resume_runtime_fields,
-    parse_emby_item_image_request,
-    parse_emby_user_items_search_request,
-    parse_emby_hide_from_resume_request,
-    parse_emby_subtitle_stream_path,
-    parse_emby_item_media_id,
-    response_needs_body_rewrite,
-    build_emby_folder_cover_grid,
-    emby_folder_cover_response_headers,
-    emby_folder_cover_grid_dimensions,
-    patch_emby_collection_folder_item_cover,
-    select_emby_folder_cover_items,
-    emby_image_proxy_path,
-    emby_request_user_id_from_auth,
-    redact_sensitive_query_values,
-    should_normalize_subtitle,
-    subtitle_body_to_vtt,
-    emby_hide_from_resume_user_data_payload,
-)
-
-
 class FakeTransport:
     def __init__(self, payload):
         self.payload = payload
@@ -554,276 +516,18 @@ class FakeMediaStationClient:
         self.scrape_apply_calls.append((media_id, match))
         return {"ok": True}
 
-class FakeStreamResponse:
-    def __init__(self, chunks):
-        self.chunks = list(chunks)
-        self.read_sizes = []
-
-    def read(self, size=-1):
-        self.read_sizes.append(size)
-        if not self.chunks:
-            return b""
-        return self.chunks.pop(0)
 
 
-class FakeSubtitleProxyHandler(SubtitleProxyHandler):
-    def __init__(self):
-        self.status = None
-        self.headers = []
-        self.ended = False
-        self.wfile = io.BytesIO()
-        self.timing_marks = []
-        self.logged_timing = None
-
-    def send_response(self, status, message=None):
-        self.status = status
-
-    def send_header(self, key, value):
-        self.headers.append((key, value))
-
-    def end_headers(self):
-        self.ended = True
-
-    def _mark_timing(self, timing, label):
-        self.timing_marks.append(label)
-
-    def _log_timing(self, timing, status, request_path):
-        self.logged_timing = (status, request_path)
 
 
-class EmbyStreamProxyCompatTest(unittest.TestCase):
-    def test_video_response_does_not_need_body_rewrite(self):
-        self.assertFalse(response_needs_body_rewrite("video/mp4", "/Videos/media-1/stream.mp4"))
-        self.assertTrue(response_needs_body_rewrite("application/json", "/emby/Items/media-1/PlaybackInfo"))
-        self.assertTrue(response_needs_body_rewrite("text/vtt; charset=utf-8", "/Videos/media-1/Subtitles/1/Stream.vtt"))
-
-    def test_stream_response_forwards_video_in_chunks(self):
-        handler = FakeSubtitleProxyHandler()
-        response = FakeStreamResponse([b"abc", b"def"])
-
-        handler._stream_response(
-            206,
-            {
-                "Content-Type": "video/mp4",
-                "Content-Length": "6",
-                "Content-Range": "bytes 0-5/6",
-                "Accept-Ranges": "bytes",
-                "Connection": "close",
-            },
-            response,
-            head_only=False,
-            request_path="/Videos/media-1/stream.mp4",
-        )
-
-        self.assertEqual(handler.status, 206)
-        self.assertTrue(handler.ended)
-        self.assertEqual(handler.wfile.getvalue(), b"abcdef")
-        self.assertIn(("Content-Type", "video/mp4"), handler.headers)
-        self.assertIn(("Content-Length", "6"), handler.headers)
-        self.assertIn(("Content-Range", "bytes 0-5/6"), handler.headers)
-        self.assertIn(("Accept-Ranges", "bytes"), handler.headers)
-        self.assertNotIn(("Connection", "close"), handler.headers)
-        self.assertEqual(response.read_sizes, [STREAM_PROXY_CHUNK_SIZE, STREAM_PROXY_CHUNK_SIZE, STREAM_PROXY_CHUNK_SIZE])
-
-    def test_stream_response_head_preserves_headers_without_reading_body(self):
-        handler = FakeSubtitleProxyHandler()
-        response = FakeStreamResponse([b"abc"])
-
-        handler._stream_response(
-            200,
-            {"Content-Type": "video/mp4", "Content-Length": "3"},
-            response,
-            head_only=True,
-            request_path="/Videos/media-1/stream.mp4",
-        )
-
-        self.assertEqual(handler.status, 200)
-        self.assertEqual(handler.wfile.getvalue(), b"")
-        self.assertIn(("Content-Length", "3"), handler.headers)
-        self.assertEqual(response.read_sizes, [])
 
 
-class EmbyHideFromResumeCompatTest(unittest.TestCase):
-    def test_parse_hide_from_resume_request_with_optional_emby_prefix(self):
-        request = parse_emby_hide_from_resume_request(
-            "/emby/Users/user-1/Items/media-1/HideFromResume?Hide=true"
-        )
-
-        self.assertEqual(
-            request,
-            {"user_id": "user-1", "media_id": "media-1", "hide": "true"},
-        )
-
-    def test_parse_hide_from_resume_request_without_hide_query(self):
-        request = parse_emby_hide_from_resume_request("/Users/user-1/Items/media-1/HideFromResume")
-
-        self.assertEqual(
-            request,
-            {"user_id": "user-1", "media_id": "media-1", "hide": ""},
-        )
-
-    def test_hide_from_resume_payload_preserves_current_position(self):
-        payload = emby_hide_from_resume_user_data_payload(
-            {
-                "UserData": {
-                    "PlaybackPositionTicks": 120000000,
-                    "PlayCount": 2,
-                    "IsFavorite": True,
-                    "Played": False,
-                    "PlayedPercentage": 12.5,
-                }
-            },
-            "media-1",
-            watched_at=datetime.datetime(2026, 7, 9, 12, 0, tzinfo=datetime.timezone.utc),
-        )
-
-        self.assertEqual(payload["ItemId"], "media-1")
-        self.assertEqual(payload["Key"], "media-1")
-        self.assertEqual(payload["PlaybackPositionTicks"], 120000000)
-        self.assertEqual(payload["PlayCount"], 2)
-        self.assertEqual(payload["IsFavorite"], True)
-        self.assertEqual(payload["Played"], False)
-        self.assertEqual(payload["PlayedPercentage"], 12.5)
-        self.assertEqual(payload["HideFromResume"], False)
-        self.assertEqual(payload["LastPlayedDate"], "2026-07-09T12:00:00.000Z")
 
 
-class EmbyImageItemIdCompatTest(unittest.TestCase):
-    def test_movie_image_tags_add_image_item_ids(self):
-        payload = {
-            "Items": [
-                {
-                    "Id": "movie-1",
-                    "Type": "Movie",
-                    "ImageTags": {"Primary": "primary-tag"},
-                    "BackdropImageTags": ["backdrop-tag"],
-                }
-            ]
-        }
-
-        self.assertTrue(patch_emby_image_item_ids(payload))
-        item = payload["Items"][0]
-        self.assertEqual(item["PrimaryImageItemId"], "movie-1")
-        self.assertEqual(item["PrimaryImageTag"], "primary-tag")
-        self.assertEqual(item["BackdropImageItemId"], "movie-1")
-        self.assertEqual(item["ParentBackdropItemId"], "movie-1")
-        self.assertEqual(item["ParentBackdropImageTags"], ["backdrop-tag"])
-
-    def test_episode_without_own_image_uses_series_image_owner(self):
-        payload = {
-            "Id": "episode-1",
-            "Type": "Episode",
-            "SeriesId": "series-1",
-            "ImageTags": {},
-            "BackdropImageTags": [],
-        }
-
-        self.assertTrue(patch_emby_image_item_ids(payload))
-        self.assertEqual(payload["PrimaryImageItemId"], "series-1")
-        self.assertEqual(payload["BackdropImageItemId"], "series-1")
-        self.assertEqual(payload["ParentBackdropItemId"], "series-1")
-        self.assertNotIn("PrimaryImageTag", payload)
-
-    def test_movie_without_any_image_source_is_unchanged(self):
-        payload = {"Id": "movie-1", "Type": "Movie", "ImageTags": {}, "BackdropImageTags": []}
-
-        self.assertFalse(patch_emby_image_item_ids(payload))
-        self.assertNotIn("PrimaryImageItemId", payload)
-        self.assertNotIn("BackdropImageItemId", payload)
 
 
-class EmbyClientTitleCompatTest(unittest.TestCase):
-    def test_movie_drops_episode_only_fields(self):
-        payload = {
-            "Id": "movie-1",
-            "Type": "Movie",
-            "Name": "寻秦记",
-            "SeasonName": "特别篇",
-            "ParentIndexNumber": 0,
-            "IndexNumber": 0,
-        }
-
-        self.assertTrue(patch_emby_client_title_fields(payload))
-
-        self.assertEqual(payload["Name"], "寻秦记")
-        self.assertNotIn("SeasonName", payload)
-        self.assertNotIn("ParentIndexNumber", payload)
-        self.assertNotIn("IndexNumber", payload)
-
-    def test_episode_cleans_release_series_name(self):
-        payload = {
-            "Id": "episode-1",
-            "Type": "Episode",
-            "Name": "第 1 集",
-            "SeriesName": "【高清剧集网发布 www.PTHDTV.com】模范出租车3[全16集][中文字幕].Taxi.Driver.S03.1080p.WEB-DL.AAC2.0.H.264-BlackTV",
-        }
-
-        self.assertTrue(patch_emby_client_title_fields(payload))
-
-        self.assertEqual(payload["SeriesName"], "模范出租车3")
-        self.assertEqual(payload["Name"], "第 1 集")
-
-    def test_plain_series_name_is_unchanged(self):
-        payload = {"Id": "episode-1", "Type": "Episode", "SeriesName": "灵魂摆渡"}
-
-        self.assertFalse(patch_emby_client_title_fields(payload))
-        self.assertEqual(payload["SeriesName"], "灵魂摆渡")
 
 
-class EmbyResumeCompatTest(unittest.TestCase):
-    def test_resume_first_page_limit_is_normalized_to_ten(self):
-        path = normalize_emby_resume_limit_path(
-            "/emby/Users/user-1/Items/Resume?Fields=MediaSources&Limit=6&MediaTypes=Video&StartIndex=0"
-        )
-
-        parsed = urllib.parse.urlparse(path)
-        query = urllib.parse.parse_qs(parsed.query)
-        self.assertEqual(parsed.path, "/emby/Users/user-1/Items/Resume")
-        self.assertEqual(query["Limit"], ["10"])
-        self.assertEqual(query["StartIndex"], ["0"])
-
-    def test_resume_first_page_limit_twelve_is_normalized_to_ten(self):
-        path = "/emby/Users/user-1/Items/Resume?Limit=12&StartIndex=0"
-
-        self.assertEqual(normalize_emby_resume_limit_path(path), "/emby/Users/user-1/Items/Resume?Limit=10&StartIndex=0")
-
-    def test_resume_first_page_missing_limit_adds_ten(self):
-        path = normalize_emby_resume_limit_path("/emby/Users/user-1/Items/Resume?Fields=MediaSources&StartIndex=0")
-
-        parsed = urllib.parse.urlparse(path)
-        query = urllib.parse.parse_qs(parsed.query)
-        self.assertEqual(query["Limit"], ["10"])
-
-    def test_resume_later_page_is_unchanged(self):
-        path = "/emby/Users/user-1/Items/Resume?Limit=6&StartIndex=6"
-
-        self.assertEqual(normalize_emby_resume_limit_path(path), path)
-
-    def test_non_resume_path_is_unchanged(self):
-        path = "/emby/Users/user-1/Items?Limit=6&StartIndex=0"
-
-        self.assertEqual(normalize_emby_resume_limit_path(path), path)
-
-    def test_resume_history_fields_add_last_played_and_sort(self):
-        payload = {
-            "Items": [
-                {"Id": "b", "UserData": {}},
-                {"Id": "a", "UserData": {}},
-                {"Id": "c", "UserData": {}},
-            ],
-            "TotalRecordCount": 3,
-        }
-        watched_at = {
-            "a": datetime.datetime(2026, 7, 9, 10, 0, tzinfo=datetime.timezone.utc),
-            "b": datetime.datetime(2026, 7, 9, 12, 0, tzinfo=datetime.timezone.utc),
-            "c": datetime.datetime(2026, 7, 9, 11, 0, tzinfo=datetime.timezone.utc),
-        }
-
-        self.assertTrue(patch_emby_resume_history_fields(payload, watched_at, limit=2))
-
-        self.assertEqual([item["Id"] for item in payload["Items"]], ["b", "c"])
-        self.assertEqual(payload["Items"][0]["UserData"]["LastPlayedDate"], "2026-07-09T12:00:00.000Z")
-        self.assertEqual(payload["TotalRecordCount"], 2)
 
 
 class MediaStationDbHelperTest(unittest.TestCase):

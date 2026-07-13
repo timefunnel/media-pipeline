@@ -27,8 +27,8 @@ media-pipeline
   - Telegram Bot 搜索、选择、提交 115 离线
   - Telegram Bot 接收 115 分享链接并转存到指定 115 目录
   - 等待 115 完成，触发 OpenList 刷新和 MSG scan/scrape
-  - 执行清理、番号格式化、成人图片修复、字幕匹配
-  - subtitle proxy 为 Emby/Infuse 补外部字幕、文件夹封面、标题番号和播放兼容
+  - 执行清理、番号格式化和自动字幕匹配
+  - 成人元数据、横竖图处理和 Emby/Jellyfin 兼容由 MSG 原生实现
 ```
 
 ## 2. 前置条件
@@ -50,7 +50,6 @@ Git
 5244  OpenList，仅本机或反代
 9696  Prowlarr，仅本机或反代
 18080 MediaStationGo 原始服务，仅本机
-18081 media-pipeline-subtitle-proxy，仅本机或反代给 Emby 客户端
 15432 MediaStationGo PostgreSQL，仅本机
 8191  FlareSolverr，可选，仅本机
 ```
@@ -64,7 +63,6 @@ ssh \
   -L 5244:127.0.0.1:5244 \
   -L 9696:127.0.0.1:9696 \
   -L 18080:127.0.0.1:18080 \
-  -L 18081:127.0.0.1:18081 \
   root@YOUR_SERVER
 ```
 
@@ -139,7 +137,7 @@ OPENLIST_TOKEN
 
 OPENLIST_MEDIA_SCAN_USERNAME / OPENLIST_MEDIA_SCAN_PASSWORD
   - OpenList 登录账号
-  - subtitle proxy 和部分媒体扫描能力使用
+  - Bot 以普通用户视角验证目录可见性和 Hide 结果时使用
 ```
 
 ## 5. 创建 115 目录并记录 cid
@@ -446,27 +444,26 @@ MEDIA_PIPELINE_*_MSG_LIBRARY_ID / MSG_ROOT_ID
 ```bash
 cd /opt/media-pipeline
 docker compose up -d pansou
-docker compose build media-pipeline-bot media-pipeline-subtitle-proxy
-docker compose up -d media-pipeline-bot media-pipeline-subtitle-proxy
+docker compose build media-pipeline-bot
+docker compose up -d media-pipeline-bot
 ```
 
 ## 9. 反代与第三方 Emby 客户端
 
-如果只是 Telegram Bot 入库，反代不是必须。若使用 Infuse、VidHub 或其他 Emby/Jellyfin 客户端，应让客户端访问 `media-pipeline-subtitle-proxy`，而不是直接访问 MSG 原始端口。
+Telegram Bot 本身不要求反代。Infuse、VidHub 和其他 Emby/Jellyfin 客户端直接访问 MSG 的 HTTPS 域名；Nginx/OpenResty 上游统一指向 `127.0.0.1:18080`，不再部署额外协议代理。
 
-本项目提供 Nginx 片段：
+Bot 自动补齐的字幕由 MSG 原生字幕接口读取。MSG Compose 必须包含同一宿主机目录的只读挂载和缓存目录配置：
 
-```text
-ops/privdo-subtitle-proxy.conf
+```yaml
+services:
+  mediastation-go:
+    volumes:
+      - /data/media-pipeline/subtitles:/subtitle-cache:ro
+    environment:
+      MEDIASTATION_SUBTITLE_CACHE_DIR: /subtitle-cache
 ```
 
-使用方式：
-
-1. 在站点 server block 中 include 该片段。
-2. 片段会把需要补丁的 Emby/Jellyfin 路径转发到 `127.0.0.1:18081`。
-3. 普通 MSG 页面和未拦截路径仍可走 `127.0.0.1:18080`。
-
-如果不配置该代理，外部字幕注入、文件夹封面补丁、成人标题番号前缀和部分播放兼容不会完整生效。
+文件夹封面、播放进度、客户端标题、搜索和字幕流均由 MSG 自身的 Emby/Jellyfin 路由负责。
 
 ## 10. 部署验证
 
@@ -477,7 +474,6 @@ docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | egrep 'openlist
 curl -fsS http://127.0.0.1:5244/api/public/settings >/dev/null
 curl -fsS http://127.0.0.1:9696 >/dev/null
 curl -fsS http://127.0.0.1:18080/api/health
-curl -fsS http://127.0.0.1:18081/health
 ```
 
 pipeline CLI：
@@ -497,7 +493,6 @@ folders 输出为当前设备自己的 115 folder id
 verify-folders 中 movie/tv/anime/adult/other 均 code=0
 verify-folders 能读取各媒体目录的 115 文件夹信息
 msg-login 返回 {"authenticated": true}
-subtitle proxy /health 返回 200
 ```
 
 Bot 验证：
@@ -586,9 +581,11 @@ docker exec -e DSN="$DSN" mediastationgo-postgres-1 sh -lc \
 
 ### 12.4 第三方客户端没有字幕或文件夹封面
 
-确认客户端连接的是 subtitle proxy 或其反代，而不是 MSG 原始端口：
+确认客户端连接的域名直接反代 MSG `127.0.0.1:18080`，并检查 MSG 是否挂载了 Bot 字幕缓存：
 
 ```bash
-curl -fsS http://127.0.0.1:18081/health
-docker logs --tail=100 media-pipeline-subtitle-proxy
+curl -fsS http://127.0.0.1:18080/api/health
+docker inspect mediastationgo-mediastation-go-1 --format '{{range .Config.Env}}{{println .}}{{end}}' | grep MEDIASTATION_SUBTITLE_CACHE_DIR
+docker inspect mediastationgo-mediastation-go-1 --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' | grep subtitle-cache
+docker logs --tail=100 mediastationgo-mediastation-go-1
 ```
