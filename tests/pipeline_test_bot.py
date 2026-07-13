@@ -19,6 +19,13 @@ class BotEntrypointTest(unittest.TestCase):
         self.assertEqual(calls, ["run_forever"])
 
 
+class VersionTest(unittest.TestCase):
+    def test_default_version_marks_architecture_cleanup_release(self):
+        from pipeline.version import get_version_info
+
+        self.assertEqual(get_version_info({})["version"], "0.2.0")
+
+
 class BotConfigTest(unittest.TestCase):
     def test_bot_config_rejects_missing_allowed_user_ids_without_fallback(self):
         from pipeline.bot import BotConfig

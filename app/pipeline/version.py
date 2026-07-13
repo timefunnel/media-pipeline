@@ -2,7 +2,7 @@ import os
 
 
 APP_NAME = "media-pipeline"
-DEFAULT_APP_VERSION = "0.1.0"
+DEFAULT_APP_VERSION = "0.2.0"
 DEFAULT_APP_REVISION = "unknown"
 
 
