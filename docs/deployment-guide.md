@@ -476,23 +476,12 @@ curl -fsS http://127.0.0.1:9696 >/dev/null
 curl -fsS http://127.0.0.1:18080/api/health
 ```
 
-pipeline CLI：
-
-```bash
-cd /opt/media-pipeline
-docker exec media-pipeline-bot python -m pipeline.cli folders
-docker exec media-pipeline-bot python -m pipeline.cli verify-folders
-docker exec media-pipeline-bot python -m pipeline.cli verify-folders
-docker exec media-pipeline-bot python -m pipeline.cli msg-login
-```
-
 期望：
 
 ```text
-folders 输出为当前设备自己的 115 folder id
-verify-folders 中 movie/tv/anime/adult/other 均 code=0
-verify-folders 能读取各媒体目录的 115 文件夹信息
-msg-login 返回 {"authenticated": true}
+media-pipeline-bot 容器为 Up，且没有持续重启
+MSG /api/health 返回 200
+Bot /version 能返回当前 version 和 revision
 ```
 
 Bot 验证：
@@ -543,11 +532,7 @@ gitleaks detect --source . --redact
 pipeline 不主动刷新 115 refresh token。115 Open token 以 OpenList 为准。遇到 115 token 失效时：
 
 1. 先在 OpenList UI 确认 `/115` 能正常刷新和列目录。
-2. 再重跑：
-
-```bash
-docker exec media-pipeline-bot python -m pipeline.cli verify-folders
-```
+2. 在 Bot 中重新执行原任务或点击重试；Bot 会在识别到 access token 失效后对目标目录执行一次 OpenList 刷新并重试。
 
 ### 12.2 搜索结果少或超时
 
@@ -561,23 +546,13 @@ curl -fsS http://127.0.0.1:9696/api/v1/health -H "X-Api-Key: $(sed -n 's#.*<ApiK
 
 ### 12.3 MSG 入库失败
 
-先确认 pipeline 能自动发现当前设备的 MSG root：
+确认 Bot 容器内已显式注入五类 MSG library/root ID：
 
 ```bash
-docker exec media-pipeline-bot python -m pipeline.cli folders
+docker inspect media-pipeline-bot --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -E '^MEDIA_PIPELINE_(MOVIE|TV|ANIME|ADULT|OTHER)_MSG_(LIBRARY|ROOT)_ID='
 ```
 
-再查 MSG 当前库是否存在唯一的 `media_type + OpenList root path` 匹配：
-
-```bash
-DSN=$(docker exec mediastationgo-mediastation-go-1 printenv MEDIASTATION_DATABASE_DSN | tr -d '\r')
-docker exec -e DSN="$DSN" mediastationgo-postgres-1 sh -lc \
-  'psql "$DSN" -tAc "select l.name,l.id,l.type,r.id,r.path from libraries l join library_roots r on r.library_id=l.id and r.deleted_at is null where l.deleted_at is null order by l.name,l.type;"'
-```
-
-如果报 `root not found`，优先检查 MSG 媒体库 root path 是否仍是 `/115/电影`、`/115/剧集`、`/115/动漫`、`/115/成人`、`/115/其他` 对应的 OpenList 路径。
-
-如果报 `multiple MediaStationGo roots matched`，说明同一类型和路径存在重复 root。先清理 MSG 内重复媒体库；确实需要保留重复项时，再在 `.env` 中手动覆盖对应分类的 `MEDIA_PIPELINE_*_MSG_LIBRARY_ID` 和 `MEDIA_PIPELINE_*_MSG_ROOT_ID`。
+如果报 `root not found`，在 MSG 管理页面核对媒体库 root 仍对应 `/115/电影`、`/115/剧集`、`/115/动漫`、`/115/成人`、`/115/其他`，然后修正 `.env` 中相应的 `MEDIA_PIPELINE_*_MSG_LIBRARY_ID` 和 `MEDIA_PIPELINE_*_MSG_ROOT_ID`。Pipeline 不再通过 PostgreSQL 自动发现或修补这些 ID。
 
 ### 12.4 第三方客户端没有字幕或文件夹封面
 

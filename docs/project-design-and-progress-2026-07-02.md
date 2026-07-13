@@ -78,13 +78,12 @@ mediastationgo-mediastation-go-1     127.0.0.1:18080->8080
 mediastationgo-postgres-1            127.0.0.1:15432->5432
 ```
 
-`/opt/media-pipeline/docker-compose.yml` 当前包含三个 service：
+`/opt/media-pipeline/docker-compose.yml` 当前包含两个 service：
 
-- `media-pipeline`：一次性 CLI service，默认命令 `folders`。
 - `media-pipeline-bot`：常驻 Bot service，`restart: unless-stopped`。
 - `pansou`：可选的 115 网盘资源搜索补充服务，只绑定本机端口。
 
-当前生产交互以 `media-pipeline-bot` 为准；CLI 不再作为维护目标，不再追平 Bot 能力。Bot service 已配置以下环境变量类别：
+镜像入口直接运行 `python -m pipeline.bot`，不再包含独立 CLI 或一次性 CLI service。Bot service 已配置以下环境变量类别：
 
 ```text
 MEDIA_PIPELINE_VERSION / MEDIA_PIPELINE_REVISION
@@ -221,7 +220,7 @@ offline task list code=0 count=97 page_count=4
 - OpenList 负责维护 115 Open token。
 - `https://prioplist.timefunnel.top/d/...` 已验证可用，但当前不作为默认播放入口。2026-07-03 对比同一 CJ7 样本：公网 OpenList `/d` 三轮平均约 1.0s；MSG cloud play 命中缓存后三轮约 2ms 到 115 CDN。因此当前保留 MSG cloud play，公网反代作为备用对照入口。
 - Bot 调 115 接口时，如果遇到 `access_token 无效/过期/失效`，会触发 OpenList `refresh=True` 后重试。
-- CLI 现保留 `folders/verify-folders/msg-login`；`probe/task-status` 等历史入口已移除，日常交互走 Telegram bot。
+- 独立 CLI 已移除，日常交互和任务诊断统一走 Telegram Bot。
 
 手动触发 OpenList refresh 的核验命令：
 
@@ -246,7 +245,7 @@ docker exec media-pipeline-bot python -c 'from pipeline.openlist import OpenList
 
 ```text
 /api/health -> HTTP 200
-msg-login -> {"authenticated": true}
+/api/auth/login -> HTTP 200
 ```
 
 当前 MSG 镜像状态：
@@ -518,8 +517,7 @@ OpenList 基线索引：
 - 动漫内容保存到 `REPLACE_WITH_115_ANIME_CID`。
 - 成人内容保存到 `REPLACE_WITH_115_ADULT_CID`。
 - 其他内容保存到 `REPLACE_WITH_115_OTHER_CID`。
-- 真实提交必须由 CLI `--commit` 或用户点击 Bot 入库按钮触发。
-- dry-run 不创建 115 任务。
+- 真实提交只能由用户点击 Bot 入库按钮触发。
 - 不做失败后自动切换其他 rank。
 - Bot 提交后会进入后台 115 状态轮询：
   - 任务提交后的 20 秒为快速观察期，每 2 秒查询一次并同步更新 Telegram 状态消息。
@@ -691,7 +689,7 @@ OK
 - `media-pipeline-bot` 镜像内没有安装 `pytest`。
 - `media-pipeline-bot` 镜像默认只 COPY `app/`，运行测试时需要显式挂载 `/opt/media-pipeline/tests`。
 - 2026-07-08 只读核验未重跑完整单测；生产容器执行 `python -m pytest` 返回 `No module named pytest`。
-- 2026-07-08 已验证 `python -m pipeline.cli --help` 能正常加载 CLI 入口。
+- 2026-07-08 曾验证旧 CLI 入口；该入口现已删除，镜像直接启动 Bot。
 
 2026-07-08 已验证的运行状态：
 
@@ -720,9 +718,9 @@ MSG guard GREEN check -> trigger restored library/root/path/relative_path/file_i
 MSG guard scope check -> non-pipeline row updates are not intercepted
 ```
 
-## 13. CLI 状态
+## 13. Bot 运维入口
 
-生产交互全部以 Telegram Bot 为准。CLI 保留为历史诊断代码，不再作为维护目标，也不要求与 Bot 功能对齐。
+生产交互全部以 Telegram Bot 为准，镜像不再携带独立 CLI 命令集。
 
 日常入口：
 
@@ -736,7 +734,7 @@ Bot /dedupe_refresh -> 刷新已入库记录，需按钮二次确认
 Bot 按钮           -> 入库、刷新进度、取消、重试 MSG 同步
 ```
 
-如需临时排障，可以在确认不会触发额外 115 风控请求后，从 `media-pipeline-bot` 容器内手动调用 Python 模块；这些命令不作为标准交互文档继续维护。
+如需临时排障，可以在确认不会触发额外 115 风控请求后，从 `media-pipeline-bot` 容器内执行只读 Python 检查；这些检查不作为用户交互入口。
 
 Bot 运维：
 
@@ -825,7 +823,6 @@ sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[
 
 - 统一部署版本标记：2026-07-08 Git HEAD 为 `6dee236`，但 bot 容器 `MEDIA_PIPELINE_REVISION` 仍为 `46a3078`。
 - 清理或确认 MSG 中 0 媒体成人 auto_category 残留库。
-- 将 CLI 的 115 access token invalid 处理与 Bot 保持一致，遇到过期 token 时自动触发 OpenList `refresh=True` 后重试。
 - 需要时补充内容分类变更入口，用于已提交但分类选错的任务。
 - 需要时补充普通电影更精确的 TMDB/年份级重复识别。
 - 若后续必须彻底停用 JavBus，需要升级或改造 MediaStationGo 成人刮削器；仅改 `api_configs` 不能关闭 MSG 内置默认成人源回退。

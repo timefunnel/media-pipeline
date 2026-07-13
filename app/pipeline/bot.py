@@ -7244,3 +7244,16 @@ def build_bot(config=None):
     store = CandidateStore(config.state_db_path)
     service = PipelineBotService(config, p115_cookie_provider=store.get_p115_cookie)
     return TelegramBot(config, telegram, store, service)
+
+
+def main():
+    try:
+        build_bot().run_forever()
+        return 0
+    except (RuntimeError, TimeoutError, ValueError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

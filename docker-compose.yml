@@ -67,19 +67,6 @@ services:
       retries: 3
       start_period: 10s
 
-  media-pipeline:
-    build: .
-    container_name: media-pipeline
-    network_mode: host
-    environment:
-      <<: *media-pipeline-library-env
-      OPENLIST_TOKEN: "${OPENLIST_TOKEN:?OPENLIST_TOKEN missing}"
-    restart: "no"
-    command: ["folders"]
-    volumes:
-      - /data/OpenList/data:/openlist-data:ro
-      - /data/Prowlarr/config:/prowlarr-config:ro
-
   media-pipeline-bot:
     build:
       context: .
@@ -173,7 +160,6 @@ services:
       LLM_SEARCH_RERANK_LIMIT: "${LLM_SEARCH_RERANK_LIMIT:-40}"
       LLM_THINKING_DISABLED: "${LLM_THINKING_DISABLED:-1}"
     restart: unless-stopped
-    command: ["bot"]
     volumes:
       - /data/OpenList/data:/openlist-data:ro
       - /data/Prowlarr/config:/prowlarr-config:ro

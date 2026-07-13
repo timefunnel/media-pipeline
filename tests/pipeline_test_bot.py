@@ -1,6 +1,24 @@
 from tests.test_pipeline_core import *
 
 
+class BotEntrypointTest(unittest.TestCase):
+    def test_main_runs_bot_directly(self):
+        from pipeline import bot
+
+        calls = []
+
+        class Runner:
+            def run_forever(self):
+                calls.append("run_forever")
+
+        runner = Runner()
+        with patch("pipeline.bot.build_bot", return_value=runner):
+            result = bot.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, ["run_forever"])
+
+
 class BotConfigTest(unittest.TestCase):
     def test_bot_config_rejects_missing_allowed_user_ids_without_fallback(self):
         from pipeline.bot import BotConfig
