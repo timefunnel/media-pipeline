@@ -362,6 +362,10 @@ class FakeMediaStationClient:
         events=None,
         scrape_search_responses=None,
         artwork_repair_response=None,
+        pipeline_scrape_response=None,
+        movie_extra_response=None,
+        episode_visibility_response=None,
+        prune_deleted_response=None,
     ):
         self.search_response = search_response or {"data": {"items": []}}
         self.list_response = list_response or {"data": {"items": []}}
@@ -369,6 +373,20 @@ class FakeMediaStationClient:
         self.events = events
         self.scrape_search_responses = scrape_search_responses or {}
         self.artwork_repair_response = artwork_repair_response or {"status": "skipped", "updated": 0, "reason": "not_needed"}
+        self.pipeline_scrape_response = pipeline_scrape_response
+        self.movie_extra_response = movie_extra_response or {"status": "success", "updated": 0, "media_count": 1, "reason": "already_clean"}
+        self.episode_visibility_response = episode_visibility_response or {
+            "status": "success",
+            "updated": 0,
+            "media_count": 1,
+            "reason": "already_valid",
+        }
+        self.prune_deleted_response = prune_deleted_response or {
+            "status": "skipped",
+            "deleted": 0,
+            "reason": "no_deleted_media",
+            "media_ids": [],
+        }
         self.scan_calls = []
         self.search_calls = []
         self.list_calls = []
@@ -377,6 +395,8 @@ class FakeMediaStationClient:
         self.scrape_search_calls = []
         self.scrape_apply_calls = []
         self.artwork_repair_calls = []
+        self.pipeline_scrape_calls = []
+        self.pipeline_maintenance_calls = []
 
     def scan_root(self, library_id, root_id):
         self.scan_calls.append((library_id, root_id))
@@ -395,6 +415,32 @@ class FakeMediaStationClient:
     def scrape_media(self, media_id):
         self.scrape_calls.append(media_id)
         return {"ok": True}
+
+    def pipeline_scrape_media(self, media_id, category, title, queries, provider, media_type):
+        self.pipeline_scrape_calls.append((media_id, category, title, list(queries or []), provider, media_type))
+        if self.pipeline_scrape_response is not None:
+            return self.pipeline_scrape_response
+        for query in queries or []:
+            self.scrape_search_calls.append((media_id, query, provider, media_type))
+            response = self.scrape_search_responses.get(query, {"items": []})
+            matches = response.get("items") or (response.get("data") or {}).get("items") or []
+            if len(matches) == 1:
+                self.scrape_apply_calls.append((media_id, matches[0]))
+                return {"mode": "apply", "query": query, "applied_count": 1}
+        self.scrape_calls.append(media_id)
+        return {"mode": "smart", "applied_count": 1}
+
+    def pipeline_repair_movie_extras(self, media_id, target):
+        self.pipeline_maintenance_calls.append(("repair_movie_extras", media_id, dict(target or {})))
+        return self.movie_extra_response
+
+    def pipeline_repair_episode_visibility(self, media_id, target):
+        self.pipeline_maintenance_calls.append(("repair_episode_visibility", media_id, dict(target or {})))
+        return self.episode_visibility_response
+
+    def pipeline_prune_deleted_media(self, target, openlist_paths):
+        self.pipeline_maintenance_calls.append(("prune_deleted_media", dict(target or {}), list(openlist_paths or [])))
+        return self.prune_deleted_response
 
     def get_media(self, media_id):
         self.get_calls.append(media_id)

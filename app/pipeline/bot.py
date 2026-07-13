@@ -2351,7 +2351,7 @@ class PipelineBotService:
                 self._refresh_openlist_targets_for_msg(openlist, authoritative_paths)
                 if progress.get("msg_stale_media_id"):
                     emit({"msg_deleted_media_prune_status": "running", "msg_deleted_media_prune_error": None})
-                    deleted_media_prune_result = self._prune_msg_deleted_media_for_targets(category, authoritative_paths)
+                    deleted_media_prune_result = self._prune_msg_deleted_media_for_targets(client, category, authoritative_paths)
                     emit(deleted_media_prune_result)
                     emit({"msg_target_scan_status": "running", "msg_target_scan_error": None})
                     target_scan_result = self._scan_msg_openlist_target_root(client, category, authoritative_paths, queries)
@@ -2418,7 +2418,7 @@ class PipelineBotService:
         if category == "movie" and movie_cleanup_touched_openlist:
             if not stage_is_complete(progress.get("msg_extra_cleanup_status")):
                 emit({"msg_extra_cleanup_status": "running", "msg_extra_cleanup_error": None})
-                extras_result = self._repair_msg_movie_extras(category, media_id, get_openlist_client())
+                extras_result = self._repair_msg_movie_extras(get_msg_client(), category, media_id, get_openlist_client())
                 if extras_result.get("msg_extra_cleanup_status") == "skipped":
                     apply_progress(extras_result)
                 else:
@@ -2429,7 +2429,7 @@ class PipelineBotService:
         if category in ("tv", "anime"):
             if not stage_is_complete(progress.get("msg_visibility_repair_status")):
                 emit({"msg_visibility_repair_status": "running", "msg_visibility_repair_error": None})
-                visibility_result = self._repair_msg_episode_visibility(category, media_id)
+                visibility_result = self._repair_msg_episode_visibility(get_msg_client(), category, media_id)
                 if visibility_result.get("msg_visibility_repair_status") == "skipped":
                     apply_progress(visibility_result)
                 else:
@@ -2511,22 +2511,33 @@ class PipelineBotService:
         root = category_to_msg_library_root(category)
         provider = root.get("provider")
         media_type = root.get("media_type")
-        if provider and media_type:
-            if media is None:
-                try:
-                    media = client.get_media(media_id)
-                except RuntimeError:
-                    media = None
-            for query in msg_scrape_queries(title, task, media):
-                matches = extract_scrape_matches(client.search_scrape_matches(media_id, query, provider, media_type))
-                if len(matches) == 1:
-                    client.apply_scrape_match(media_id, matches[0])
-                    return {"msg_scrape_mode": "apply", "msg_scrape_query": query}
-        client.scrape_media(media_id)
-        return {"msg_scrape_mode": "smart", "msg_scrape_query": None}
+        result = client.pipeline_scrape_media(
+            media_id,
+            category,
+            title,
+            msg_scrape_queries(title, task, media),
+            provider,
+            media_type,
+        )
+        if not isinstance(result, dict) or result.get("mode") not in ("apply", "smart"):
+            raise RuntimeError("MediaStationGo pipeline scrape returned invalid response")
+        return {
+            "msg_scrape_mode": result.get("mode"),
+            "msg_scrape_query": result.get("query"),
+            "msg_scrape_applied_count": int(result.get("applied_count") or 0),
+        }
 
-    def _repair_msg_movie_extras(self, category, media_id, openlist_client=None):
-        result = self._build_msg_db_client().repair_movie_extras(category, media_id=media_id)
+    def _pipeline_maintenance_target(self, category):
+        root = category_to_msg_library_root(category)
+        return {
+            "category": category,
+            "library_id": root.get("library_id"),
+            "root_id": root.get("root_id"),
+            "root_openlist_path": category_to_openlist_path(category),
+        }
+
+    def _repair_msg_movie_extras(self, client, category, media_id, openlist_client=None):
+        result = client.pipeline_repair_movie_extras(media_id, self._pipeline_maintenance_target(category))
         if not isinstance(result, dict):
             raise RuntimeError("MediaStationGo movie extra cleanup returned invalid response")
         status = result.get("status")
@@ -2634,8 +2645,8 @@ class PipelineBotService:
             raise RuntimeError("OpenList adult extra video hide returned invalid status: %s" % (status or "-"))
         return result
 
-    def _repair_msg_episode_visibility(self, category, media_id):
-        result = self._build_msg_db_client().repair_episode_visibility(category, media_id=media_id)
+    def _repair_msg_episode_visibility(self, client, category, media_id):
+        result = client.pipeline_repair_episode_visibility(media_id, self._pipeline_maintenance_target(category))
         if not isinstance(result, dict):
             raise RuntimeError("MediaStationGo episode visibility repair returned invalid response")
         status = result.get("status")
@@ -2681,8 +2692,8 @@ class PipelineBotService:
             "msg_artwork_repair_error": None,
         }
 
-    def _prune_msg_deleted_media_for_targets(self, category, openlist_paths):
-        result = self._build_msg_db_client().purge_deleted_media_under_openlist_paths(category, openlist_paths)
+    def _prune_msg_deleted_media_for_targets(self, client, category, openlist_paths):
+        result = client.pipeline_prune_deleted_media(self._pipeline_maintenance_target(category), openlist_paths)
         if not isinstance(result, dict):
             raise RuntimeError("MediaStationGo deleted media prune returned invalid response")
         status = result.get("status")

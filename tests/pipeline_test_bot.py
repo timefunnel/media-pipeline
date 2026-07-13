@@ -4729,19 +4729,11 @@ class PipelineBotServiceTest(unittest.TestCase):
             search_response={"data": {"items": [{"id": "media-1", "library_id": "test-anime-library", "title": "Aki Sora"}]}}
         )
 
-        class FakeMsgDb:
-            def __init__(self):
-                self.calls = []
-
-            def repair_episode_visibility(self, category, media_id=None):
-                self.calls.append((category, media_id))
-                return {"status": "success", "updated": 3, "media_count": 5, "reason": "repaired"}
-
-        fake_db = FakeMsgDb()
+        fake_msg.episode_visibility_response = {"status": "success", "updated": 3, "media_count": 5, "reason": "repaired"}
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
-            "pipeline.bot.MediaStationDbClient", return_value=fake_db
-        ), patch("pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()), patch(
+            "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
+        ), patch(
             "pipeline.bot.OpenListClient", side_effect=lambda url, token: RetryOpenList(events)
         ):
             service = PipelineBotService(
@@ -4763,7 +4755,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             )
 
         self.assertEqual(fake_msg.scrape_calls, ["media-1"])
-        self.assertEqual(fake_db.calls, [("anime", "media-1")])
+        self.assertEqual(fake_msg.pipeline_maintenance_calls[0][0:2], ("repair_episode_visibility", "media-1"))
         self.assertEqual(task["msg_visibility_repair_status"], "success")
         self.assertEqual(task["msg_visibility_repair_updated"], 3)
         self.assertEqual(task["msg_visibility_repair_media_count"], 5)
@@ -4915,8 +4907,8 @@ class PipelineBotServiceTest(unittest.TestCase):
         from pipeline.bot import BotConfig, PipelineBotService
 
         fake_openlist = CleaningOpenList({})
-        with patch("pipeline.bot.MediaStationDbClient") as db_cls:
-            db_cls.return_value.repair_movie_extras.return_value = {
+        fake_msg = FakeMediaStationClient(
+            movie_extra_response={
                 "status": "success",
                 "updated": 1,
                 "media_count": 2,
@@ -4924,11 +4916,13 @@ class PipelineBotServiceTest(unittest.TestCase):
                 "openlist_hide_patterns": [r"^Extras$"],
                 "reason": "extras_hidden",
             }
-            service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
-            result = service._repair_msg_movie_extras("movie", "media-1", fake_openlist)
+        )
+        service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
+        result = service._repair_msg_movie_extras(fake_msg, "movie", "media-1", fake_openlist)
 
         self.assertEqual(fake_openlist.meta_hide_calls, [("/115/movie/Movie", [r"^Extras$"], True)])
         self.assertEqual(fake_openlist.source_delete_calls, [])
+        self.assertEqual(fake_msg.pipeline_maintenance_calls[0][0:2], ("repair_movie_extras", "media-1"))
         self.assertEqual(result["msg_extra_cleanup_status"], "success")
         self.assertEqual(result["msg_extra_cleanup_updated"], 1)
         self.assertEqual(result["msg_extra_cleanup_hidden_count"], 1)
@@ -6294,15 +6288,17 @@ class PipelineBotServiceTest(unittest.TestCase):
                 }
             },
             artwork_repair_response={"status": "success", "updated": 1, "fields": ["poster_url"]},
+            prune_deleted_response={
+                "status": "success",
+                "deleted": 1,
+                "reason": "deleted_media_pruned",
+                "media_ids": ["media-old"],
+            },
         )
 
         class FakeMsgDb:
             def __init__(self):
                 self.calls = []
-
-            def purge_deleted_media_under_openlist_paths(self, category, openlist_paths):
-                self.calls.append((category, list(openlist_paths)))
-                return {"status": "success", "deleted": 1, "reason": "deleted_media_pruned", "media_ids": ["media-old"]}
 
             def create_temporary_library_root(self, category, openlist_path):
                 self.calls.append(("create_root", category, openlist_path))
@@ -6363,11 +6359,23 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(
             fake_db.calls,
             [
-                ("adult", [target_path]),
                 ("create_root", "adult", target_path),
                 ("reassign_root", "media-new", "test-adult-root"),
                 ("delete_root", "temp-root"),
             ],
+        )
+        self.assertIn(
+            (
+                "prune_deleted_media",
+                {
+                    "category": "adult",
+                    "library_id": "test-adult-library",
+                    "root_id": "test-adult-root",
+                    "root_openlist_path": adult_root,
+                },
+                [target_path],
+            ),
+            fake_msg.pipeline_maintenance_calls,
         )
         self.assertEqual(fake_msg.scan_calls, [("test-adult-library", "temp-root")])
         self.assertEqual(fake_msg.scrape_calls, ["media-new"])

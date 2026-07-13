@@ -1935,6 +1935,30 @@ class OpenListClientTest(unittest.TestCase):
 
 
 class MediaStationClientTest(unittest.TestCase):
+    def test_pipeline_methods_use_authenticated_msg_endpoints(self):
+        transport = SequenceTransport(
+            [
+                {"tokens": {"access_token": "msg-token"}},
+                {"code": 0, "message": "ok", "data": {"mode": "smart", "media_id": "media-1"}},
+                {"code": 0, "message": "ok", "data": {"status": "success", "updated": 1}},
+                {"code": 0, "message": "ok", "data": {"status": "success", "updated": 2}},
+                {"code": 0, "message": "ok", "data": {"status": "success", "deleted": 1}},
+            ]
+        )
+        client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
+        target = {"category": "movie", "library_id": "library-1", "root_id": "root-1", "root_openlist_path": "/115/电影"}
+
+        self.assertEqual(client.pipeline_scrape_media("media-1", "movie", "Movie", ["Movie"], "tmdb", "movie")["mode"], "smart")
+        self.assertEqual(client.pipeline_repair_movie_extras("media-1", target)["updated"], 1)
+        self.assertEqual(client.pipeline_repair_episode_visibility("media-1", target)["updated"], 2)
+        self.assertEqual(client.pipeline_prune_deleted_media(target, ["/115/电影/Movie"])["deleted"], 1)
+
+        self.assertEqual(transport.calls[1]["url"], "http://127.0.0.1:18080/api/pipeline/media/media-1/scrape")
+        self.assertEqual(transport.calls[2]["url"], "http://127.0.0.1:18080/api/pipeline/media/media-1/repair-movie-extras")
+        self.assertEqual(transport.calls[3]["url"], "http://127.0.0.1:18080/api/pipeline/media/media-1/repair-episode-visibility")
+        self.assertEqual(transport.calls[4]["url"], "http://127.0.0.1:18080/api/pipeline/deleted-media/prune")
+        self.assertEqual(transport.calls[4]["data"]["openlist_paths"], ["/115/电影/Movie"])
+
     def test_list_libraries_uses_libraries_endpoint(self):
         transport = SequenceTransport(
             [

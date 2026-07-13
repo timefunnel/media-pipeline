@@ -139,6 +139,38 @@ class MediaStationClient:
             },
         )
 
+    def pipeline_scrape_media(self, media_id, category, title, queries, provider, media_type):
+        return self._pipeline_request(
+            "POST",
+            "/pipeline/media/%s/scrape" % quote_path(media_id),
+            data={
+                "category": category,
+                "title": title,
+                "queries": list(queries or []),
+                "provider": provider,
+                "media_type": media_type,
+            },
+        )
+
+    def pipeline_repair_movie_extras(self, media_id, target):
+        return self._pipeline_request(
+            "POST",
+            "/pipeline/media/%s/repair-movie-extras" % quote_path(media_id),
+            data=dict(target or {}),
+        )
+
+    def pipeline_repair_episode_visibility(self, media_id, target):
+        return self._pipeline_request(
+            "POST",
+            "/pipeline/media/%s/repair-episode-visibility" % quote_path(media_id),
+            data=dict(target or {}),
+        )
+
+    def pipeline_prune_deleted_media(self, target, openlist_paths):
+        payload = dict(target or {})
+        payload["openlist_paths"] = list(openlist_paths or [])
+        return self._pipeline_request("POST", "/pipeline/deleted-media/prune", data=payload)
+
     def search_scrape_matches(self, media_id, query, provider, media_type):
         params = urllib.parse.urlencode({"query": query, "provider": provider, "media_type": media_type})
         return self._request("GET", "/media/%s/scrape/search?%s" % (quote_path(media_id), params))
@@ -226,6 +258,12 @@ class MediaStationClient:
                 self.login()
                 return self._request(method, path, data=data, retry=False)
             raise
+
+    def _pipeline_request(self, method, path, data=None):
+        response = self._request(method, path, data=data)
+        if not isinstance(response, dict) or response.get("code") != 0 or not isinstance(response.get("data"), dict):
+            raise RuntimeError("MediaStationGo pipeline API returned invalid response")
+        return response["data"]
 
     def _url(self, path):
         return self.base_url + "/" + str(path).lstrip("/")
