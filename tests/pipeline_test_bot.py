@@ -5953,31 +5953,6 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["msg_match_path"], "cloud://openlist/115/电影/秋色之空/01.mkv")
         self.assertEqual(fake_msg.search_calls, [])
 
-    def test_find_media_by_openlist_paths_matches_encoded_child_path(self):
-        from pipeline.bot import find_media_by_openlist_paths
-
-        media = find_media_by_openlist_paths(
-            [
-                {
-                    "id": "wrong",
-                    "library_id": "library-1",
-                    "path": "cloud://openlist/115/电影/其他/01.mkv",
-                },
-                {
-                    "id": "right",
-                    "library_id": "library-1",
-                    "path": "cloud://openlist/115/%E7%94%B5%E5%BD%B1/Sintel/main.mkv",
-                    "size_bytes": 800 * 1024 * 1024,
-                },
-            ],
-            ["/115/电影/Sintel"],
-            library_id="library-1",
-        )
-
-        self.assertEqual(media["id"], "right")
-        self.assertEqual(media["_pipeline_match_mode"], "path")
-        self.assertEqual(media["_pipeline_match_path"], "cloud://openlist/115/电影/Sintel/main.mkv")
-
     def test_run_msg_pipeline_ingest_polls_persisted_job(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
@@ -6253,10 +6228,9 @@ class PipelineBotServiceTest(unittest.TestCase):
 
     def test_sync_completed_task_rescans_when_saved_msg_media_was_deleted(self):
         from pipeline.bot import BotConfig, PipelineBotService
-        from pipeline.openlist_utils import openlist_path_to_cloud_path
-
         adult_root = category_to_openlist_path("adult")
         target_path = adult_root + "/ABF-363"
+        target_cloud_path = "cloud://openlist" + target_path
         events = []
         fake_openlist = CleaningOpenList(
             {
@@ -6277,7 +6251,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                             "id": "media-new",
                             "library_id": "test-adult-library",
                             "title": "ABF-363",
-                            "path": openlist_path_to_cloud_path(target_path) + "/ABF-363.mp4",
+                            "path": target_cloud_path + "/ABF-363.mp4",
                             "size_bytes": 3 * 1024 * 1024 * 1024,
                         }
                     ]
@@ -6318,7 +6292,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "msg_media_id": "media-old",
                     "msg_media_title": "ABF-363 old",
                     "msg_match_mode": "path",
-                    "msg_match_path": openlist_path_to_cloud_path(target_path) + "/ABF-363.mp4",
+                    "msg_match_path": target_cloud_path + "/ABF-363.mp4",
                     "msg_scrape_status": "success",
                     "msg_artwork_repair_status": "failed",
                     "msg_artwork_repair_error": "MediaStationGo API failed: HTTP 404 not found",

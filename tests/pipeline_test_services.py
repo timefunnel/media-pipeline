@@ -775,53 +775,27 @@ class MediaStationClientTest(unittest.TestCase):
         self.assertEqual(transport.calls[9]["url"], "http://127.0.0.1:18080/api/pipeline/ingest")
         self.assertEqual(transport.calls[10]["url"], "http://127.0.0.1:18080/api/pipeline/ingest/ingest-1")
 
-    def test_list_libraries_uses_libraries_endpoint(self):
+    def test_media_read_methods_use_authenticated_endpoints(self):
         transport = SequenceTransport(
             [
                 {"tokens": {"access_token": "msg-token"}},
-                {"data": {"items": [{"id": "lib-1", "name": "电影", "type": "movie"}]}},
+                {"data": {"items": []}},
+                {"data": {"items": []}},
+                {"data": {"id": "media-1"}},
             ]
         )
         client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
 
-        response = client.list_libraries(include_hidden=True)
+        client.search_media("Movie", limit=20)
+        client.list_library_media("library-1", page=2, page_size=100, group_versions=0)
+        client.get_media("media-1")
 
-        self.assertEqual(extract_library_items(response), [{"id": "lib-1", "name": "电影", "type": "movie"}])
-        self.assertEqual(transport.calls[1]["method"], "GET")
-        self.assertEqual(transport.calls[1]["url"], "http://127.0.0.1:18080/api/libraries?include_hidden=1")
-        self.assertEqual(transport.calls[1]["headers"]["Authorization"], "Bearer msg-token")
-
-    def test_scan_root_logs_in_and_uses_bearer_token(self):
-        transport = SequenceTransport([{"tokens": {"access_token": "msg-token"}}, {"ok": True}])
-        client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
-
-        result = client.scan_root("library-1", "root-1")
-
-        self.assertEqual(result, {"ok": True})
-        self.assertEqual(transport.calls[0]["method"], "POST")
-        self.assertEqual(transport.calls[0]["url"], "http://127.0.0.1:18080/api/auth/login")
-        self.assertEqual(transport.calls[0]["data"], {"username": "admin", "password": "secret"})
-        self.assertEqual(transport.calls[1]["method"], "POST")
-        self.assertEqual(transport.calls[1]["url"], "http://127.0.0.1:18080/api/libraries/library-1/roots/root-1/scan")
-        self.assertEqual(transport.calls[1]["headers"]["Authorization"], "Bearer msg-token")
-
-    def test_scrape_media_uses_single_item_scrape_body(self):
-        transport = SequenceTransport([{"tokens": {"access_token": "msg-token"}}, {"ok": True}])
-        client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
-
-        client.scrape_media("media-1")
-
-        call = transport.calls[1]
-        self.assertEqual(call["method"], "POST")
-        self.assertEqual(call["url"], "http://127.0.0.1:18080/api/media/media-1/scrape")
+        self.assertEqual(transport.calls[1]["url"], "http://127.0.0.1:18080/api/media?q=Movie&limit=20")
         self.assertEqual(
-            call["data"],
-            {
-                "episode_images": False,
-                "refresh_matched": True,
-                "include_matched": True,
-            },
+            transport.calls[2]["url"],
+            "http://127.0.0.1:18080/api/libraries/library-1/media?page=2&page_size=100&group_versions=0",
         )
+        self.assertEqual(transport.calls[3]["url"], "http://127.0.0.1:18080/api/media/media-1")
 
     def test_extracts_and_matches_media_items_flexibly(self):
         response = {"data": {"items": [{"id": "media-1", "library_id": "library-1", "title": "GANA-2525"}]}}

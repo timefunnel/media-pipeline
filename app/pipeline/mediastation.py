@@ -85,15 +85,6 @@ class MediaStationClient:
         self.access_token = token
         return response
 
-    def scan_root(self, library_id, root_id):
-        return self._request("POST", "/libraries/%s/roots/%s/scan" % (quote_path(library_id), quote_path(root_id)))
-
-    def list_libraries(self, include_hidden=False):
-        path = "/libraries"
-        if include_hidden:
-            path += "?" + urllib.parse.urlencode({"include_hidden": 1})
-        return self._request("GET", path)
-
     def list_library_media(self, library_id, page=1, page_size=200, group_versions=0):
         query = urllib.parse.urlencode(
             {
@@ -107,17 +98,6 @@ class MediaStationClient:
     def search_media(self, query, limit=20):
         params = urllib.parse.urlencode({"q": query, "limit": int(limit)})
         return self._request("GET", "/media?%s" % params)
-
-    def scrape_media(self, media_id):
-        return self._request(
-            "POST",
-            "/media/%s/scrape" % quote_path(media_id),
-            data={
-                "episode_images": False,
-                "refresh_matched": True,
-                "include_matched": True,
-            },
-        )
 
     def pipeline_scrape_media(self, media_id, category, title, queries, provider, media_type):
         return self._pipeline_request(
@@ -185,17 +165,6 @@ class MediaStationClient:
     def pipeline_get_ingest(self, job_id):
         return self._pipeline_request("GET", "/pipeline/ingest/%s" % quote_path(job_id))
 
-    def search_scrape_matches(self, media_id, query, provider, media_type):
-        params = urllib.parse.urlencode({"query": query, "provider": provider, "media_type": media_type})
-        return self._request("GET", "/media/%s/scrape/search?%s" % (quote_path(media_id), params))
-
-    def apply_scrape_match(self, media_id, match):
-        if not isinstance(match, dict):
-            raise ValueError("MediaStationGo scrape match must be an object")
-        data = dict(match)
-        data["episode_images"] = False
-        return self._request("POST", "/media/%s/scrape/apply" % quote_path(media_id), data=data)
-
     def get_media(self, media_id):
         return self._request("GET", "/media/%s" % quote_path(media_id))
 
@@ -244,14 +213,6 @@ def quote_path(value):
 
 def extract_media_items(response):
     return extract_items(response, ("items", "media", "medias", "results", "list", "content", "records"))
-
-
-def extract_scrape_matches(response):
-    return extract_items(response, ("items", "matches", "results", "list", "content", "records"))
-
-
-def extract_library_items(response):
-    return extract_items(response, ("items", "libraries", "results", "list", "content", "records"))
 
 
 def extract_items(response, keys):

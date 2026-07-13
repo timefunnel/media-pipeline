@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import urllib.parse
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -34,7 +35,6 @@ from pipeline.mediastation import (
     MediaStationClient,
     MediaStationApiError,
     extract_codes,
-    extract_library_items,
     extract_media_id,
     extract_media_items,
     find_matching_media,
@@ -44,6 +44,28 @@ from pipeline.openlist import OpenListClient, OpenListPasswordTokenProvider, Ope
 from pipeline.openlist_tokens import OpenListTokenStore
 from pipeline.prowlarr import ProwlarrClient, ProwlarrConfig, torrent_bytes_to_magnet
 from pipeline.resource_selector import ResourceSelector
+
+
+def find_fake_media_by_openlist_paths(items, openlist_paths, library_id=None):
+    targets = [("cloud://openlist" + str(path or "")).rstrip("/") for path in openlist_paths or []]
+    best = None
+    best_score = 0
+    for item in items or []:
+        if library_id and str((item or {}).get("library_id") or "") != str(library_id):
+            continue
+        media_path = urllib.parse.unquote(str((item or {}).get("path") or "")).replace("\\", "/").rstrip("/")
+        for target in targets:
+            if media_path == target:
+                score = 2000
+            elif media_path.startswith(target + "/"):
+                score = 1000
+            else:
+                continue
+            score += min(int((item or {}).get("size_bytes") or 0) // (100 * 1024 * 1024), 100)
+            if score > best_score:
+                best = item
+                best_score = score
+    return best
 class FakeTransport:
     def __init__(self, payload):
         self.payload = payload
@@ -369,12 +391,6 @@ class FakeMediaStationClient:
         self.pipeline_ingest_calls = []
         self.pipeline_ingest_jobs = {}
 
-    def scan_root(self, library_id, root_id):
-        self.scan_calls.append((library_id, root_id))
-        if self.events is not None:
-            self.events.append(("scan",))
-        return {"ok": True}
-
     def search_media(self, query, limit=20):
         self.search_calls.append((query, limit))
         return self.search_response
@@ -382,10 +398,6 @@ class FakeMediaStationClient:
     def list_library_media(self, library_id, page=1, page_size=200, group_versions=0):
         self.list_calls.append((library_id, page, page_size, group_versions))
         return self.list_response
-
-    def scrape_media(self, media_id):
-        self.scrape_calls.append(media_id)
-        return {"ok": True}
 
     def pipeline_scrape_media(self, media_id, category, title, queries, provider, media_type):
         self.pipeline_scrape_calls.append((media_id, category, title, list(queries or []), provider, media_type))
@@ -438,8 +450,6 @@ class FakeMediaStationClient:
         return self.migration_apply_response
 
     def pipeline_start_ingest(self, request):
-        from pipeline.bot import find_media_by_openlist_paths
-
         request = dict(request or {})
         self.pipeline_ingest_calls.append(request)
         self.scan_calls.append((request.get("library_id"), request.get("root_id")))
@@ -454,7 +464,7 @@ class FakeMediaStationClient:
             media = None
             if target_paths:
                 items = extract_media_items(self.list_response) + extract_media_items(self.search_response)
-                media = find_media_by_openlist_paths(items, target_paths, library_id=library_id)
+                media = find_fake_media_by_openlist_paths(items, target_paths, library_id=library_id)
             if media is None and (not target_paths or not request.get("require_target_path")):
                 for query in queries:
                     items = extract_media_items(self.search_media(query, limit=20))
@@ -507,14 +517,6 @@ class FakeMediaStationClient:
         if self.get_response is None:
             return {"id": media_id}
         return self.get_response
-
-    def search_scrape_matches(self, media_id, query, provider, media_type):
-        self.scrape_search_calls.append((media_id, query, provider, media_type))
-        return self.scrape_search_responses.get(query, {"items": []})
-
-    def apply_scrape_match(self, media_id, match):
-        self.scrape_apply_calls.append((media_id, match))
-        return {"ok": True}
 
 
 

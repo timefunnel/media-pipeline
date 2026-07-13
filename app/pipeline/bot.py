@@ -65,7 +65,6 @@ from pipeline.openlist_utils import (
     is_openlist_video_file,
     normalize_openlist_path,
     normalize_openlist_text,
-    openlist_path_to_cloud_path,
     openlist_item_is_dir,
     openlist_item_name,
     openlist_item_path,
@@ -130,7 +129,6 @@ from pipeline.mediastation import (
     extract_codes,
     extract_media_id,
     extract_media_items,
-    extract_scrape_matches,
     find_matching_media,
     media_belongs_to_library,
     media_haystack,
@@ -2872,47 +2870,6 @@ def unique_openlist_paths(paths):
     return out
 
 
-def find_media_by_openlist_paths(items, openlist_paths, library_id=None):
-    targets = [normalize_msg_cloud_path(openlist_path_to_cloud_path(path)) for path in openlist_paths or []]
-    targets = [target for target in targets if target]
-    if not targets:
-        return None
-
-    best = None
-    best_score = 0
-    best_path = ""
-    for item in items or []:
-        if not media_belongs_to_library(item, library_id):
-            continue
-        for value in media_path_values(item):
-            media_path = normalize_msg_cloud_path(value)
-            for target in targets:
-                score = media_openlist_path_match_score(media_path, target, item)
-                if score > best_score:
-                    best = item
-                    best_score = score
-                    best_path = media_path
-    if best is not None:
-        best["_pipeline_match_mode"] = "path"
-        best["_pipeline_match_path"] = best_path
-    return best
-
-
-def media_openlist_path_match_score(media_path, target_path, item):
-    if not media_path or not target_path:
-        return 0
-    score = 0
-    if media_path == target_path:
-        score = 2000
-    elif media_path.startswith(target_path.rstrip("/") + "/"):
-        score = 1000
-    if score <= 0:
-        return 0
-    score += min(media_path.count("/"), 50)
-    score += min(media_item_size_bytes(item) // (100 * 1024 * 1024), 100)
-    return score
-
-
 def media_path_values(value):
     paths = []
     if isinstance(value, dict):
@@ -2932,17 +2889,6 @@ def media_path_values(value):
 def media_primary_path(media):
     paths = media_path_values(media)
     return paths[0] if paths else ""
-
-
-def normalize_msg_cloud_path(value):
-    text = urllib.parse.unquote(str(value or "").strip()).replace("\\", "/").rstrip("/")
-    if not text:
-        return ""
-    if text.startswith("cloud://openlist"):
-        return text
-    if text.startswith("/"):
-        return openlist_path_to_cloud_path(text).rstrip("/")
-    return text
 
 
 def media_item_size_bytes(item):
