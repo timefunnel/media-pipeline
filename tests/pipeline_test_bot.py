@@ -36,7 +36,6 @@ class BotConfigTest(unittest.TestCase):
                 "TG_BOT_TOKEN": "123:token",
                 "TG_ALLOWED_USER_IDS": "700656624",
                 "MSG_BASE_URL": "http://127.0.0.1:18080/api",
-                "MSG_DATABASE_DSN": "postgresql://mediastation:mediastation@127.0.0.1:15432/mediastation",
                 "MSG_ADMIN_USER": "admin",
                 "MSG_ADMIN_PASSWORD": "secret",
                 "MSG_SYNC_POLL_SECONDS": "0",
@@ -45,7 +44,6 @@ class BotConfigTest(unittest.TestCase):
 
         self.assertTrue(config.msg_enabled)
         self.assertEqual(config.msg_base_url, "http://127.0.0.1:18080/api")
-        self.assertEqual(config.msg_database_dsn, "postgresql://mediastation:mediastation@127.0.0.1:15432/mediastation")
         self.assertEqual(config.msg_admin_user, "admin")
         self.assertEqual(config.msg_admin_password, "secret")
         self.assertEqual(config.msg_sync_poll_seconds, 0)
@@ -4591,8 +4589,9 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"info_hash": "ABC", "status_name": "success", "name": "Sintel.mkv", "msg_error": "old error"},
             )
 
-        self.assertEqual(events, [("openlist", "/115/电影", True)])
+        self.assertEqual(events, [])
         self.assertEqual(fake_msg.scan_calls, [("test-movie-library", "test-movie-root")])
+        self.assertEqual(fake_msg.pipeline_ingest_calls[0]["target_openlist_paths"], [])
         self.assertEqual(fake_msg.scrape_calls, ["media-1"])
         self.assertEqual(fake_msg.artwork_repair_calls, [])
         self.assertEqual(task["msg_sync_status"], "success")
@@ -4630,7 +4629,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                 {"info_hash": "OTHER", "status_name": "success", "name": "Archive.bin"},
             )
 
-        self.assertEqual(events, [("openlist", "/115/其他", True)])
+        self.assertEqual(events, [])
         self.assertEqual(fake_msg.scan_calls, [("test-other-library", "test-other-root")])
         self.assertEqual(fake_msg.scrape_calls, [])
         self.assertEqual(task["msg_sync_status"], "success")
@@ -4656,10 +4655,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
             "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
-        ), patch("pipeline.bot.OpenListClient", side_effect=lambda url, token: RetryOpenList([])), patch(
-            "pipeline.bot.MediaStationDbClient"
-        ) as db_cls:
-            db_cls.return_value.repair_movie_extras.return_value = {"status": "success", "updated": 0, "media_count": 1}
+        ), patch("pipeline.bot.OpenListClient", side_effect=lambda url, token: RetryOpenList([])):
             service = PipelineBotService(
                 BotConfig(
                     "token",
@@ -4799,8 +4795,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
             "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
-        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist), patch("pipeline.bot.MediaStationDbClient") as db_cls:
-            db_cls.return_value.repair_movie_extras.return_value = {"status": "success", "updated": 1, "media_count": 2}
+        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist):
             service = PipelineBotService(
                 BotConfig(
                     "token",
@@ -5200,7 +5195,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertLess(events.index(("meta_hide", new_path, (r"^ad\.mp4$",), True)), events.index(("scan",)))
         self.assertLess(events.index(("scan",)), events.index(("artwork_repair",)))
         self.assertLess(events.index(("artwork_repair",)), events.index(("subtitle_match", "adult", "downloaded folder", "media-1", "MIDA-304")))
-        self.assertEqual(fake_msg.search_calls[0], ("MIDA-304", 20))
+        self.assertEqual(fake_msg.pipeline_ingest_calls[0]["queries"][0], "MIDA-304")
         self.assertEqual(fake_msg.artwork_repair_calls, ["media-1"])
         self.assertEqual(task["openlist_adult_format_status"], "success")
         self.assertEqual(task["openlist_adult_code"], "MIDA-304")
@@ -6001,67 +5996,33 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(media["_pipeline_match_mode"], "path")
         self.assertEqual(media["_pipeline_match_path"], "cloud://openlist/115/电影/Sintel/main.mkv")
 
-    def test_wait_for_msg_media_rejects_query_match_when_target_path_is_missing(self):
+    def test_run_msg_pipeline_ingest_polls_persisted_job(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
-        fake_msg = FakeMediaStationClient(
-            search_response={
-                "data": {
-                    "items": [
-                        {
-                            "id": "wrong-media",
-                            "library_id": "test-adult-library",
-                            "title": "MIDE-949",
-                            "original_name": "MIRD-268",
-                            "path": "cloud://openlist/115/成人/MIRD-268/MIRD-268.mp4",
-                        }
-                    ]
-                }
-            },
-            list_response={"data": {"items": []}},
-        )
-        service = PipelineBotService(
-            BotConfig(
-                "token",
-                {700656624},
-                "/tmp/state.db",
-                msg_admin_user="admin",
-                msg_admin_password="secret",
-                msg_enabled=True,
-                msg_sync_poll_seconds=0,
-            )
-        )
+        class PollingMediaStation(FakeMediaStationClient):
+            def pipeline_start_ingest(self, request):
+                self.pipeline_ingest_calls.append(dict(request))
+                return {"id": "ingest-1", "status": "running", "stage": "scan", "result": {}}
 
-        with self.assertRaisesRegex(RuntimeError, "path=/115/成人/MIDE-949"):
-            service._wait_for_msg_media(
-                fake_msg,
-                "test-adult-library",
-                ["MIDE-949"],
-                target_openlist_paths=["/115/成人/MIDE-949"],
-                require_target_path=True,
-            )
-
-        self.assertEqual(fake_msg.search_calls, [("MIDE-949", 20)])
-
-    def test_wait_for_msg_media_accepts_search_result_with_target_path(self):
-        from pipeline.bot import BotConfig, PipelineBotService
-
-        fake_msg = FakeMediaStationClient(
-            search_response={
-                "data": {
-                    "items": [
-                        {
+            def pipeline_get_ingest(self, job_id):
+                self.asserted_job_id = job_id
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "stage": "completed",
+                    "result": {
+                        "scan": {"visited": 1, "added": 1},
+                        "media": {
                             "id": "right-media",
-                            "library_id": "test-adult-library",
-                            "title": "mide 949",
-                            "original_name": "MIDE-949",
+                            "title": "MIDE-949",
                             "path": "cloud://openlist/115/成人/MIDE-949/MIDE-949.mp4",
-                        }
-                    ]
+                            "match_mode": "path",
+                            "match_path": "/115/成人/MIDE-949",
+                        },
+                    },
                 }
-            },
-            list_response={"data": {"items": []}},
-        )
+
+        fake_msg = PollingMediaStation()
         service = PipelineBotService(
             BotConfig(
                 "token",
@@ -6070,21 +6031,79 @@ class PipelineBotServiceTest(unittest.TestCase):
                 msg_admin_user="admin",
                 msg_admin_password="secret",
                 msg_enabled=True,
-                msg_sync_poll_seconds=0,
+                msg_sync_poll_seconds=2,
+                msg_sync_poll_interval_seconds=1,
             )
         )
+        progress = {}
 
-        media = service._wait_for_msg_media(
-            fake_msg,
-            "test-adult-library",
-            ["MIDE-949"],
-            target_openlist_paths=["/115/成人/MIDE-949"],
-            require_target_path=True,
+        with patch("pipeline.bot.time.sleep"):
+            result = service._run_msg_pipeline_ingest(
+                fake_msg,
+                "adult",
+                "MIDE-949",
+                progress,
+                ["MIDE-949"],
+                ["/115/成人/MIDE-949"],
+                True,
+                progress.update,
+            )
+
+        self.assertEqual(fake_msg.asserted_job_id, "ingest-1")
+        self.assertEqual(result["_media"]["id"], "right-media")
+        self.assertEqual(result["msg_target_scan_status"], "success")
+        self.assertEqual(progress["msg_ingest_status"], "completed")
+
+    def test_sync_completed_task_keeps_running_while_msg_ingest_is_pending(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            pipeline_ingest_response={"id": "ingest-pending", "status": "running", "stage": "scan", "result": {}}
         )
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
+        ), patch("pipeline.bot.OpenListClient", return_value=CleaningOpenList({"/115/电影": []})):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    msg_sync_poll_seconds=0,
+                    openlist_pre_scan_clean_enabled=False,
+                )
+            )
+            pending = service.sync_completed_task(
+                "movie",
+                "Sintel",
+                {"info_hash": "ABC", "status_name": "success", "name": "Sintel"},
+            )
+            fake_msg.pipeline_ingest_jobs["ingest-pending"] = {
+                "id": "ingest-pending",
+                "status": "completed",
+                "stage": "completed",
+                "result": {
+                    "scan": {"visited": 1, "added": 1},
+                    "media": {
+                        "id": "media-1",
+                        "title": "Sintel",
+                        "path": "cloud://openlist/115/电影/Sintel/Sintel.mkv",
+                        "match_mode": "query",
+                        "match_path": "",
+                    },
+                },
+            }
+            completed = service.sync_completed_task("movie", "Sintel", pending)
 
-        self.assertEqual(media["id"], "right-media")
-        self.assertEqual(media["_pipeline_match_mode"], "path")
-        self.assertEqual(media["_pipeline_match_path"], "cloud://openlist/115/成人/MIDE-949/MIDE-949.mp4")
+        self.assertEqual(pending["msg_sync_status"], "running")
+        self.assertEqual(pending["msg_scan_status"], "running")
+        self.assertEqual(pending["msg_ingest_job_id"], "ingest-pending")
+        self.assertIsNone(pending["msg_error"])
+        self.assertEqual(completed["msg_sync_status"], "success")
+        self.assertEqual(completed["msg_media_id"], "media-1")
+        self.assertEqual(len(fake_msg.pipeline_ingest_calls), 1)
 
     def test_sync_completed_other_task_uses_other_root_without_adult_code_format(self):
         from pipeline.bot import BotConfig, PipelineBotService
@@ -6296,27 +6315,9 @@ class PipelineBotServiceTest(unittest.TestCase):
             },
         )
 
-        class FakeMsgDb:
-            def __init__(self):
-                self.calls = []
-
-            def create_temporary_library_root(self, category, openlist_path):
-                self.calls.append(("create_root", category, openlist_path))
-                return {"root_id": "temp-root", "path": openlist_path_to_cloud_path(openlist_path)}
-
-            def reassign_media_root(self, media_id, root_id):
-                self.calls.append(("reassign_root", media_id, root_id))
-
-            def delete_library_root(self, root_id):
-                self.calls.append(("delete_root", root_id))
-
-        fake_db = FakeMsgDb()
-
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
             "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
-        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist), patch(
-            "pipeline.bot.MediaStationDbClient", return_value=fake_db
-        ):
+        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist):
             service = PipelineBotService(
                 BotConfig(
                     "token",
@@ -6355,29 +6356,9 @@ class PipelineBotServiceTest(unittest.TestCase):
             )
 
         self.assertEqual(fake_msg.get_calls, ["media-old"])
-        self.assertIn(("openlist", target_path, True), events)
-        self.assertEqual(
-            fake_db.calls,
-            [
-                ("create_root", "adult", target_path),
-                ("reassign_root", "media-new", "test-adult-root"),
-                ("delete_root", "temp-root"),
-            ],
-        )
-        self.assertIn(
-            (
-                "prune_deleted_media",
-                {
-                    "category": "adult",
-                    "library_id": "test-adult-library",
-                    "root_id": "test-adult-root",
-                    "root_openlist_path": adult_root,
-                },
-                [target_path],
-            ),
-            fake_msg.pipeline_maintenance_calls,
-        )
-        self.assertEqual(fake_msg.scan_calls, [("test-adult-library", "temp-root")])
+        self.assertEqual(fake_msg.scan_calls, [("test-adult-library", "test-adult-root")])
+        self.assertEqual(fake_msg.pipeline_ingest_calls[0]["target_openlist_paths"], [target_path])
+        self.assertEqual(fake_msg.pipeline_ingest_calls[0]["prune_deleted_openlist_paths"], [target_path])
         self.assertEqual(fake_msg.scrape_calls, ["media-new"])
         self.assertEqual(fake_msg.artwork_repair_calls, ["media-new"])
         self.assertEqual(task["msg_sync_status"], "success")
@@ -6388,6 +6369,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["msg_deleted_media_prune_deleted"], 1)
         self.assertEqual(task["msg_target_scan_status"], "success")
         self.assertEqual(task["msg_target_scan_path"], target_path)
+        self.assertEqual(task["msg_ingest_status"], "completed")
         self.assertEqual(task["msg_match_mode"], "path")
         self.assertEqual(task["msg_scrape_status"], "success")
         self.assertEqual(task["msg_artwork_repair_status"], "success")

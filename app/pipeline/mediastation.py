@@ -199,6 +199,12 @@ class MediaStationClient:
             data={"source": dict(source or {}), "target": dict(target or {})},
         )
 
+    def pipeline_start_ingest(self, request):
+        return self._pipeline_request("POST", "/pipeline/ingest", data=dict(request or {}))
+
+    def pipeline_get_ingest(self, job_id):
+        return self._pipeline_request("GET", "/pipeline/ingest/%s" % quote_path(job_id))
+
     def search_scrape_matches(self, media_id, query, provider, media_type):
         params = urllib.parse.urlencode({"query": query, "provider": provider, "media_type": media_type})
         return self._request("GET", "/media/%s/scrape/search?%s" % (quote_path(media_id), params))

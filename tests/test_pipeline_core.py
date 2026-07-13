@@ -370,6 +370,7 @@ class FakeMediaStationClient:
         migration_search_response=None,
         migration_validate_response=None,
         migration_apply_response=None,
+        pipeline_ingest_response=None,
     ):
         self.search_response = search_response or {"data": {"items": []}}
         self.list_response = list_response or {"data": {"items": []}}
@@ -395,6 +396,7 @@ class FakeMediaStationClient:
         self.migration_search_response = migration_search_response or {"items": []}
         self.migration_validate_response = migration_validate_response
         self.migration_apply_response = migration_apply_response
+        self.pipeline_ingest_response = pipeline_ingest_response
         self.scan_calls = []
         self.search_calls = []
         self.list_calls = []
@@ -405,6 +407,8 @@ class FakeMediaStationClient:
         self.artwork_repair_calls = []
         self.pipeline_scrape_calls = []
         self.pipeline_maintenance_calls = []
+        self.pipeline_ingest_calls = []
+        self.pipeline_ingest_jobs = {}
 
     def scan_root(self, library_id, root_id):
         self.scan_calls.append((library_id, root_id))
@@ -473,6 +477,69 @@ class FakeMediaStationClient:
         if self.migration_apply_response is None:
             raise AssertionError("migration_apply_response missing")
         return self.migration_apply_response
+
+    def pipeline_start_ingest(self, request):
+        from pipeline.bot import find_media_by_openlist_paths
+
+        request = dict(request or {})
+        self.pipeline_ingest_calls.append(request)
+        self.scan_calls.append((request.get("library_id"), request.get("root_id")))
+        if self.events is not None:
+            self.events.append(("scan",))
+        if self.pipeline_ingest_response is not None:
+            job = dict(self.pipeline_ingest_response)
+        else:
+            queries = list(request.get("queries") or [])
+            target_paths = list(request.get("target_openlist_paths") or [])
+            library_id = request.get("library_id")
+            media = None
+            if target_paths:
+                items = extract_media_items(self.list_response) + extract_media_items(self.search_response)
+                media = find_media_by_openlist_paths(items, target_paths, library_id=library_id)
+            if media is None and (not target_paths or not request.get("require_target_path")):
+                for query in queries:
+                    items = extract_media_items(self.search_media(query, limit=20))
+                    media = find_matching_media(items, queries, library_id=library_id)
+                    if media:
+                        break
+                if media is None:
+                    items = extract_media_items(self.list_library_media(library_id, page=1, page_size=200, group_versions=0))
+                    media = find_matching_media(items, queries, library_id=library_id)
+            job_id = "ingest-%d" % (len(self.pipeline_ingest_jobs) + 1)
+            if media is None:
+                job = {
+                    "id": job_id,
+                    "status": "failed",
+                    "stage": "failed",
+                    "error": "MediaStationGo media not found after root scan",
+                    "result": {},
+                }
+            else:
+                prune = self.prune_deleted_response if request.get("prune_deleted_openlist_paths") else None
+                job = {
+                    "id": job_id,
+                    "status": "completed",
+                    "stage": "completed",
+                    "message": "completed",
+                    "result": {
+                        "scan": {"library_id": library_id, "visited": 1, "added": 1, "updated": 0, "removed": 0},
+                        "media": {
+                            "id": media.get("id"),
+                            "title": media.get("title"),
+                            "path": media.get("path"),
+                            "match_mode": "path" if target_paths else "query",
+                            "match_path": target_paths[0] if target_paths else "",
+                        },
+                        "deleted_media_prune": prune,
+                    },
+                }
+        job_id = str(job.get("id") or "ingest-%d" % (len(self.pipeline_ingest_jobs) + 1))
+        job["id"] = job_id
+        self.pipeline_ingest_jobs[job_id] = job
+        return job
+
+    def pipeline_get_ingest(self, job_id):
+        return self.pipeline_ingest_jobs[job_id]
 
     def get_media(self, media_id):
         self.get_calls.append(media_id)

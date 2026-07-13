@@ -1658,91 +1658,33 @@ class CategoryConfigTest(unittest.TestCase):
         self.assertEqual(msg_roots["anime"]["library_id"], "anime-library-json")
         self.assertEqual(msg_roots["anime"]["root_id"], "anime-root-json")
 
-    def test_discovers_missing_msg_root_ids_from_database(self):
+    def test_rejects_missing_msg_root_ids_without_database_fallback(self):
         from pipeline.config import MSG_LIBRARY_ROOTS, category_to_msg_library_root
-
-        class FakeConn:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def execute(self, _sql):
-                return self
-
-            def fetchall(self):
-                return [
-                    {
-                        "library_id": "movie-library-db",
-                        "root_id": "movie-root-db",
-                        "library_name": "电影",
-                        "media_type": "movie",
-                        "root_path": "cloud://openlist/115%2F%E7%94%B5%E5%BD%B1",
-                    },
-                    {
-                        "library_id": "adult-library-db",
-                        "root_id": "adult-root-db",
-                        "library_name": "成人",
-                        "media_type": "adult",
-                        "root_path": "cloud://openlist/115%2F%E6%88%90%E4%BA%BA",
-                    },
-                ]
 
         original_roots = copy.deepcopy(MSG_LIBRARY_ROOTS)
         try:
             MSG_LIBRARY_ROOTS["movie"]["library_id"] = "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID"
             MSG_LIBRARY_ROOTS["movie"]["root_id"] = "REPLACE_WITH_MSG_MOVIE_ROOT_ID"
-            root = category_to_msg_library_root("movie", connect=lambda _dsn: FakeConn(), env={})
+            with self.assertRaisesRegex(RuntimeError, "root ids missing"):
+                category_to_msg_library_root("movie")
         finally:
             MSG_LIBRARY_ROOTS.clear()
             MSG_LIBRARY_ROOTS.update(original_roots)
 
-        self.assertEqual(root["library_id"], "movie-library-db")
-        self.assertEqual(root["root_id"], "movie-root-db")
-        self.assertEqual(root["provider"], "tmdb")
-        self.assertEqual(root["media_type"], "movie")
-
-    def test_discovering_missing_msg_root_ids_rejects_ambiguous_matches(self):
+    def test_returns_explicit_msg_root_ids_without_discovery(self):
         from pipeline.config import MSG_LIBRARY_ROOTS, category_to_msg_library_root
-
-        class FakeConn:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def execute(self, _sql):
-                return self
-
-            def fetchall(self):
-                return [
-                    {
-                        "library_id": "movie-library-1",
-                        "root_id": "movie-root-1",
-                        "library_name": "电影",
-                        "media_type": "movie",
-                        "root_path": "cloud://openlist/115%2F%E7%94%B5%E5%BD%B1",
-                    },
-                    {
-                        "library_id": "movie-library-2",
-                        "root_id": "movie-root-2",
-                        "library_name": "电影",
-                        "media_type": "movie",
-                        "root_path": "cloud://openlist/115%2F%E7%94%B5%E5%BD%B1",
-                    },
-                ]
 
         original_roots = copy.deepcopy(MSG_LIBRARY_ROOTS)
         try:
-            MSG_LIBRARY_ROOTS["movie"]["library_id"] = "REPLACE_WITH_MSG_MOVIE_LIBRARY_ID"
-            MSG_LIBRARY_ROOTS["movie"]["root_id"] = "REPLACE_WITH_MSG_MOVIE_ROOT_ID"
-            with self.assertRaisesRegex(RuntimeError, "multiple MediaStationGo roots matched"):
-                category_to_msg_library_root("movie", connect=lambda _dsn: FakeConn(), env={})
+            MSG_LIBRARY_ROOTS["movie"]["library_id"] = "movie-library-explicit"
+            MSG_LIBRARY_ROOTS["movie"]["root_id"] = "movie-root-explicit"
+            root = category_to_msg_library_root("movie")
         finally:
             MSG_LIBRARY_ROOTS.clear()
             MSG_LIBRARY_ROOTS.update(original_roots)
+
+        self.assertEqual(root["library_id"], "movie-library-explicit")
+        self.assertEqual(root["root_id"], "movie-root-explicit")
 
     def test_load_category_config_rejects_conflicting_external_sources(self):
         from pipeline.config import load_category_config
@@ -1947,6 +1889,8 @@ class MediaStationClientTest(unittest.TestCase):
                 {"code": 0, "message": "ok", "data": {"items": [{"title": "Show"}]}},
                 {"code": 0, "message": "ok", "data": {"target_openlist_path": "/115/动漫/Show"}},
                 {"code": 0, "message": "ok", "data": {"target_openlist_path": "/115/动漫/Show"}},
+                {"code": 0, "message": "ok", "data": {"id": "ingest-1", "status": "running"}},
+                {"code": 0, "message": "ok", "data": {"id": "ingest-1", "status": "completed"}},
             ]
         )
         client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
@@ -1973,6 +1917,8 @@ class MediaStationClientTest(unittest.TestCase):
         self.assertEqual(client.pipeline_search_migration_candidates("Show", 20)["items"][0]["title"], "Show")
         self.assertEqual(client.pipeline_validate_migration(migration_source, migration_target)["target_openlist_path"], "/115/动漫/Show")
         self.assertEqual(client.pipeline_apply_migration(migration_source, migration_target)["target_openlist_path"], "/115/动漫/Show")
+        self.assertEqual(client.pipeline_start_ingest({"category": "movie"})["id"], "ingest-1")
+        self.assertEqual(client.pipeline_get_ingest("ingest-1")["status"], "completed")
 
         self.assertEqual(transport.calls[1]["url"], "http://127.0.0.1:18080/api/pipeline/media/media-1/scrape")
         self.assertEqual(transport.calls[2]["url"], "http://127.0.0.1:18080/api/pipeline/media/media-1/repair-movie-extras")
@@ -1983,6 +1929,8 @@ class MediaStationClientTest(unittest.TestCase):
         self.assertEqual(transport.calls[6]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/search")
         self.assertEqual(transport.calls[7]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/validate")
         self.assertEqual(transport.calls[8]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/apply")
+        self.assertEqual(transport.calls[9]["url"], "http://127.0.0.1:18080/api/pipeline/ingest")
+        self.assertEqual(transport.calls[10]["url"], "http://127.0.0.1:18080/api/pipeline/ingest/ingest-1")
 
     def test_list_libraries_uses_libraries_endpoint(self):
         transport = SequenceTransport(

@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import nullcontext
@@ -141,7 +142,7 @@ from pipeline.mediastation import (
     media_belongs_to_library,
     media_haystack,
 )
-from pipeline.msgdb import DEFAULT_MSG_DATABASE_DSN, MediaStationDbClient, build_migration_target, openlist_path_to_cloud_path
+from pipeline.msgdb import build_migration_target, openlist_path_to_cloud_path
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider
 from pipeline.openlist_tokens import OpenListTokenStore
@@ -401,7 +402,6 @@ class BotConfig:
     pansou_plugins: tuple = ()
     telegram_timeout: int = 90
     msg_base_url: str = DEFAULT_MSG_BASE_URL
-    msg_database_dsn: str = DEFAULT_MSG_DATABASE_DSN
     msg_admin_user: str = ""
     msg_admin_password: str = ""
     msg_enabled: bool = False
@@ -511,7 +511,6 @@ class BotConfig:
             pansou_plugins=tuple(parse_csv_strings(env.get("PANSOU_PLUGINS"), ())),
             telegram_timeout=int(env.get("TG_API_TIMEOUT", "90")),
             msg_base_url=env.get("MSG_BASE_URL", DEFAULT_MSG_BASE_URL),
-            msg_database_dsn=env.get("MSG_DATABASE_DSN", DEFAULT_MSG_DATABASE_DSN),
             msg_admin_user=msg_admin_user,
             msg_admin_password=msg_admin_password,
             msg_enabled=parse_bool(env.get("MSG_ENABLED"), bool(msg_admin_user and msg_admin_password)),
@@ -1597,6 +1596,10 @@ class LlmRerankBusy(RuntimeError):
     pass
 
 
+class MediaStationIngestPending(RuntimeError):
+    pass
+
+
 class PipelineBotService:
     def __init__(self, config, p115_cookie_provider=None):
         self.config = config
@@ -2016,6 +2019,10 @@ class PipelineBotService:
 
         try:
             result = self._sync_mediastation(category, title, out, progress_callback=capture_progress)
+        except MediaStationIngestPending:
+            out["msg_sync_status"] = "running"
+            out["msg_error"] = None
+            return out
         except (RuntimeError, ValueError) as exc:
             mark_current_sync_stage_failed(out, str(exc))
             out["msg_sync_status"] = "failed"
@@ -2372,49 +2379,29 @@ class PipelineBotService:
             else:
                 apply_progress(adult_extra_hide_result)
 
-        target_openlist_paths = msg_target_openlist_paths(category, progress)
         require_target_path = bool(msg_authoritative_openlist_paths(progress))
         deleted_media_prune_result = prefixed_task_fields(progress, "msg_deleted_media_prune_")
         target_scan_result = prefixed_task_fields(progress, "msg_target_scan_")
+        ingest_result = prefixed_task_fields(progress, "msg_ingest_")
 
         if progress.get("msg_scan_status") != "success" or not media_id:
-            openlist = get_openlist_client()
             client = get_msg_client()
-            authoritative_paths = []
-            if require_target_path:
-                authoritative_paths = msg_authoritative_openlist_paths(progress)
-                self._refresh_openlist_targets_for_msg(openlist, authoritative_paths)
-                if progress.get("msg_stale_media_id"):
-                    emit({"msg_deleted_media_prune_status": "running", "msg_deleted_media_prune_error": None})
-                    deleted_media_prune_result = self._prune_msg_deleted_media_for_targets(client, category, authoritative_paths)
-                    emit(deleted_media_prune_result)
-                    emit({"msg_target_scan_status": "running", "msg_target_scan_error": None})
-                    target_scan_result = self._scan_msg_openlist_target_root(client, category, authoritative_paths, queries)
-                    media = target_scan_result.pop("_media", None)
-                    emit(target_scan_result)
-            if media is None:
-                emit({"msg_scan_status": "running", "msg_error": None})
-                client.scan_root(root["library_id"], root["root_id"])
-                try:
-                    media = self._wait_for_msg_media(
-                        client,
-                        root["library_id"],
-                        queries,
-                        target_openlist_paths=target_openlist_paths,
-                        require_target_path=require_target_path,
-                    )
-                except RuntimeError as exc:
-                    if (
-                        isinstance(exc, MediaStationApiError)
-                        or not require_target_path
-                        or not authoritative_paths
-                        or not str(exc).startswith("MediaStationGo media not found after root scan:")
-                    ):
-                        raise
-                    emit({"msg_target_scan_status": "running", "msg_target_scan_error": None})
-                    target_scan_result = self._scan_msg_openlist_target_root(client, category, authoritative_paths, queries)
-                    media = target_scan_result.pop("_media", None)
-                    emit(target_scan_result)
+            authoritative_paths = msg_authoritative_openlist_paths(progress) if require_target_path else []
+            emit({"msg_scan_status": "running", "msg_error": None})
+            ingest_result = self._run_msg_pipeline_ingest(
+                client,
+                category,
+                title,
+                progress,
+                queries,
+                authoritative_paths,
+                require_target_path,
+                emit,
+            )
+            media = ingest_result.pop("_media")
+            deleted_media_prune_result = prefixed_task_fields(ingest_result, "msg_deleted_media_prune_")
+            target_scan_result = prefixed_task_fields(ingest_result, "msg_target_scan_")
+            apply_progress(ingest_result)
             media_id = extract_media_id(media)
             if not media_id:
                 raise RuntimeError("MediaStationGo media id missing after scan")
@@ -2517,6 +2504,7 @@ class PipelineBotService:
             **extras_result,
             **visibility_result,
             **artwork_result,
+            **ingest_result,
             **deleted_media_prune_result,
             **target_scan_result,
             **subtitle_result,
@@ -2728,116 +2716,134 @@ class PipelineBotService:
             "msg_artwork_repair_error": None,
         }
 
-    def _prune_msg_deleted_media_for_targets(self, client, category, openlist_paths):
-        result = client.pipeline_prune_deleted_media(self._pipeline_maintenance_target(category), openlist_paths)
-        if not isinstance(result, dict):
-            raise RuntimeError("MediaStationGo deleted media prune returned invalid response")
-        status = result.get("status")
-        if status not in ("success", "skipped"):
-            raise RuntimeError("MediaStationGo deleted media prune returned invalid status: %s" % (status or "-"))
-        return {
-            "msg_deleted_media_prune_status": status,
-            "msg_deleted_media_prune_deleted": int(result.get("deleted") or 0),
-            "msg_deleted_media_prune_reason": result.get("reason"),
-            "msg_deleted_media_prune_error": None,
-        }
-
-    def _scan_msg_openlist_target_root(self, client, category, openlist_paths, queries):
-        target_path = next((path for path in unique_openlist_paths(openlist_paths) if path), "")
-        if not target_path:
-            return {"msg_target_scan_status": "skipped", "msg_target_scan_reason": "target_missing", "msg_target_scan_error": None}
-        scan_root_path = openlist_scan_root_for_msg_target(target_path)
-        db = self._build_msg_db_client()
-        temp_root = db.create_temporary_library_root(category, scan_root_path)
+    def _run_msg_pipeline_ingest(self, client, category, title, progress, queries, authoritative_paths, require_target_path, emit):
         root = category_to_msg_library_root(category)
-        cleanup_error = None
-        try:
-            client.scan_root(root["library_id"], temp_root["root_id"])
-            media = self._wait_for_msg_media(
-                client,
-                root["library_id"],
-                queries,
-                target_openlist_paths=[target_path],
-                require_target_path=True,
-            )
-            media_id = extract_media_id(media)
-            if not media_id:
-                raise RuntimeError("MediaStationGo media id missing after target scan")
-            db.reassign_media_root(media_id, root["root_id"])
-            media["library_root_id"] = root["root_id"]
-            media["_pipeline_match_mode"] = "path"
-            media["_pipeline_match_path"] = media.get("_pipeline_match_path") or media.get("path")
-            result = {
-                "msg_target_scan_status": "success",
-                "msg_target_scan_root_id": temp_root["root_id"],
-                "msg_target_scan_path": scan_root_path,
-                "msg_target_scan_match_path": target_path,
-                "msg_target_scan_error": None,
-                "_media": media,
+        previous_failed = progress.get("msg_ingest_status") == "failed"
+        job_id = "" if previous_failed else str(progress.get("msg_ingest_job_id") or "").strip()
+        idempotency_key = "" if previous_failed else str(progress.get("msg_ingest_idempotency_key") or "").strip()
+        if not idempotency_key:
+            idempotency_key = "media-pipeline:%s" % uuid.uuid4().hex
+        emit(
+            {
+                "msg_ingest_status": "running",
+                "msg_ingest_idempotency_key": idempotency_key,
+                "msg_ingest_error": None,
             }
-        finally:
-            try:
-                db.delete_library_root(temp_root["root_id"])
-            except Exception as exc:
-                cleanup_error = str(exc)
-        if cleanup_error:
-            raise RuntimeError("MediaStationGo temporary root cleanup failed: %s" % cleanup_error)
-        return result
+        )
 
-    def _wait_for_msg_media(self, client, library_id, queries, target_openlist_paths=None, require_target_path=False):
+        if job_id:
+            job = client.pipeline_get_ingest(job_id)
+        else:
+            request = {
+                **self._pipeline_maintenance_target(category),
+                "idempotency_key": idempotency_key,
+                "title": title,
+                "queries": list(queries or []),
+                "target_openlist_paths": list(authoritative_paths or []),
+                "require_target_path": bool(require_target_path),
+                "prune_deleted_openlist_paths": list(authoritative_paths or []) if progress.get("msg_stale_media_id") else [],
+                "scan": True,
+                "repair_movie_extras": False,
+                "repair_episode_visibility": False,
+            }
+            job = client.pipeline_start_ingest(request)
+
         deadline = time.monotonic() + max(0, int(self.config.msg_sync_poll_seconds))
         interval = max(1, int(self.config.msg_sync_poll_interval_seconds))
         while True:
-            if target_openlist_paths:
-                items = extract_media_items(client.list_library_media(library_id, page=1, page_size=200, group_versions=0))
-                media = find_media_by_openlist_paths(items, target_openlist_paths, library_id=library_id)
-                if media:
-                    return media
-
-                for query in queries:
-                    items = extract_media_items(client.search_media(query, limit=20))
-                    media = find_media_by_openlist_paths(items, target_openlist_paths, library_id=library_id)
-                    if media:
-                        return media
-            if not require_target_path:
-                for query in queries:
-                    items = extract_media_items(client.search_media(query, limit=20))
-                    media = find_matching_media(items, queries, library_id=library_id)
-                    if media:
-                        media["_pipeline_match_mode"] = "query"
-                        return media
-
-                items = extract_media_items(client.list_library_media(library_id, page=1, page_size=200, group_versions=0))
-                media = find_matching_media(items, queries, library_id=library_id)
-                if media:
-                    media["_pipeline_match_mode"] = "query"
-                    return media
-
-            if time.monotonic() >= deadline:
+            if not isinstance(job, dict):
+                raise RuntimeError("MediaStationGo pipeline ingest returned invalid response")
+            job_id = str(job.get("id") or "").strip()
+            status = str(job.get("status") or "").strip()
+            if not job_id or status not in ("running", "completed", "failed"):
+                raise RuntimeError("MediaStationGo pipeline ingest returned invalid job")
+            emit(
+                {
+                    "msg_ingest_job_id": job_id,
+                    "msg_ingest_status": status,
+                    "msg_ingest_stage": job.get("stage"),
+                    "msg_ingest_message": job.get("message"),
+                    "msg_ingest_error": job.get("error") or None,
+                }
+            )
+            if status == "completed":
                 break
+            if status == "failed":
+                raise RuntimeError("MediaStationGo pipeline ingest failed: %s" % (job.get("error") or "unknown error"))
+            if time.monotonic() >= deadline:
+                raise MediaStationIngestPending("MediaStationGo pipeline ingest is still running: %s" % job_id)
             time.sleep(interval)
-        target_hint = ", ".join(target_openlist_paths or [])
-        query_hint = queries[0] if queries else "-"
-        raise RuntimeError("MediaStationGo media not found after root scan: %s%s" % (query_hint, " path=%s" % target_hint if target_hint else ""))
+            job = client.pipeline_get_ingest(job_id)
+
+        result = job.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("MediaStationGo pipeline ingest result missing")
+        media_result = result.get("media")
+        if not isinstance(media_result, dict) or not media_result.get("id"):
+            raise RuntimeError("MediaStationGo pipeline ingest media missing")
+        match_mode = media_result.get("match_mode") or "query"
+        media = {
+            "id": media_result.get("id"),
+            "title": media_result.get("title"),
+            "path": media_result.get("path"),
+            "library_id": root.get("library_id"),
+            "library_root_id": root.get("root_id"),
+            "_pipeline_match_mode": match_mode,
+            "_pipeline_match_path": media_result.get("path") if match_mode == "path" else media_result.get("match_path"),
+        }
+        updates = {
+            "_media": media,
+            "msg_ingest_status": "completed",
+            "msg_ingest_error": None,
+        }
+        scan_result = result.get("scan")
+        if isinstance(scan_result, dict):
+            updates.update(
+                {
+                    "msg_ingest_scan_visited": int(scan_result.get("visited") or 0),
+                    "msg_ingest_scan_added": int(scan_result.get("added") or 0),
+                    "msg_ingest_scan_updated": int(scan_result.get("updated") or 0),
+                    "msg_ingest_scan_removed": int(scan_result.get("removed") or 0),
+                }
+            )
+        prune_result = result.get("deleted_media_prune")
+        if isinstance(prune_result, dict):
+            prune_status = prune_result.get("status")
+            if prune_status not in ("success", "skipped"):
+                raise RuntimeError("MediaStationGo pipeline ingest prune returned invalid status")
+            updates.update(
+                {
+                    "msg_deleted_media_prune_status": prune_status,
+                    "msg_deleted_media_prune_deleted": int(prune_result.get("deleted") or 0),
+                    "msg_deleted_media_prune_reason": prune_result.get("reason"),
+                    "msg_deleted_media_prune_error": None,
+                }
+            )
+        if authoritative_paths:
+            updates.update(
+                {
+                    "msg_target_scan_status": "success",
+                    "msg_target_scan_root_id": root.get("root_id"),
+                    "msg_target_scan_path": authoritative_paths[0],
+                    "msg_target_scan_match_path": media_result.get("match_path") or authoritative_paths[0],
+                    "msg_target_scan_error": None,
+                }
+            )
+        else:
+            updates.update(
+                {
+                    "msg_target_scan_status": "skipped",
+                    "msg_target_scan_reason": "root_scan",
+                    "msg_target_scan_error": None,
+                }
+            )
+        return updates
 
     def _refresh_openlist_for_msg(self, category):
         path = category_to_openlist_path(category)
         client = OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
         client.list_path(path, refresh=True)
         return client
-
-    def _refresh_openlist_targets_for_msg(self, client, paths):
-        targets = unique_openlist_paths(paths)
-        if not targets:
-            return
-        errors = []
-        for path in targets:
-            try:
-                client.list_path(path, refresh=True)
-            except RuntimeError as exc:
-                errors.append("%s: %s" % (path, exc))
-        if errors and len(errors) == len(targets):
-            raise RuntimeError("OpenList target refresh failed before MSG scan: %s" % "; ".join(errors[:3]))
 
     def _clean_openlist_before_msg(self, client, category, title, task):
         if not self.config.openlist_pre_scan_clean_enabled:
@@ -2887,10 +2893,6 @@ class PipelineBotService:
             self.config.msg_admin_user,
             self.config.msg_admin_password,
         )
-
-    def _build_msg_db_client(self):
-        return MediaStationDbClient(self.config.msg_database_dsn)
-
 
 def msg_target_openlist_paths(category, task):
     task = task or {}
@@ -2949,17 +2951,6 @@ def unique_openlist_paths(paths):
             seen.add(key)
             out.append(normalized)
     return out
-
-
-def openlist_scan_root_for_msg_target(path):
-    path = normalize_openlist_path(path)
-    if not path:
-        return ""
-    suffix = posixpath.splitext(path)[1].lower()
-    if suffix in VIDEO_EXTENSIONS:
-        parent = posixpath.dirname(path.rstrip("/"))
-        return normalize_openlist_path(parent or "/")
-    return path
 
 
 def find_media_by_openlist_paths(items, openlist_paths, library_id=None):
@@ -5493,6 +5484,16 @@ STALE_MSG_MEDIA_RESET_KEYS = (
     "msg_media_title",
     "msg_match_mode",
     "msg_match_path",
+    "msg_ingest_job_id",
+    "msg_ingest_idempotency_key",
+    "msg_ingest_status",
+    "msg_ingest_stage",
+    "msg_ingest_message",
+    "msg_ingest_error",
+    "msg_ingest_scan_visited",
+    "msg_ingest_scan_added",
+    "msg_ingest_scan_updated",
+    "msg_ingest_scan_removed",
     "msg_scan_status",
     "msg_scrape_status",
     "msg_scrape_mode",

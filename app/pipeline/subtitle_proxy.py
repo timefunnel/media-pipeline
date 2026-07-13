@@ -21,7 +21,8 @@ except ImportError:
     ImageOps = None
 
 from pipeline.adult_metadata import ADULT_ARTWORK_PUBLIC_PATH, DEFAULT_ADULT_ARTWORK_CACHE_DIR
-from pipeline.config import DEFAULT_MSG_DATABASE_DSN, category_to_msg_library_root
+from pipeline.config import category_to_msg_library_root
+from pipeline.msgdb import DEFAULT_MSG_DATABASE_DSN
 from pipeline.mediastation import iter_code_matches
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider
 from pipeline.external_subtitles import DEFAULT_SUBTITLE_CACHE_DIR, LocalSubtitleProvider, local_subtitle_uri_valid

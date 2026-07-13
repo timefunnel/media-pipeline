@@ -370,7 +370,7 @@ docker exec -e DSN="$DSN" mediastationgo-postgres-1 sh -lc \
   'psql "$DSN" -tAc "select l.name,l.id,l.type,r.id,r.path from libraries l join library_roots r on r.library_id=l.id and r.deleted_at is null where l.deleted_at is null order by l.name,l.type;"'
 ```
 
-正常情况下不需要把 `library_id/root_id` 手动填入 `.env`。pipeline 会通过 `MSG_DATABASE_DSN` 查询 MSG PostgreSQL，并按 `media_type + OpenList root path` 自动发现。只有同一 `media_type + root path` 出现多条匹配，或你需要强制指定某个 root 时，才手动覆盖 `MEDIA_PIPELINE_*_MSG_LIBRARY_ID` 和 `MEDIA_PIPELINE_*_MSG_ROOT_ID`。
+必须在 `.env` 中显式配置各分类的 `MEDIA_PIPELINE_*_MSG_LIBRARY_ID` 和 `MEDIA_PIPELINE_*_MSG_ROOT_ID`。Bot 只通过 MSG 管理员 API 工作，不再连接 MSG PostgreSQL，也不会自动猜测媒体库或 root。
 
 ## 8. 部署 media-pipeline
 
@@ -413,9 +413,6 @@ TG_ALLOWED_USER_IDS
 MSG_ADMIN_PASSWORD
   MediaStationGo 管理员密码
 
-MSG_DATABASE_DSN
-  postgres://mediastation:<postgres password>@127.0.0.1:15432/mediastation?sslmode=disable
-
 MEDIA_PIPELINE_*_FOLDER_ID
   115 目录 cid
 
@@ -441,7 +438,7 @@ PANSOU_IMAGE / PANSOU_PORT / PANSOU_CACHE_DIR / PANSOU_SERVER_CHANNELS / PANSOU_
   PANSOU_SERVER_CHANNELS 和 PANSOU_SERVER_ENABLED_PLUGINS 控制 PanSou 自身可用搜索源
 
 MEDIA_PIPELINE_*_MSG_LIBRARY_ID / MSG_ROOT_ID
-  通常留空，由 pipeline 根据 MSG_DATABASE_DSN 自动发现；仅在自动发现歧义时手动覆盖
+  必填，分别填写对应分类在 MSG 中的 library id 和 root id
 ```
 
 构建并启动：

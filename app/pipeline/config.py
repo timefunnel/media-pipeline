@@ -2,11 +2,8 @@ import copy
 import json
 import os
 import posixpath
-import urllib.parse
 
 
-DEFAULT_MSG_DATABASE_DSN = "postgresql://mediastation:mediastation@127.0.0.1:15432/mediastation"
-MSG_CLOUD_PREFIX = "cloud://openlist"
 PLACEHOLDER_PREFIX = "REPLACE_WITH_"
 
 
@@ -235,20 +232,23 @@ def category_to_openlist_path(category):
         raise ValueError("unsupported category: %s" % category)
 
 
-def category_to_msg_library_root(category, connect=None, env=None):
+def category_to_msg_library_root(category):
     try:
         root = dict(MSG_LIBRARY_ROOTS[category])
     except KeyError:
         raise ValueError("unsupported category: %s" % category)
     if msg_library_root_needs_discovery(root):
-        root = discover_msg_library_root(category, connect=connect, env=env)
+        raise RuntimeError(
+            "MediaStationGo root ids missing for %s; configure MEDIA_PIPELINE_%s_MSG_LIBRARY_ID and MEDIA_PIPELINE_%s_MSG_ROOT_ID"
+            % (category, category.upper(), category.upper())
+        )
     return root
 
 
-def msg_library_roots(connect=None, env=None):
+def msg_library_roots():
     roots = {}
     for category in sorted(MSG_LIBRARY_ROOTS.keys()):
-        roots[category] = category_to_msg_library_root(category, connect=connect, env=env)
+        roots[category] = category_to_msg_library_root(category)
     return roots
 
 
@@ -259,81 +259,6 @@ def msg_library_root_needs_discovery(root):
 def is_placeholder_or_empty(value):
     value = str(value or "").strip()
     return not value or value.startswith(PLACEHOLDER_PREFIX)
-
-
-def discover_msg_library_root(category, connect=None, env=None):
-    env = env if env is not None else os.environ
-    try:
-        root = dict(MSG_LIBRARY_ROOTS[category])
-        openlist_path = OPENLIST_PATHS[category]
-    except KeyError:
-        raise ValueError("unsupported category: %s" % category)
-
-    dsn = str(env.get("MSG_DATABASE_DSN") or DEFAULT_MSG_DATABASE_DSN).strip()
-    rows = load_msg_library_root_rows(dsn, connect=connect)
-    root_paths = set(openlist_path_to_msg_cloud_path_candidates(openlist_path))
-    expected_type = str(root.get("media_type") or "").strip()
-    matches = []
-    for row in rows:
-        row_type = str(row.get("media_type") or row.get("library_type") or "").strip()
-        row_path = str(row.get("root_path") or "").strip()
-        if row_type == expected_type and row_path in root_paths:
-            matches.append(row)
-
-    if not matches:
-        raise RuntimeError(
-            "MediaStationGo root not found for %s: media_type=%s openlist_path=%s"
-            % (category, expected_type, openlist_path)
-        )
-    if len(matches) > 1:
-        raise RuntimeError(
-            "multiple MediaStationGo roots matched for %s: media_type=%s openlist_path=%s"
-            % (category, expected_type, openlist_path)
-        )
-
-    match = matches[0]
-    root["library_id"] = str(match.get("library_id") or "").strip()
-    root["root_id"] = str(match.get("root_id") or "").strip()
-    if not root["library_id"] or not root["root_id"]:
-        raise RuntimeError("MediaStationGo root discovery returned incomplete ids for %s" % category)
-    MSG_LIBRARY_ROOTS[category] = dict(root)
-    return dict(root)
-
-
-def load_msg_library_root_rows(dsn, connect=None):
-    connect = connect or default_msg_database_connect
-    with connect(dsn) as conn:
-        rows = conn.execute(
-            """
-            select
-                l.id as library_id,
-                l.name as library_name,
-                l.type as media_type,
-                r.id as root_id,
-                r.path as root_path
-            from libraries l
-            join library_roots r on r.library_id = l.id
-            where l.deleted_at is null
-              and r.deleted_at is null
-            """
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def default_msg_database_connect(dsn):
-    import psycopg
-    from psycopg.rows import dict_row
-
-    return psycopg.connect(dsn, row_factory=dict_row)
-
-
-def openlist_path_to_msg_cloud_path_candidates(path):
-    normalized = normalize_openlist_path(path)
-    if not normalized:
-        return []
-    encoded = MSG_CLOUD_PREFIX + "/" + urllib.parse.quote(normalized.lstrip("/"), safe="")
-    raw = MSG_CLOUD_PREFIX + normalized
-    return [encoded, raw]
 
 
 def normalize_openlist_path(path):
