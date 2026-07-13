@@ -6253,7 +6253,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
     def test_sync_completed_task_rescans_when_saved_msg_media_was_deleted(self):
         from pipeline.bot import BotConfig, PipelineBotService
-        from pipeline.msgdb import openlist_path_to_cloud_path
+        from pipeline.openlist_utils import openlist_path_to_cloud_path
 
         adult_root = category_to_openlist_path("adult")
         target_path = adult_root + "/ABF-363"

@@ -65,6 +65,7 @@ from pipeline.openlist_utils import (
     is_openlist_video_file,
     normalize_openlist_path,
     normalize_openlist_text,
+    openlist_path_to_cloud_path,
     openlist_item_is_dir,
     openlist_item_name,
     openlist_item_path,
@@ -72,6 +73,7 @@ from pipeline.openlist_utils import (
     replace_openlist_path_prefix,
 )
 from pipeline.migration import (
+    build_migration_target,
     format_migration_confirm_message,
     format_migration_result_message,
     format_migration_running_message,
@@ -133,7 +135,6 @@ from pipeline.mediastation import (
     media_belongs_to_library,
     media_haystack,
 )
-from pipeline.msgdb import build_migration_target, openlist_path_to_cloud_path
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider
 from pipeline.openlist_tokens import OpenListTokenStore

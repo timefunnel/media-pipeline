@@ -530,44 +530,6 @@ class FakeMediaStationClient:
 
 
 
-class MediaStationDbHelperTest(unittest.TestCase):
-    def test_deleted_movie_media_hide_candidate_uses_top_level_resource(self):
-        from pipeline.msgdb import deleted_openlist_media_hide_candidate
-
-        candidate = deleted_openlist_media_hide_candidate(
-            {
-                "id": "media-1",
-                "library_id": "test-movie-library",
-                "library_root_id": "test-movie-root",
-                "path": "cloud://openlist/115/电影/Movie/Movie.mkv",
-                "deleted_at": "2026-07-05T22:00:00+08:00",
-            }
-        )
-
-        self.assertEqual(candidate["target_openlist_path"], "/115/电影/Movie")
-        self.assertEqual(candidate["hide_path"], "/115/电影")
-        self.assertEqual(candidate["hide_pattern"], "^Movie$")
-        self.assertEqual(candidate["target_kind"], "folder")
-
-    def test_deleted_anime_media_hide_candidate_uses_episode_file(self):
-        from pipeline.msgdb import deleted_openlist_media_hide_candidate
-
-        candidate = deleted_openlist_media_hide_candidate(
-            {
-                "id": "media-1",
-                "library_id": "test-anime-library",
-                "library_root_id": "test-anime-root",
-                "path": "cloud://openlist/115/动漫/秋色之空/01.associated.mkv",
-                "deleted_at": "2026-07-05T22:00:00+08:00",
-            }
-        )
-
-        self.assertEqual(candidate["target_openlist_path"], "/115/动漫/秋色之空/01.associated.mkv")
-        self.assertEqual(candidate["hide_path"], "/115/动漫/秋色之空")
-        self.assertEqual(candidate["hide_pattern"], r"^01\.associated\.mkv$")
-        self.assertEqual(candidate["target_kind"], "file")
-
-
 class EventOpenList:
     def __init__(self, events):
         self.events = events

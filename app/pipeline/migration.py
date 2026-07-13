@@ -1,3 +1,8 @@
+import posixpath
+
+from pipeline.config import category_to_openlist_path
+
+
 MIGRATION_CATEGORY_LABELS = {
     "movie": "电影库",
     "tv": "剧集库",
@@ -5,6 +10,22 @@ MIGRATION_CATEGORY_LABELS = {
     "adult": "成人库",
     "other": "其他库",
 }
+
+
+def build_migration_target(candidate, target_category):
+    target_category = str(target_category or "").strip()
+    source_category = (candidate or {}).get("category")
+    if source_category and source_category == target_category:
+        raise ValueError("target category must be different from source category")
+    target_root_path = category_to_openlist_path(target_category)
+    source_name = posixpath.basename(str((candidate or {}).get("source_openlist_path") or "").rstrip("/"))
+    if not source_name:
+        raise ValueError("source path name missing")
+    return {
+        "target_category": target_category,
+        "target_root_openlist_path": target_root_path,
+        "target_openlist_path": posixpath.join(target_root_path, source_name),
+    }
 
 
 def format_size(value):

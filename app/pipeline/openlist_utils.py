@@ -18,6 +18,7 @@ DEFAULT_VIDEO_EXTENSIONS = {
     ".webm",
     ".wmv",
 }
+MSG_CLOUD_PREFIX = "cloud://openlist"
 
 
 def is_openlist_video_file(item):
@@ -66,6 +67,10 @@ def normalize_openlist_path(path):
     if normalized == ".":
         return ""
     return normalized
+
+
+def openlist_path_to_cloud_path(path):
+    return MSG_CLOUD_PREFIX + normalize_openlist_path(path)
 
 
 def replace_openlist_path_prefix(path, old_prefix, new_prefix):

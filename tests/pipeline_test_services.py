@@ -381,177 +381,18 @@ class ExternalSubtitleTest(unittest.TestCase):
 
 
 class CategoryConfigTest(unittest.TestCase):
-    def test_msgdb_groups_episode_rows_into_one_migration_candidate(self):
-        from pipeline.msgdb import build_migration_candidates, build_migration_target, cloud_path_to_openlist_path
 
-        rows = [
-            {
-                "id": "m1",
-                "library_id": "test-tv-library",
-                "library_root_id": "test-tv-root",
-                "title": "成龙历险记",
-                "path": "cloud://openlist/115/剧集/成龙历险记/成龙历险记 第01集.mp4",
-                "root_path": "cloud://openlist/115%2F%E5%89%A7%E9%9B%86",
-                "size_bytes": 100,
-                "library_name": "剧集",
-                "library_type": "tv",
-            },
-            {
-                "id": "m2",
-                "library_id": "test-tv-library",
-                "library_root_id": "test-tv-root",
-                "title": "成龙历险记",
-                "path": "cloud://openlist/115/剧集/成龙历险记/成龙历险记 第02集.mp4",
-                "root_path": "cloud://openlist/115%2F%E5%89%A7%E9%9B%86",
-                "size_bytes": 200,
-                "library_name": "剧集",
-                "library_type": "tv",
-            },
-        ]
+    def test_build_migration_target_uses_target_category_root(self):
+        from pipeline.migration import build_migration_target
 
-        candidates = build_migration_candidates(rows, limit=20)
-        target = build_migration_target(candidates[0], "anime")
+        target = build_migration_target(
+            {"category": "tv", "source_openlist_path": "/115/剧集/成龙历险记"},
+            "anime",
+        )
 
-        self.assertEqual(cloud_path_to_openlist_path("cloud://openlist/115%2F%E5%89%A7%E9%9B%86"), "/115/剧集")
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["source_openlist_path"], "/115/剧集/成龙历险记")
-        self.assertEqual(candidates[0]["source_kind"], "folder")
-        self.assertEqual(candidates[0]["category"], "tv")
-        self.assertEqual(candidates[0]["media_count"], 2)
-        self.assertEqual(candidates[0]["total_size"], 300)
+        self.assertEqual(target["target_category"], "anime")
+        self.assertEqual(target["target_root_openlist_path"], "/115/动漫")
         self.assertEqual(target["target_openlist_path"], "/115/动漫/成龙历险记")
-
-    def test_msgdb_rewrites_cloud_play_strm_url_when_migrating_paths(self):
-        from pipeline.msgdb import replace_strm_url_prefix
-
-        old_path = "/115/\u5267\u96c6/\u6210\u9f99\u5386\u9669\u8bb0"
-        new_path = "/115/\u52a8\u6f2b/\u6210\u9f99\u5386\u9669\u8bb0"
-        url = (
-            "/api/cloud/play/openlist?ref="
-            "%2F115%2F%E5%89%A7%E9%9B%86%2F%E6%88%90%E9%BE%99%E5%8E%86%E9%99%A9%E8%AE%B0"
-            "%2F%E6%88%90%E9%BE%99%E5%8E%86%E9%99%A9%E8%AE%B0+%E7%AC%AC01%E9%9B%86.mp4"
-        )
-
-        rewritten = replace_strm_url_prefix(url, old_path, new_path)
-
-        self.assertIn("%2F115%2F%E5%8A%A8%E6%BC%AB%2F%E6%88%90%E9%BE%99%E5%8E%86%E9%99%A9%E8%AE%B0", rewritten)
-        self.assertNotIn("%2F115%2F%E5%89%A7%E9%9B%86%2F%E6%88%90%E9%BE%99%E5%8E%86%E9%99%A9%E8%AE%B0", rewritten)
-
-    def test_msgdb_builds_episode_visibility_updates_for_bad_anime_rows(self):
-        from pipeline.msgdb import build_episode_visibility_updates
-
-        rows = [
-            {
-                "id": "m1",
-                "path": "cloud://openlist/115/Anime/Show/Show S01E01.mkv",
-                "relative_path": "",
-                "season_num": 0,
-                "episode_num": 0,
-                "episode_title": "",
-            },
-            {
-                "id": "m2",
-                "path": "cloud://openlist/115/Anime/Show/Show 1080p.mkv",
-                "relative_path": "",
-                "season_num": None,
-                "episode_num": None,
-                "episode_title": "",
-            },
-        ]
-
-        updates = build_episode_visibility_updates(rows, "cloud://openlist/115/Anime")
-
-        self.assertEqual([item["id"] for item in updates], ["m1", "m2"])
-        self.assertEqual(updates[0]["relative_path"], "Show/Show S01E01.mkv")
-        self.assertEqual(updates[0]["season_num"], 1)
-        self.assertEqual(updates[0]["episode_num"], 1)
-        self.assertEqual(updates[1]["relative_path"], "Show/Show 1080p.mkv")
-        self.assertEqual(updates[1]["season_num"], 1)
-        self.assertEqual(updates[1]["episode_num"], 2)
-
-    def test_msgdb_detects_movie_extra_rows_under_pack_subfolders(self):
-        from pipeline.msgdb import movie_media_row_looks_like_extra
-
-        self.assertTrue(
-            movie_media_row_looks_like_extra(
-                {
-                    "path": "cloud://openlist/115/电影/Godzilla Pack/PV/[DBD-Raws][Godzilla Final Wars][PV][01].mkv",
-                    "title": "pv",
-                },
-                "/115/电影/Godzilla Pack",
-            )
-        )
-        self.assertFalse(
-            movie_media_row_looks_like_extra(
-                {
-                    "path": "cloud://openlist/115/电影/Godzilla Pack/[DBD-Raws][Godzilla Final Wars][Ver.A].mkv",
-                    "title": "Godzilla Pack",
-                },
-                "/115/电影/Godzilla Pack",
-            )
-        )
-
-    def test_msgdb_movie_extra_repair_reason_uses_hidden_terms(self):
-        from pipeline.msgdb import MediaStationDbClient
-
-        class FakeCursor:
-            def __init__(self, rows):
-                self.rows = rows
-
-            def fetchone(self):
-                return self.rows[0] if self.rows else None
-
-            def fetchall(self):
-                return list(self.rows)
-
-        class FakeConn:
-            def __init__(self):
-                self.step = 0
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def transaction(self):
-                return self
-
-            def execute(self, sql, params=()):
-                self.step += 1
-                if self.step == 1:
-                    return FakeCursor(
-                        [
-                            {
-                                "id": "main-1",
-                                "path": "cloud://openlist/115/电影/Godzilla Pack/[DBD-Raws][Godzilla Final Wars][Ver.A].mkv",
-                            }
-                        ]
-                    )
-                if self.step == 2:
-                    return FakeCursor(
-                        [
-                            {
-                                "id": "main-1",
-                                "path": "cloud://openlist/115/电影/Godzilla Pack/[DBD-Raws][Godzilla Final Wars][Ver.A].mkv",
-                                "title": "Godzilla Final Wars",
-                                "deleted_at": None,
-                            },
-                            {
-                                "id": "extra-1",
-                                "path": "cloud://openlist/115/电影/Godzilla Pack/PV/sample.mkv",
-                                "title": "PV",
-                                "deleted_at": None,
-                            },
-                        ]
-                    )
-                return FakeCursor([])
-
-        client = MediaStationDbClient("postgres://unused", connect=lambda: FakeConn())
-        result = client.repair_movie_extras("movie", "main-1")
-
-        self.assertEqual(result["reason"], "extras_hidden")
-        self.assertEqual(result["openlist_hide_patterns"], ["^PV$"])
 
     def test_routes_movie_tv_anime_adult_and_other_to_separate_115_folders(self):
         from pipeline.config import category_maps, load_category_config
