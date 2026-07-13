@@ -4,12 +4,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from pipeline.adult_metadata import (
-    DEFAULT_ADULT_ARTWORK_CACHE_DIR,
-    build_adult_artwork_repair,
-)
-
-
 DEFAULT_MSG_BASE_URL = "http://127.0.0.1:18080/api"
 CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,10})[\s._-]+(\d{3,4})(?![\d-])", re.IGNORECASE)
 FC2_PPV_PATTERN = re.compile(r"(?<![A-Za-z0-9])FC2[\s._-]*PPV[\s._-]*(\d{5,10})(?!\d)", re.IGNORECASE)
@@ -36,20 +30,6 @@ CODE_PREFIX_DENYLIST = {
     "X264",
     "X265",
 }
-ADULT_ARTWORK_BAD_HOSTS = (
-    "javbus.com",
-    "javbus.sbs",
-    "cdnbus.cyou",
-    "javsee.cyou",
-    "busjav.cyou",
-)
-ADULT_IMAGE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-}
-
-
 class MediaStationTransport:
     def request(self, method, url, headers=None, data=None, timeout=None):
         req_headers = dict(headers or {})
@@ -237,49 +217,6 @@ class MediaStationClient:
             raise ValueError("MediaStationGo metadata update fields missing")
         return self._request("PATCH", "/media/%s/metadata" % quote_path(media_id), data=data)
 
-    def repair_adult_artwork(
-        self,
-        media_id,
-        verifier=None,
-        semantic_enabled=True,
-        cache_dir=DEFAULT_ADULT_ARTWORK_CACHE_DIR,
-        public_base_url="",
-        generate_portrait=True,
-        fetcher=None,
-        metadata_provider=None,
-    ):
-        media = self.get_media(media_id)
-        if semantic_enabled:
-            semantic_result = build_adult_artwork_repair(
-                media,
-                cache_dir=cache_dir,
-                public_base_url=public_base_url,
-                generate_portrait=generate_portrait,
-                fetcher=fetcher,
-                metadata_provider=metadata_provider,
-            )
-            if semantic_result.get("status") == "success" and semantic_result.get("patch"):
-                updated = self.update_media_metadata(media_id, semantic_result["patch"])
-                return {
-                    **semantic_result,
-                    "media": updated,
-                }
-            if semantic_result.get("reason") not in ("candidate_not_found", "usable_image_not_found"):
-                return semantic_result
-        if not adult_media_artwork_needs_repair(media):
-            return {"status": "skipped", "updated": 0, "reason": "not_needed"}
-        patch = adult_artwork_repair_patch(media, verifier=verifier)
-        if not patch:
-            return {"status": "skipped", "updated": 0, "reason": "replacement_not_found"}
-        updated = self.update_media_metadata(media_id, patch)
-        return {
-            "status": "success",
-            "updated": len(patch),
-            "fields": sorted(patch.keys()),
-            "patch": patch,
-            "media": updated,
-        }
-
     def _request(self, method, path, data=None, retry=True):
         if not self.access_token:
             self.login()
@@ -321,175 +258,6 @@ def extract_access_token(response):
 
 def quote_path(value):
     return urllib.parse.quote(str(value), safe="")
-
-
-def adult_media_artwork_needs_repair(media):
-    if not isinstance(media, dict):
-        return False
-    return artwork_url_needs_repair(media.get("poster_url")) or artwork_url_needs_repair(media.get("backdrop_url"))
-
-
-def adult_artwork_repair_patch(media, verifier=None):
-    if not isinstance(media, dict):
-        return {}
-    verify = verifier or reachable_image_url
-    patch = {}
-    poster_url = str(media.get("poster_url") or "")
-    backdrop_url = str(media.get("backdrop_url") or "")
-    selected_dmm_cid = None
-
-    poster_needs_repair = is_bad_adult_artwork_url(poster_url) or (is_dmm_artwork_url(poster_url) and not verify(poster_url))
-    if poster_needs_repair:
-        for candidate in iter_adult_poster_candidates(media):
-            if candidate == poster_url:
-                continue
-            if verify(candidate):
-                patch["poster_url"] = candidate
-                selected_dmm_cid = dmm_cid_from_artwork_url(candidate)
-                break
-        if "poster_url" not in patch:
-            patch["poster_url"] = ""
-
-    backdrop_needs_repair = is_bad_adult_artwork_url(backdrop_url) or (is_dmm_artwork_url(backdrop_url) and not verify(backdrop_url))
-    if backdrop_needs_repair:
-        for candidate in iter_adult_backdrop_candidates(media, preferred_cid=selected_dmm_cid):
-            if candidate == backdrop_url:
-                continue
-            if verify(candidate):
-                patch["backdrop_url"] = candidate
-                break
-        if "backdrop_url" not in patch:
-            patch["backdrop_url"] = ""
-
-    return patch
-
-
-def iter_adult_poster_candidates(media):
-    for candidate in iter_mgstage_poster_candidates(media.get("backdrop_url")):
-        yield candidate
-    for code in adult_codes_from_media(media):
-        for cid in iter_dmm_cids(code):
-            yield "https://pics.dmm.co.jp/digital/video/%s/%spl.jpg" % (cid, cid)
-
-
-def iter_adult_backdrop_candidates(media, preferred_cid=None):
-    if preferred_cid:
-        for candidate in iter_dmm_backdrop_urls(preferred_cid):
-            yield candidate
-    for code in adult_codes_from_media(media):
-        for cid in iter_dmm_cids(code):
-            if cid == preferred_cid:
-                continue
-            for candidate in iter_dmm_backdrop_urls(cid):
-                yield candidate
-
-
-def iter_mgstage_poster_candidates(value):
-    parsed = urllib.parse.urlparse(str(value or ""))
-    if parsed.netloc.lower() != "image.mgstage.com":
-        return
-    filename = parsed.path.rsplit("/", 1)[-1]
-    if "cap_e_0_" not in filename:
-        return
-    for prefix in ("pf_o1_", "pb_e_", "pb_e_0_"):
-        candidate_name = filename.replace("cap_e_0_", prefix, 1)
-        yield urllib.parse.urlunparse(parsed._replace(path=parsed.path.rsplit("/", 1)[0] + "/" + candidate_name))
-
-
-def iter_dmm_backdrop_urls(cid):
-    yield "https://pics.dmm.co.jp/digital/video/%s/%sjp-1.jpg" % (cid, cid)
-    yield "https://pics.dmm.co.jp/digital/video/%s/%sjp.jpg" % (cid, cid)
-
-
-def adult_codes_from_media(media):
-    if not isinstance(media, dict):
-        return []
-    values = []
-    for key in ("original_name", "title", "name", "file_name", "filename", "path", "file_path", "source_path"):
-        value = media.get(key)
-        if value:
-            values.append(value)
-    nested = media.get("media")
-    if isinstance(nested, dict):
-        values.extend(adult_codes_from_media(nested))
-
-    out = []
-    seen = set()
-    for value in values:
-        for code in iter_code_matches(value):
-            key = code.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(code)
-    return out
-
-
-def iter_dmm_cids(code):
-    match = re.match(r"^([A-Za-z]{2,10})-(\d{3,5})$", str(code or ""))
-    if not match:
-        return
-    prefix = match.group(1).lower()
-    raw = match.group(2)
-    number = int(raw)
-    variants = [str(number), "%03d" % number, "%04d" % number, "%05d" % number]
-    seen = set()
-    for prefix_value in (prefix, "1" + prefix):
-        for value in variants:
-            cid = prefix_value + value
-            if cid in seen:
-                continue
-            seen.add(cid)
-            yield cid
-
-
-def dmm_cid_from_artwork_url(value):
-    parsed = urllib.parse.urlparse(str(value or ""))
-    parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) >= 3 and parts[-3:-1] and parts[-3] == "video":
-        return parts[-2]
-    return None
-
-
-def is_bad_adult_artwork_url(value):
-    if not value:
-        return False
-    host = urllib.parse.urlparse(str(value)).netloc.lower()
-    return any(host == item or host.endswith("." + item) for item in ADULT_ARTWORK_BAD_HOSTS)
-
-
-def is_dmm_artwork_url(value):
-    if not value:
-        return False
-    host = urllib.parse.urlparse(str(value)).netloc.lower()
-    return host == "pics.dmm.co.jp" or host.endswith(".dmm.co.jp")
-
-
-def artwork_url_needs_repair(value):
-    return is_bad_adult_artwork_url(value) or is_dmm_artwork_url(value)
-
-
-def reachable_image_url(url, timeout=8):
-    if not str(url or "").startswith(("http://", "https://")):
-        return False
-    request = urllib.request.Request(str(url), headers=ADULT_IMAGE_HEADERS, method="GET")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            status = getattr(response, "status", 200)
-            if status < 200 or status >= 300:
-                return False
-            final_url = ""
-            if hasattr(response, "geturl"):
-                final_url = response.geturl() or ""
-            if "now_printing" in final_url.lower():
-                return False
-            content_type = response.headers.get("Content-Type", "").lower()
-            if content_type.startswith("image/"):
-                return True
-            prefix = response.read(16)
-            return prefix.startswith((b"\xff\xd8\xff", b"\x89PNG", b"GIF8", b"RIFF"))
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, ValueError):
-        return False
 
 
 def extract_media_items(response):

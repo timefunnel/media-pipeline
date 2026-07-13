@@ -361,7 +361,6 @@ class FakeMediaStationClient:
         get_response=None,
         events=None,
         scrape_search_responses=None,
-        artwork_repair_response=None,
         pipeline_scrape_response=None,
         movie_extra_response=None,
         episode_visibility_response=None,
@@ -377,7 +376,6 @@ class FakeMediaStationClient:
         self.get_response = get_response
         self.events = events
         self.scrape_search_responses = scrape_search_responses or {}
-        self.artwork_repair_response = artwork_repair_response or {"status": "skipped", "updated": 0, "reason": "not_needed"}
         self.pipeline_scrape_response = pipeline_scrape_response
         self.movie_extra_response = movie_extra_response or {"status": "success", "updated": 0, "media_count": 1, "reason": "already_clean"}
         self.episode_visibility_response = episode_visibility_response or {
@@ -404,7 +402,6 @@ class FakeMediaStationClient:
         self.scrape_calls = []
         self.scrape_search_calls = []
         self.scrape_apply_calls = []
-        self.artwork_repair_calls = []
         self.pipeline_scrape_calls = []
         self.pipeline_maintenance_calls = []
         self.pipeline_ingest_calls = []
@@ -556,14 +553,6 @@ class FakeMediaStationClient:
     def apply_scrape_match(self, media_id, match):
         self.scrape_apply_calls.append((media_id, match))
         return {"ok": True}
-
-    def repair_adult_artwork(self, media_id, **_kwargs):
-        self.artwork_repair_calls.append(media_id)
-        if self.events is not None:
-            self.events.append(("artwork_repair",))
-        return self.artwork_repair_response
-
-
 
 class FakeStreamResponse:
     def __init__(self, chunks):

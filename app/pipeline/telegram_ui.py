@@ -299,7 +299,6 @@ def task_diagnostic_stage_values(task):
         ("msg_scrape_status", "MSG刮削"),
         ("msg_extra_cleanup_status", "特典隐藏"),
         ("msg_visibility_repair_status", "可见性修复"),
-        ("msg_artwork_repair_status", "图片修复"),
         ("subtitle_match_status", "字幕匹配"),
     ):
         value = (task or {}).get(key)
@@ -445,23 +444,6 @@ def append_task_lines(lines, task, category=None):
             lines.append("MSG可见性修复：失败")
             if task.get("msg_visibility_repair_error"):
                 lines.append("可见性修复错误：%s" % task.get("msg_visibility_repair_error"))
-    if category == "adult" and task.get("msg_artwork_repair_status"):
-        if task.get("msg_artwork_repair_status") == "success":
-            lines.append("成人图片修复：已完成（%s 项）" % (task.get("msg_artwork_repair_updated") or 0))
-        elif task.get("msg_artwork_repair_status") == "running":
-            lines.append("成人图片修复：进行中")
-        elif task.get("msg_artwork_repair_reason") == "replacement_not_found":
-            lines.append("成人图片修复：未完成（未找到可直连替代图源）")
-        elif task.get("msg_artwork_repair_reason") == "public_base_url_missing":
-            lines.append("成人图片修复：未完成（未配置公开图片地址）")
-        elif task.get("msg_artwork_repair_reason") == "usable_image_not_found":
-            lines.append("成人图片修复：未完成（候选图不可用）")
-        elif task.get("msg_artwork_repair_reason") == "not_needed":
-            lines.append("成人图片修复：无需处理")
-        elif task.get("msg_artwork_repair_status") != "skipped":
-            lines.append("成人图片修复：失败")
-            if task.get("msg_artwork_repair_error"):
-                lines.append("图片修复错误：%s" % task.get("msg_artwork_repair_error"))
     if task.get("subtitle_match_status"):
         if task.get("subtitle_match_status") == "success":
             lines.append(
