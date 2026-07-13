@@ -454,6 +454,43 @@ class CandidateStoreTest(unittest.TestCase):
 
         self.assertEqual([record["info_hash"] for record in running], ["AAA"])
 
+    def test_candidate_store_lists_running_msg_sync_tasks_beyond_initial_limit(self):
+        from pipeline.bot import CandidateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            for index in range(60):
+                store.save_task(
+                    700656624,
+                    9001,
+                    "movie",
+                    "Synced %02d" % index,
+                    {
+                        "info_hash": "SYNCED%02d" % index,
+                        "status_name": "success",
+                        "msg_sync_status": "success",
+                        "msg_scrape_status": "success",
+                    },
+                )
+            store.save_task(
+                700656624,
+                9001,
+                "movie",
+                "Late Running",
+                {"info_hash": "LATE", "status_name": "success", "msg_sync_status": "running"},
+            )
+            conn = sqlite3.connect(store.db_path)
+            try:
+                conn.execute("update offline_tasks set created_at = 1, updated_at = 1 where info_hash like 'SYNCED%'")
+                conn.execute("update offline_tasks set created_at = 100, updated_at = 100 where info_hash = 'LATE'")
+                conn.commit()
+            finally:
+                conn.close()
+
+            running = store.list_msg_sync_running_tasks(limit=10)
+
+        self.assertEqual([record["info_hash"] for record in running], ["LATE"])
+
     def test_candidate_store_lists_active_115_tasks(self):
         from pipeline.bot import CandidateStore
 

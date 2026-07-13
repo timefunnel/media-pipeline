@@ -1493,20 +1493,19 @@ class CandidateStore:
                 select info_hash, user_id, chat_id, category, title, task_json, created_at, updated_at
                 from offline_tasks
                 order by updated_at asc, created_at asc
-                limit ?
-                """,
-                (int(limit),),
+                """
             ).fetchall()
         finally:
             conn.close()
         records = [task_record_from_row(row) for row in rows]
-        return [
+        running = [
             record
             for record in records
             if TASK_STATE.is_offline_success(record["task"])
             and task_sync_is_running(record["task"])
             and not task_msg_synced(record["task"])
         ]
+        return running[: int(limit)]
 
     def list_active_115_tasks(self, limit=50):
         conn = self._connect()
