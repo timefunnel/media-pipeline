@@ -24,6 +24,16 @@ from pipeline.admin_web import (
 
 
 class AdminWebTest(unittest.TestCase):
+
+    def test_task_status_group_treats_skipped_scrape_as_synced(self):
+        task = {
+            "status_name": "success",
+            "msg_sync_status": "success",
+            "msg_scrape_status": "skipped",
+        }
+
+        self.assertEqual(task_status_group(task), "success")
+
     def create_state_db(self, path):
         conn = sqlite3.connect(path)
         try:
@@ -1588,6 +1598,8 @@ class CategoryConfigTest(unittest.TestCase):
         self.assertEqual(other["root_id"], "REPLACE_WITH_MSG_OTHER_ROOT_ID")
         self.assertEqual(other["provider"], "tmdb")
         self.assertEqual(other["media_type"], "movie")
+        self.assertTrue(movie["scrape_enabled"])
+        self.assertFalse(other["scrape_enabled"])
 
     def test_load_category_config_allows_env_overrides(self):
         from pipeline.config import category_maps, load_category_config
@@ -1599,7 +1611,8 @@ class CategoryConfigTest(unittest.TestCase):
                 "MEDIA_PIPELINE_MOVIE_MSG_LIBRARY_ID": "library-override",
                 "MEDIA_PIPELINE_MOVIE_MSG_ROOT_ID": "root-override",
                 "MEDIA_PIPELINE_MOVIE_MSG_PROVIDER": "tmdb",
-                "MEDIA_PIPELINE_MOVIE_MSG_MEDIA_TYPE": "movie",
+                    "MEDIA_PIPELINE_MOVIE_MSG_MEDIA_TYPE": "movie",
+                    "MEDIA_PIPELINE_MOVIE_MSG_SCRAPE_ENABLED": "false",
             }
         )
         folder_ids, openlist_paths, msg_roots = category_maps(config)
@@ -1608,6 +1621,7 @@ class CategoryConfigTest(unittest.TestCase):
         self.assertEqual(openlist_paths["movie"], "/115/电影新")
         self.assertEqual(msg_roots["movie"]["library_id"], "library-override")
         self.assertEqual(msg_roots["movie"]["root_id"], "root-override")
+        self.assertFalse(msg_roots["movie"]["scrape_enabled"])
         self.assertEqual(folder_ids["adult"], "REPLACE_WITH_115_ADULT_CID")
 
     def test_default_category_config_does_not_embed_instance_ids(self):

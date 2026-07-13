@@ -583,6 +583,26 @@ class CandidateStoreTest(unittest.TestCase):
 
 
 class TaskStateMachineTest(unittest.TestCase):
+
+    def test_task_state_machine_treats_skipped_scrape_as_synced(self):
+        from pipeline.task_state import TASK_STATE
+        from pipeline.telegram_ui import format_task_status_message
+
+        self.assertTrue(
+            TASK_STATE.msg_synced(
+                {
+                    "msg_sync_status": "success",
+                    "msg_scrape_status": "skipped",
+                }
+            )
+        )
+        message = format_task_status_message(
+            "Archive",
+            {"msg_sync_status": "success", "msg_scrape_status": "skipped"},
+            category="other",
+        )
+        self.assertIn("MSG刮削：已跳过", message)
+
     def test_task_state_machine_marks_first_running_stage_failed(self):
         from pipeline.task_state import TASK_STATE
 
@@ -4579,6 +4599,45 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["msg_scrape_status"], "success")
         self.assertEqual(task["msg_media_id"], "media-1")
         self.assertIsNone(task["msg_error"])
+
+    def test_sync_completed_other_task_scans_without_scraping(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+        from pipeline.task_state import TASK_STATE
+
+        events = []
+        fake_msg = FakeMediaStationClient(
+            search_response={"data": {"items": [{"id": "media-other", "library_id": "test-other-library", "title": "Archive"}]}}
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
+        ), patch("pipeline.bot.OpenListClient", side_effect=lambda url, token: RetryOpenList(events)):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    msg_sync_poll_seconds=0,
+                    openlist_pre_scan_clean_enabled=False,
+                )
+            )
+            task = service.sync_completed_task(
+                "other",
+                "Archive",
+                {"info_hash": "OTHER", "status_name": "success", "name": "Archive.bin"},
+            )
+
+        self.assertEqual(events, [("openlist", "/115/其他", True)])
+        self.assertEqual(fake_msg.scan_calls, [("test-other-library", "test-other-root")])
+        self.assertEqual(fake_msg.scrape_calls, [])
+        self.assertEqual(task["msg_sync_status"], "success")
+        self.assertEqual(task["msg_scrape_status"], "skipped")
+        self.assertEqual(task["msg_scrape_mode"], "disabled")
+        self.assertEqual(task["msg_scrape_reason"], "category_disabled")
+        self.assertTrue(TASK_STATE.msg_synced(task))
 
     def test_sync_completed_movie_task_applies_unique_clean_scrape_match(self):
         from pipeline.bot import BotConfig, PipelineBotService

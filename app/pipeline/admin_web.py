@@ -13,7 +13,7 @@ import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from pipeline.task_state import STATUS_FAILED, STATUS_RUNNING, STATUS_SUCCESS, TASK_STATE
+from pipeline.task_state import STATUS_FAILED, STATUS_RUNNING, TASK_STATE
 
 
 DEFAULT_ADMIN_WEB_HOST = "127.0.0.1"
@@ -330,7 +330,7 @@ def task_status_group(task):
         return "failed"
     if TASK_STATE.status_name(task) in ("failed", "cancelled"):
         return "failed"
-    if TASK_STATE.is_offline_success(task) and task.get("msg_scrape_status") == STATUS_SUCCESS:
+    if TASK_STATE.is_offline_success(task) and TASK_STATE.msg_synced(task):
         return "success"
     if TASK_STATE.is_offline_success(task) and not task.get("msg_sync_status"):
         return "pending"

@@ -2394,10 +2394,23 @@ class PipelineBotService:
                 }
             )
 
-        if progress.get("msg_scrape_status") != "success":
-            emit({"msg_scrape_status": "running", "msg_media_id": media_id, "msg_media_title": media_title})
-            scrape_result = self._scrape_msg_media(get_msg_client(), category, media_id, title, progress, media)
-            emit({"msg_scrape_status": "success", "msg_media_id": media_id, "msg_media_title": media_title, **scrape_result})
+        if not stage_is_complete(progress.get("msg_scrape_status")):
+            if not root.get("scrape_enabled", True):
+                emit(
+                    {
+                        "msg_scrape_status": "skipped",
+                        "msg_scrape_mode": "disabled",
+                        "msg_scrape_reason": "category_disabled",
+                        "msg_media_id": media_id,
+                        "msg_media_title": media_title,
+                    }
+                )
+            else:
+                emit({"msg_scrape_status": "running", "msg_media_id": media_id, "msg_media_title": media_title})
+                scrape_result = self._scrape_msg_media(get_msg_client(), category, media_id, title, progress, media)
+                emit({"msg_scrape_status": "success", "msg_media_id": media_id, "msg_media_title": media_title, **scrape_result})
+        if not stage_is_complete(progress.get("msg_scrape_status")):
+            raise RuntimeError("MediaStationGo scrape stage incomplete")
         extras_result = prefixed_task_fields(progress, "msg_extra_cleanup_")
         movie_cleanup_touched_openlist = int(clean_result.get("openlist_hidden_count") or 0) > 0 or int(
             clean_result.get("openlist_cleaned_count") or 0
@@ -2453,7 +2466,7 @@ class PipelineBotService:
         return {
             "msg_sync_status": "success",
             "msg_scan_status": "success",
-            "msg_scrape_status": "success",
+            "msg_scrape_status": progress.get("msg_scrape_status"),
             "msg_library_id": msg_library_id,
             "msg_root_id": msg_root_id,
             "msg_media_id": media_id,

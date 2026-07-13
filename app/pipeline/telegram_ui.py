@@ -430,6 +430,8 @@ def append_task_lines(lines, task, category=None):
     if task.get("msg_scrape_status"):
         if task.get("msg_scrape_status") == "success":
             lines.append("MSG刮削：已完成")
+        elif task.get("msg_scrape_status") == "skipped":
+            lines.append("MSG刮削：已跳过")
         elif task.get("msg_scrape_status") == "running":
             lines.append("MSG刮削：进行中")
         else:

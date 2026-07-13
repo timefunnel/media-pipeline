@@ -19,6 +19,7 @@ DEFAULT_CATEGORY_CONFIG = {
             "root_id": "REPLACE_WITH_MSG_MOVIE_ROOT_ID",
             "provider": "tmdb",
             "media_type": "movie",
+            "scrape_enabled": True,
         },
     },
     "tv": {
@@ -29,6 +30,7 @@ DEFAULT_CATEGORY_CONFIG = {
             "root_id": "REPLACE_WITH_MSG_TV_ROOT_ID",
             "provider": "tmdb",
             "media_type": "tv",
+            "scrape_enabled": True,
         },
     },
     "anime": {
@@ -39,6 +41,7 @@ DEFAULT_CATEGORY_CONFIG = {
             "root_id": "REPLACE_WITH_MSG_ANIME_ROOT_ID",
             "provider": "tmdb",
             "media_type": "anime",
+            "scrape_enabled": True,
         },
     },
     "adult": {
@@ -49,6 +52,7 @@ DEFAULT_CATEGORY_CONFIG = {
             "root_id": "REPLACE_WITH_MSG_ADULT_ROOT_ID",
             "provider": "adult",
             "media_type": "adult",
+            "scrape_enabled": True,
         },
     },
     "other": {
@@ -59,6 +63,7 @@ DEFAULT_CATEGORY_CONFIG = {
             "root_id": "REPLACE_WITH_MSG_OTHER_ROOT_ID",
             "provider": "tmdb",
             "media_type": "movie",
+            "scrape_enabled": False,
         },
     },
 }
@@ -144,6 +149,9 @@ def _apply_category_config(config, overrides):
             "root_id": values.get("msg_root_id") or values.get("root_id") or values.get("rootId"),
             "provider": values.get("provider"),
             "media_type": values.get("media_type") or values.get("mediaType"),
+            "scrape_enabled": values["scrape_enabled"]
+            if "scrape_enabled" in values
+            else values.get("scrapeEnabled"),
         }
         for key, value in nested_msg.items():
             if key in ("library_id", "libraryId"):
@@ -152,9 +160,13 @@ def _apply_category_config(config, overrides):
                 flat_msg["root_id"] = value
             elif key in ("provider", "media_type", "mediaType"):
                 flat_msg["media_type" if key == "mediaType" else key] = value
+            elif key in ("scrape_enabled", "scrapeEnabled"):
+                flat_msg["scrape_enabled"] = value
 
         for key, value in flat_msg.items():
-            if value not in (None, ""):
+            if key == "scrape_enabled" and value not in (None, ""):
+                msg[key] = _category_config_bool(value, "%s.msg.scrape_enabled" % category)
+            elif value not in (None, ""):
                 msg[key] = str(value).strip()
 
 
@@ -168,6 +180,7 @@ def _apply_category_env_overrides(config, env):
             (prefix + "_MSG_ROOT_ID", "msg_root_id"),
             (prefix + "_MSG_PROVIDER", "provider"),
             (prefix + "_MSG_MEDIA_TYPE", "media_type"),
+            (prefix + "_MSG_SCRAPE_ENABLED", "scrape_enabled"),
         ):
             value = str(env.get(env_key) or "").strip()
             if value:
@@ -189,6 +202,20 @@ def _validate_category_config(config):
         for key in ("library_id", "root_id", "provider", "media_type"):
             if not str(msg.get(key) or "").strip():
                 raise RuntimeError("library config for %s missing msg.%s" % (category, key))
+        msg["scrape_enabled"] = _category_config_bool(
+            msg.get("scrape_enabled", True), "%s.msg.scrape_enabled" % category
+        )
+
+
+def _category_config_bool(value, label):
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise RuntimeError("invalid boolean for %s: %s" % (label, value))
 
 
 FOLDER_IDS, OPENLIST_PATHS, MSG_LIBRARY_ROOTS = category_maps()

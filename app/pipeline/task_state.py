@@ -74,7 +74,7 @@ class TaskStateMachine:
 
     def msg_synced(self, task):
         task = task or {}
-        return task.get("msg_sync_status") == STATUS_SUCCESS and task.get("msg_scrape_status") == STATUS_SUCCESS
+        return task.get("msg_sync_status") == STATUS_SUCCESS and self.stage_is_complete(task.get("msg_scrape_status"))
 
     def sync_is_running(self, task):
         task = task or {}
