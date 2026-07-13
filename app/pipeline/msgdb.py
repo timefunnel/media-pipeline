@@ -357,6 +357,35 @@ class MediaStationDbClient:
             "media_ids": media_ids,
         }
 
+    def create_temporary_library_root(self, category, openlist_path):
+        root = category_to_msg_library_root(category)
+        openlist_path = normalize_openlist_path(openlist_path)
+        if not openlist_path:
+            raise ValueError("temporary library root path must not be empty")
+        root_id = new_uuid()
+        cloud_path = openlist_path_to_cloud_path(openlist_path)
+        with self._connect() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    insert into library_roots (
+                        id, created_at, updated_at, deleted_at, library_id, name, path, enabled, sort_order
+                    ) values (%s, now(), now(), null, %s, %s, %s, true, 9999)
+                    """,
+                    (root_id, root["library_id"], posixpath.basename(openlist_path.rstrip("/")) or "target", cloud_path),
+                )
+        return {"root_id": root_id, "path": cloud_path}
+
+    def reassign_media_root(self, media_id, root_id):
+        with self._connect() as conn:
+            with conn.transaction():
+                conn.execute("update media set library_root_id = %s, updated_at = now() where id = %s", (root_id, media_id))
+
+    def delete_library_root(self, root_id):
+        with self._connect() as conn:
+            with conn.transaction():
+                conn.execute("delete from library_roots where id = %s", (root_id,))
+
     def _connect(self):
         if self._connect_override is not None:
             return self._connect_override()

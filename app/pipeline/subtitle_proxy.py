@@ -20,8 +20,7 @@ except ImportError:
     Image = None
     ImageOps = None
 
-ADULT_ARTWORK_PUBLIC_PATH = "/pipeline-artwork/adult"
-DEFAULT_ADULT_ARTWORK_CACHE_DIR = "/artwork-cache/adult"
+from pipeline.adult_metadata import ADULT_ARTWORK_PUBLIC_PATH, DEFAULT_ADULT_ARTWORK_CACHE_DIR
 from pipeline.config import DEFAULT_MSG_DATABASE_DSN, category_to_msg_library_root
 from pipeline.mediastation import iter_code_matches
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider

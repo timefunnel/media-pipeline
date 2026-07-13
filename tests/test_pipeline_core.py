@@ -33,7 +33,6 @@ for _category, _prefix in {
 
 from pipeline.client115 import Client115
 from pipeline.config import category_to_folder_id, category_to_msg_library_root, category_to_openlist_path
-from pipeline.mediastation import extract_scrape_matches
 from pipeline.mediastation import (
     MediaStationClient,
     MediaStationApiError,
@@ -46,7 +45,6 @@ from pipeline.mediastation import (
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes, normalize_task, task_can_cancel, wait_for_task
 from pipeline.openlist import OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider, extract_openlist_login_token
 from pipeline.openlist_tokens import OpenListTokenStore
-from pipeline.bot import msg_target_openlist_paths
 from pipeline.prowlarr import ProwlarrClient, ProwlarrConfig, torrent_bytes_to_magnet
 from pipeline.resource_selector import ResourceSelector
 from pipeline.subtitle_proxy import (
@@ -363,14 +361,14 @@ class FakeMediaStationClient:
         get_response=None,
         events=None,
         scrape_search_responses=None,
-        pipeline_scrape_response=None,
+        artwork_repair_response=None,
     ):
         self.search_response = search_response or {"data": {"items": []}}
         self.list_response = list_response or {"data": {"items": []}}
         self.get_response = get_response
         self.events = events
         self.scrape_search_responses = scrape_search_responses or {}
-        self.pipeline_scrape_response = pipeline_scrape_response
+        self.artwork_repair_response = artwork_repair_response or {"status": "skipped", "updated": 0, "reason": "not_needed"}
         self.scan_calls = []
         self.search_calls = []
         self.list_calls = []
@@ -378,16 +376,7 @@ class FakeMediaStationClient:
         self.scrape_calls = []
         self.scrape_search_calls = []
         self.scrape_apply_calls = []
-        self.pipeline_scrape_calls = []
-        self.repair_movie_extras_calls = []
-        self.repair_episode_visibility_calls = []
-        self.prune_deleted_media_calls = []
-        self.pipeline_ingest_start_calls = []
-        self.pipeline_ingest_get_calls = []
-        self.pipeline_ingest_jobs = {}
-        self.repair_movie_extras_response = {"status": "success", "updated": 0, "media_count": 1}
-        self.repair_episode_visibility_response = {"status": "success", "updated": 0, "media_count": 1}
-        self.prune_deleted_media_response = {"status": "skipped", "deleted": 0, "reason": "no_deleted_media", "media_ids": []}
+        self.artwork_repair_calls = []
 
     def scan_root(self, library_id, root_id):
         self.scan_calls.append((library_id, root_id))
@@ -402,17 +391,6 @@ class FakeMediaStationClient:
     def list_library_media(self, library_id, page=1, page_size=200, group_versions=0):
         self.list_calls.append((library_id, page, page_size, group_versions))
         return self.list_response
-
-    def pipeline_scrape_media(self, media_id, payload):
-        payload = dict(payload or {})
-        self.pipeline_scrape_calls.append((media_id, payload))
-        if self.pipeline_scrape_response is not None:
-            return dict(self.pipeline_scrape_response)
-        for query in payload.get("queries") or []:
-            matches = extract_scrape_matches(self.scrape_search_responses.get(query, {"items": []}))
-            if len(matches) == 1:
-                return {"mode": "apply", "query": query, "match_count": 1}
-        return {"mode": "smart", "query": None, "match_count": 0}
 
     def scrape_media(self, media_id):
         self.scrape_calls.append(media_id)
@@ -434,113 +412,11 @@ class FakeMediaStationClient:
         self.scrape_apply_calls.append((media_id, match))
         return {"ok": True}
 
-    def repair_movie_extras(self, media_id, category, library_id=None, root_id=None, root_openlist_path=None):
-        self.repair_movie_extras_calls.append((media_id, category, library_id, root_id, root_openlist_path))
-        return dict(self.repair_movie_extras_response)
-
-    def repair_episode_visibility(self, media_id, category, library_id=None, root_id=None, root_openlist_path=None):
-        self.repair_episode_visibility_calls.append((media_id, category, library_id, root_id, root_openlist_path))
-        return dict(self.repair_episode_visibility_response)
-
-    def prune_deleted_media(self, category, openlist_paths, library_id=None, root_id=None, root_openlist_path=None):
-        self.prune_deleted_media_calls.append((category, list(openlist_paths or []), library_id, root_id, root_openlist_path))
-        return dict(self.prune_deleted_media_response)
-
-    def start_pipeline_ingest(self, payload):
-        payload = dict(payload or {})
-        self.pipeline_ingest_start_calls.append(payload)
-        library_id = payload.get("library_id")
-        root_id = payload.get("root_id")
-        category = payload.get("category")
-        root_openlist_path = payload.get("root_openlist_path")
-        result = {}
-        if payload.get("prune_deleted_openlist_paths"):
-            result["deleted_media_prune"] = self.prune_deleted_media(
-                category,
-                payload.get("prune_deleted_openlist_paths"),
-                library_id=library_id,
-                root_id=root_id,
-                root_openlist_path=root_openlist_path,
-            )
-        if payload.get("scan"):
-            self.scan_root(library_id, root_id)
-            result["scan"] = {"library_id": library_id, "visited": 1, "added": 0, "updated": 1, "skipped": 0, "probed": 0, "removed": 0}
-        media = self._pipeline_ingest_media(payload)
-        if not media:
-            job = {"id": "ingest-1", "status": "failed", "error": "MediaStationGo media not found after root scan", "result": result}
-            self.pipeline_ingest_jobs[job["id"]] = job
-            return job
-        result["media"] = media
-        if payload.get("repair_movie_extras"):
-            result["movie_extras"] = self.repair_movie_extras(
-                media.get("id"),
-                category,
-                library_id=library_id,
-                root_id=root_id,
-                root_openlist_path=root_openlist_path,
-            )
-        if payload.get("repair_episode_visibility"):
-            result["episode_visibility"] = self.repair_episode_visibility(
-                media.get("id"),
-                category,
-                library_id=library_id,
-                root_id=root_id,
-                root_openlist_path=root_openlist_path,
-            )
-        job = {"id": "ingest-1", "status": "completed", "result": result}
-        self.pipeline_ingest_jobs[job["id"]] = job
-        return job
-
-    def get_pipeline_ingest(self, job_id):
-        self.pipeline_ingest_get_calls.append(job_id)
-        return self.pipeline_ingest_jobs[job_id]
-
-    def _pipeline_ingest_media(self, payload):
-        targets = list(payload.get("target_openlist_paths") or [])
-        if targets:
-            self.list_calls.append((payload.get("library_id"), 1, 200, 0))
-            media = self._pipeline_ingest_match_target(extract_media_items(self.list_response), targets)
-            if media:
-                return media
-            for query in payload.get("queries") or []:
-                self.search_calls.append((query, 20))
-                media = self._pipeline_ingest_match_target(extract_media_items(self.search_response), targets)
-                if media:
-                    return media
-            if payload.get("require_target_path"):
-                return None
-            items = extract_media_items(self.search_response)
-            if items:
-                media = dict(items[0])
-                media.setdefault("match_mode", "query")
-                return media
-        for query in payload.get("queries") or []:
-            self.search_calls.append((query, 20))
-            items = extract_media_items(self.search_response)
-            if items:
-                media = dict(items[0])
-                media.setdefault("match_mode", "query")
-                return media
-        items = extract_media_items(self.list_response)
-        if items:
-            media = dict(items[0])
-            media.setdefault("match_mode", "query")
-            return media
-        return None
-
-    def _pipeline_ingest_match_target(self, items, targets):
-        from pipeline.msgdb import cloud_path_to_openlist_path, normalize_openlist_path
-
-        for item in items or []:
-            path = cloud_path_to_openlist_path((item or {}).get("path"))
-            for target in targets:
-                target = normalize_openlist_path(target)
-                if path == target or path.startswith(target.rstrip("/") + "/"):
-                    media = dict(item)
-                    media["match_mode"] = "path"
-                    media["match_path"] = item.get("path")
-                    return media
-        return None
+    def repair_adult_artwork(self, media_id, **_kwargs):
+        self.artwork_repair_calls.append(media_id)
+        if self.events is not None:
+            self.events.append(("artwork_repair",))
+        return self.artwork_repair_response
 
 
 
@@ -579,22 +455,6 @@ class FakeSubtitleProxyHandler(SubtitleProxyHandler):
 
     def _log_timing(self, timing, status, request_path):
         self.logged_timing = (status, request_path)
-
-
-class MsgTargetOpenListPathsTest(unittest.TestCase):
-    def test_authoritative_path_omits_stale_task_name(self):
-        task = {
-            "name": "ABF-246-U",
-            "openlist_adult_format_new_path": "/115/成人/ABF-246",
-            "openlist_adult_format_old_path": "/115/成人/ABF-246-U",
-        }
-
-        self.assertEqual(msg_target_openlist_paths("adult", task), ["/115/成人/ABF-246"])
-
-    def test_falls_back_to_task_name_without_authoritative_path(self):
-        task = {"name": "ABF-246-U"}
-
-        self.assertEqual(msg_target_openlist_paths("adult", task), ["/115/成人/ABF-246-U"])
 
 
 class EmbyStreamProxyCompatTest(unittest.TestCase):

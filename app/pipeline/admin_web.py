@@ -47,6 +47,7 @@ STAGE_LABELS = (
     ("msg_scrape_status", "MSG刮削"),
     ("msg_extra_cleanup_status", "特典隐藏"),
     ("msg_visibility_repair_status", "可见性修复"),
+    ("msg_artwork_repair_status", "图片修复"),
     ("subtitle_match_status", "字幕匹配"),
 )
 
@@ -58,6 +59,7 @@ ERROR_FIELDS = (
     ("msg_error", "MSG"),
     ("msg_extra_cleanup_error", "特典隐藏"),
     ("msg_visibility_repair_error", "可见性修复"),
+    ("msg_artwork_repair_error", "图片修复"),
     ("subtitle_match_error", "字幕匹配"),
 )
 
@@ -344,6 +346,7 @@ def summarize_tasks(records):
         "failed": 0,
         "success": 0,
         "pending": 0,
+        "adult_artwork_failed": 0,
         "subtitle_failed": 0,
     }
     for record in records or []:
@@ -351,6 +354,8 @@ def summarize_tasks(records):
         group = task_status_group(record.get("task"))
         summary[group] = summary.get(group, 0) + 1
         task = record.get("task") or {}
+        if task.get("msg_artwork_repair_status") == STATUS_FAILED:
+            summary["adult_artwork_failed"] += 1
         if task.get("subtitle_match_status") == STATUS_FAILED:
             summary["subtitle_failed"] += 1
     return summary
@@ -1422,6 +1427,7 @@ MSG_AUTH_APP_JS = r"""
       metric("进行中", summary.running || 0, "running"),
       metric("失败", summary.failed || 0, "failed"),
       metric("已完成", summary.success || 0, "success"),
+      metric("图片失败", summary.adult_artwork_failed || 0, "failed"),
       metric("字幕失败", summary.subtitle_failed || 0, "failed")
     ].join("");
   }
@@ -1553,6 +1559,7 @@ MSG_AUTH_APP_JS = r"""
       ["msg_scrape_status", "MSG刮削"],
       ["msg_extra_cleanup_status", "特典隐藏"],
       ["msg_visibility_repair_status", "可见性修复"],
+      ["msg_artwork_repair_status", "图片修复"],
       ["subtitle_match_status", "字幕匹配"]
     ];
     const rows = labels.filter(([key]) => task && task[key]).map(([key, label]) => `<div class="stage"><span>${escapeHtml(label)}</span>${statusBadge(task[key])}</div>`);

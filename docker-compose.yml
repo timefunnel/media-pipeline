@@ -33,6 +33,40 @@ x-media-pipeline-library-env: &media-pipeline-library-env
   MEDIA_PIPELINE_OTHER_MSG_MEDIA_TYPE: "${MEDIA_PIPELINE_OTHER_MSG_MEDIA_TYPE:-movie}"
 
 services:
+  pansou:
+    image: "${PANSOU_IMAGE:-ghcr.io/fish2018/pansou:latest}"
+    container_name: pansou
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PANSOU_PORT:-8888}:8888"
+    environment:
+      PORT: "8888"
+      CHANNELS: "${PANSOU_SERVER_CHANNELS:-tgsearchers6,yunpanx,yp123pan,wp123zy,Lsp115,oneonefivewpfx,Channel_Shares_115,vip115hot,gimy115,gimy115iso,gokuapan,Q_dongman,Netdisk_Movies}"
+      ENABLED_PLUGINS: "${PANSOU_SERVER_ENABLED_PLUGINS:-hunhepan,jikepan,panwiki,pansearch,panta,qupansou,hdr4k,pan666,susu,qupanshe,xdpan,qqpd,gying,ash}"
+      CACHE_ENABLED: "${PANSOU_CACHE_ENABLED:-true}"
+      CACHE_PATH: /app/cache
+      CACHE_MAX_SIZE: "${PANSOU_CACHE_MAX_SIZE:-100}"
+      CACHE_TTL: "${PANSOU_CACHE_TTL:-60}"
+      ASYNC_PLUGIN_ENABLED: "${PANSOU_ASYNC_PLUGIN_ENABLED:-true}"
+      ASYNC_RESPONSE_TIMEOUT: "${PANSOU_ASYNC_RESPONSE_TIMEOUT:-4}"
+      ASYNC_MAX_BACKGROUND_WORKERS: "${PANSOU_ASYNC_MAX_BACKGROUND_WORKERS:-8}"
+      ASYNC_MAX_BACKGROUND_TASKS: "${PANSOU_ASYNC_MAX_BACKGROUND_TASKS:-40}"
+      ASYNC_CACHE_TTL_HOURS: "${PANSOU_ASYNC_CACHE_TTL_HOURS:-1}"
+      AUTH_ENABLED: "${PANSOU_AUTH_ENABLED:-false}"
+      AUTH_USERS: "${PANSOU_AUTH_USERS:-}"
+      AUTH_TOKEN_EXPIRY: "${PANSOU_AUTH_TOKEN_EXPIRY:-24}"
+      AUTH_JWT_SECRET: "${PANSOU_AUTH_JWT_SECRET:-}"
+    mem_limit: "${PANSOU_MEM_LIMIT:-512m}"
+    cpus: "${PANSOU_CPUS:-1.0}"
+    volumes:
+      - "${PANSOU_CACHE_DIR:-/data/pansou/cache}:/app/cache"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8888/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   media-pipeline:
     build: .
     container_name: media-pipeline
@@ -60,6 +94,7 @@ services:
       OPENLIST_TOKEN: "${OPENLIST_TOKEN:?OPENLIST_TOKEN missing}"
       OPENLIST_MEDIA_SCAN_USERNAME: "${OPENLIST_MEDIA_SCAN_USERNAME:?OPENLIST_MEDIA_SCAN_USERNAME missing}"
       OPENLIST_MEDIA_SCAN_PASSWORD: "${OPENLIST_MEDIA_SCAN_PASSWORD:?OPENLIST_MEDIA_SCAN_PASSWORD missing}"
+      P115_COOKIE: "${P115_COOKIE:-}"
       TG_BOT_TOKEN: "${TG_BOT_TOKEN:?TG_BOT_TOKEN missing}"
       TG_ALLOWED_USER_IDS: "${TG_ALLOWED_USER_IDS:-700656624}"
       <<: *media-pipeline-library-env
@@ -77,6 +112,13 @@ services:
       BOT_SEARCH_PAGE_SIZE: "${BOT_SEARCH_PAGE_SIZE:-5}"
       BOT_TASK_LIST_PAGE_SIZE: "${BOT_TASK_LIST_PAGE_SIZE:-5}"
       BOT_TASK_LIST_FETCH_LIMIT: "${BOT_TASK_LIST_FETCH_LIMIT:-100}"
+      PANSOU_ENABLED: "${PANSOU_ENABLED:-0}"
+      PANSOU_URL: "${PANSOU_URL:-http://127.0.0.1:8888}"
+      PANSOU_TOKEN: "${PANSOU_TOKEN:-}"
+      PANSOU_TIMEOUT_SECONDS: "${PANSOU_TIMEOUT_SECONDS:-5}"
+      PANSOU_CLOUD_TYPES: "${PANSOU_CLOUD_TYPES:-115}"
+      PANSOU_SOURCE_TYPE: "${PANSOU_SOURCE_TYPE:-all}"
+      PANSOU_PLUGINS: "${PANSOU_PLUGINS:-}"
       TG_API_TIMEOUT: "${TG_API_TIMEOUT:-90}"
       BOT_SYNC_RECOVERY_INTERVAL_SECONDS: "${BOT_SYNC_RECOVERY_INTERVAL_SECONDS:-60}"
       BOT_TASK_WORKERS: "${BOT_TASK_WORKERS:-2}"

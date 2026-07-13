@@ -37,6 +37,7 @@ SYNC_STAGE_DEFINITIONS = (
     StageDefinition("msg_scrape_status"),
     StageDefinition("msg_extra_cleanup_status", "msg_extra_cleanup_error"),
     StageDefinition("msg_visibility_repair_status", "msg_visibility_repair_error"),
+    StageDefinition("msg_artwork_repair_status", "msg_artwork_repair_error"),
     StageDefinition("subtitle_match_status", "subtitle_match_error"),
 )
 

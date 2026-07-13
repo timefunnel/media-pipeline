@@ -52,6 +52,8 @@ def download_uri_label(value):
     value = str(value or "")
     if value.lower().startswith("magnet:"):
         return "磁链"
+    if "115.com/s/" in value or "115cdn.com/s/" in value:
+        return "115分享"
     if is_prowlarr_download_uri(value):
         return "Prowlarr下载项"
     if value:
@@ -79,20 +81,94 @@ def format_search_page_message(query, candidates, page, page_count, total, title
         lines.append(stats_line)
     for _candidate_id, candidate in candidates:
         rank = candidate.get("rank")
-        lines.append("%s. %s" % (rank, candidate.get("title")))
-        lines.append("站点：%s  做种：%s  大小：%s" % (candidate.get("indexer"), candidate.get("seeders"), format_size(candidate.get("size"))))
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.append("#%s %s" % (rank, candidate.get("title")))
+        append_candidate_detail_lines(lines, candidate)
     return "\n".join(lines)
 
 def format_library_choice_message(candidate):
     lines = ["已选择：%s" % candidate.get("title")]
     if candidate.get("rank"):
         lines.append("候选：#%s" % candidate.get("rank"))
-    lines.append("站点：%s  做种：%s  大小：%s" % (candidate.get("indexer"), candidate.get("seeders"), format_size(candidate.get("size"))))
+    append_candidate_detail_lines(lines, candidate)
     lines.append("链接类型：%s" % download_uri_label(candidate.get("download_uri")))
     info_hash = candidate_info_hash(candidate)
     if info_hash:
         lines.append("info_hash：%s" % info_hash)
     return "\n".join(lines)
+
+def append_candidate_detail_lines(lines, candidate):
+    if (candidate or {}).get("source_kind") == "115_share":
+        source = candidate.get("indexer") or candidate.get("pansou_channel") or "-"
+        append_pansou_field_lines(lines, candidate)
+        lines.append("来源：%s  类型：115分享" % source)
+        share_parts = []
+        if candidate.get("shareCode"):
+            share_parts.append("分享：%s" % candidate.get("shareCode"))
+        if candidate.get("sharePassword"):
+            share_parts.append("提取：%s" % candidate.get("sharePassword"))
+        if share_parts:
+            lines.append("  ".join(share_parts))
+        summary = truncate_candidate_text(candidate.get("pansou_summary"), 110)
+        if summary and not pansou_has_detail_fields(candidate):
+            lines.append("摘要：%s" % summary)
+        return
+    lines.append("站点：%s  做种：%s  大小：%s" % (candidate.get("indexer"), candidate.get("seeders"), format_size(candidate.get("size"))))
+
+def append_pansou_field_lines(lines, candidate):
+    fields = (candidate or {}).get("pansou_fields") or {}
+    version = fields.get("version")
+    resource_type = fields.get("resource_type")
+    primary_parts = []
+    size_label = share_candidate_size_label(candidate)
+    if size_label and size_label != "未知":
+        primary_parts.append("大小：%s" % size_label)
+    if resource_type:
+        primary_parts.append("规格：%s" % truncate_candidate_text(resource_type, 42))
+    if version:
+        primary_parts.append("版本：%s" % truncate_candidate_text(version, 30))
+    if primary_parts:
+        lines.append("  ".join(primary_parts))
+    elif size_label:
+        lines.append("大小：%s" % size_label)
+    if fields.get("subtitles"):
+        lines.append("字幕：%s" % truncate_candidate_text(fields.get("subtitles"), 150))
+    if fields.get("audio"):
+        lines.append("音频：%s" % truncate_candidate_text(fields.get("audio"), 150))
+    if fields.get("filename"):
+        lines.append("文件：%s" % truncate_candidate_text(fields.get("filename"), 150))
+    tail_parts = []
+    if fields.get("country"):
+        tail_parts.append("国家：%s" % truncate_candidate_text(fields.get("country"), 24))
+    if fields.get("tmdb"):
+        tail_parts.append("TMDB：%s" % truncate_candidate_text(fields.get("tmdb"), 24))
+    if fields.get("tags"):
+        tail_parts.append("标签：%s" % truncate_candidate_text(fields.get("tags"), 70))
+    if tail_parts:
+        lines.append("  ".join(tail_parts))
+
+def pansou_has_detail_fields(candidate):
+    fields = (candidate or {}).get("pansou_fields") or {}
+    return any(fields.get(key) for key in ("version", "audio", "subtitles", "filename", "resource_type", "tmdb", "size", "tags"))
+
+def share_candidate_size_label(candidate):
+    size_text = str((candidate or {}).get("pansou_size_text") or "").strip()
+    if size_text:
+        return size_text
+    size = (candidate or {}).get("size")
+    if size in (None, "", 0):
+        return "未知"
+    return format_size(size)
+
+def truncate_candidate_text(value, limit):
+    value = " ".join(str(value or "").split())
+    if not value:
+        return ""
+    limit = int(limit)
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)].rstrip() + "..."
 
 def format_duplicate_message(candidate, duplicate):
     if duplicate.get("level") == "strong":
@@ -182,11 +258,18 @@ def format_dedupe_refresh_message(entries, count):
 
 def format_submit_message(candidate, result, category=None, content_profile=None):
     lines = ["已提交：%s" % candidate.get("title")]
+    if result.get("submit_kind") == "115_share_receive":
+        lines[0] = "已转存115分享：%s" % candidate.get("title")
     if category:
         lines.append("入库目录：%s" % CATEGORY_LABELS.get(category, category))
     if content_profile:
         lines.append("内容分类：%s" % CONTENT_PROFILE_LABELS.get(content_profile, content_profile))
     for task in result.get("tasks") or []:
+        if task_is_115_share_receive(task):
+            lines.append("任务ID：%s" % task.get("info_hash"))
+            if task.get("share_code"):
+                lines.append("分享码：%s" % task.get("share_code"))
+            continue
         if task.get("info_hash"):
             lines.append("info_hash：%s" % task["info_hash"])
     task_status = result.get("task_status")
@@ -216,6 +299,7 @@ def task_diagnostic_stage_values(task):
         ("msg_scrape_status", "MSG刮削"),
         ("msg_extra_cleanup_status", "特典隐藏"),
         ("msg_visibility_repair_status", "可见性修复"),
+        ("msg_artwork_repair_status", "图片修复"),
         ("subtitle_match_status", "字幕匹配"),
     ):
         value = (task or {}).get(key)
@@ -273,7 +357,12 @@ def format_task_list_message(records, page=0, page_count=1, total=None, page_siz
     return "\n".join(lines)
 
 def append_task_lines(lines, task, category=None):
-    if task.get("info_hash"):
+    if task_is_115_share_receive(task):
+        lines.append("任务类型：115分享转存")
+        lines.append("任务ID：%s" % task.get("info_hash"))
+        if task.get("share_code"):
+            lines.append("分享码：%s" % task.get("share_code"))
+    elif task.get("info_hash"):
         lines.append("info_hash：%s" % task["info_hash"])
     lines.append("当前状态：%s" % (task.get("status_name") or "-"))
     if task.get("percent_done") is not None:
@@ -354,6 +443,23 @@ def append_task_lines(lines, task, category=None):
             lines.append("MSG可见性修复：失败")
             if task.get("msg_visibility_repair_error"):
                 lines.append("可见性修复错误：%s" % task.get("msg_visibility_repair_error"))
+    if category == "adult" and task.get("msg_artwork_repair_status"):
+        if task.get("msg_artwork_repair_status") == "success":
+            lines.append("成人图片修复：已完成（%s 项）" % (task.get("msg_artwork_repair_updated") or 0))
+        elif task.get("msg_artwork_repair_status") == "running":
+            lines.append("成人图片修复：进行中")
+        elif task.get("msg_artwork_repair_reason") == "replacement_not_found":
+            lines.append("成人图片修复：未完成（未找到可直连替代图源）")
+        elif task.get("msg_artwork_repair_reason") == "public_base_url_missing":
+            lines.append("成人图片修复：未完成（未配置公开图片地址）")
+        elif task.get("msg_artwork_repair_reason") == "usable_image_not_found":
+            lines.append("成人图片修复：未完成（候选图不可用）")
+        elif task.get("msg_artwork_repair_reason") == "not_needed":
+            lines.append("成人图片修复：无需处理")
+        elif task.get("msg_artwork_repair_status") != "skipped":
+            lines.append("成人图片修复：失败")
+            if task.get("msg_artwork_repair_error"):
+                lines.append("图片修复错误：%s" % task.get("msg_artwork_repair_error"))
     if task.get("subtitle_match_status"):
         if task.get("subtitle_match_status") == "success":
             lines.append(
@@ -398,6 +504,7 @@ def search_page_reply_markup(
     allow_anime_retry=False,
     allow_bt4g_retry=False,
     allow_llm_rerank=False,
+    allow_pansou_search=False,
 ):
     rows = []
     for candidate_id, candidate in candidates:
@@ -419,12 +526,22 @@ def search_page_reply_markup(
         retry.append({"text": "动漫", "callback_data": "anime_search:%s" % session_id})
     if allow_bt4g_retry:
         retry.append({"text": "BT4G", "callback_data": "bt4g_search:%s" % session_id})
+    if allow_pansou_search:
+        retry.append({"text": "网盘搜索", "callback_data": "pansou_search:%s" % session_id})
     if retry:
         rows.append(retry)
     if allow_llm_rerank:
         rows.append([{"text": "LLM优选", "callback_data": "llm_rerank:%s" % session_id}])
     rows.append([{"text": "关闭", "callback_data": "close_search:%s" % session_id}])
     return {"inline_keyboard": rows}
+
+def task_is_115_share_receive(task):
+    return (task or {}).get("source_kind") == "115_share"
+
+def submit_callback_text(result):
+    if (result or {}).get("submit_kind") == "115_share_receive":
+        return "已转存115分享"
+    return "已提交 115 离线"
 
 def search_page_jump_buttons(session_id, page, page_count):
     if page_count <= 1:

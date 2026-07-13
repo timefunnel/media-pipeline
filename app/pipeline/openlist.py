@@ -7,6 +7,7 @@ import urllib.request
 DEFAULT_OPENLIST_URL = "http://127.0.0.1:5244"
 DEFAULT_OPENLIST_TOKEN_FILE = "/run/secrets/openlist_token"
 DEFAULT_LIST_PAGE_SIZE = 200
+DEFAULT_REMOVE_BATCH_SIZE = 50
 DEFAULT_META_LIST_PAGE_SIZE = 200
 
 
@@ -30,7 +31,7 @@ class OpenListTokenProvider:
 
 
 class OpenListPasswordTokenProvider:
-    def __init__(self, base_url, username, password, transport=None, timeout=30):
+    def __init__(self, base_url=DEFAULT_OPENLIST_URL, username="", password="", transport=None, timeout=30):
         self.base_url = str(base_url or DEFAULT_OPENLIST_URL).rstrip("/")
         self.username = str(username or "").strip()
         self.password = str(password or "")
@@ -39,16 +40,14 @@ class OpenListPasswordTokenProvider:
 
     def load_token(self):
         if not self.username or not self.password:
-            raise RuntimeError(
-                "OpenList media scan credentials missing; set OPENLIST_MEDIA_SCAN_USERNAME and OPENLIST_MEDIA_SCAN_PASSWORD"
-            )
+            raise RuntimeError("OpenList media scan credentials missing")
         response = self.transport.request(
             "POST",
             self.base_url + "/api/auth/login",
             data={"username": self.username, "password": self.password},
             timeout=self.timeout,
         )
-        if response.get("code") != 200:
+        if isinstance(response, dict) and response.get("code") not in (None, 200):
             raise RuntimeError("OpenList login failed: %s" % (response.get("message") or response.get("code")))
         token = extract_openlist_login_token(response)
         if not token:
@@ -82,18 +81,18 @@ class OpenListTransport:
 
 def extract_openlist_login_token(response):
     if not isinstance(response, dict):
-        return ""
+        return None
     data = response.get("data")
     if isinstance(data, dict):
-        for key in ("token", "access_token"):
-            value = str(data.get(key) or "").strip()
+        for key in ("token", "access_token", "accessToken"):
+            value = data.get(key)
             if value:
-                return value
-    for key in ("token", "access_token"):
-        value = str(response.get(key) or "").strip()
+                return str(value)
+    for key in ("token", "access_token", "accessToken"):
+        value = response.get(key)
         if value:
-            return value
-    return ""
+            return str(value)
+    return None
 
 
 class OpenListClient:
@@ -149,6 +148,22 @@ class OpenListClient:
             raise RuntimeError("OpenList get failed: %s" % (response.get("message") or response.get("code")))
         return response
 
+    def remove_names(self, dir_path, names, batch_size=DEFAULT_REMOVE_BATCH_SIZE):
+        names = [str(name) for name in names if str(name or "").strip()]
+        responses = []
+        for index in range(0, len(names), int(batch_size)):
+            batch = names[index : index + int(batch_size)]
+            response = self.transport.request(
+                "POST",
+                self.base_url + "/api/fs/remove",
+                headers={"Authorization": self.token},
+                data={"dir": dir_path, "names": batch},
+                timeout=self.timeout,
+            )
+            if response.get("code") != 200:
+                raise RuntimeError("OpenList remove failed: %s" % (response.get("message") or response.get("code")))
+            responses.append(response)
+        return responses
 
     def rename_path(self, path, name):
         response = self.transport.request(

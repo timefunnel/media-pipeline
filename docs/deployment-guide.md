@@ -25,6 +25,7 @@ MediaStationGo + PostgreSQL
 
 media-pipeline
   - Telegram Bot 搜索、选择、提交 115 离线
+  - Telegram Bot 接收 115 分享链接并转存到指定 115 目录
   - 等待 115 完成，触发 OpenList 刷新和 MSG scan/scrape
   - 执行清理、番号格式化、成人图片修复、字幕匹配
   - subtitle proxy 为 Emby/Infuse 补外部字幕、文件夹封面、标题番号和播放兼容
@@ -418,6 +419,27 @@ MSG_DATABASE_DSN
 MEDIA_PIPELINE_*_FOLDER_ID
   115 目录 cid
 
+P115_COOKIE
+  115 网页 Cookie
+  仅用于 115 分享链接转存到当前账号目录；推荐部署后在 Telegram Bot 里使用 /p115_cookie 扫码写入 state.db
+  state.db 中已保存的 Cookie 优先于 P115_COOKIE，更新后无需重启 Bot
+  磁链离线和目录读取仍复用 OpenList 维护的 115 Open access_token/refresh_token
+
+PANSOU_ENABLED / PANSOU_URL
+  可选网盘搜索补充，仅用于 Bot 搜索结果里的“网盘搜索”按钮
+  启用后调用 PanSou /api/search，并只消费 115 分享结果；入库仍复用现有 115 分享转存链路
+  常用值：PANSOU_ENABLED=1，PANSOU_URL=http://127.0.0.1:8888
+
+PANSOU_TOKEN / PANSOU_TIMEOUT_SECONDS / PANSOU_CLOUD_TYPES / PANSOU_SOURCE_TYPE / PANSOU_PLUGINS
+  PanSou 认证和搜索参数；未启用 PanSou 认证时 PANSOU_TOKEN 留空
+  默认只查 115：PANSOU_CLOUD_TYPES=115
+  PANSOU_PLUGINS 是每次搜索请求指定的插件列表；通常留空，让 PanSou 服务端使用已启用插件
+
+PANSOU_IMAGE / PANSOU_PORT / PANSOU_CACHE_DIR / PANSOU_SERVER_CHANNELS / PANSOU_SERVER_ENABLED_PLUGINS
+  PanSou 服务端容器配置；默认使用 ghcr.io/fish2018/pansou:latest
+  服务只绑定 127.0.0.1:8888，缓存默认写入 /data/pansou/cache
+  PANSOU_SERVER_CHANNELS 和 PANSOU_SERVER_ENABLED_PLUGINS 控制 PanSou 自身可用搜索源
+
 MEDIA_PIPELINE_*_MSG_LIBRARY_ID / MSG_ROOT_ID
   通常留空，由 pipeline 根据 MSG_DATABASE_DSN 自动发现；仅在自动发现歧义时手动覆盖
 ```
@@ -426,6 +448,7 @@ MEDIA_PIPELINE_*_MSG_LIBRARY_ID / MSG_ROOT_ID
 
 ```bash
 cd /opt/media-pipeline
+docker compose up -d pansou
 docker compose build media-pipeline-bot media-pipeline-subtitle-proxy
 docker compose up -d media-pipeline-bot media-pipeline-subtitle-proxy
 ```
@@ -466,6 +489,7 @@ pipeline CLI：
 cd /opt/media-pipeline
 docker exec media-pipeline-bot python -m pipeline.cli folders
 docker exec media-pipeline-bot python -m pipeline.cli verify-folders
+docker exec media-pipeline-bot python -m pipeline.cli verify-folders
 docker exec media-pipeline-bot python -m pipeline.cli msg-login
 ```
 
@@ -476,6 +500,7 @@ folders 输出为当前设备自己的 115 folder id
 verify-folders 中 movie/tv/anime/adult/other 均 code=0
 verify-folders 能读取各媒体目录的 115 文件夹信息
 msg-login 返回 {"authenticated": true}
+subtitle proxy /health 返回 200
 ```
 
 Bot 验证：

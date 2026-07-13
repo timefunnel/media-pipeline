@@ -14,7 +14,17 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
-from pipeline.client115 import Client115
+from pipeline.client115 import (
+    Client115,
+    P115QRCodeLoginClient,
+    Share115Client,
+    is_115_share_url,
+    mask_p115_cookie,
+    p115_cookie_is_valid,
+    parse_115_share_url,
+    qrcode_status_label,
+    share_receive_task_id,
+)
 from pipeline.config import category_to_folder_id, category_to_msg_library_root, category_to_openlist_path
 from pipeline.dedupe import (
     candidate_dedupe_identities,
@@ -49,6 +59,15 @@ from pipeline.external_subtitles import (
     DEFAULT_SUBTITLE_PROVIDERS,
     DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS,
     build_subtitle_matcher_from_config,
+)
+from pipeline.adult_metadata import (
+    DEFAULT_ADULT_ARTWORK_CACHE_DIR,
+    DEFAULT_ADULT_METADATA_BASE_URLS,
+    DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS,
+    DEFAULT_ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS,
+    DEFAULT_ADULT_METADATA_FLARESOLVERR_URL,
+    AdultHTMLMetadataProvider,
+    normalize_adult_base_urls,
 )
 from pipeline.openlist_utils import (
     is_openlist_video_file,
@@ -100,6 +119,7 @@ from pipeline.telegram_ui import (
     search_page_jump_buttons,
     search_page_reply_markup,
     submit_reply_markup,
+    submit_callback_text,
     task_diagnostic_stage_values,
     task_from_submit_result,
     task_can_retry_msg_sync,
@@ -116,6 +136,7 @@ from pipeline.mediastation import (
     extract_codes,
     extract_media_id,
     extract_media_items,
+    extract_scrape_matches,
     find_matching_media,
     media_belongs_to_library,
     media_haystack,
@@ -131,6 +152,7 @@ from pipeline.prowlarr import (
     ProwlarrConfig,
     is_prowlarr_download_uri,
 )
+from pipeline.pansou import DEFAULT_PANSOU_CLOUD_TYPES, DEFAULT_PANSOU_TIMEOUT_SECONDS, DEFAULT_PANSOU_URL, PanSouClient
 from pipeline.resource_selector import ResourceSelector
 from pipeline.search_stats import (
     SearchResultList,
@@ -194,6 +216,7 @@ DEFAULT_TASK_LIST_PAGE_SIZE = 5
 DEFAULT_TASK_LIST_FETCH_LIMIT = 100
 DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES = 20 * 1024 * 1024
 ADULT_EXTRA_VIDEO_HIDE_MIN_BYTES = 200 * 1024 * 1024
+P115_COOKIE_SETTING_KEY = "p115_cookie"
 DEFAULT_SUBTITLE_BACKFILL_LIMIT = 20
 DEFAULT_SUBTITLE_REMATCH_LIMIT = 10
 DEFAULT_SUBTITLE_FIND_LIMIT = 8
@@ -233,7 +256,7 @@ CONTENT_PROFILE_LABELS = {
     "other": "其他",
 }
 DEFAULT_SEARCH_CATEGORY = "movie"
-START_TEXT = "直接发送关键词、番号或磁链即可搜索/入库；/help 查看功能；/tasks 查看最近任务；/version 查看版本"
+START_TEXT = "直接发送关键词、番号、磁链或 115 分享链接即可搜索/入库；/help 查看功能；/tasks 查看最近任务；/p115_cookie 管理 115 Cookie；/version 查看版本"
 HELP_TEXT = """直接发送关键词、番号或磁链即可。
 
 常用入口：
@@ -243,11 +266,12 @@ HELP_TEXT = """直接发送关键词、番号或磁链即可。
 /migrate 迁移已有媒体到其他库，下一条消息输入关键词
 /subtitle_report 查看成人库字幕补齐统计
 /subtitle_find <番号或标题> 查找成人库影片并重配字幕
+/p115_cookie 查看或扫码更新 115 分享转存 Cookie
 /dedupe_refresh 刷新已入库记录（需二次确认）
 /cancel 退出当前等待输入
 /version 查看当前版本
 
-搜索统计会显示来源、耗时、返回/展示数量和 LLM 重排状态。
+搜索统计会显示来源、耗时、返回/展示数量和 LLM 重排状态。搜索结果可单独补查网盘 115 分享。
 搜索结果里选择资源后，再选择入电影、剧集、动漫、成人或其他库。"""
 BOT_COMMANDS = [
     {"command": "start", "description": "打开使用说明"},
@@ -258,6 +282,7 @@ BOT_COMMANDS = [
     {"command": "migrate", "description": "迁移已入库媒体到其他库"},
     {"command": "subtitle_report", "description": "查看成人库字幕补齐统计"},
     {"command": "subtitle_find", "description": "按番号或标题查找字幕影片"},
+    {"command": "p115_cookie", "description": "查看或扫码更新 115 分享转存 Cookie"},
     {"command": "dedupe_refresh", "description": "刷新重复判断索引（需二次确认）"},
     {"command": "cancel", "description": "退出当前等待输入"},
     {"command": "version", "description": "查看当前版本"},
@@ -367,6 +392,13 @@ class BotConfig:
     prowlarr_url: str = DEFAULT_PROWLARR_URL
     prowlarr_config: str = DEFAULT_PROWLARR_CONFIG
     prowlarr_search_timeout_seconds: int = DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS
+    pansou_enabled: bool = False
+    pansou_url: str = DEFAULT_PANSOU_URL
+    pansou_token: str = ""
+    pansou_timeout_seconds: int = DEFAULT_PANSOU_TIMEOUT_SECONDS
+    pansou_cloud_types: tuple = DEFAULT_PANSOU_CLOUD_TYPES
+    pansou_source_type: str = "all"
+    pansou_plugins: tuple = ()
     telegram_timeout: int = 90
     msg_base_url: str = DEFAULT_MSG_BASE_URL
     msg_database_dsn: str = DEFAULT_MSG_DATABASE_DSN
@@ -390,6 +422,14 @@ class BotConfig:
     subtitle_search_timeout_seconds: int = DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS
     subtitle_download_max_bytes: int = DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES
     subtitle_backfill_default_limit: int = DEFAULT_SUBTITLE_BACKFILL_LIMIT
+    adult_external_scraper_enabled: bool = True
+    adult_artwork_cache_dir: str = DEFAULT_ADULT_ARTWORK_CACHE_DIR
+    adult_artwork_public_base_url: str = ""
+    adult_artwork_generate_portrait_enabled: bool = True
+    adult_metadata_base_urls: tuple = DEFAULT_ADULT_METADATA_BASE_URLS
+    adult_metadata_fetch_timeout_seconds: int = DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS
+    adult_metadata_flaresolverr_url: str = DEFAULT_ADULT_METADATA_FLARESOLVERR_URL
+    adult_metadata_flaresolverr_timeout_seconds: int = DEFAULT_ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS
     assrt_api_token: str = ""
     opensubtitles_api_key: str = ""
     opensubtitles_username: str = ""
@@ -420,6 +460,7 @@ class BotConfig:
     llm_timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
     llm_search_rerank_limit: int = DEFAULT_LLM_SEARCH_RERANK_LIMIT
     llm_thinking_disabled: bool = True
+    p115_cookie: str = ""
 
     @classmethod
     def from_env(cls, env=None):
@@ -461,6 +502,13 @@ class BotConfig:
             prowlarr_search_timeout_seconds=int(
                 env.get("PROWLARR_SEARCH_TIMEOUT_SECONDS", str(DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS))
             ),
+            pansou_enabled=parse_bool(env.get("PANSOU_ENABLED"), bool((env.get("PANSOU_URL") or "").strip())),
+            pansou_url=env.get("PANSOU_URL", DEFAULT_PANSOU_URL),
+            pansou_token=env.get("PANSOU_TOKEN") or env.get("PANSOU_AUTH_TOKEN") or "",
+            pansou_timeout_seconds=int(env.get("PANSOU_TIMEOUT_SECONDS", str(DEFAULT_PANSOU_TIMEOUT_SECONDS))),
+            pansou_cloud_types=tuple(parse_csv_strings(env.get("PANSOU_CLOUD_TYPES"), DEFAULT_PANSOU_CLOUD_TYPES)),
+            pansou_source_type=env.get("PANSOU_SOURCE_TYPE", "all"),
+            pansou_plugins=tuple(parse_csv_strings(env.get("PANSOU_PLUGINS"), ())),
             telegram_timeout=int(env.get("TG_API_TIMEOUT", "90")),
             msg_base_url=env.get("MSG_BASE_URL", DEFAULT_MSG_BASE_URL),
             msg_database_dsn=env.get("MSG_DATABASE_DSN", DEFAULT_MSG_DATABASE_DSN),
@@ -502,6 +550,27 @@ class BotConfig:
             subtitle_backfill_default_limit=normalize_subtitle_backfill_limit(
                 env.get("SUBTITLE_BACKFILL_DEFAULT_LIMIT", str(DEFAULT_SUBTITLE_BACKFILL_LIMIT))
             ),
+            adult_external_scraper_enabled=parse_bool(env.get("ADULT_EXTERNAL_SCRAPER_ENABLED"), True),
+            adult_artwork_cache_dir=env.get("ADULT_ARTWORK_CACHE_DIR", DEFAULT_ADULT_ARTWORK_CACHE_DIR),
+            adult_artwork_public_base_url=(env.get("ADULT_ARTWORK_PUBLIC_BASE_URL") or "").strip(),
+            adult_artwork_generate_portrait_enabled=parse_bool(env.get("ADULT_ARTWORK_GENERATE_PORTRAIT_ENABLED"), True),
+            adult_metadata_base_urls=tuple(
+                normalize_adult_base_urls(env.get("ADULT_METADATA_BASE_URLS") or DEFAULT_ADULT_METADATA_BASE_URLS)
+            ),
+            adult_metadata_fetch_timeout_seconds=max(
+                1,
+                int(env.get("ADULT_METADATA_FETCH_TIMEOUT_SECONDS", str(DEFAULT_ADULT_METADATA_FETCH_TIMEOUT_SECONDS))),
+            ),
+            adult_metadata_flaresolverr_url=(env.get("ADULT_METADATA_FLARESOLVERR_URL") or "").strip(),
+            adult_metadata_flaresolverr_timeout_seconds=max(
+                1,
+                int(
+                    env.get(
+                        "ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS",
+                        str(DEFAULT_ADULT_METADATA_FLARESOLVERR_TIMEOUT_SECONDS),
+                    )
+                ),
+            ),
             assrt_api_token=env.get("ASSRT_API_TOKEN", ""),
             opensubtitles_api_key=env.get("OPENSUBTITLES_API_KEY", ""),
             opensubtitles_username=env.get("OPENSUBTITLES_USERNAME", ""),
@@ -542,6 +611,13 @@ class BotConfig:
             llm_timeout_seconds=int(env.get("LLM_TIMEOUT_SECONDS", str(DEFAULT_LLM_TIMEOUT_SECONDS))),
             llm_search_rerank_limit=int(env.get("LLM_SEARCH_RERANK_LIMIT", str(DEFAULT_LLM_SEARCH_RERANK_LIMIT))),
             llm_thinking_disabled=parse_bool(env.get("LLM_THINKING_DISABLED"), True),
+            p115_cookie=(
+                env.get("P115_COOKIE")
+                or env.get("SHARE115_COOKIE")
+                or env.get("CLOUD115_COOKIE")
+                or env.get("PAN115_COOKIE")
+                or ""
+            ),
         )
 
 
@@ -687,6 +763,28 @@ class CandidateStore:
                     reason text,
                     error text,
                     attempt_count integer not null default 0,
+                    created_at integer not null,
+                    updated_at integer not null
+                )
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists bot_settings (
+                    key text primary key,
+                    value text not null,
+                    updated_at integer not null
+                )
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists p115_qr_sessions (
+                    id integer primary key autoincrement,
+                    user_id integer not null,
+                    chat_id integer not null,
+                    session_json text not null,
+                    status text not null,
                     created_at integer not null,
                     updated_at integer not null
                 )
@@ -1164,6 +1262,116 @@ class CandidateStore:
             conn.close()
         return [dedupe_entry_from_row(row) for row in rows[: int(limit)]]
 
+    def set_setting(self, key, value):
+        key = str(key or "").strip()
+        if not key:
+            raise ValueError("setting key must not be empty")
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                insert into bot_settings (key, value, updated_at)
+                values (?, ?, ?)
+                on conflict(key) do update set
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, str(value or ""), now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_setting(self, key, default=""):
+        key = str(key or "").strip()
+        if not key:
+            return default
+        conn = self._connect()
+        try:
+            row = conn.execute("select value from bot_settings where key = ?", (key,)).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return default
+        return row[0]
+
+    def set_p115_cookie(self, cookie):
+        cookie = str(cookie or "").strip()
+        if not p115_cookie_is_valid(cookie):
+            raise ValueError("invalid 115 cookie")
+        self.set_setting(P115_COOKIE_SETTING_KEY, cookie)
+
+    def get_p115_cookie(self):
+        return self.get_setting(P115_COOKIE_SETTING_KEY, "")
+
+    def create_p115_qr_session(self, user_id, chat_id, session):
+        now = int(time.time())
+        payload = json.dumps(session or {}, ensure_ascii=False, sort_keys=True)
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """
+                insert into p115_qr_sessions (user_id, chat_id, session_json, status, created_at, updated_at)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (int(user_id), int(chat_id), payload, "pending", now, now),
+            )
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    def load_p115_qr_session(self, session_id):
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                select id, user_id, chat_id, session_json, status, created_at, updated_at
+                from p115_qr_sessions
+                where id = ?
+                """,
+                (int(session_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            raise RuntimeError("p115 qr session not found: %s" % session_id)
+        return {
+            "id": row[0],
+            "user_id": row[1],
+            "chat_id": row[2],
+            "session": json.loads(row[3]),
+            "status": row[4],
+            "created_at": row[5],
+            "updated_at": row[6],
+        }
+
+    def update_p115_qr_session(self, session_id, status, session=None):
+        status = str(status or "").strip()
+        if not status:
+            raise ValueError("p115 qr status must not be empty")
+        current = self.load_p115_qr_session(session_id)
+        payload = json.dumps(session if session is not None else current["session"], ensure_ascii=False, sort_keys=True)
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                update p115_qr_sessions
+                set session_json = ?, status = ?, updated_at = ?
+                where id = ?
+                """,
+                (payload, status, now, int(session_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        current["session"] = json.loads(payload)
+        current["status"] = status
+        current["updated_at"] = now
+        return current
+
     def processed_trash_hide_media_ids(self, media_ids):
         normalized = [str(value or "").strip() for value in media_ids or [] if str(value or "").strip()]
         if not normalized:
@@ -1391,8 +1599,9 @@ class LlmRerankBusy(RuntimeError):
 
 
 class PipelineBotService:
-    def __init__(self, config):
+    def __init__(self, config, p115_cookie_provider=None):
         self.config = config
+        self.p115_cookie_provider = p115_cookie_provider
         self._llm_rerank_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-rerank")
         self._llm_rerank_lock = threading.Lock()
         self._subtitle_matcher = None
@@ -1531,6 +1740,22 @@ class PipelineBotService:
             metadata=stats.to_metadata(profile="bt4g", raw_count=len(candidates), selected_count=len(ranked), settings=search_settings),
         )
 
+    def search_pansou(self, query, limit=DEFAULT_SEARCH_LIMIT):
+        if not self.config.pansou_enabled:
+            raise RuntimeError("PanSou is not enabled")
+        client = PanSouClient(
+            self.config.pansou_url,
+            token=self.config.pansou_token,
+            timeout=self.config.pansou_timeout_seconds,
+        )
+        return client.search(
+            query,
+            limit=limit,
+            cloud_types=self.config.pansou_cloud_types,
+            source_type=self.config.pansou_source_type,
+            plugins=self.config.pansou_plugins,
+        )
+
     def _rerank_search_candidates_with_timeout(self, query, category, ranked):
         timeout = max(0.1, float(self.config.llm_timeout_seconds or DEFAULT_LLM_TIMEOUT_SECONDS))
         if not self._llm_rerank_lock.acquire(blocking=False):
@@ -1597,6 +1822,8 @@ class PipelineBotService:
         return self._build_msg_client().get_media(media_id)
 
     def submit(self, category, download_uri):
+        if is_115_share_url(download_uri):
+            return self._submit_115_share(category, download_uri)
         download_uri = self._resolve_download_uri(download_uri)
         result = summarize_submit(
             self._call_115(category, lambda client: client.add_offline_urls([download_uri], category_to_folder_id(category)))
@@ -1609,6 +1836,37 @@ class PipelineBotService:
             return download_uri
         api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
         return ProwlarrClient(self.config.prowlarr_url, api_key).resolve_download_uri(download_uri)
+
+    def _submit_115_share(self, category, download_uri):
+        folder_id = category_to_folder_id(category)
+        client = self._build_115_share_client()
+        response = client.receive_share_url(download_uri, folder_id)
+        data = response.get("data") or {}
+        task_id = share_receive_task_id(data.get("share_code"))
+        task = {
+            "info_hash": task_id,
+            "source_kind": "115_share",
+            "name": ", ".join(item.get("name") or "" for item in data.get("items") or [] if item.get("name")) or data.get("share_code"),
+            "status_name": "success",
+            "percent_done": 100,
+            "wp_path_id": folder_id,
+            "file_id": first_value(data.get("save_as_top_fids")),
+            "share_code": data.get("share_code"),
+            "source_url": data.get("source_url") or download_uri,
+            "received_item_count": len(data.get("items") or []),
+        }
+        if self.config.msg_enabled:
+            task["msg_sync_status"] = "running"
+            task["msg_error"] = None
+        return {
+            "state": True,
+            "code": response.get("code", 0),
+            "message": "115分享转存完成",
+            "submit_kind": "115_share_receive",
+            "tasks": [task],
+            "task_status": task,
+            "raw": response,
+        }
 
     def task_status(self, category, info_hash):
         return self._call_115(category, lambda client: find_task_by_info_hash(client, info_hash, max_pages=10))
@@ -1964,6 +2222,14 @@ class PipelineBotService:
         token = OpenListTokenStore(self.config.openlist_db).load_access_token()
         return Client115(token.access_token)
 
+    def _build_115_share_client(self):
+        cookie = ""
+        if self.p115_cookie_provider is not None:
+            cookie = str(self.p115_cookie_provider() or "").strip()
+        if not cookie:
+            cookie = self.config.p115_cookie
+        return Share115Client(cookie)
+
     def _sync_mediastation(self, category, title, task, progress_callback=None):
         progress = dict(task or {})
         openlist_client = None
@@ -2075,45 +2341,46 @@ class PipelineBotService:
         target_openlist_paths = msg_target_openlist_paths(category, progress)
         require_target_path = bool(msg_authoritative_openlist_paths(progress))
         deleted_media_prune_result = prefixed_task_fields(progress, "msg_deleted_media_prune_")
+        target_scan_result = prefixed_task_fields(progress, "msg_target_scan_")
 
         if progress.get("msg_scan_status") != "success" or not media_id:
             openlist = get_openlist_client()
             client = get_msg_client()
             authoritative_paths = []
-            prune_deleted_paths = []
             if require_target_path:
                 authoritative_paths = msg_authoritative_openlist_paths(progress)
                 self._refresh_openlist_targets_for_msg(openlist, authoritative_paths)
                 if progress.get("msg_stale_media_id"):
                     emit({"msg_deleted_media_prune_status": "running", "msg_deleted_media_prune_error": None})
-                    prune_deleted_paths = authoritative_paths
+                    deleted_media_prune_result = self._prune_msg_deleted_media_for_targets(category, authoritative_paths)
+                    emit(deleted_media_prune_result)
+                    emit({"msg_target_scan_status": "running", "msg_target_scan_error": None})
+                    target_scan_result = self._scan_msg_openlist_target_root(client, category, authoritative_paths, queries)
+                    media = target_scan_result.pop("_media", None)
+                    emit(target_scan_result)
             if media is None:
                 emit({"msg_scan_status": "running", "msg_error": None})
-                movie_cleanup_touched_openlist = int(clean_result.get("openlist_hidden_count") or 0) > 0 or int(
-                    clean_result.get("openlist_cleaned_count") or 0
-                ) > 0
-                ingest_result = self._run_msg_pipeline_ingest(
-                    client,
-                    category,
-                    title,
-                    queries,
-                    scan=True,
-                    target_openlist_paths=target_openlist_paths,
-                    require_target_path=require_target_path,
-                    prune_deleted_openlist_paths=prune_deleted_paths,
-                    repair_movie_extras=category == "movie" and movie_cleanup_touched_openlist,
-                    repair_episode_visibility=category in ("tv", "anime"),
-                )
-                ingest_updates = ingest_result["updates"]
-                if ingest_updates.get("msg_deleted_media_prune_status"):
-                    deleted_media_prune_result = prefixed_task_fields(ingest_updates, "msg_deleted_media_prune_")
-                if ingest_updates.get("msg_extra_cleanup_status"):
-                    extras_result = prefixed_task_fields(ingest_updates, "msg_extra_cleanup_")
-                    self._apply_msg_movie_extras_hide(ingest_result.get("movie_extras"), get_openlist_client)
-                if ingest_updates.get("msg_visibility_repair_status"):
-                    visibility_result = prefixed_task_fields(ingest_updates, "msg_visibility_repair_")
-                emit(ingest_updates)
-                media = ingest_result["media"]
+                client.scan_root(root["library_id"], root["root_id"])
+                try:
+                    media = self._wait_for_msg_media(
+                        client,
+                        root["library_id"],
+                        queries,
+                        target_openlist_paths=target_openlist_paths,
+                        require_target_path=require_target_path,
+                    )
+                except RuntimeError as exc:
+                    if (
+                        isinstance(exc, MediaStationApiError)
+                        or not require_target_path
+                        or not authoritative_paths
+                        or not str(exc).startswith("MediaStationGo media not found after root scan:")
+                    ):
+                        raise
+                    emit({"msg_target_scan_status": "running", "msg_target_scan_error": None})
+                    target_scan_result = self._scan_msg_openlist_target_root(client, category, authoritative_paths, queries)
+                    media = target_scan_result.pop("_media", None)
+                    emit(target_scan_result)
             media_id = extract_media_id(media)
             if not media_id:
                 raise RuntimeError("MediaStationGo media id missing after scan")
@@ -2123,8 +2390,8 @@ class PipelineBotService:
                     "msg_scan_status": "success",
                     "msg_media_id": media_id,
                     "msg_media_title": media_title,
-                    "msg_match_mode": media.get("_pipeline_match_mode") or media.get("match_mode") or "query",
-                    "msg_match_path": media.get("_pipeline_match_path") or media.get("match_path"),
+                    "msg_match_mode": media.get("_pipeline_match_mode") or "query",
+                    "msg_match_path": media.get("_pipeline_match_path"),
                 }
             )
 
@@ -2139,7 +2406,7 @@ class PipelineBotService:
         if category == "movie" and movie_cleanup_touched_openlist:
             if not stage_is_complete(progress.get("msg_extra_cleanup_status")):
                 emit({"msg_extra_cleanup_status": "running", "msg_extra_cleanup_error": None})
-                extras_result = self._repair_msg_movie_extras(category, media_id, get_openlist_client(), get_msg_client())
+                extras_result = self._repair_msg_movie_extras(category, media_id, get_openlist_client())
                 if extras_result.get("msg_extra_cleanup_status") == "skipped":
                     apply_progress(extras_result)
                 else:
@@ -2150,13 +2417,24 @@ class PipelineBotService:
         if category in ("tv", "anime"):
             if not stage_is_complete(progress.get("msg_visibility_repair_status")):
                 emit({"msg_visibility_repair_status": "running", "msg_visibility_repair_error": None})
-                visibility_result = self._repair_msg_episode_visibility(category, media_id, get_msg_client())
+                visibility_result = self._repair_msg_episode_visibility(category, media_id)
                 if visibility_result.get("msg_visibility_repair_status") == "skipped":
                     apply_progress(visibility_result)
                 else:
                     emit(visibility_result)
             else:
                 apply_progress(visibility_result)
+        artwork_result = prefixed_task_fields(progress, "msg_artwork_repair_")
+        if root.get("media_type") == "adult":
+            if not stage_is_complete(progress.get("msg_artwork_repair_status")):
+                emit({"msg_artwork_repair_status": "running", "msg_artwork_repair_error": None})
+                artwork_result = self._repair_msg_adult_artwork(get_msg_client(), media_id)
+                if artwork_result.get("msg_artwork_repair_status") == "skipped":
+                    apply_progress(artwork_result)
+                else:
+                    emit(artwork_result)
+            else:
+                apply_progress(artwork_result)
         msg_library_id = (root or {}).get("library_id") or progress.get("msg_library_id")
         msg_root_id = (root or {}).get("root_id") or progress.get("msg_root_id")
         subtitle_result = prefixed_task_fields(progress, "subtitle_match_")
@@ -2191,7 +2469,9 @@ class PipelineBotService:
             **adult_extra_hide_result,
             **extras_result,
             **visibility_result,
+            **artwork_result,
             **deleted_media_prune_result,
+            **target_scan_result,
             **subtitle_result,
         }
 
@@ -2219,44 +2499,22 @@ class PipelineBotService:
         root = category_to_msg_library_root(category)
         provider = root.get("provider")
         media_type = root.get("media_type")
-        if media is None and provider and media_type:
-            try:
-                media = client.get_media(media_id)
-            except RuntimeError:
-                media = None
-        result = client.pipeline_scrape_media(
-            media_id,
-            {
-                "category": category,
-                "title": title,
-                "queries": msg_scrape_queries(title, task, media),
-                "provider": provider,
-                "media_type": media_type,
-            },
-        )
-        mode = str((result or {}).get("mode") or "").strip()
-        if mode not in ("apply", "smart"):
-            raise RuntimeError("MediaStationGo pipeline scrape returned invalid mode: %s" % (mode or "-"))
-        return {
-            "msg_scrape_mode": mode,
-            "msg_scrape_query": (result or {}).get("query"),
-            "msg_scrape_match_count": int((result or {}).get("match_count") or 0),
-        }
+        if provider and media_type:
+            if media is None:
+                try:
+                    media = client.get_media(media_id)
+                except RuntimeError:
+                    media = None
+            for query in msg_scrape_queries(title, task, media):
+                matches = extract_scrape_matches(client.search_scrape_matches(media_id, query, provider, media_type))
+                if len(matches) == 1:
+                    client.apply_scrape_match(media_id, matches[0])
+                    return {"msg_scrape_mode": "apply", "msg_scrape_query": query}
+        client.scrape_media(media_id)
+        return {"msg_scrape_mode": "smart", "msg_scrape_query": None}
 
-    def _repair_msg_movie_extras(self, category, media_id, openlist_client=None, msg_client=None):
-        root = category_to_msg_library_root(category)
-        client = msg_client or self._build_msg_client()
-        result = client.repair_movie_extras(
-            media_id,
-            category,
-            library_id=root.get("library_id"),
-            root_id=root.get("root_id"),
-            root_openlist_path=category_to_openlist_path(category),
-        )
-        self._apply_msg_movie_extras_hide(result, openlist_client)
-        return self._msg_movie_extras_progress_fields(result)
-
-    def _apply_msg_movie_extras_hide(self, result, openlist_client=None):
+    def _repair_msg_movie_extras(self, category, media_id, openlist_client=None):
+        result = self._build_msg_db_client().repair_movie_extras(category, media_id=media_id)
         if not isinstance(result, dict):
             raise RuntimeError("MediaStationGo movie extra cleanup returned invalid response")
         status = result.get("status")
@@ -2267,20 +2525,14 @@ class PipelineBotService:
         if hide_patterns:
             if not hide_path:
                 raise RuntimeError("MediaStationGo movie extra cleanup returned hide patterns without path")
-            if callable(openlist_client):
-                client = openlist_client()
-            else:
-                client = openlist_client or OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
+            client = openlist_client or OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
             client.upsert_meta_hide(hide_path, hide_patterns, h_sub=True)
-
-    def _msg_movie_extras_progress_fields(self, result):
-        hide_patterns = [str(pattern) for pattern in (result or {}).get("openlist_hide_patterns") or [] if str(pattern or "").strip()]
         return {
-            "msg_extra_cleanup_status": (result or {}).get("status"),
-            "msg_extra_cleanup_updated": int((result or {}).get("updated") or 0),
-            "msg_extra_cleanup_media_count": int((result or {}).get("media_count") or 0),
+            "msg_extra_cleanup_status": status,
+            "msg_extra_cleanup_updated": int(result.get("updated") or 0),
+            "msg_extra_cleanup_media_count": int(result.get("media_count") or 0),
             "msg_extra_cleanup_hidden_count": len(hide_patterns),
-            "msg_extra_cleanup_reason": (result or {}).get("reason"),
+            "msg_extra_cleanup_reason": result.get("reason"),
             "msg_extra_cleanup_error": None,
         }
 
@@ -2370,16 +2622,8 @@ class PipelineBotService:
             raise RuntimeError("OpenList adult extra video hide returned invalid status: %s" % (status or "-"))
         return result
 
-    def _repair_msg_episode_visibility(self, category, media_id, msg_client=None):
-        root = category_to_msg_library_root(category)
-        client = msg_client or self._build_msg_client()
-        result = client.repair_episode_visibility(
-            media_id,
-            category,
-            library_id=root.get("library_id"),
-            root_id=root.get("root_id"),
-            root_openlist_path=category_to_openlist_path(category),
-        )
+    def _repair_msg_episode_visibility(self, category, media_id):
+        result = self._build_msg_db_client().repair_episode_visibility(category, media_id=media_id)
         if not isinstance(result, dict):
             raise RuntimeError("MediaStationGo episode visibility repair returned invalid response")
         status = result.get("status")
@@ -2393,105 +2637,40 @@ class PipelineBotService:
             "msg_visibility_repair_error": None,
         }
 
-    def _run_msg_pipeline_ingest(
-        self,
-        client,
-        category,
-        title,
-        queries,
-        scan=True,
-        target_openlist_paths=None,
-        require_target_path=False,
-        prune_deleted_openlist_paths=None,
-        repair_movie_extras=False,
-        repair_episode_visibility=False,
-    ):
-        root = category_to_msg_library_root(category)
-        payload = {
-            "category": category,
-            "library_id": root.get("library_id"),
-            "root_id": root.get("root_id"),
-            "root_openlist_path": category_to_openlist_path(category),
-            "title": title,
-            "queries": list(queries or []),
-            "target_openlist_paths": list(target_openlist_paths or []),
-            "require_target_path": bool(require_target_path),
-            "prune_deleted_openlist_paths": list(prune_deleted_openlist_paths or []),
-            "scan": bool(scan),
-            "repair_movie_extras": bool(repair_movie_extras),
-            "repair_episode_visibility": bool(repair_episode_visibility),
-        }
-        job = client.start_pipeline_ingest(payload)
-        job_id = str((job or {}).get("id") or "").strip()
-        if not job_id:
-            raise RuntimeError("MediaStationGo pipeline ingest job id missing")
-        interval = max(1, int(self.config.msg_sync_poll_interval_seconds))
-        deadline = time.monotonic() + max(interval, int(self.config.msg_sync_poll_seconds))
-        while str((job or {}).get("status") or "") == "running":
-            if time.monotonic() >= deadline:
-                raise RuntimeError("MediaStationGo pipeline ingest timed out: %s" % job_id)
-            time.sleep(interval)
-            job = client.get_pipeline_ingest(job_id)
-        status = str((job or {}).get("status") or "")
-        if status != "completed":
-            raise RuntimeError((job or {}).get("error") or "MediaStationGo pipeline ingest failed: %s" % status)
-        result = (job or {}).get("result") or {}
-        media = result.get("media") or {}
-        media_id = extract_media_id(media)
-        if not media_id:
-            raise RuntimeError("MediaStationGo pipeline ingest media id missing")
-        updates = self._msg_pipeline_ingest_progress_fields(result)
-        media["_pipeline_match_mode"] = updates.get("msg_match_mode")
-        media["_pipeline_match_path"] = updates.get("msg_match_path")
-        return {"job": job, "result": result, "media": media, "updates": updates, "movie_extras": result.get("movie_extras")}
-
-    def _msg_pipeline_ingest_progress_fields(self, result):
-        result = result or {}
-        media = result.get("media") or {}
-        updates = {
-            "msg_scan_status": "success",
-            "msg_media_id": extract_media_id(media),
-            "msg_media_title": media_display_title(media),
-            "msg_match_mode": media.get("match_mode") or "query",
-            "msg_match_path": media.get("match_path"),
-            "msg_error": None,
-        }
-        prune = result.get("deleted_media_prune")
-        if isinstance(prune, dict):
-            updates.update(
-                {
-                    "msg_deleted_media_prune_status": prune.get("status"),
-                    "msg_deleted_media_prune_deleted": int(prune.get("deleted") or 0),
-                    "msg_deleted_media_prune_reason": prune.get("reason"),
-                    "msg_deleted_media_prune_error": None,
-                }
+    def _repair_msg_adult_artwork(self, client, media_id):
+        result = client.repair_adult_artwork(
+            media_id,
+            semantic_enabled=self.config.adult_external_scraper_enabled,
+            cache_dir=self.config.adult_artwork_cache_dir,
+            public_base_url=self.config.adult_artwork_public_base_url,
+            generate_portrait=self.config.adult_artwork_generate_portrait_enabled,
+            metadata_provider=AdultHTMLMetadataProvider(
+                bases=self.config.adult_metadata_base_urls,
+                timeout=self.config.adult_metadata_fetch_timeout_seconds,
+                flaresolverr_url=self.config.adult_metadata_flaresolverr_url,
+                flaresolverr_timeout=self.config.adult_metadata_flaresolverr_timeout_seconds,
             )
-        movie_extras = result.get("movie_extras")
-        if isinstance(movie_extras, dict):
-            updates.update(self._msg_movie_extras_progress_fields(movie_extras))
-        visibility = result.get("episode_visibility")
-        if isinstance(visibility, dict):
-            updates.update(
-                {
-                    "msg_visibility_repair_status": visibility.get("status"),
-                    "msg_visibility_repair_updated": int(visibility.get("updated") or 0),
-                    "msg_visibility_repair_media_count": int(visibility.get("media_count") or 0),
-                    "msg_visibility_repair_reason": visibility.get("reason"),
-                    "msg_visibility_repair_error": None,
-                }
-            )
-        return updates
-
-    def _prune_msg_deleted_media_for_targets(self, category, openlist_paths, msg_client=None):
-        root = category_to_msg_library_root(category)
-        client = msg_client or self._build_msg_client()
-        result = client.prune_deleted_media(
-            category,
-            openlist_paths,
-            library_id=root.get("library_id"),
-            root_id=root.get("root_id"),
-            root_openlist_path=category_to_openlist_path(category),
+            if self.config.adult_external_scraper_enabled
+            else False,
         )
+        if not isinstance(result, dict):
+            raise RuntimeError("MediaStationGo adult artwork repair returned invalid response")
+        status = result.get("status")
+        if status not in ("success", "skipped"):
+            raise RuntimeError("MediaStationGo adult artwork repair returned invalid status: %s" % (status or "-"))
+        return {
+            "msg_artwork_repair_status": status,
+            "msg_artwork_repair_updated": int(result.get("updated") or 0),
+            "msg_artwork_repair_reason": result.get("reason"),
+            "msg_artwork_repair_fields": ",".join(result.get("fields") or []),
+            "msg_artwork_repair_metadata_source": result.get("metadata_source"),
+            "msg_artwork_repair_poster_source": result.get("poster_source"),
+            "msg_artwork_repair_backdrop_source": result.get("backdrop_source"),
+            "msg_artwork_repair_error": None,
+        }
+
+    def _prune_msg_deleted_media_for_targets(self, category, openlist_paths):
+        result = self._build_msg_db_client().purge_deleted_media_under_openlist_paths(category, openlist_paths)
         if not isinstance(result, dict):
             raise RuntimeError("MediaStationGo deleted media prune returned invalid response")
         status = result.get("status")
@@ -2503,6 +2682,48 @@ class PipelineBotService:
             "msg_deleted_media_prune_reason": result.get("reason"),
             "msg_deleted_media_prune_error": None,
         }
+
+    def _scan_msg_openlist_target_root(self, client, category, openlist_paths, queries):
+        target_path = next((path for path in unique_openlist_paths(openlist_paths) if path), "")
+        if not target_path:
+            return {"msg_target_scan_status": "skipped", "msg_target_scan_reason": "target_missing", "msg_target_scan_error": None}
+        scan_root_path = openlist_scan_root_for_msg_target(target_path)
+        db = self._build_msg_db_client()
+        temp_root = db.create_temporary_library_root(category, scan_root_path)
+        root = category_to_msg_library_root(category)
+        cleanup_error = None
+        try:
+            client.scan_root(root["library_id"], temp_root["root_id"])
+            media = self._wait_for_msg_media(
+                client,
+                root["library_id"],
+                queries,
+                target_openlist_paths=[target_path],
+                require_target_path=True,
+            )
+            media_id = extract_media_id(media)
+            if not media_id:
+                raise RuntimeError("MediaStationGo media id missing after target scan")
+            db.reassign_media_root(media_id, root["root_id"])
+            media["library_root_id"] = root["root_id"]
+            media["_pipeline_match_mode"] = "path"
+            media["_pipeline_match_path"] = media.get("_pipeline_match_path") or media.get("path")
+            result = {
+                "msg_target_scan_status": "success",
+                "msg_target_scan_root_id": temp_root["root_id"],
+                "msg_target_scan_path": scan_root_path,
+                "msg_target_scan_match_path": target_path,
+                "msg_target_scan_error": None,
+                "_media": media,
+            }
+        finally:
+            try:
+                db.delete_library_root(temp_root["root_id"])
+            except Exception as exc:
+                cleanup_error = str(exc)
+        if cleanup_error:
+            raise RuntimeError("MediaStationGo temporary root cleanup failed: %s" % cleanup_error)
+        return result
 
     def _wait_for_msg_media(self, client, library_id, queries, target_openlist_paths=None, require_target_path=False):
         deadline = time.monotonic() + max(0, int(self.config.msg_sync_poll_seconds))
@@ -2614,7 +2835,7 @@ class PipelineBotService:
 
 def msg_target_openlist_paths(category, task):
     task = task or {}
-    authoritative_paths = []
+    paths = []
     for key in (
         "openlist_adult_format_new_path",
         "openlist_adult_format_path",
@@ -2623,13 +2844,8 @@ def msg_target_openlist_paths(category, task):
     ):
         value = normalize_openlist_path(task.get(key))
         if value:
-            authoritative_paths.append(value)
+            paths.append(value)
 
-    authoritative_paths = unique_openlist_paths(authoritative_paths)
-    if authoritative_paths:
-        return authoritative_paths
-
-    paths = []
     root_path = normalize_openlist_path(category_to_openlist_path(category))
     if root_path:
         for name in task_openlist_target_names(task):
@@ -2674,6 +2890,17 @@ def unique_openlist_paths(paths):
             seen.add(key)
             out.append(normalized)
     return out
+
+
+def openlist_scan_root_for_msg_target(path):
+    path = normalize_openlist_path(path)
+    if not path:
+        return ""
+    suffix = posixpath.splitext(path)[1].lower()
+    if suffix in VIDEO_EXTENSIONS:
+        parent = posixpath.dirname(path.rstrip("/"))
+        return normalize_openlist_path(parent or "/")
+    return path
 
 
 def find_media_by_openlist_paths(items, openlist_paths, library_id=None):
@@ -2835,6 +3062,9 @@ class TelegramBot:
             with self._typing_action(chat_id):
                 self._handle_subtitle_find_command(chat_id, argument)
             return
+        if command == "/p115_cookie":
+            self._handle_p115_cookie_command(chat_id)
+            return
         if command == "/dedupe_refresh":
             self._handle_dedupe_refresh_command(chat_id)
             return
@@ -2842,7 +3072,7 @@ class TelegramBot:
             self.telegram.send_message(chat_id, format_version_info())
             return
         if text.startswith("/"):
-            self.telegram.send_message(chat_id, "这个命令不再作为搜索入口。直接发送关键词、番号或磁链即可；/help 查看功能。")
+            self.telegram.send_message(chat_id, "这个命令不再作为搜索入口。直接发送关键词、番号、磁链或 115 分享链接即可；/help 查看功能。")
             return
 
         subtitle_find_query = parse_subtitle_find_query(text)
@@ -2851,7 +3081,7 @@ class TelegramBot:
                 self._handle_subtitle_find_command(chat_id, subtitle_find_query)
             return
 
-        direct_candidate = magnet_candidate_from_text(text)
+        direct_candidate = share115_candidate_from_text(text) or magnet_candidate_from_text(text)
         if direct_candidate:
             candidate_id = self.store.save_candidate(
                 user_id,
@@ -2937,6 +3167,9 @@ class TelegramBot:
         if action == "bt4g_search":
             self._handle_bt4g_search_callback(user_id, chat_id, callback_id, value)
             return
+        if action == "pansou_search":
+            self._handle_pansou_search_callback(user_id, chat_id, callback_id, value)
+            return
         if action == "llm_rerank":
             self._handle_llm_rerank_callback(user_id, chat_id, message_id, callback_id, value)
             return
@@ -2995,6 +3228,15 @@ class TelegramBot:
             return
         if action == "dedupe_refresh_cancel":
             self._handle_dedupe_refresh_cancel_callback(chat_id, message_id, callback_id)
+            return
+        if action == "p115_cookie_start":
+            self._handle_p115_cookie_start_callback(user_id, chat_id, message_id, callback_id)
+            return
+        if action == "p115_cookie_check":
+            self._handle_p115_cookie_check_callback(user_id, chat_id, message_id, callback_id, value)
+            return
+        if action == "p115_cookie_cancel":
+            self._handle_p115_cookie_cancel_callback(user_id, chat_id, message_id, callback_id, value)
             return
         if action == "subtitle_backfill_confirm":
             self._handle_subtitle_backfill_confirm_callback(chat_id, message_id, callback_id, value, retry_attempted=False)
@@ -3410,6 +3652,45 @@ class TelegramBot:
         text, reply_markup = self._render_search_page(bt4g_session_id, page=0)
         self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
 
+    def _handle_pansou_search_callback(self, user_id, chat_id, callback_id, session_id):
+        try:
+            session = self.store.load_search_session(session_id)
+        except RuntimeError:
+            self.telegram.answer_callback_query(callback_id, "搜索结果不存在")
+            return
+        if session["user_id"] != user_id:
+            self.telegram.answer_callback_query(callback_id, "无权查看此搜索")
+            return
+        if not self.config.pansou_enabled:
+            self.telegram.answer_callback_query(callback_id, "PanSou 未启用")
+            return
+
+        self.telegram.answer_callback_query(callback_id, "正在搜索网盘")
+        try:
+            with self._typing_action(chat_id or session["chat_id"]):
+                candidates = self.service.search_pansou(session["query"], limit=self.config.search_limit)
+        except Exception as exc:
+            self.telegram.send_message(session["chat_id"], "网盘搜索失败：%s" % exc)
+            return
+        if not candidates:
+            self.telegram.send_message(session["chat_id"], "网盘搜索未找到可用的 115 分享")
+            return
+
+        candidate_ids = []
+        for candidate in candidates:
+            candidate_id = self.store.save_candidate(user_id, session["chat_id"], DEFAULT_SEARCH_CATEGORY, session["query"], candidate)
+            candidate_ids.append(candidate_id)
+        pansou_session_id = self.store.save_search_session(
+            user_id,
+            session["chat_id"],
+            "pansou",
+            session["query"],
+            candidate_ids,
+            metadata={"profile": "pansou", "raw_count": len(candidates), "selected_count": len(candidates)},
+        )
+        text, reply_markup = self._render_search_page(pansou_session_id, page=0)
+        self.telegram.send_message(session["chat_id"], text, reply_markup=reply_markup)
+
     def _handle_choose_library_callback(self, user_id, chat_id, message_id, callback_id, candidate_id):
         record = self.store.load_candidate(candidate_id)
         if record["user_id"] != user_id:
@@ -3544,7 +3825,7 @@ class TelegramBot:
         self._save_tasks_from_submit(record, candidate, result, category, content_profile=content_profile)
         self.store.finish_candidate_submission(candidate_id, "submitted", info_hash=first_submit_task_info_hash(result))
         if answer and not callback_answered:
-            self.telegram.answer_callback_query(callback_id, "已提交 115 离线")
+            self.telegram.answer_callback_query(callback_id, submit_callback_text(result))
         self._delete_callback_message(chat_id, message_id)
         sent = self.telegram.send_message(
             chat_id or record["chat_id"],
@@ -3561,6 +3842,7 @@ class TelegramBot:
                 telegram_status_message_id=status_message_id,
                 content_profile=content_profile,
             )
+        self._sync_successful_submit_tasks(result)
 
     def _find_duplicate_before_submit(self, category, record, candidate):
         local = find_local_duplicate(self.store.list_all_tasks(), category, record, candidate)
@@ -3880,6 +4162,138 @@ class TelegramBot:
             message_id,
             "已取消迁移：%s" % record["candidate"].get("title"),
             reply_markup={"inline_keyboard": []},
+            fallback_chat_id=record["chat_id"],
+        )
+
+    def _handle_p115_cookie_command(self, chat_id):
+        cookie = self.store.get_p115_cookie() or self.config.p115_cookie
+        self.telegram.send_message(
+            chat_id,
+            format_p115_cookie_status_message(cookie),
+            reply_markup=p115_cookie_status_reply_markup(),
+        )
+
+    def _handle_p115_cookie_start_callback(self, user_id, chat_id, message_id, callback_id):
+        self.telegram.answer_callback_query(callback_id, "正在生成二维码")
+        try:
+            session = P115QRCodeLoginClient().start()
+            session_id = self.store.create_p115_qr_session(user_id, chat_id, session)
+        except Exception as exc:
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                "生成 115 扫码登录二维码失败：%s" % exc,
+                reply_markup=p115_cookie_status_reply_markup(),
+            )
+            return
+
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_p115_qr_message(session_id, session, status_label="等待扫码"),
+            reply_markup=p115_cookie_qr_reply_markup(session_id),
+        )
+
+    def _handle_p115_cookie_check_callback(self, user_id, chat_id, message_id, callback_id, session_id):
+        record = self._load_owned_p115_qr_session(user_id, callback_id, session_id)
+        if record is None:
+            return
+        if record["status"] in {"confirmed", "cancelled", "expired"}:
+            self.telegram.answer_callback_query(callback_id, qrcode_session_final_label(record["status"]))
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                format_p115_qr_final_message(record["status"], self.store.get_p115_cookie()),
+                reply_markup=p115_cookie_status_reply_markup(),
+                fallback_chat_id=record["chat_id"],
+            )
+            return
+
+        client = P115QRCodeLoginClient(app=(record["session"] or {}).get("app") or "web")
+        try:
+            status = client.status(record["session"])
+        except Exception as exc:
+            self.telegram.answer_callback_query(callback_id, "状态查询失败")
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                "查询 115 扫码状态失败：%s" % exc,
+                reply_markup=p115_cookie_qr_reply_markup(record["id"]),
+                fallback_chat_id=record["chat_id"],
+            )
+            return
+
+        status_code = int(status.get("status") or 0)
+        if status_code == 2:
+            try:
+                cookie = client.login(record["session"], require_confirmed=False)
+                self.store.set_p115_cookie(cookie)
+                self.store.update_p115_qr_session(record["id"], "confirmed")
+            except Exception as exc:
+                self.telegram.answer_callback_query(callback_id, "保存失败")
+                self._update_callback_message(
+                    chat_id,
+                    message_id,
+                    "115 扫码已确认，但保存 Cookie 失败：%s" % exc,
+                    reply_markup=p115_cookie_qr_reply_markup(record["id"]),
+                    fallback_chat_id=record["chat_id"],
+                )
+                return
+            self.telegram.answer_callback_query(callback_id, "已保存 115 Cookie")
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                format_p115_cookie_saved_message(cookie),
+                reply_markup=p115_cookie_status_reply_markup(),
+                fallback_chat_id=record["chat_id"],
+            )
+            return
+
+        if status_code == -1:
+            self.store.update_p115_qr_session(record["id"], "expired")
+            self.telegram.answer_callback_query(callback_id, "二维码已过期")
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                format_p115_qr_final_message("expired", self.store.get_p115_cookie()),
+                reply_markup=p115_cookie_status_reply_markup(),
+                fallback_chat_id=record["chat_id"],
+            )
+            return
+
+        if status_code == -2:
+            self.store.update_p115_qr_session(record["id"], "cancelled")
+            self.telegram.answer_callback_query(callback_id, "已取消")
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                format_p115_qr_final_message("cancelled", self.store.get_p115_cookie()),
+                reply_markup=p115_cookie_status_reply_markup(),
+                fallback_chat_id=record["chat_id"],
+            )
+            return
+
+        status_label = qrcode_status_label(status_code)
+        self.telegram.answer_callback_query(callback_id, status_label)
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_p115_qr_message(record["id"], record["session"], status_label=status_label),
+            reply_markup=p115_cookie_qr_reply_markup(record["id"]),
+            fallback_chat_id=record["chat_id"],
+        )
+
+    def _handle_p115_cookie_cancel_callback(self, user_id, chat_id, message_id, callback_id, session_id):
+        record = self._load_owned_p115_qr_session(user_id, callback_id, session_id)
+        if record is None:
+            return
+        self.store.update_p115_qr_session(record["id"], "cancelled")
+        self.telegram.answer_callback_query(callback_id, "已取消")
+        self._update_callback_message(
+            chat_id,
+            message_id,
+            format_p115_qr_final_message("cancelled", self.store.get_p115_cookie()),
+            reply_markup=p115_cookie_status_reply_markup(),
             fallback_chat_id=record["chat_id"],
         )
 
@@ -4347,6 +4761,7 @@ class TelegramBot:
         is_adult_session = session["category"] == "adult"
         is_anime_session = session["category"] == "anime"
         is_bt4g_session = session["category"] == "bt4g"
+        is_pansou_session = session["category"] == "pansou"
         title = "搜索结果"
         if not candidate_ids:
             title = "未找到可用资源"
@@ -4356,6 +4771,8 @@ class TelegramBot:
             title = "动漫源搜索结果"
         elif is_bt4g_session:
             title = "BT4G搜索结果"
+        elif is_pansou_session:
+            title = "网盘搜索结果"
         return format_search_page_message(
             session["query"],
             candidates,
@@ -4369,14 +4786,20 @@ class TelegramBot:
             candidates,
             page,
             page_count,
-            allow_adult_retry=not is_adult_session and not is_anime_session and not is_bt4g_session and not is_strong_adult_code_query(session["query"]),
+            allow_adult_retry=not is_adult_session
+            and not is_anime_session
+            and not is_bt4g_session
+            and not is_pansou_session
+            and not is_strong_adult_code_query(session["query"]),
             allow_anime_retry=not is_adult_session
             and not is_anime_session
             and not is_bt4g_session
+            and not is_pansou_session
             and not is_strong_adult_code_query(session["query"])
             and not should_search_anime(DEFAULT_SEARCH_CATEGORY, session["query"]),
-            allow_bt4g_retry=self._should_allow_bt4g_retry(session),
-            allow_llm_rerank=self.config.llm_search_rerank_enabled and bool(candidate_ids),
+            allow_bt4g_retry=self._should_allow_bt4g_retry(session) and not is_pansou_session,
+            allow_llm_rerank=self.config.llm_search_rerank_enabled and bool(candidate_ids) and not is_pansou_session,
+            allow_pansou_search=self.config.pansou_enabled and not is_pansou_session,
         )
 
     def _should_allow_bt4g_retry(self, session):
@@ -4415,6 +4838,40 @@ class TelegramBot:
                 saved_task,
             )
 
+    def _sync_successful_submit_tasks(self, result):
+        for task in result.get("tasks") or []:
+            info_hash = task.get("info_hash")
+            if not info_hash:
+                continue
+            try:
+                record = self.store.load_task(info_hash)
+            except RuntimeError:
+                continue
+            current_task = record.get("task") or {}
+            if not TASK_STATE.is_offline_success(current_task):
+                continue
+            if task_msg_synced(current_task) or not task_sync_is_running(current_task):
+                continue
+            lock = self._try_acquire_task_lock(info_hash)
+            if lock is None:
+                continue
+            try:
+                try:
+                    record = self.store.load_task(info_hash)
+                except RuntimeError:
+                    continue
+                current_task = self._task_with_known_status_message_id(record, record.get("task"))
+                if not TASK_STATE.is_offline_success(current_task):
+                    continue
+                if task_msg_synced(current_task) or not task_sync_is_running(current_task):
+                    continue
+                synced_task = self._sync_completed_task_with_store_progress(record, current_task)
+                synced_task = self._task_with_known_status_message_id(record, synced_task)
+                self.store.save_task(record["user_id"], record["chat_id"], record["category"], record["title"], synced_task)
+                self._update_recovered_115_task_message(record, synced_task, force=True)
+            finally:
+                lock.release()
+
     def _load_owned_task(self, user_id, callback_id, info_hash):
         try:
             record = self.store.load_task(info_hash)
@@ -4434,6 +4891,17 @@ class TelegramBot:
             return None
         if record["user_id"] != user_id:
             self.telegram.answer_callback_query(callback_id, "无权操作此迁移")
+            return None
+        return record
+
+    def _load_owned_p115_qr_session(self, user_id, callback_id, session_id):
+        try:
+            record = self.store.load_p115_qr_session(session_id)
+        except RuntimeError:
+            self.telegram.answer_callback_query(callback_id, "扫码会话不存在")
+            return None
+        if record["user_id"] != user_id:
+            self.telegram.answer_callback_query(callback_id, "无权操作此扫码会话")
             return None
         return record
 
@@ -4981,16 +5449,19 @@ STALE_MSG_MEDIA_RESET_KEYS = (
     "msg_visibility_repair_media_count",
     "msg_visibility_repair_reason",
     "msg_visibility_repair_error",
+    "msg_artwork_repair_status",
+    "msg_artwork_repair_updated",
+    "msg_artwork_repair_reason",
+    "msg_artwork_repair_fields",
+    "msg_artwork_repair_metadata_source",
+    "msg_artwork_repair_poster_source",
+    "msg_artwork_repair_backdrop_source",
+    "msg_artwork_repair_error",
     "subtitle_match_status",
     "subtitle_match_source",
     "subtitle_match_reason",
     "subtitle_match_error",
     "subtitle_match_path",
-    "msg_target_scan_status",
-    "msg_target_scan_root_id",
-    "msg_target_scan_path",
-    "msg_target_scan_match_path",
-    "msg_target_scan_error",
 )
 
 
@@ -6317,6 +6788,8 @@ def parse_callback_data(value):
         return "anime_search", int(payload)
     if action == "bt4g_search":
         return "bt4g_search", int(payload)
+    if action == "pansou_search":
+        return "pansou_search", int(payload)
     if action == "llm_rerank":
         return "llm_rerank", int(payload)
     if action == "profile":
@@ -6352,6 +6825,10 @@ def parse_callback_data(value):
         return "migrate_cancel", int(payload)
     if action in ("dedupe_refresh_confirm", "dedupe_refresh_cancel") and payload:
         return action, payload
+    if action == "p115_cookie_start" and payload:
+        return "p115_cookie_start", payload
+    if action in ("p115_cookie_check", "p115_cookie_cancel") and payload:
+        return action, int(payload)
     if action in ("subtitle_backfill_confirm", "subtitle_backfill_retry") and payload:
         return action, int(payload)
     if action == "subtitle_backfill_cancel" and payload:
@@ -6379,6 +6856,95 @@ def parse_callback_data(value):
     if action == "subpick" and payload:
         return action, int(payload)
     return None, None
+
+
+def share115_candidate_from_text(text):
+    parsed = parse_115_share_url(text)
+    if parsed is None:
+        return None
+    return {
+        "title": "115分享 %s" % parsed.share_code,
+        "download_uri": parsed.url,
+        "indexer": "115分享",
+        "seeders": None,
+        "size": None,
+        "rank": 1,
+        "source_kind": "115_share",
+        "shareCode": parsed.share_code,
+    }
+
+
+def format_p115_cookie_status_message(cookie):
+    if p115_cookie_is_valid(cookie):
+        return "115 分享转存 Cookie：可用\n%s\n\n可扫码更新；Bot 不会回显完整 Cookie。" % mask_p115_cookie(cookie)
+    return "115 分享转存 Cookie：未配置或格式无效\n\n点击“扫码更新”，使用 115 App 扫码确认后保存。Bot 不会回显完整 Cookie。"
+
+
+def format_p115_cookie_saved_message(cookie):
+    return "115 Cookie 已保存，后续 115 分享链接转存会直接使用。\n%s" % mask_p115_cookie(cookie)
+
+
+def format_p115_qr_message(session_id, session, status_label="等待扫码"):
+    return "\n".join(
+        [
+            "115 扫码登录",
+            "会话：%s" % session_id,
+            "状态：%s" % status_label,
+            "二维码链接：%s" % ((session or {}).get("qrcode_url") or "-"),
+            "",
+            "用 115 App 扫码并确认后，点击“刷新状态”。",
+        ]
+    )
+
+
+def format_p115_qr_final_message(status, cookie):
+    if status == "confirmed":
+        return format_p115_cookie_saved_message(cookie)
+    if status == "expired":
+        return "115 扫码登录二维码已过期。\n\n当前 Cookie：%s" % (
+            mask_p115_cookie(cookie) if p115_cookie_is_valid(cookie) else "未配置或格式无效"
+        )
+    if status == "cancelled":
+        return "已取消本次 115 扫码登录。\n\n当前 Cookie：%s" % (
+            mask_p115_cookie(cookie) if p115_cookie_is_valid(cookie) else "未配置或格式无效"
+        )
+    return format_p115_cookie_status_message(cookie)
+
+
+def qrcode_session_final_label(status):
+    return {
+        "confirmed": "已保存",
+        "expired": "二维码已过期",
+        "cancelled": "已取消",
+    }.get(str(status or ""), "已结束")
+
+
+def p115_cookie_status_reply_markup():
+    return {
+        "inline_keyboard": [
+            [{"text": "扫码更新", "callback_data": "p115_cookie_start:1"}],
+        ]
+    }
+
+
+def p115_cookie_qr_reply_markup(session_id):
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "刷新状态", "callback_data": "p115_cookie_check:%s" % int(session_id)},
+                {"text": "取消", "callback_data": "p115_cookie_cancel:%s" % int(session_id)},
+            ]
+        ]
+    }
+
+
+def first_value(value):
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if item:
+                return item
+        return None
+    return value
 
 
 def subtitle_backfill_record_from_row(row):
@@ -6619,6 +7185,7 @@ def format_task_diagnostics_message(record):
         ("msg_error", "MSG错误"),
         ("msg_extra_cleanup_error", "特典隐藏错误"),
         ("msg_visibility_repair_error", "可见性修复错误"),
+        ("msg_artwork_repair_error", "图片修复错误"),
     ):
         if task.get(key):
             lines.append("%s：%s" % (label, task.get(key)))
@@ -6706,5 +7273,5 @@ def build_bot(config=None):
     config = config or BotConfig.from_env()
     telegram = TelegramApi(config.token, timeout=config.telegram_timeout)
     store = CandidateStore(config.state_db_path)
-    service = PipelineBotService(config)
+    service = PipelineBotService(config, p115_cookie_provider=store.get_p115_cookie)
     return TelegramBot(config, telegram, store, service)
