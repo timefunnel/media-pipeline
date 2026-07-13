@@ -366,6 +366,10 @@ class FakeMediaStationClient:
         movie_extra_response=None,
         episode_visibility_response=None,
         prune_deleted_response=None,
+        deleted_hide_candidates_response=None,
+        migration_search_response=None,
+        migration_validate_response=None,
+        migration_apply_response=None,
     ):
         self.search_response = search_response or {"data": {"items": []}}
         self.list_response = list_response or {"data": {"items": []}}
@@ -387,6 +391,10 @@ class FakeMediaStationClient:
             "reason": "no_deleted_media",
             "media_ids": [],
         }
+        self.deleted_hide_candidates_response = deleted_hide_candidates_response or {"items": []}
+        self.migration_search_response = migration_search_response or {"items": []}
+        self.migration_validate_response = migration_validate_response
+        self.migration_apply_response = migration_apply_response
         self.scan_calls = []
         self.search_calls = []
         self.list_calls = []
@@ -441,6 +449,30 @@ class FakeMediaStationClient:
     def pipeline_prune_deleted_media(self, target, openlist_paths):
         self.pipeline_maintenance_calls.append(("prune_deleted_media", dict(target or {}), list(openlist_paths or [])))
         return self.prune_deleted_response
+
+    def pipeline_list_deleted_media_hide_candidates(self, limit=100):
+        self.pipeline_maintenance_calls.append(("list_deleted_media_hide_candidates", int(limit)))
+        return self.deleted_hide_candidates_response
+
+    def pipeline_search_migration_candidates(self, query, limit=20):
+        self.pipeline_maintenance_calls.append(("search_migration_candidates", query, int(limit)))
+        return self.migration_search_response
+
+    def pipeline_validate_migration(self, source, target):
+        self.pipeline_maintenance_calls.append(("validate_migration", dict(source or {}), dict(target or {})))
+        if self.events is not None:
+            self.events.append(("msg_validate_migration", source.get("source_openlist_path"), target.get("category")))
+        if self.migration_validate_response is None:
+            raise AssertionError("migration_validate_response missing")
+        return self.migration_validate_response
+
+    def pipeline_apply_migration(self, source, target):
+        self.pipeline_maintenance_calls.append(("apply_migration", dict(source or {}), dict(target or {})))
+        if self.events is not None:
+            self.events.append(("msg_apply_migration", source.get("source_openlist_path"), target.get("category")))
+        if self.migration_apply_response is None:
+            raise AssertionError("migration_apply_response missing")
+        return self.migration_apply_response
 
     def get_media(self, media_id):
         self.get_calls.append(media_id)

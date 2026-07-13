@@ -171,6 +171,34 @@ class MediaStationClient:
         payload["openlist_paths"] = list(openlist_paths or [])
         return self._pipeline_request("POST", "/pipeline/deleted-media/prune", data=payload)
 
+    def pipeline_list_deleted_media_hide_candidates(self, limit=100):
+        return self._pipeline_request(
+            "POST",
+            "/pipeline/deleted-media/hide-candidates",
+            data={"limit": max(1, int(limit))},
+        )
+
+    def pipeline_search_migration_candidates(self, query, limit=20):
+        return self._pipeline_request(
+            "POST",
+            "/pipeline/migrations/search",
+            data={"query": str(query or "").strip(), "limit": max(1, int(limit))},
+        )
+
+    def pipeline_validate_migration(self, source, target):
+        return self._pipeline_request(
+            "POST",
+            "/pipeline/migrations/validate",
+            data={"source": dict(source or {}), "target": dict(target or {})},
+        )
+
+    def pipeline_apply_migration(self, source, target):
+        return self._pipeline_request(
+            "POST",
+            "/pipeline/migrations/apply",
+            data={"source": dict(source or {}), "target": dict(target or {})},
+        )
+
     def search_scrape_matches(self, media_id, query, provider, media_type):
         params = urllib.parse.urlencode({"query": query, "provider": provider, "media_type": media_type})
         return self._request("GET", "/media/%s/scrape/search?%s" % (quote_path(media_id), params))

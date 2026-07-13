@@ -1943,21 +1943,46 @@ class MediaStationClientTest(unittest.TestCase):
                 {"code": 0, "message": "ok", "data": {"status": "success", "updated": 1}},
                 {"code": 0, "message": "ok", "data": {"status": "success", "updated": 2}},
                 {"code": 0, "message": "ok", "data": {"status": "success", "deleted": 1}},
+                {"code": 0, "message": "ok", "data": {"items": [{"media_id": "deleted-1"}]}},
+                {"code": 0, "message": "ok", "data": {"items": [{"title": "Show"}]}},
+                {"code": 0, "message": "ok", "data": {"target_openlist_path": "/115/动漫/Show"}},
+                {"code": 0, "message": "ok", "data": {"target_openlist_path": "/115/动漫/Show"}},
             ]
         )
         client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
         target = {"category": "movie", "library_id": "library-1", "root_id": "root-1", "root_openlist_path": "/115/电影"}
+        migration_source = {
+            "category": "tv",
+            "library_id": "library-tv",
+            "library_root_id": "root-tv",
+            "source_openlist_path": "/115/剧集/Show",
+            "source_kind": "folder",
+        }
+        migration_target = {
+            "category": "anime",
+            "library_id": "library-anime",
+            "root_id": "root-anime",
+            "root_openlist_path": "/115/动漫",
+        }
 
         self.assertEqual(client.pipeline_scrape_media("media-1", "movie", "Movie", ["Movie"], "tmdb", "movie")["mode"], "smart")
         self.assertEqual(client.pipeline_repair_movie_extras("media-1", target)["updated"], 1)
         self.assertEqual(client.pipeline_repair_episode_visibility("media-1", target)["updated"], 2)
         self.assertEqual(client.pipeline_prune_deleted_media(target, ["/115/电影/Movie"])["deleted"], 1)
+        self.assertEqual(client.pipeline_list_deleted_media_hide_candidates(100)["items"][0]["media_id"], "deleted-1")
+        self.assertEqual(client.pipeline_search_migration_candidates("Show", 20)["items"][0]["title"], "Show")
+        self.assertEqual(client.pipeline_validate_migration(migration_source, migration_target)["target_openlist_path"], "/115/动漫/Show")
+        self.assertEqual(client.pipeline_apply_migration(migration_source, migration_target)["target_openlist_path"], "/115/动漫/Show")
 
         self.assertEqual(transport.calls[1]["url"], "http://127.0.0.1:18080/api/pipeline/media/media-1/scrape")
         self.assertEqual(transport.calls[2]["url"], "http://127.0.0.1:18080/api/pipeline/media/media-1/repair-movie-extras")
         self.assertEqual(transport.calls[3]["url"], "http://127.0.0.1:18080/api/pipeline/media/media-1/repair-episode-visibility")
         self.assertEqual(transport.calls[4]["url"], "http://127.0.0.1:18080/api/pipeline/deleted-media/prune")
         self.assertEqual(transport.calls[4]["data"]["openlist_paths"], ["/115/电影/Movie"])
+        self.assertEqual(transport.calls[5]["url"], "http://127.0.0.1:18080/api/pipeline/deleted-media/hide-candidates")
+        self.assertEqual(transport.calls[6]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/search")
+        self.assertEqual(transport.calls[7]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/validate")
+        self.assertEqual(transport.calls[8]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/apply")
 
     def test_list_libraries_uses_libraries_endpoint(self):
         transport = SequenceTransport(

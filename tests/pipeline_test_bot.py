@@ -4851,11 +4851,8 @@ class PipelineBotServiceTest(unittest.TestCase):
         fake_msg = FakeMediaStationClient(
             search_response={"data": {"items": [{"id": "media-1", "library_id": "test-movie-library", "title": "Movie"}]}},
             events=events,
-        )
-
-        class FakeMsgDb:
-            def list_deleted_openlist_media_for_hide(self, limit=100):
-                return [
+            deleted_hide_candidates_response={
+                "items": [
                     {
                         "media_id": "trash-1",
                         "target_openlist_path": "/115/其他/Old",
@@ -4869,10 +4866,12 @@ class PipelineBotServiceTest(unittest.TestCase):
                         "hide_pattern": "^Gone$",
                     },
                 ]
+            },
+        )
 
         with tempfile.TemporaryDirectory() as tmp, patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
             "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
-        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist), patch("pipeline.bot.MediaStationDbClient", return_value=FakeMsgDb()):
+        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist):
             state_db = str(Path(tmp) / "state.db")
             service = PipelineBotService(
                 BotConfig(
@@ -4898,6 +4897,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(fake_openlist.source_delete_calls, [])
         self.assertLess(events.index(("meta_hide", "/115/其他", ("^Old$",), True)), events.index(("scan",)))
         self.assertEqual(processed, {"trash-1", "trash-2"})
+        self.assertIn(("list_deleted_media_hide_candidates", 100), fake_msg.pipeline_maintenance_calls)
         self.assertEqual(task["openlist_trash_hide_status"], "success")
         self.assertEqual(task["openlist_trash_hide_hidden_count"], 1)
         self.assertEqual(task["openlist_trash_hide_skipped_count"], 1)
@@ -6699,26 +6699,18 @@ class PipelineBotServiceTest(unittest.TestCase):
         from pipeline.bot import BotConfig, PipelineBotService
 
         events = []
-
-        class FakeMigrationDb:
-            def search_migration_candidates(self, query, limit=20):
-                raise AssertionError("not used")
-
-            def validate_migration_target_available(self, candidate, target_category):
-                events.append(("db_validate", candidate["source_openlist_path"], target_category))
-
-            def validate_migration_source_ready(self, candidate):
-                events.append(("db_preflight", candidate["source_openlist_path"]))
-
-            def migrate_media_group(self, candidate, target_category):
-                events.append(("db_migrate", candidate["source_openlist_path"], target_category))
-                return {
-                    "source_openlist_path": candidate["source_openlist_path"],
-                    "target_openlist_path": "/115/动漫/成龙历险记",
-                    "target_category": target_category,
-                    "media_count": 95,
-                    "series_count": 1,
-                }
+        migration_result = {
+            "source_openlist_path": "/115/剧集/成龙历险记",
+            "target_openlist_path": "/115/动漫/成龙历险记",
+            "target_category": "anime",
+            "media_count": 95,
+            "series_count": 1,
+        }
+        fake_msg = FakeMediaStationClient(
+            events=events,
+            migration_validate_response=dict(migration_result),
+            migration_apply_response=dict(migration_result),
+        )
 
         fake_openlist = CleaningOpenList(
             {
@@ -6728,14 +6720,24 @@ class PipelineBotServiceTest(unittest.TestCase):
             events=events,
         )
 
-        with patch("pipeline.bot.MediaStationDbClient", return_value=FakeMigrationDb()), patch(
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
             "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
         ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist):
-            service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                )
+            )
             result = service.migrate_media_candidate(
                 {
                     "title": "成龙历险记",
                     "category": "tv",
+                    "library_id": "test-tv-library",
+                    "library_root_id": "test-tv-root",
                     "source_openlist_path": "/115/剧集/成龙历险记",
                     "source_kind": "folder",
                     "media_count": 95,
@@ -6743,21 +6745,52 @@ class PipelineBotServiceTest(unittest.TestCase):
                 "anime",
             )
 
-        self.assertEqual(events[1], ("db_preflight", result["source_openlist_path"]))
         self.assertEqual(
-            events[:1] + events[2:],
+            events,
             [
-                ("db_validate", "/115/剧集/成龙历险记", "anime"),
+                ("msg_validate_migration", "/115/剧集/成龙历险记", "anime"),
                 ("list_all", "/115/剧集", False),
                 ("list_all", "/115/动漫", False),
                 ("move", "/115/剧集", "/115/动漫", ("成龙历险记",)),
                 ("openlist", "/115/剧集", True),
                 ("openlist", "/115/动漫", True),
-                ("db_migrate", "/115/剧集/成龙历险记", "anime"),
+                ("msg_apply_migration", "/115/剧集/成龙历险记", "anime"),
             ],
         )
         self.assertEqual(result["target_openlist_path"], "/115/动漫/成龙历险记")
         self.assertTrue(result["openlist_moved"])
+
+    def test_search_migration_candidates_restores_category_from_configured_library_id(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            migration_search_response={
+                "items": [
+                    {
+                        "title": "Archive",
+                        "library_id": "test-other-library",
+                        "library_root_id": "test-other-root",
+                        "library_type": "movie",
+                        "category": "movie",
+                        "source_openlist_path": "/115/其他/Archive",
+                        "source_kind": "folder",
+                    }
+                ]
+            }
+        )
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                )
+            )
+            candidates = service.search_migration_candidates("Archive")
+
+        self.assertEqual(candidates[0]["category"], "other")
 
     def test_sync_completed_task_marks_failed_scan_stage(self):
         from pipeline.bot import BotConfig, PipelineBotService

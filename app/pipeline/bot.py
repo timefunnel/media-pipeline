@@ -25,7 +25,7 @@ from pipeline.client115 import (
     qrcode_status_label,
     share_receive_task_id,
 )
-from pipeline.config import category_to_folder_id, category_to_msg_library_root, category_to_openlist_path
+from pipeline.config import category_to_folder_id, category_to_msg_library_root, category_to_openlist_path, msg_library_roots
 from pipeline.dedupe import (
     candidate_dedupe_identities,
     candidate_info_hash,
@@ -1803,7 +1803,23 @@ class PipelineBotService:
         self._llm_rerank_lock.release()
 
     def search_migration_candidates(self, query, limit=20):
-        return self._build_msg_db_client().search_migration_candidates(query, limit=limit)
+        result = self._build_msg_client().pipeline_search_migration_candidates(query, limit=limit)
+        items = result.get("items") if isinstance(result, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError("MediaStationGo migration search returned invalid response")
+        category_by_library_id = {
+            root.get("library_id"): category
+            for category, root in msg_library_roots().items()
+            if root.get("library_id")
+        }
+        normalized = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise RuntimeError("MediaStationGo migration search returned invalid candidate")
+            candidate = dict(item)
+            candidate["category"] = category_by_library_id.get(candidate.get("library_id"), candidate.get("category") or "")
+            normalized.append(candidate)
+        return normalized
 
     def _build_search_reranker(self):
         return SearchRerankClient(
@@ -1878,9 +1894,22 @@ class PipelineBotService:
 
     def migrate_media_candidate(self, candidate, target_category):
         target = build_migration_target(candidate, target_category)
-        db_client = self._build_msg_db_client()
-        db_client.validate_migration_target_available(candidate, target_category)
-        db_client.validate_migration_source_ready(candidate)
+        msg_client = self._build_msg_client()
+        source = {
+            "category": candidate.get("category"),
+            "library_id": candidate.get("library_id"),
+            "library_root_id": candidate.get("library_root_id"),
+            "source_openlist_path": candidate.get("source_openlist_path"),
+            "source_kind": candidate.get("source_kind"),
+        }
+        msg_target = self._pipeline_maintenance_target(target_category)
+        validation = msg_client.pipeline_validate_migration(source, msg_target)
+        if (
+            not isinstance(validation, dict)
+            or validation.get("source_openlist_path") != candidate.get("source_openlist_path")
+            or validation.get("target_openlist_path") != target.get("target_openlist_path")
+        ):
+            raise RuntimeError("MediaStationGo migration validation returned invalid response")
 
         openlist_client = OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
         source_path = candidate["source_openlist_path"]
@@ -1896,7 +1925,13 @@ class PipelineBotService:
         openlist_client.list_path(source_dir, refresh=True)
         openlist_client.list_path(target_root, refresh=True)
 
-        result = db_client.migrate_media_group(candidate, target_category)
+        result = msg_client.pipeline_apply_migration(source, msg_target)
+        if (
+            not isinstance(result, dict)
+            or result.get("source_openlist_path") != candidate.get("source_openlist_path")
+            or result.get("target_openlist_path") != target.get("target_openlist_path")
+        ):
+            raise RuntimeError("MediaStationGo migration apply returned invalid response")
         result["openlist_moved"] = True
         try:
             result["dedupe_index_count"] = CandidateStore(self.config.state_db_path).migrate_dedupe_entries(
@@ -2278,7 +2313,7 @@ class PipelineBotService:
         if self.config.msg_trash_hide_sync_enabled:
             if not stage_is_complete(progress.get("openlist_trash_hide_status")):
                 emit({"openlist_trash_hide_status": "running", "openlist_trash_hide_error": None})
-                trash_hide_result = self._sync_msg_trash_to_openlist_hide(get_openlist_client())
+                trash_hide_result = self._sync_msg_trash_to_openlist_hide(get_msg_client(), get_openlist_client())
                 if trash_hide_result.get("openlist_trash_hide_status") != "skipped":
                     emit(trash_hide_result)
                 else:
@@ -2559,11 +2594,12 @@ class PipelineBotService:
             "msg_extra_cleanup_error": None,
         }
 
-    def _sync_msg_trash_to_openlist_hide(self, openlist_client):
+    def _sync_msg_trash_to_openlist_hide(self, msg_client, openlist_client):
         store = CandidateStore(self.config.state_db_path)
-        candidates = self._build_msg_db_client().list_deleted_openlist_media_for_hide(
-            limit=self.config.msg_trash_hide_sync_limit
-        )
+        response = msg_client.pipeline_list_deleted_media_hide_candidates(limit=self.config.msg_trash_hide_sync_limit)
+        candidates = response.get("items") if isinstance(response, dict) else None
+        if not isinstance(candidates, list):
+            raise RuntimeError("MediaStationGo deleted media hide candidates returned invalid response")
         processed = store.processed_trash_hide_media_ids([candidate["media_id"] for candidate in candidates])
         pending = [candidate for candidate in candidates if candidate["media_id"] not in processed]
         if not pending:
