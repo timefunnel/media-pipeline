@@ -104,6 +104,8 @@ from pipeline.telegram_ui import (
     format_submit_message,
     format_task_list_message,
     format_task_status_message,
+    home_back_reply_markup,
+    home_reply_markup,
     library_choice_reply_markup,
     msg_match_mode_label,
     msg_sync_status_label,
@@ -247,8 +249,13 @@ CONTENT_PROFILE_LABELS = {
     "other": "其他",
 }
 DEFAULT_SEARCH_CATEGORY = "movie"
-START_TEXT = "直接发送关键词、番号、磁链或 115 分享链接即可搜索/入库；/help 查看功能；/tasks 查看最近任务；/p115_cookie 管理 115 Cookie；/version 查看版本"
-HELP_TEXT = """直接发送关键词、番号或磁链即可。
+START_TEXT = """媒体资源助手
+
+直接发送关键词、番号、磁链或 115 分享链接，即可搜索并选择入库。
+也可以使用下方功能菜单。"""
+HELP_TEXT = """使用说明
+
+直接发送关键词、番号、磁链或 115 分享链接即可。
 
 常用入口：
 /tasks 查看最近任务
@@ -265,8 +272,8 @@ HELP_TEXT = """直接发送关键词、番号或磁链即可。
 搜索统计会显示来源、耗时、返回/展示数量和 LLM 重排状态。搜索结果可单独补查网盘 115 分享。
 搜索结果里选择资源后，再选择入电影、剧集、动漫、成人或其他库。"""
 BOT_COMMANDS = [
-    {"command": "start", "description": "打开使用说明"},
-    {"command": "help", "description": "查看搜索统计和功能说明"},
+    {"command": "start", "description": "打开功能菜单"},
+    {"command": "help", "description": "查看完整使用说明"},
     {"command": "tasks", "description": "查看最近任务、刷新进度或取消任务"},
     {"command": "status", "description": "按 info_hash 查询任务进度"},
     {"command": "diag", "description": "查看任务或MSG媒体诊断"},
@@ -2933,7 +2940,7 @@ class TelegramBot:
 
         text = (message.get("text") or "").strip()
         if not text:
-            self.telegram.send_message(chat_id, START_TEXT)
+            self.telegram.send_message(chat_id, START_TEXT, reply_markup=home_reply_markup())
             return
 
         command, argument = split_command(text)
@@ -2949,10 +2956,10 @@ class TelegramBot:
                 self._handle_pending_message(chat_id, user_id, text, pending)
                 return
         if command == "/start":
-            self.telegram.send_message(chat_id, START_TEXT)
+            self.telegram.send_message(chat_id, START_TEXT, reply_markup=home_reply_markup())
             return
         if command == "/help":
-            self.telegram.send_message(chat_id, HELP_TEXT)
+            self.telegram.send_message(chat_id, HELP_TEXT, reply_markup=home_reply_markup())
             return
         if command == "/tasks":
             self._send_task_list(chat_id, user_id)
@@ -3066,6 +3073,9 @@ class TelegramBot:
             return
 
         action, value = parse_callback_data(callback.get("data") or "")
+        if action == "home":
+            self._handle_home_callback(user_id, chat_id, message_id, callback_id, value)
+            return
         if action == "page":
             session_id, page = value
             self._handle_search_page_callback(user_id, chat_id, message_id, callback_id, session_id, page)
@@ -3225,6 +3235,76 @@ class TelegramBot:
             reply_markup=reply_markup,
             fallback_chat_id=session["chat_id"],
         )
+
+    def _handle_home_callback(self, user_id, chat_id, message_id, callback_id, target):
+        target = str(target or "").strip()
+        if target == "menu":
+            self.store.clear_pending_action(user_id, chat_id)
+            self.telegram.answer_callback_query(callback_id, "功能菜单")
+            self._update_callback_message(chat_id, message_id, START_TEXT, reply_markup=home_reply_markup(), fallback_chat_id=chat_id)
+            return
+        if target == "tasks":
+            records, page, page_count, total = self._task_list_page(user_id, page=0)
+            self.telegram.answer_callback_query(callback_id, "最近任务")
+            if not records:
+                self._update_callback_message(chat_id, message_id, "最近任务\n暂无任务", reply_markup=home_back_reply_markup(), fallback_chat_id=chat_id)
+                return
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                format_task_list_message(records, page=page, page_count=page_count, total=total, page_size=self.config.task_list_page_size),
+                reply_markup=task_list_reply_markup(records, page=page, page_count=page_count, page_size=self.config.task_list_page_size),
+                fallback_chat_id=chat_id,
+            )
+            return
+        if target == "subtitles":
+            self.telegram.answer_callback_query(callback_id, "字幕管理")
+            try:
+                report = self.service.subtitle_backfill_report_adult()
+            except (RuntimeError, ValueError) as exc:
+                self._update_callback_message(
+                    chat_id,
+                    message_id,
+                    "字幕补齐报表生成失败：%s" % exc,
+                    reply_markup=home_back_reply_markup(),
+                    fallback_chat_id=chat_id,
+                )
+                return
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                format_subtitle_backfill_report_message(report, bucket="pending", page=0),
+                reply_markup=subtitle_backfill_report_reply_markup(
+                    report,
+                    bucket="pending",
+                    page=0,
+                    batch_limit=self.config.subtitle_backfill_default_limit,
+                ),
+                fallback_chat_id=chat_id,
+            )
+            return
+        if target == "migrate":
+            self.store.save_pending_action(user_id, chat_id, PENDING_ACTION_MIGRATE_QUERY)
+            self.telegram.answer_callback_query(callback_id, "请输入迁移关键词")
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                MIGRATE_PROMPT_TEXT,
+                reply_markup=home_back_reply_markup(),
+                fallback_chat_id=chat_id,
+            )
+            return
+        if target == "p115":
+            self.telegram.answer_callback_query(callback_id, "115 Cookie")
+            self._update_callback_message(
+                chat_id,
+                message_id,
+                format_p115_cookie_status_message(self.store.get_p115_cookie()),
+                reply_markup=p115_cookie_status_reply_markup(),
+                fallback_chat_id=chat_id,
+            )
+            return
+        self.telegram.answer_callback_query(callback_id, "不支持的菜单操作")
 
     def _handle_llm_rerank_callback(self, user_id, chat_id, message_id, callback_id, session_id):
         try:
@@ -6105,11 +6185,12 @@ def subtitle_backfill_report_reply_markup(report, bucket="pending", page=0, batc
     keyboard.append([{"text": "查找影片", "callback_data": "subfind_prompt:1"}])
     keyboard.append(
         [
-            {"text": "上一页", "callback_data": "subtitle_report:%s:%s" % (bucket, previous_page)},
-            {"text": "刷新", "callback_data": "subtitle_report:%s:%s" % (bucket, page)},
-            {"text": "下一页", "callback_data": "subtitle_report:%s:%s" % (bucket, next_page)},
+            {"text": "‹ 上一页", "callback_data": "subtitle_report:%s:%s" % (bucket, previous_page)},
+            {"text": "↻ 刷新", "callback_data": "subtitle_report:%s:%s" % (bucket, page)},
+            {"text": "下一页 ›", "callback_data": "subtitle_report:%s:%s" % (bucket, next_page)},
         ]
     )
+    keyboard.append([{"text": "⌂ 功能菜单", "callback_data": "home:menu"}])
     return {
         "inline_keyboard": keyboard
     }
@@ -6691,6 +6772,8 @@ def parse_callback_data(value):
     action, sep, payload = (value or "").partition(":")
     if not sep:
         return None, None
+    if action == "home" and payload:
+        return "home", payload
     if action == "choose":
         return "choose", int(payload)
     if action == "back_search":
@@ -6840,6 +6923,7 @@ def p115_cookie_status_reply_markup():
     return {
         "inline_keyboard": [
             [{"text": "扫码更新", "callback_data": "p115_cookie_start:1"}],
+            [{"text": "⌂ 功能菜单", "callback_data": "home:menu"}],
         ]
     }
 

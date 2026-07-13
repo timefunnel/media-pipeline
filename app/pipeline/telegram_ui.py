@@ -21,6 +21,20 @@ CONTENT_PROFILE_LABELS = {
     "other": "其他",
 }
 
+TASK_STATUS_LABELS = {
+    "submitted": "已提交",
+    "pending": "排队中",
+    "waiting": "等待中",
+    "running": "处理中",
+    "downloading": "下载中",
+    "success": "已完成",
+    "completed": "已完成",
+    "failed": "失败",
+    "cancelled": "已取消",
+    "canceled": "已取消",
+    "skipped": "已跳过",
+}
+
 def search_page_count(total, page_size=SEARCH_PAGE_SIZE):
     if total <= 0:
         return 1
@@ -74,8 +88,20 @@ def msg_match_mode_label(value):
         "query": "标题/番号命中",
     }.get(value, value or "-")
 
+
+def task_status_label(value):
+    value = str(value or "").strip()
+    return TASK_STATUS_LABELS.get(value.lower(), value or "-")
+
+
+def compact_task_id(value, length=12):
+    value = str(value or "").strip()
+    if len(value) <= int(length):
+        return value
+    return value[: int(length)] + "…"
+
 def format_search_page_message(query, candidates, page, page_count, total, title="搜索结果", metadata=None):
-    lines = ["%s：%s" % (title, query), "第 %s/%s 页，共 %s 条" % (page + 1, page_count, total)]
+    lines = [title, "关键词：%s" % query, "第 %s/%s 页 · 共 %s 条" % (page + 1, page_count, total)]
     stats_line = format_search_stats(metadata)
     if stats_line:
         lines.append(stats_line)
@@ -85,6 +111,8 @@ def format_search_page_message(query, candidates, page, page_count, total, title
             lines.append("")
         lines.append("#%s %s" % (rank, candidate.get("title")))
         append_candidate_detail_lines(lines, candidate)
+    if not candidates:
+        lines.extend(["", "可使用下方按钮补查其他来源。"])
     return "\n".join(lines)
 
 def format_library_choice_message(candidate):
@@ -262,7 +290,7 @@ def format_submit_message(candidate, result, category=None, content_profile=None
         lines[0] = "已转存115分享：%s" % candidate.get("title")
     if category:
         lines.append("入库目录：%s" % CATEGORY_LABELS.get(category, category))
-    if content_profile:
+    if content_profile and content_profile != category:
         lines.append("内容分类：%s" % CONTENT_PROFILE_LABELS.get(content_profile, content_profile))
     for task in result.get("tasks") or []:
         if task_is_115_share_receive(task):
@@ -274,17 +302,17 @@ def format_submit_message(candidate, result, category=None, content_profile=None
             lines.append("info_hash：%s" % task["info_hash"])
     task_status = result.get("task_status")
     if task_status:
-        lines.append("当前状态：%s" % task_status.get("status_name"))
+        lines.append("当前状态：%s" % task_status_label(task_status.get("status_name")))
         if task_status.get("percent_done") is not None:
-            lines.append("完成进度：%s" % task_status.get("percent_done"))
+            lines.append("完成进度：%s" % format_percent(task_status.get("percent_done")))
         if task_status.get("file_id"):
             lines.append("file_id：%s" % task_status.get("file_id"))
     if result.get("message"):
-        lines.append("message：%s" % result["message"])
+        lines.append("结果：%s" % result["message"])
     return "\n".join(lines)
 
 def format_task_status_message(title, task, category=None):
-    lines = ["任务状态：%s" % title]
+    lines = ["任务详情", str(title or "-")]
     append_task_lines(lines, task, category=category)
     return "\n".join(lines)
 
@@ -332,27 +360,28 @@ def format_auto_cancel_result_message(title, result, task, category=None):
 def format_task_list_message(records, page=0, page_count=1, total=None, page_size=DEFAULT_TASK_LIST_PAGE_SIZE):
     if total is None:
         total = len(records)
-    lines = ["最近任务：第 %s/%s 页，共 %s 条" % (page + 1, page_count, total)]
+    lines = ["最近任务", "第 %s/%s 页 · 共 %s 条" % (page + 1, page_count, total)]
     start_index = page * int(page_size) + 1
     for idx, record in enumerate(records, 1):
         task = record["task"]
         title = record["title"] or task.get("name") or task.get("info_hash")
         display_index = start_index + idx - 1
-        lines.append("%s. %s" % (display_index, title))
-        lines.append(
-            "入库：%s  状态：%s  进度：%s"
-            % (
-                CATEGORY_LABELS.get(record.get("category"), record.get("category") or "-"),
-                task.get("status_name") or "-",
-                format_percent(task.get("percent_done")),
-            )
-        )
-        if task.get("content_profile"):
+        lines.append("")
+        lines.append("#%s %s" % (display_index, title))
+        summary = [
+            CATEGORY_LABELS.get(record.get("category"), record.get("category") or "-"),
+            task_status_label(task.get("status_name")),
+        ]
+        progress = format_percent(task.get("percent_done"))
+        if progress != "-":
+            summary.append(progress)
+        lines.append(" · ".join(summary))
+        if task.get("content_profile") and task.get("content_profile") != record.get("category"):
             lines.append("内容：%s" % CONTENT_PROFILE_LABELS.get(task.get("content_profile"), task.get("content_profile")))
         if task.get("msg_sync_status"):
             lines.append("MSG：%s" % msg_sync_status_label(task.get("msg_sync_status")))
         if task.get("info_hash"):
-            lines.append("info_hash：%s" % task["info_hash"])
+            lines.append("任务ID：%s" % compact_task_id(task["info_hash"]))
     return "\n".join(lines)
 
 def append_task_lines(lines, task, category=None):
@@ -363,9 +392,13 @@ def append_task_lines(lines, task, category=None):
             lines.append("分享码：%s" % task.get("share_code"))
     elif task.get("info_hash"):
         lines.append("info_hash：%s" % task["info_hash"])
-    lines.append("当前状态：%s" % (task.get("status_name") or "-"))
-    if task.get("percent_done") is not None:
-        lines.append("完成进度：%s" % format_percent(task.get("percent_done")))
+    status_summary = task_status_label(task.get("status_name"))
+    progress = format_percent(task.get("percent_done"))
+    if progress != "-":
+        status_summary += " · " + progress
+    lines.append("当前状态：%s" % status_summary)
+    if category:
+        lines.append("入库目录：%s" % CATEGORY_LABELS.get(category, category))
     if task.get("file_id"):
         lines.append("file_id：%s" % task.get("file_id"))
     if task.get("wp_path_id"):
@@ -468,7 +501,37 @@ def append_task_lines(lines, task, category=None):
 def format_percent(value):
     if value is None:
         return "-"
-    return str(value)
+    text = str(value).strip()
+    if not text:
+        return "-"
+    if text.endswith("%"):
+        return text
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return text
+    if number.is_integer():
+        return "%s%%" % int(number)
+    return ("%.1f" % number).rstrip("0").rstrip(".") + "%"
+
+
+def home_reply_markup():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "最近任务", "callback_data": "home:tasks"},
+                {"text": "字幕管理", "callback_data": "home:subtitles"},
+            ],
+            [
+                {"text": "媒体迁移", "callback_data": "home:migrate"},
+                {"text": "115 Cookie", "callback_data": "home:p115"},
+            ],
+        ]
+    }
+
+
+def home_back_reply_markup():
+    return {"inline_keyboard": [[{"text": "⌂ 功能菜单", "callback_data": "home:menu"}]]}
 
 def submit_reply_markup(result):
     for task in result.get("tasks") or []:
@@ -495,9 +558,9 @@ def search_page_reply_markup(
         rows.append([{"text": "#%s 入库" % candidate.get("rank"), "callback_data": "choose:%s" % candidate_id}])
     nav = []
     if page > 0:
-        nav.append({"text": "上一页", "callback_data": "page:%s:%s" % (session_id, page - 1)})
+        nav.append({"text": "‹ 上一页", "callback_data": "page:%s:%s" % (session_id, page - 1)})
     if page + 1 < page_count:
-        nav.append({"text": "下一页", "callback_data": "page:%s:%s" % (session_id, page + 1)})
+        nav.append({"text": "下一页 ›", "callback_data": "page:%s:%s" % (session_id, page + 1)})
     if nav:
         rows.append(nav)
     page_jump = search_page_jump_buttons(session_id, page, page_count)
@@ -505,18 +568,18 @@ def search_page_reply_markup(
         rows.append(page_jump)
     retry = []
     if allow_adult_retry:
-        retry.append({"text": "🔞", "callback_data": "adult_search:%s" % session_id})
+        retry.append({"text": "补查成人", "callback_data": "adult_search:%s" % session_id})
     if allow_anime_retry:
-        retry.append({"text": "动漫", "callback_data": "anime_search:%s" % session_id})
+        retry.append({"text": "补查动漫", "callback_data": "anime_search:%s" % session_id})
     if allow_bt4g_retry:
-        retry.append({"text": "BT4G", "callback_data": "bt4g_search:%s" % session_id})
+        retry.append({"text": "补查 BT4G", "callback_data": "bt4g_search:%s" % session_id})
     if allow_pansou_search:
-        retry.append({"text": "网盘搜索", "callback_data": "pansou_search:%s" % session_id})
+        retry.append({"text": "搜索115网盘", "callback_data": "pansou_search:%s" % session_id})
     if retry:
         rows.append(retry)
     if allow_llm_rerank:
-        rows.append([{"text": "LLM优选", "callback_data": "llm_rerank:%s" % session_id}])
-    rows.append([{"text": "关闭", "callback_data": "close_search:%s" % session_id}])
+        rows.append([{"text": "LLM 优选", "callback_data": "llm_rerank:%s" % session_id}])
+    rows.append([{"text": "关闭结果", "callback_data": "close_search:%s" % session_id}])
     return {"inline_keyboard": rows}
 
 def task_is_115_share_receive(task):
@@ -548,7 +611,7 @@ def search_page_jump_buttons(session_id, page, page_count):
             row.append({"text": "...", "callback_data": "page:%s:%s" % (session_id, page)})
         text = str(target + 1)
         if target == page:
-            text = "[%s]" % text
+            text = "·%s·" % text
         row.append({"text": text, "callback_data": "page:%s:%s" % (session_id, target)})
         previous = target
     return row
@@ -593,12 +656,12 @@ def duplicate_reply_markup(duplicate, category, candidate_id, content_profile=No
 def task_reply_markup(task):
     info_hash = (task or {}).get("info_hash")
     if task_can_retry_msg_sync(task):
-        return {"inline_keyboard": [[{"text": "重试MSG同步", "callback_data": "retry_msg:%s" % info_hash}]]}
+        return {"inline_keyboard": [[{"text": "重试 MSG 同步", "callback_data": "retry_msg:%s" % info_hash}]]}
     rows = []
     if TASK_STATE.can_refresh_offline_status(task):
-        row = [{"text": "刷新进度", "callback_data": "status:%s" % info_hash}]
+        row = [{"text": "↻ 刷新进度", "callback_data": "status:%s" % info_hash}]
         if TASK_STATE.can_cancel_offline_task(task):
-            row.append({"text": "取消任务", "callback_data": "cancel:%s" % info_hash})
+            row.append({"text": "✕ 取消任务", "callback_data": "cancel:%s" % info_hash})
         rows.append(row)
     if task_can_match_subtitles(task):
         rows.append([{"text": "查找字幕", "callback_data": "subtitle:%s" % info_hash}])
@@ -641,21 +704,20 @@ def task_list_reply_markup(records, page=0, page_count=1, page_size=DEFAULT_TASK
         info_hash = task.get("info_hash") or record["info_hash"]
         display_index = page * int(page_size) + idx
         if task_can_retry_msg_sync(task):
-            rows.append([{"text": "重试MSG %s" % display_index, "callback_data": "retry_msg:%s" % info_hash}])
+            rows.append([{"text": "#%s 重试 MSG" % display_index, "callback_data": "retry_msg:%s" % info_hash}])
             continue
         if not TASK_STATE.can_refresh_offline_status(task):
             continue
-        row = [{"text": "刷新 %s" % display_index, "callback_data": "status:%s" % info_hash}]
+        row = [{"text": "#%s ↻ 刷新" % display_index, "callback_data": "status:%s" % info_hash}]
         if TASK_STATE.can_cancel_offline_task(task):
-            row.append({"text": "取消 %s" % display_index, "callback_data": "cancel:%s" % info_hash})
+            row.append({"text": "#%s ✕ 取消" % display_index, "callback_data": "cancel:%s" % info_hash})
         rows.append(row)
     nav = []
     if page > 0:
-        nav.append({"text": "上一页", "callback_data": "tasks_page:%s" % (page - 1)})
+        nav.append({"text": "‹ 上一页", "callback_data": "tasks_page:%s" % (page - 1)})
     if page + 1 < page_count:
-        nav.append({"text": "下一页", "callback_data": "tasks_page:%s" % (page + 1)})
+        nav.append({"text": "下一页 ›", "callback_data": "tasks_page:%s" % (page + 1)})
     if nav:
         rows.append(nav)
-    if not rows:
-        return None
+    rows.append([{"text": "⌂ 功能菜单", "callback_data": "home:menu"}])
     return {"inline_keyboard": rows}

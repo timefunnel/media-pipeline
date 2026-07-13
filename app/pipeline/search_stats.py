@@ -105,19 +105,23 @@ def format_search_stats(metadata):
     failed_count = int(metadata.get("failed_count") or 0)
     timeout_count = int(metadata.get("timeout_count") or 0)
     skipped_count = int(metadata.get("skipped_count") or 0)
-    parts = ["来源%s个" % source_count, "耗时%.1fs" % (total_ms / 1000.0), "返回%s条" % raw_count]
+    parts = ["%.1fs" % (total_ms / 1000.0), "%s源" % source_count, "返回%s" % raw_count]
     if selected_count:
-        parts.append("展示%s条" % selected_count)
+        parts.append("展示%s" % selected_count)
+    lines = ["搜索：" + " · ".join(parts)]
+    warnings = []
     if failed_count:
-        parts.append("失败%s个" % failed_count)
+        warnings.append("失败%s" % failed_count)
     if timeout_count:
-        parts.append("超时%s个" % timeout_count)
+        warnings.append("超时%s" % timeout_count)
     if skipped_count:
-        parts.append("跳过慢源%s个" % skipped_count)
+        warnings.append("跳过慢源%s" % skipped_count)
+    if warnings:
+        lines.append("异常：" + " · ".join(warnings))
     llm_part = format_llm_rerank_stats(metadata)
     if llm_part:
-        parts.append(llm_part)
-    return "搜索统计：" + "，".join(parts)
+        lines.append(llm_part)
+    return "\n".join(lines)
 
 
 def format_llm_rerank_stats(metadata):
