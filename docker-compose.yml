@@ -39,6 +39,8 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:${PANSOU_PORT:-8888}:8888"
+    extra_hosts:
+      - "t.me:149.154.167.99"
     environment:
       PORT: "8888"
       CHANNELS: "${PANSOU_SERVER_CHANNELS:-tgsearchers6,yunpanx,yp123pan,wp123zy,Lsp115,oneonefivewpfx,Channel_Shares_115,vip115hot,gimy115,gimy115iso,gokuapan,Q_dongman,Netdisk_Movies}"
