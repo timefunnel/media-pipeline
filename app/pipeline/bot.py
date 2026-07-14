@@ -1436,9 +1436,18 @@ class CandidateStore:
                 if not adult_source_declares_chinese_subtitles(task_title, task):
                     continue
                 previous = out.get(media_id) or {}
+                declared_code = first_adult_code(
+                    [
+                        task.get("openlist_adult_code"),
+                        task_title,
+                        task.get("name"),
+                        task.get("openlist_adult_format_old_path"),
+                        task.get("openlist_adult_video_old_path"),
+                    ]
+                )
                 out[media_id] = {
                     "media_id": media_id,
-                    "adult_code": str(task.get("openlist_adult_code") or previous.get("adult_code") or "").strip(),
+                    "adult_code": str(declared_code or previous.get("adult_code") or "").strip(),
                     "title": str(task_title or previous.get("title") or "").strip(),
                     "status": "declared",
                     "source": "resource_name",
@@ -5802,7 +5811,9 @@ def process_subtitle_backfill_media(media, matcher, store, result, retry_attempt
         return False
     records = backfill_records if backfill_records is not None else store.subtitle_backfill_records([media_id])
     previous = records.get(media_id)
-    if previous and previous.get("status") == "declared":
+    task = subtitle_backfill_task_from_media(media)
+    code = task.get("openlist_adult_code")
+    if previous and previous.get("status") == "declared" and subtitle_declared_record_matches_code(previous, code):
         result["declared"] += 1
         result["with_subtitles"] += 1
         result["current"] = {
@@ -5843,8 +5854,6 @@ def process_subtitle_backfill_media(media, matcher, store, result, retry_attempt
             },
         )
         return False
-    task = subtitle_backfill_task_from_media(media)
-    code = task.get("openlist_adult_code")
     if not code:
         result["skipped"] += 1
         result["pending"] += 1
@@ -6022,6 +6031,8 @@ def subtitle_report_item_from_media(media, records):
     task = subtitle_backfill_task_from_media(media)
     code = task.get("openlist_adult_code") or ""
     record = (records or {}).get(media_id) if media_id else None
+    if record and record.get("status") == "declared" and not subtitle_declared_record_matches_code(record, code):
+        record = None
     status = "untried"
     status_label = "未尝试"
     if not code:
@@ -6041,6 +6052,12 @@ def subtitle_report_item_from_media(media, records):
         "reason": (record or {}).get("reason") or "",
         "error": (record or {}).get("error") or "",
     }
+
+
+def subtitle_declared_record_matches_code(record, code):
+    record_code = first_adult_code([(record or {}).get("adult_code")])
+    media_code = first_adult_code([code])
+    return bool(record_code and media_code and record_code.casefold() == media_code.casefold())
 
 
 def subtitle_report_status_label(status):

@@ -394,6 +394,7 @@ class CandidateStoreTest(unittest.TestCase):
             records = store.subtitle_backfill_records(["media-hmn-720"])
 
         self.assertEqual(records["media-hmn-720"]["status"], "declared")
+        self.assertEqual(records["media-hmn-720"]["adult_code"], "HMN-720")
         self.assertEqual(records["media-hmn-720"]["source"], "resource_name")
         self.assertEqual(records["media-hmn-720"]["reason"], "source_declares_chinese_subtitles")
 
@@ -5826,6 +5827,73 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(report["with_subtitles"], 1)
         self.assertEqual(report["pending"], 0)
         self.assertEqual(report["buckets"]["cached"][0]["status"], "declared")
+
+    def test_subtitle_backfill_ignores_declared_record_from_stale_media_mapping(self):
+        from pipeline.bot import BotConfig, CandidateStore, PipelineBotService
+        from pipeline.config import category_to_msg_library_root
+
+        class FakeSubtitleCache:
+            def list_tracks(self, media_id):
+                return []
+
+        class FakeSubtitleMatcher:
+            def __init__(self):
+                self.cache = FakeSubtitleCache()
+                self.calls = []
+
+            def match_task(self, category, title, task, force=False):
+                self.calls.append((category, title, task.get("openlist_adult_code"), force))
+                return {"subtitle_match_status": "skipped", "subtitle_match_reason": "not_found"}
+
+        root = category_to_msg_library_root("adult")
+        media_payload = {
+            "id": "media-reused",
+            "library_id": root["library_id"],
+            "title": "MIRD-268",
+            "path": "cloud://openlist/115/成人/MIRD-268/MIRD-268.mp4",
+        }
+        fake_msg = FakeMediaStationClient(
+            get_response={"data": media_payload},
+            list_response={"data": {"items": [media_payload]}},
+        )
+        matcher = FakeSubtitleMatcher()
+
+        with tempfile.TemporaryDirectory() as tmp, patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.build_subtitle_matcher_from_config", return_value=matcher
+        ):
+            state_db = str(Path(tmp) / "state.db")
+            store = CandidateStore(state_db)
+            store.save_task(
+                700656624,
+                9001,
+                "adult",
+                "ABW-276 [中文字幕]",
+                {
+                    "info_hash": "STALE-DECLARED-MAPPING",
+                    "msg_media_id": "media-reused",
+                    "openlist_adult_code": "ABW-276",
+                },
+            )
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    state_db,
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    subtitle_auto_match_enabled=True,
+                )
+            )
+
+            result = service.subtitle_backfill_one_adult("media-reused")
+            report = service.subtitle_backfill_report_adult()
+
+        self.assertEqual(result["attempted"], 1)
+        self.assertEqual(result["declared"], 0)
+        self.assertEqual(matcher.calls, [("adult", "MIRD-268", "MIRD-268", False)])
+        self.assertEqual(report["declared"], 0)
+        self.assertEqual(report["pending"], 1)
 
     def test_subtitle_backfill_fails_when_cache_read_fails(self):
         from pipeline.bot import BotConfig, PipelineBotService
