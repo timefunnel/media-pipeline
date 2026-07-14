@@ -173,6 +173,61 @@ class PanSouIntegrationTest(unittest.TestCase):
         self.assertEqual(candidates[0]["title"], "速度与激情7 【LGNB素鸡顶封】")
         self.assertEqual(candidates[0]["rank"], 1)
 
+    def test_pansou_client_filters_zero_relevance_results(self):
+        transport = FakePanSouTransport(
+            {
+                "code": 0,
+                "data": {
+                    "results": [
+                        {
+                            "channel": "noise",
+                            "title": "回到未来2",
+                            "content": "名称：回到未来2",
+                            "links": [{"type": "115", "url": "https://115.com/s/noise111"}],
+                        },
+                        {
+                            "channel": "exact",
+                            "title": "鬼父",
+                            "content": "名称：鬼父 完整版",
+                            "links": [{"type": "115", "url": "https://115.com/s/exact111"}],
+                        },
+                    ]
+                },
+            }
+        )
+
+        candidates = PanSouClient("http://pansou.local", transport=transport).search("鬼父", limit=10)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["indexer"], "tg:exact")
+
+    def test_pansou_client_accepts_all_separated_query_terms(self):
+        transport = FakePanSouTransport(
+            {
+                "code": 0,
+                "data": {
+                    "results": [
+                        {
+                            "channel": "match",
+                            "title": "清纯少女可爱写真",
+                            "content": "名称：清纯少女可爱写真",
+                            "links": [{"type": "115", "url": "https://115.com/s/match111"}],
+                        },
+                        {
+                            "channel": "partial",
+                            "title": "可爱写真",
+                            "content": "名称：可爱写真",
+                            "links": [{"type": "115", "url": "https://115.com/s/partial111"}],
+                        },
+                    ]
+                },
+            }
+        )
+
+        candidates = PanSouClient("http://pansou.local", transport=transport).search("可爱 清纯", limit=10)
+
+        self.assertEqual([candidate["title"] for candidate in candidates], ["清纯少女可爱写真"])
+
     def test_pansou_client_extracts_lgnb_structured_fields(self):
         content = (
             "【LGNB素鸡顶封】🎬 名称：速度与激情7📝 描述：经历了紧张刺激的伦敦大战，多米尼克重新回归平静生活。"

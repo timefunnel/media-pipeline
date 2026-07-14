@@ -423,22 +423,49 @@ def parse_pansou_size_bytes(value):
 
 
 def rank_pansou_candidates(candidates, query):
+    # PanSou's API filter ignores result.content, where some channels keep the real title.
     query_norm = normalize_pansou_text(query)
     if not query_norm:
         return sorted(candidates, key=lambda item: item.get("_pansou_order", 0))
-    return sorted(candidates, key=lambda item: (-pansou_candidate_score(item, query_norm), item.get("_pansou_order", 0)))
+    query_terms = pansou_query_terms(query)
+    scored = [(pansou_candidate_score(item, query_norm, query_terms), item) for item in candidates]
+    return [
+        item
+        for score, item in sorted(scored, key=lambda pair: (-pair[0], pair[1].get("_pansou_order", 0)))
+        if score > 0
+    ]
 
 
-def pansou_candidate_score(candidate, query_norm):
+def pansou_query_terms(query):
+    terms = [normalize_pansou_text(part) for part in re.split(r"\s+", str(query or "").strip())]
+    return [term for term in terms if term]
+
+
+def pansou_candidate_score(candidate, query_norm, query_terms=None):
     title_norm = normalize_pansou_text(candidate.get("title"))
     text_norm = normalize_pansou_text(candidate.get("_pansou_score_text"))
+    terms = list(query_terms or [query_norm])
+    full_title_match = bool(query_norm and query_norm in title_norm)
+    full_text_match = bool(query_norm and query_norm in text_norm)
+    all_title_terms_match = bool(terms and all(term in title_norm for term in terms))
+    all_text_terms_match = bool(terms and all(term in text_norm for term in terms))
+    if not (full_title_match or full_text_match or all_title_terms_match or all_text_terms_match):
+        return 0
+
     score = 0
-    if query_norm and query_norm in title_norm:
-        score += 100
-    if query_norm and query_norm in text_norm:
-        score += 60
-    if title_norm.startswith(query_norm):
-        score += 20
+    if title_norm == query_norm:
+        score += 500
+    elif title_norm.startswith(query_norm):
+        score += 350
+    elif full_title_match:
+        score += 300
+    if full_text_match:
+        score += 150
+    if len(terms) > 1:
+        if all_title_terms_match:
+            score += 120
+        elif all_text_terms_match:
+            score += 60
     return score
 
 
