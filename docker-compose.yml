@@ -39,10 +39,11 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:${PANSOU_PORT:-8888}:8888"
-    extra_hosts:
-      - "t.me:149.154.167.99"
+    command: ["/bin/sh", "/usr/local/bin/pansou-tme-entrypoint.sh"]
     environment:
       PORT: "8888"
+      PANSOU_TME_ALIAS_HOST: "${PANSOU_TME_ALIAS_HOST:-telegram.me}"
+      PANSOU_TME_REFRESH_SECONDS: "${PANSOU_TME_REFRESH_SECONDS:-3600}"
       CHANNELS: "${PANSOU_SERVER_CHANNELS:-tgsearchers6,yunpanx,yp123pan,wp123zy,Lsp115,oneonefivewpfx,Channel_Shares_115,vip115hot,gimy115,gimy115iso,gokuapan,Q_dongman,Netdisk_Movies}"
       ENABLED_PLUGINS: "${PANSOU_SERVER_ENABLED_PLUGINS:-hunhepan,jikepan,panwiki,pansearch,panta,qupansou,hdr4k,pan666,susu,qupanshe,xdpan,qqpd,gying,ash}"
       CACHE_ENABLED: "${PANSOU_CACHE_ENABLED:-true}"
@@ -62,8 +63,9 @@ services:
     cpus: "${PANSOU_CPUS:-1.0}"
     volumes:
       - "${PANSOU_CACHE_DIR:-/data/pansou/cache}:/app/cache"
+      - "./ops/pansou-tme-entrypoint.sh:/usr/local/bin/pansou-tme-entrypoint.sh:ro"
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8888/api/health"]
+      test: ["CMD", "/bin/sh", "/usr/local/bin/pansou-tme-entrypoint.sh", "--healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
