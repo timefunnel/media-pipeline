@@ -242,6 +242,10 @@ ACTIVE_115_SLOW_POLL_INTERVAL_SECONDS = 600
 ACTIVE_115_TIMEOUT_SECONDS = 7200
 DEFAULT_TASK_WORKERS = 2
 DEFAULT_TASK_MESSAGE_EDIT_MIN_INTERVAL_SECONDS = 2
+DEFAULT_INTERNAL_API_PORT = 8765
+DEFAULT_INTERNAL_API_WORKERS = 3
+DEFAULT_INTERNAL_API_OWNER_WORKERS = 2
+DEFAULT_INTERNAL_API_SEARCH_TTL_SECONDS = 15 * 60
 CATEGORY_LABELS = {"movie": "电影库", "tv": "剧集库", "anime": "动漫库", "adult": "成人库", "other": "其他库"}
 CONTENT_PROFILE_LABELS = {
     "adult": "成人",
@@ -452,6 +456,13 @@ class BotConfig:
     llm_search_rerank_limit: int = DEFAULT_LLM_SEARCH_RERANK_LIMIT
     llm_thinking_disabled: bool = True
     p115_cookie: str = ""
+    internal_api_enabled: bool = False
+    internal_api_token: str = ""
+    internal_api_host: str = "127.0.0.1"
+    internal_api_port: int = DEFAULT_INTERNAL_API_PORT
+    internal_api_workers: int = DEFAULT_INTERNAL_API_WORKERS
+    internal_api_owner_workers: int = DEFAULT_INTERNAL_API_OWNER_WORKERS
+    internal_api_search_ttl_seconds: int = DEFAULT_INTERNAL_API_SEARCH_TTL_SECONDS
 
     @classmethod
     def from_env(cls, env=None):
@@ -478,6 +489,10 @@ class BotConfig:
         llm_api_key = (env.get("LLM_API_KEY") or env.get("DEEPSEEK_API_KEY") or "").strip()
         if llm_search_rerank_enabled and not llm_api_key:
             raise RuntimeError("LLM_API_KEY missing")
+        internal_api_enabled = parse_bool(env.get("INTERNAL_API_ENABLED"), False)
+        internal_api_token = (env.get("INTERNAL_API_TOKEN") or "").strip()
+        if internal_api_enabled and not internal_api_token:
+            raise RuntimeError("INTERNAL_API_TOKEN missing")
 
         return cls(
             token=token,
@@ -586,6 +601,24 @@ class BotConfig:
                 or env.get("CLOUD115_COOKIE")
                 or env.get("PAN115_COOKIE")
                 or ""
+            ),
+            internal_api_enabled=internal_api_enabled,
+            internal_api_token=internal_api_token,
+            internal_api_host=(env.get("INTERNAL_API_HOST") or "127.0.0.1").strip(),
+            internal_api_port=max(1, int(env.get("INTERNAL_API_PORT", str(DEFAULT_INTERNAL_API_PORT)))),
+            internal_api_workers=max(1, int(env.get("INTERNAL_API_WORKERS", str(DEFAULT_INTERNAL_API_WORKERS)))),
+            internal_api_owner_workers=max(
+                1,
+                int(env.get("INTERNAL_API_OWNER_WORKERS", str(DEFAULT_INTERNAL_API_OWNER_WORKERS))),
+            ),
+            internal_api_search_ttl_seconds=max(
+                1,
+                int(
+                    env.get(
+                        "INTERNAL_API_SEARCH_TTL_SECONDS",
+                        str(DEFAULT_INTERNAL_API_SEARCH_TTL_SECONDS),
+                    )
+                ),
             ),
         )
 
@@ -1617,6 +1650,36 @@ class PipelineBotService:
         self._llm_rerank_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-rerank")
         self._llm_rerank_lock = threading.Lock()
         self._subtitle_matcher = None
+        self._search_capabilities_lock = threading.Lock()
+        self._search_capabilities_cache = None
+        self._search_capabilities_cached_at = 0.0
+
+    def search_capabilities(self, cache_seconds=60):
+        now = time.monotonic()
+        with self._search_capabilities_lock:
+            if self._search_capabilities_cache is not None and now - self._search_capabilities_cached_at < cache_seconds:
+                return dict(self._search_capabilities_cache)
+            capabilities = {
+                "pansou": bool(self.config.pansou_enabled),
+                "bt4g": False,
+                "llm_rerank": bool(self.config.llm_search_rerank_enabled),
+            }
+            try:
+                api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
+                prowlarr = ProwlarrClient(
+                    self.config.prowlarr_url,
+                    api_key,
+                    timeout=self.config.prowlarr_search_timeout_seconds,
+                )
+                capabilities["bt4g"] = any(
+                    indexer_enabled(indexer) and indexer_matches_label(indexer, "BT4G")
+                    for indexer in prowlarr.indexers()
+                )
+            except Exception as exc:
+                capabilities["bt4g_error"] = str(exc)
+            self._search_capabilities_cache = capabilities
+            self._search_capabilities_cached_at = now
+            return dict(capabilities)
 
     def search(self, query, category, limit=DEFAULT_SEARCH_LIMIT, profile=None):
         profile = profile or search_profile_for_query(category, query)
@@ -1957,14 +2020,14 @@ class PipelineBotService:
             result["dedupe_index_error"] = str(exc)
         return result
 
-    def check_duplicate(self, category, query, candidate):
-        if not self.config.msg_enabled:
+    def check_duplicate(self, category, query, candidate, target=None):
+        if not self.config.msg_enabled and target is None:
             return None
         queries = duplicate_media_queries(category, query, candidate)
         if not queries:
             return None
         client = self._build_msg_client()
-        root = category_to_msg_library_root(category)
+        root = self._msg_target(category, target)
         media = find_matching_media(
             extract_media_items(client.search_media(queries[0], limit=20)),
             queries,
@@ -2013,13 +2076,13 @@ class PipelineBotService:
         ).load_token()
         return OpenListClient(self.config.openlist_url, token)
 
-    def sync_completed_task(self, category, title, task, progress_callback=None):
+    def sync_completed_task(self, category, title, task, progress_callback=None, target=None):
         out = dict(task or {})
         if not TASK_STATE.is_offline_success(out):
             return out
         if task_msg_synced(out):
             return out
-        if not self.config.msg_enabled:
+        if not self.config.msg_enabled and target is None:
             return out
 
         def capture_progress(progress):
@@ -2028,7 +2091,13 @@ class PipelineBotService:
                 progress_callback(dict(progress))
 
         try:
-            result = self._sync_mediastation(category, title, out, progress_callback=capture_progress)
+            result = self._sync_mediastation(
+                category,
+                title,
+                out,
+                progress_callback=capture_progress,
+                target=target,
+            )
         except MediaStationIngestPending:
             out["msg_sync_status"] = "running"
             out["msg_error"] = None
@@ -2281,8 +2350,10 @@ class PipelineBotService:
             cookie = self.config.p115_cookie
         return Share115Client(cookie)
 
-    def _sync_mediastation(self, category, title, task, progress_callback=None):
+    def _sync_mediastation(self, category, title, task, progress_callback=None, target=None):
         progress = dict(task or {})
+        msg_target = self._msg_target(category, target)
+        root_openlist_path = msg_target["root_openlist_path"]
         openlist_client = None
         msg_client = None
 
@@ -2298,7 +2369,7 @@ class PipelineBotService:
         def get_openlist_client():
             nonlocal openlist_client
             if openlist_client is None:
-                openlist_client = self._refresh_openlist_for_msg(category)
+                openlist_client = self._refresh_openlist_for_msg(root_openlist_path)
             return openlist_client
 
         def get_msg_client():
@@ -2311,7 +2382,9 @@ class PipelineBotService:
         if category == "adult" and self.config.openlist_adult_code_format_enabled:
             if not stage_is_complete(progress.get("openlist_adult_format_status")):
                 emit({"openlist_adult_format_status": "running", "openlist_adult_format_error": None})
-                format_result = self._format_openlist_adult_before_msg(get_openlist_client(), category, title, progress)
+                format_result = self._format_openlist_adult_before_msg(
+                    get_openlist_client(), category, title, progress, root_openlist_path
+                )
                 if format_result.get("openlist_adult_format_status") != "skipped":
                     emit(format_result)
                 else:
@@ -2345,7 +2418,9 @@ class PipelineBotService:
         if self.config.openlist_pre_scan_clean_enabled:
             if not stage_is_complete(progress.get("openlist_clean_status")):
                 emit({"openlist_clean_status": "running", "openlist_clean_error": None})
-                clean_result = self._clean_openlist_before_msg(get_openlist_client(), category, title, progress)
+                clean_result = self._clean_openlist_before_msg(
+                    get_openlist_client(), category, title, progress, root_openlist_path
+                )
                 if clean_result.get("openlist_clean_status") != "skipped":
                     emit(clean_result)
                 else:
@@ -2362,7 +2437,7 @@ class PipelineBotService:
 
         media_id = progress.get("msg_media_id")
         media_title = progress.get("msg_media_title")
-        root = category_to_msg_library_root(category)
+        root = msg_target
         media = None
         if progress.get("msg_scan_status") == "success" and media_id:
             media = self._load_existing_msg_media(get_msg_client(), media_id)
@@ -2380,7 +2455,7 @@ class PipelineBotService:
             if not stage_is_complete(progress.get("openlist_adult_extra_hide_status")):
                 emit({"openlist_adult_extra_hide_status": "running", "openlist_adult_extra_hide_error": None})
                 adult_extra_hide_result = self._hide_openlist_adult_extra_videos_before_msg(
-                    get_openlist_client(), category, queries, progress
+                    get_openlist_client(), category, queries, progress, root_openlist_path
                 )
                 if adult_extra_hide_result.get("openlist_adult_extra_hide_status") != "skipped":
                     emit(adult_extra_hide_result)
@@ -2407,6 +2482,7 @@ class PipelineBotService:
                 authoritative_paths,
                 require_target_path,
                 emit,
+                msg_target,
             )
             media = ingest_result.pop("_media")
             deleted_media_prune_result = prefixed_task_fields(ingest_result, "msg_deleted_media_prune_")
@@ -2439,7 +2515,9 @@ class PipelineBotService:
                 )
             else:
                 emit({"msg_scrape_status": "running", "msg_media_id": media_id, "msg_media_title": media_title})
-                scrape_result = self._scrape_msg_media(get_msg_client(), category, media_id, title, progress, media)
+                scrape_result = self._scrape_msg_media(
+                    get_msg_client(), category, media_id, title, progress, media, msg_target
+                )
                 emit({"msg_scrape_status": "success", "msg_media_id": media_id, "msg_media_title": media_title, **scrape_result})
         if not stage_is_complete(progress.get("msg_scrape_status")):
             raise RuntimeError("MediaStationGo scrape stage incomplete")
@@ -2450,7 +2528,9 @@ class PipelineBotService:
         if category == "movie" and movie_cleanup_touched_openlist:
             if not stage_is_complete(progress.get("msg_extra_cleanup_status")):
                 emit({"msg_extra_cleanup_status": "running", "msg_extra_cleanup_error": None})
-                extras_result = self._repair_msg_movie_extras(get_msg_client(), category, media_id, get_openlist_client())
+                extras_result = self._repair_msg_movie_extras(
+                    get_msg_client(), category, media_id, get_openlist_client(), msg_target
+                )
                 if extras_result.get("msg_extra_cleanup_status") == "skipped":
                     apply_progress(extras_result)
                 else:
@@ -2461,7 +2541,9 @@ class PipelineBotService:
         if category in ("tv", "anime"):
             if not stage_is_complete(progress.get("msg_visibility_repair_status")):
                 emit({"msg_visibility_repair_status": "running", "msg_visibility_repair_error": None})
-                visibility_result = self._repair_msg_episode_visibility(get_msg_client(), category, media_id)
+                visibility_result = self._repair_msg_episode_visibility(
+                    get_msg_client(), category, media_id, msg_target
+                )
                 if visibility_result.get("msg_visibility_repair_status") == "skipped":
                     apply_progress(visibility_result)
                 else:
@@ -2528,8 +2610,8 @@ class PipelineBotService:
         except Exception as exc:
             return {"subtitle_match_status": "failed", "subtitle_match_error": str(exc)}
 
-    def _scrape_msg_media(self, client, category, media_id, title, task, media=None):
-        root = category_to_msg_library_root(category)
+    def _scrape_msg_media(self, client, category, media_id, title, task, media=None, target=None):
+        root = self._msg_target(category, target)
         provider = root.get("provider")
         media_type = root.get("media_type")
         result = client.pipeline_scrape_media(
@@ -2548,17 +2630,36 @@ class PipelineBotService:
             "msg_scrape_applied_count": int(result.get("applied_count") or 0),
         }
 
-    def _pipeline_maintenance_target(self, category):
-        root = category_to_msg_library_root(category)
+    def _msg_target(self, category, target=None):
+        if target is None:
+            root = category_to_msg_library_root(category)
+            root["root_openlist_path"] = category_to_openlist_path(category)
+            return root
+        if not isinstance(target, dict):
+            raise ValueError("MediaStationGo target must be an object")
+        normalized = {}
+        for key in ("library_id", "root_id", "root_openlist_path", "provider", "media_type"):
+            value = str(target.get(key) or "").strip()
+            if not value:
+                raise ValueError("MediaStationGo target %s missing" % key)
+            normalized[key] = value
+        normalized["root_openlist_path"] = normalize_openlist_path(normalized["root_openlist_path"])
+        if not normalized["root_openlist_path"].startswith("/"):
+            raise ValueError("MediaStationGo target root_openlist_path must be absolute")
+        normalized["scrape_enabled"] = bool(target.get("scrape_enabled", True))
+        return normalized
+
+    def _pipeline_maintenance_target(self, category, target=None):
+        root = self._msg_target(category, target)
         return {
             "category": category,
             "library_id": root.get("library_id"),
             "root_id": root.get("root_id"),
-            "root_openlist_path": category_to_openlist_path(category),
+            "root_openlist_path": root.get("root_openlist_path"),
         }
 
-    def _repair_msg_movie_extras(self, client, category, media_id, openlist_client=None):
-        result = client.pipeline_repair_movie_extras(media_id, self._pipeline_maintenance_target(category))
+    def _repair_msg_movie_extras(self, client, category, media_id, openlist_client=None, target=None):
+        result = client.pipeline_repair_movie_extras(media_id, self._pipeline_maintenance_target(category, target))
         if not isinstance(result, dict):
             raise RuntimeError("MediaStationGo movie extra cleanup returned invalid response")
         status = result.get("status")
@@ -2652,10 +2753,10 @@ class PipelineBotService:
             "openlist_trash_hide_at": int(time.time()),
         }
 
-    def _hide_openlist_adult_extra_videos_before_msg(self, client, category, queries, task):
+    def _hide_openlist_adult_extra_videos_before_msg(self, client, category, queries, task, root_openlist_path=None):
         result = hide_openlist_adult_extra_videos(
             client,
-            category_to_openlist_path(category),
+            root_openlist_path or category_to_openlist_path(category),
             queries,
             task=task,
             pre_scan_max_bytes=self.config.openlist_pre_scan_clean_max_bytes,
@@ -2667,8 +2768,8 @@ class PipelineBotService:
             raise RuntimeError("OpenList adult extra video hide returned invalid status: %s" % (status or "-"))
         return result
 
-    def _repair_msg_episode_visibility(self, client, category, media_id):
-        result = client.pipeline_repair_episode_visibility(media_id, self._pipeline_maintenance_target(category))
+    def _repair_msg_episode_visibility(self, client, category, media_id, target=None):
+        result = client.pipeline_repair_episode_visibility(media_id, self._pipeline_maintenance_target(category, target))
         if not isinstance(result, dict):
             raise RuntimeError("MediaStationGo episode visibility repair returned invalid response")
         status = result.get("status")
@@ -2682,8 +2783,19 @@ class PipelineBotService:
             "msg_visibility_repair_error": None,
         }
 
-    def _run_msg_pipeline_ingest(self, client, category, title, progress, queries, authoritative_paths, require_target_path, emit):
-        root = category_to_msg_library_root(category)
+    def _run_msg_pipeline_ingest(
+        self,
+        client,
+        category,
+        title,
+        progress,
+        queries,
+        authoritative_paths,
+        require_target_path,
+        emit,
+        target=None,
+    ):
+        root = self._msg_target(category, target)
         previous_failed = progress.get("msg_ingest_status") == "failed"
         job_id = "" if previous_failed else str(progress.get("msg_ingest_job_id") or "").strip()
         idempotency_key = "" if previous_failed else str(progress.get("msg_ingest_idempotency_key") or "").strip()
@@ -2701,7 +2813,7 @@ class PipelineBotService:
             job = client.pipeline_get_ingest(job_id)
         else:
             request = {
-                **self._pipeline_maintenance_target(category),
+                **self._pipeline_maintenance_target(category, root),
                 "idempotency_key": idempotency_key,
                 "title": title,
                 "queries": list(queries or []),
@@ -2805,19 +2917,21 @@ class PipelineBotService:
             )
         return updates
 
-    def _refresh_openlist_for_msg(self, category):
-        path = category_to_openlist_path(category)
+    def _refresh_openlist_for_msg(self, root_openlist_path):
+        path = normalize_openlist_path(root_openlist_path)
+        if not path:
+            raise ValueError("OpenList root path missing")
         client = OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
         client.list_path(path, refresh=True)
         return client
 
-    def _clean_openlist_before_msg(self, client, category, title, task):
+    def _clean_openlist_before_msg(self, client, category, title, task, root_openlist_path=None):
         if not self.config.openlist_pre_scan_clean_enabled:
             return {"openlist_clean_status": "skipped", "openlist_clean_reason": "disabled"}
         try:
             return clean_openlist_task_media(
                 client,
-                category_to_openlist_path(category),
+                root_openlist_path or category_to_openlist_path(category),
                 media_search_queries(title, task),
                 task=task,
                 max_bytes=self.config.openlist_pre_scan_clean_max_bytes,
@@ -2832,7 +2946,7 @@ class PipelineBotService:
                 "openlist_cleaned_at": int(time.time()),
             }
 
-    def _format_openlist_adult_before_msg(self, client, category, title, task):
+    def _format_openlist_adult_before_msg(self, client, category, title, task, root_openlist_path=None):
         if category != "adult":
             return {}
         if not self.config.openlist_adult_code_format_enabled:
@@ -2840,7 +2954,7 @@ class PipelineBotService:
         try:
             return format_openlist_adult_code(
                 client,
-                category_to_openlist_path(category),
+                root_openlist_path or category_to_openlist_path(category),
                 media_search_queries(title, task),
                 task=task,
             )
@@ -2955,7 +3069,7 @@ def media_item_size_bytes(item):
 
 
 class TelegramBot:
-    def __init__(self, config, telegram, store, service):
+    def __init__(self, config, telegram, store, service, internal_api=None):
         self.config = config
         self.telegram = telegram
         self.store = store
@@ -2966,6 +3080,7 @@ class TelegramBot:
         self._task_message_update_times = {}
         self._task_message_update_guard = threading.Lock()
         self._subtitle_backfill_lock = threading.Lock()
+        self.internal_api = internal_api
 
     def handle_update(self, update):
         if update.get("message"):
@@ -5283,11 +5398,17 @@ class TelegramBot:
             print("telegram command setup failed: %s" % exc, flush=True)
 
     def run_forever(self):
-        self.configure_bot_commands()
-        self.start_sync_recovery_thread()
-        offset = None
-        while True:
-            offset = self.poll_updates_once(offset)
+        if self.internal_api is not None:
+            self.internal_api.start()
+        try:
+            self.configure_bot_commands()
+            self.start_sync_recovery_thread()
+            offset = None
+            while True:
+                offset = self.poll_updates_once(offset)
+        finally:
+            if self.internal_api is not None:
+                self.internal_api.stop()
 
     def poll_updates_once(self, offset):
         try:
@@ -7356,14 +7477,28 @@ def build_bot(config=None):
     telegram = TelegramApi(config.token, timeout=config.telegram_timeout)
     store = CandidateStore(config.state_db_path)
     service = PipelineBotService(config, p115_cookie_provider=store.get_p115_cookie)
-    return TelegramBot(config, telegram, store, service)
+    internal_api = None
+    if config.internal_api_enabled:
+        from pipeline.internal_api import InternalApiServer
+
+        internal_api = InternalApiServer(
+            service=service,
+            db_path=config.state_db_path,
+            token=config.internal_api_token,
+            host=config.internal_api_host,
+            port=config.internal_api_port,
+            workers=config.internal_api_workers,
+            owner_workers=config.internal_api_owner_workers,
+            search_ttl_seconds=config.internal_api_search_ttl_seconds,
+        )
+    return TelegramBot(config, telegram, store, service, internal_api=internal_api)
 
 
 def main():
     try:
         build_bot().run_forever()
         return 0
-    except (RuntimeError, TimeoutError, ValueError) as exc:
+    except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
 

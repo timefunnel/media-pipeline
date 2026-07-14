@@ -439,6 +439,55 @@ MEDIA_PIPELINE_*_MSG_LIBRARY_ID / MSG_ROOT_ID
   必填，分别填写对应分类在 MSG 中的 library id 和 root id
 ```
 
+### 8.1 MSG 内部 API
+
+内部 API 默认关闭。启用时至少配置：
+
+```text
+INTERNAL_API_ENABLED=1
+INTERNAL_API_TOKEN=REPLACE_WITH_A_LONG_RANDOM_TOKEN
+INTERNAL_API_HOST=127.0.0.1
+INTERNAL_API_PORT=8765
+INTERNAL_API_WORKERS=3
+INTERNAL_API_OWNER_WORKERS=2
+INTERNAL_API_SEARCH_TTL_SECONDS=900
+```
+
+`INTERNAL_API_HOST=127.0.0.1` 仅允许宿主机访问。如果 MSG 位于 Docker bridge 网络，可绑定宿主机对应的 bridge 地址；无法固定 bridge 地址时也可绑定 `0.0.0.0`，但必须同时使用宿主机防火墙限制为 MSG 所在内网访问。Bearer token 不是公网暴露方案，不要把该端口直接开放到互联网。
+
+`GET /health` 不要求认证，只返回 `{"status":"ok"}`，用于容器健康检查且不泄露配置。所有 `/v1/*` 路由必须发送：
+
+```http
+Authorization: Bearer <INTERNAL_API_TOKEN>
+```
+
+API 契约：
+
+```text
+POST /v1/search
+  JSON: owner_id, query, category, source(default|pansou|bt4g), limit
+  返回: session_id, expires_at, items, metadata, capabilities
+  capabilities 明确给出 pansou、bt4g、llm_rerank 是否可用；MSG UI 不应自行猜测
+  每个 item 带服务端 candidate_id；session/candidate 写入 BOT_STATE_DB，默认 15 分钟过期
+
+POST /v1/imports
+  Header: Idempotency-Key
+  JSON: owner_id, search_session_id, candidate_id, category,
+        library_id, root_id, root_openlist_path, provider, media_type,
+        force_duplicate(可选，默认 false)
+  不接受浏览器提供 download_uri；只使用已持久化的搜索候选
+  root_openlist_path 必须与该 category 当前配置的 OpenList 路径一致，否则在查重和 115 请求前返回 409
+  入队前按显式 library_id 查询 MSG：弱重复返回可强制的 409，只有 force_duplicate=true 才继续；强番号重复始终不可强制
+
+GET /v1/imports/{id}?owner_id=<owner>
+POST /v1/imports/{id}/cancel  JSON: {"owner_id":"..."}
+POST /v1/imports/{id}/retry   JSON: {"owner_id":"..."}
+```
+
+任务状态为 `queued/running/completed/completed_with_warning/failed/canceled`。响应持续包含 `stage`、可读 `message`、`request/result/error`、`info_hash`、`msg_media_id` 和 `msg_media_title`。只有明确得到 `msg_media_id` 才会返回 `completed`；已入库但刮削、字幕或后续阶段失败时返回 `completed_with_warning`。
+
+`owner_id` 仅用于 API 任务隔离。真正的用户授权、可见媒体库和 owner 字符串签发由 MSG 负责；pipeline 不使用 Telegram 用户任务表推断 MSG Web 用户所有权。
+
 构建并启动：
 
 ```bash
