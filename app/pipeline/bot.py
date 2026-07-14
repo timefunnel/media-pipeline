@@ -59,6 +59,8 @@ from pipeline.external_subtitles import (
     DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES,
     DEFAULT_SUBTITLE_PROVIDERS,
     DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS,
+    SOURCE_DECLARED_CHINESE_SUBTITLE_REASON,
+    adult_source_declares_chinese_subtitles,
     build_subtitle_matcher_from_config,
 )
 from pipeline.openlist_utils import (
@@ -1402,6 +1404,7 @@ class CandidateStore:
         normalized = [str(value or "").strip() for value in media_ids or [] if str(value or "").strip()]
         if not normalized:
             return {}
+        normalized_set = set(normalized)
         out = {}
         conn = self._connect()
         try:
@@ -1416,6 +1419,36 @@ class CandidateStore:
                 ).fetchone()
                 if row is not None:
                     out[media_id] = subtitle_backfill_record_from_row(row)
+            task_rows = conn.execute(
+                """
+                select title, task_json
+                from offline_tasks
+                where category = 'adult'
+                order by updated_at desc
+                """
+            ).fetchall()
+            declared_media_ids = set()
+            for task_title, task_json in task_rows:
+                task = json.loads(task_json)
+                media_id = str(task.get("msg_media_id") or "").strip()
+                if media_id not in normalized_set or media_id in declared_media_ids:
+                    continue
+                if not adult_source_declares_chinese_subtitles(task_title, task):
+                    continue
+                previous = out.get(media_id) or {}
+                out[media_id] = {
+                    "media_id": media_id,
+                    "adult_code": str(task.get("openlist_adult_code") or previous.get("adult_code") or "").strip(),
+                    "title": str(task_title or previous.get("title") or "").strip(),
+                    "status": "declared",
+                    "source": "resource_name",
+                    "reason": SOURCE_DECLARED_CHINESE_SUBTITLE_REASON,
+                    "error": "",
+                    "attempt_count": int(previous.get("attempt_count") or 0),
+                    "created_at": previous.get("created_at"),
+                    "updated_at": previous.get("updated_at"),
+                }
+                declared_media_ids.add(media_id)
         finally:
             conn.close()
         return out
@@ -5665,6 +5698,7 @@ def new_subtitle_backfill_result(limit, retry_attempted=False, status_filter=Non
         "pending": 0,
         "matched": 0,
         "cached": 0,
+        "declared": 0,
         "previous": 0,
         "not_found": 0,
         "failed": 0,
@@ -5768,6 +5802,26 @@ def process_subtitle_backfill_media(media, matcher, store, result, retry_attempt
         return False
     records = backfill_records if backfill_records is not None else store.subtitle_backfill_records([media_id])
     previous = records.get(media_id)
+    if previous and previous.get("status") == "declared":
+        result["declared"] += 1
+        result["with_subtitles"] += 1
+        result["current"] = {
+            "media_id": media_id,
+            "title": title,
+            "reason": SOURCE_DECLARED_CHINESE_SUBTITLE_REASON,
+        }
+        update_subtitle_backfill_recent(
+            result,
+            {
+                "media_id": media_id,
+                "title": title,
+                "code": previous.get("adult_code") or "",
+                "status": "declared",
+                "source": "resource_name",
+                "reason": SOURCE_DECLARED_CHINESE_SUBTITLE_REASON,
+            },
+        )
+        return False
     if previous and not retry_attempted and previous.get("status") in SUBTITLE_BACKFILL_SKIP_STATUSES:
         result["previous"] += 1
         result["pending"] += 1
@@ -5870,10 +5924,11 @@ def format_subtitle_backfill_message(result):
         [
             "扫描：%s  尝试：%s/%s" % (result.get("scanned") or 0, result.get("attempted") or 0, result.get("limit") or 0),
             "已补字幕：%s  待补：%s" % (result.get("with_subtitles") or 0, result.get("pending") or 0),
-            "命中：%s  已有缓存：%s  已尝试跳过：%s  未找到：%s  失败：%s  跳过：%s"
+            "命中：%s  已有缓存：%s  资源已带：%s  已尝试跳过：%s  未找到：%s  失败：%s  跳过：%s"
             % (
                 result.get("matched") or 0,
                 result.get("cached") or 0,
+                result.get("declared") or 0,
                 result.get("previous") or 0,
                 result.get("not_found") or 0,
                 result.get("failed") or 0,
@@ -5900,6 +5955,8 @@ def subtitle_backfill_status_label(item):
         return "已有"
     if status == "success":
         return "命中%s" % ("(%s)" % source if source else "")
+    if status == "declared":
+        return "资源已带中文字幕"
     if status == "skipped" and (item or {}).get("reason") == "not_found":
         return "未找到"
     if status == "failed":
@@ -5911,6 +5968,7 @@ def new_subtitle_backfill_report():
     return {
         "total": 0,
         "with_subtitles": 0,
+        "declared": 0,
         "pending": 0,
         "untried": 0,
         "not_found": 0,
@@ -5937,6 +5995,11 @@ def add_media_to_subtitle_backfill_report(report, matcher, records, media):
     if media_id and subtitle_matcher_has_cached_tracks(matcher, media_id):
         item["status"] = "cached"
         item["status_label"] = "已补"
+        report["with_subtitles"] += 1
+        report["buckets"]["cached"].append(item)
+        return
+    if item.get("status") == "declared":
+        report["declared"] += 1
         report["with_subtitles"] += 1
         report["buckets"]["cached"].append(item)
         return
@@ -5983,6 +6046,7 @@ def subtitle_report_item_from_media(media, records):
 def subtitle_report_status_label(status):
     return {
         "cached": "已补",
+        "declared": "资源已标中文字幕",
         "success": "记录成功但缓存缺失",
         "not_found": "未找到",
         "failed": "失败",
@@ -6042,7 +6106,7 @@ def subtitle_find_result_item_from_media(media, matcher, records):
 
 def subtitle_find_bucket_for_item(item):
     status = str((item or {}).get("status") or "")
-    if status == "cached":
+    if status in ("cached", "declared"):
         return "cached"
     if status in ("untried", "not_found", "failed", "no_code"):
         return status
@@ -6051,7 +6115,7 @@ def subtitle_find_bucket_for_item(item):
 
 def subtitle_find_item_button_label(index, item):
     status = (item or {}).get("status")
-    if status == "cached":
+    if status in ("cached", "declared"):
         return "#%s 重配" % index
     if status in SUBTITLE_BACKFILL_SKIP_STATUSES:
         return "#%s 重试" % index
@@ -6119,6 +6183,7 @@ def format_subtitle_backfill_report_message(report, bucket="pending", page=0):
     lines = [
         "成人库字幕补齐报表",
         "总数：%s  已补字幕：%s  待补：%s" % (report.get("total") or 0, report.get("with_subtitles") or 0, report.get("pending") or 0),
+        "资源已标中文字幕：%s" % (report.get("declared") or 0),
         "未尝试：%s  未找到：%s  失败：%s  无番号：%s"
         % (report.get("untried") or 0, report.get("not_found") or 0, report.get("failed") or 0, report.get("no_code") or 0),
         "列表：%s 第 %s/%s 页（%s 条）" % (SUBTITLE_REPORT_BUCKET_LABELS[bucket], page + 1, page_count, len(items)),
@@ -6175,7 +6240,7 @@ def subtitle_backfill_report_reply_markup(report, bucket="pending", page=0, batc
         callback_data = subtitle_report_item_callback_data(item, bucket, page)
         if not callback_data:
             continue
-        if item.get("status") == "cached":
+        if item.get("status") in ("cached", "declared"):
             label = "#%s 重配" % index
         else:
             label = "#%s 重试" % index if (item.get("status") in SUBTITLE_BACKFILL_SKIP_STATUSES) else "#%s 补齐" % index
@@ -6222,7 +6287,7 @@ def subtitle_report_item_callback_data(item, bucket, page):
     status = (item or {}).get("status")
     if status == "no_code":
         return None
-    action = "subrematch" if status == "cached" else ("sub1r" if status in SUBTITLE_BACKFILL_SKIP_STATUSES else "sub1")
+    action = "subrematch" if status in ("cached", "declared") else ("sub1r" if status in SUBTITLE_BACKFILL_SKIP_STATUSES else "sub1")
     data = "%s:%s:%s:%s" % (action, normalize_subtitle_report_bucket(bucket), max(0, int(page or 0)), media_id)
     if len(data.encode("utf-8")) > 64:
         return None

@@ -373,6 +373,30 @@ class CandidateStoreTest(unittest.TestCase):
         self.assertEqual(second["error"], "upstream")
         self.assertEqual(second["attempt_count"], 2)
 
+    def test_candidate_store_marks_adult_source_with_chinese_subtitle_label_as_declared(self):
+        from pipeline.bot import CandidateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CandidateStore(str(Path(tmp) / "state.db"))
+            store.save_task(
+                700656624,
+                9001,
+                "adult",
+                "[HD] HMN-720 [中文字幕] 标题",
+                {
+                    "info_hash": "DECLARED-CHINESE-SUBTITLE",
+                    "msg_media_id": "media-hmn-720",
+                    "openlist_adult_code": "HMN-720",
+                    "openlist_adult_video_old_path": "/115/成人/HMN-720/hmn-720ch.mp4",
+                },
+            )
+
+            records = store.subtitle_backfill_records(["media-hmn-720"])
+
+        self.assertEqual(records["media-hmn-720"]["status"], "declared")
+        self.assertEqual(records["media-hmn-720"]["source"], "resource_name")
+        self.assertEqual(records["media-hmn-720"]["reason"], "source_declares_chinese_subtitles")
+
     def test_candidate_store_persists_migration_candidate(self):
         from pipeline.bot import CandidateStore
 
@@ -5730,6 +5754,78 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(retried["attempted"], 1)
         self.assertEqual(retried["matched"], 1)
         self.assertEqual(matcher.calls, [("adult", "SSIS-218", "media-target", "SSIS-218", False)])
+
+    def test_subtitle_backfill_one_treats_declared_chinese_source_as_already_covered(self):
+        from pipeline.bot import BotConfig, CandidateStore, PipelineBotService
+        from pipeline.config import category_to_msg_library_root
+
+        class FakeSubtitleCache:
+            def list_tracks(self, media_id):
+                return []
+
+        class FakeSubtitleMatcher:
+            def __init__(self):
+                self.cache = FakeSubtitleCache()
+                self.calls = []
+
+            def match_task(self, category, title, task, force=False):
+                self.calls.append((category, title, task, force))
+                raise AssertionError("declared Chinese source must not search subtitle providers")
+
+        root = category_to_msg_library_root("adult")
+        media_payload = {
+            "id": "media-hmn-720",
+            "library_id": root["library_id"],
+            "title": "HMN-720",
+            "path": "cloud://openlist/115/成人/HMN-720/HMN-720.mp4",
+        }
+        fake_msg = FakeMediaStationClient(
+            get_response={"data": media_payload},
+            list_response={"data": {"items": [media_payload]}},
+        )
+        matcher = FakeSubtitleMatcher()
+
+        with tempfile.TemporaryDirectory() as tmp, patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.build_subtitle_matcher_from_config", return_value=matcher
+        ):
+            state_db = str(Path(tmp) / "state.db")
+            store = CandidateStore(state_db)
+            store.save_task(
+                700656624,
+                9001,
+                "adult",
+                "[HD] HMN-720 [中文字幕] 标题",
+                {
+                    "info_hash": "DECLARED-CHINESE-SUBTITLE",
+                    "msg_media_id": "media-hmn-720",
+                    "openlist_adult_code": "HMN-720",
+                    "openlist_adult_video_old_path": "/115/成人/HMN-720/hmn-720ch.mp4",
+                },
+            )
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    state_db,
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    subtitle_auto_match_enabled=True,
+                )
+            )
+
+            result = service.subtitle_backfill_one_adult("media-hmn-720")
+            report = service.subtitle_backfill_report_adult()
+
+        self.assertEqual(result["attempted"], 0)
+        self.assertEqual(result["declared"], 1)
+        self.assertEqual(result["with_subtitles"], 1)
+        self.assertEqual(result["pending"], 0)
+        self.assertEqual(matcher.calls, [])
+        self.assertEqual(report["declared"], 1)
+        self.assertEqual(report["with_subtitles"], 1)
+        self.assertEqual(report["pending"], 0)
+        self.assertEqual(report["buckets"]["cached"][0]["status"], "declared")
 
     def test_subtitle_backfill_fails_when_cache_read_fails(self):
         from pipeline.bot import BotConfig, PipelineBotService

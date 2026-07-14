@@ -216,6 +216,72 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertEqual(len(tracks), 1)
         self.assertEqual(tracks[0]["source"], "fake")
 
+    def test_adult_source_declares_chinese_subtitles_from_explicit_markers_and_code_suffix(self):
+        from pipeline.external_subtitles import adult_source_declares_chinese_subtitles
+
+        positives = [
+            ("[HD] HMN-720 [中文字幕] 标题", {}),
+            ("SSIS-470 标题《FHD中文》", {}),
+            ("SSIS-310", {"name": "SSIS-310_CH.HD"}),
+            ("HMN-720", {"openlist_adult_video_old_path": "/115/成人/HMN-720/hmn-720ch.mp4"}),
+            ("MIDE-882", {"name": "MIDE-882.CHS.1080p"}),
+            ("MIDE-949", {"name": "MIDE-949 Chinese"}),
+        ]
+        negatives = [
+            ("PRED-867", {"openlist_adult_video_old_path": "/115/成人/PRED-867/PRED-867J-UC.mp4"}),
+            ("[无码破解] HMN-723", {"name": "HMN-723-U"}),
+            ("SSIS-415 普通版本", {"name": "SSIS-415"}),
+        ]
+
+        for title, task in positives:
+            with self.subTest(title=title, task=task):
+                self.assertTrue(adult_source_declares_chinese_subtitles(title, task))
+        for title, task in negatives:
+            with self.subTest(title=title, task=task):
+                self.assertFalse(adult_source_declares_chinese_subtitles(title, task))
+
+    def test_subtitle_matcher_skips_declared_chinese_source_but_manual_force_can_override(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
+
+        class FakeProvider:
+            name = "fake"
+
+            def __init__(self):
+                self.search_calls = []
+
+            def enabled(self):
+                return True
+
+            def search(self, query, code=""):
+                self.search_calls.append((query, code))
+                return [{"id": "candidate-1"}]
+
+            def download(self, candidate, query, code=""):
+                return SubtitleDownload(
+                    source=self.name,
+                    provider_id=candidate["id"],
+                    filename="HMN-720.srt",
+                    body=b"subtitle-body",
+                    query=query,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SubtitleCache(tmp)
+            provider = FakeProvider()
+            matcher = SubtitleMatcher(cache, [provider], enabled=True, adult_only=True)
+            task = {
+                "msg_media_id": "media-1",
+                "openlist_adult_code": "HMN-720",
+                "openlist_adult_video_old_path": "/115/成人/HMN-720/hmn-720ch.mp4",
+            }
+            skipped = matcher.match_task("adult", "HMN-720", task)
+            forced = matcher.match_task("adult", "HMN-720", task, force=True)
+
+        self.assertEqual(skipped["subtitle_match_status"], "skipped")
+        self.assertEqual(skipped["subtitle_match_reason"], "source_declares_chinese_subtitles")
+        self.assertEqual(forced["subtitle_match_status"], "success")
+        self.assertEqual(provider.search_calls, [("HMN-720", "HMN-720")])
+
     def test_subtitle_matcher_continues_after_candidate_download_error(self):
         from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
 

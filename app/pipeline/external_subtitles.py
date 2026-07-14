@@ -21,6 +21,16 @@ LOCAL_SUBTITLE_SCHEME = "local-subtitle"
 CHINESE_LANGUAGE_CODES = ("zh-cn", "zh-tw", "ze")
 SUBTITLECAT_BASE_URL = "https://www.subtitlecat.com/"
 SUBTITLECAT_LANGUAGE_ORDER = ("zh-CN", "zh-TW")
+SOURCE_DECLARED_CHINESE_SUBTITLE_REASON = "source_declares_chinese_subtitles"
+EXPLICIT_CHINESE_SUBTITLE_PATTERN = re.compile(
+    r"中文(?:字幕)?|中字|简中|簡中|繁中|简体中文|簡體中文|繁體中文|官中|中英(?:双语|雙語)?"
+    r"|(?<![a-z0-9])(?:chs|cht|chinese)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+ADULT_CODE_CHINESE_SUBTITLE_SUFFIX_PATTERN = re.compile(
+    r"(?:^|[^a-z0-9])[a-z]{2,10}[-_\s]?\d{2,8}[\s._-]*ch(?=$|[^a-z0-9])",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -430,6 +440,8 @@ class SubtitleMatcher:
         media_id = str((task or {}).get("msg_media_id") or "").strip()
         if not media_id:
             return subtitle_result("skipped", reason="media_id_missing")
+        if category == "adult" and not force and adult_source_declares_chinese_subtitles(title, task):
+            return subtitle_result("skipped", reason=SOURCE_DECLARED_CHINESE_SUBTITLE_REASON)
         existing = self.cache.list_tracks(media_id)
         if existing and not force:
             return subtitle_result("success", count=len(existing), source="cache", reason="already_cached")
@@ -739,6 +751,27 @@ def subtitle_task_queries(category, title, task):
         return [code], code
     queries = unique_values([title, (task or {}).get("msg_media_title")])
     return queries[:2], codes[0] if codes else ""
+
+
+def adult_source_declares_chinese_subtitles(title, task):
+    values = [
+        title,
+        (task or {}).get("name"),
+        (task or {}).get("source_name"),
+        (task or {}).get("download_name"),
+        (task or {}).get("file_name"),
+        (task or {}).get("openlist_adult_format_old_path"),
+        (task or {}).get("openlist_adult_video_old_path"),
+    ]
+    for value in values:
+        text = urllib.parse.unquote(str(value or "")).strip()
+        if not text:
+            continue
+        if EXPLICIT_CHINESE_SUBTITLE_PATTERN.search(text):
+            return True
+        if ADULT_CODE_CHINESE_SUBTITLE_SUFFIX_PATTERN.search(text):
+            return True
+    return False
 
 
 def extract_assrt_subs(payload):
