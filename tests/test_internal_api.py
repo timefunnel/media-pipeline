@@ -239,6 +239,38 @@ class BotApiConfigTest(InternalApiTestCase):
         self.assertEqual(config.internal_api_search_ttl_seconds, 900)
 
 
+class SearchResponseTest(InternalApiTestCase):
+    def test_empty_search_is_a_successful_response_with_pansou_capability(self):
+        class EmptySearchService(FakePipelineService):
+            def search(self, query, category, limit=20):
+                return ResultList([], metadata={"profile": category})
+
+        _, _, _, application = self.build_components(EmptySearchService())
+
+        response = application.search(
+            {"owner_id": "owner-a", "query": "missing", "category": "movie", "source": "default"}
+        )
+
+        self.assertEqual(response["items"], [])
+        self.assertTrue(response["capabilities"]["pansou"])
+
+    def test_search_failure_keeps_error_semantics_and_exposes_safe_capabilities(self):
+        class FailingSearchService(FakePipelineService):
+            def search(self, query, category, limit=20):
+                raise TimeoutError("BT4G timed out")
+
+        _, _, _, application = self.build_components(FailingSearchService())
+
+        with self.assertRaises(ApiError) as raised:
+            application.search(
+                {"owner_id": "owner-a", "query": "missing", "category": "movie", "source": "default"}
+            )
+
+        self.assertEqual(raised.exception.status, 502)
+        self.assertEqual(raised.exception.code, "search_failed")
+        self.assertTrue(raised.exception.details["capabilities"]["pansou"])
+
+
 class PipelineTargetOverrideTest(InternalApiTestCase):
     def test_service_uses_explicit_target_for_scrape_and_maintenance(self):
         service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))

@@ -867,28 +867,30 @@ class InternalApiApplication:
         if limit < 1 or limit > 200:
             raise ApiError(400, "invalid_limit", "limit must be between 1 and 200")
         try:
+            capabilities = self.service.search_capabilities()
+        except Exception as exc:
+            raise ApiError(502, "capability_check_failed", str(exc))
+        if not isinstance(capabilities, dict):
+            raise ApiError(502, "capability_check_failed", "pipeline capabilities returned invalid response")
+        error_details = {"capabilities": capabilities}
+        try:
             if source == "pansou":
                 result = self.service.search_pansou(query, limit=limit)
             elif source == "bt4g":
                 result = self.service.search_bt4g(query, limit=limit)
             else:
                 result = self.service.search(query, category, limit=limit)
-        except ApiError:
+        except ApiError as exc:
+            exc.details.setdefault("capabilities", capabilities)
             raise
         except Exception as exc:
-            raise ApiError(502, "search_failed", str(exc))
+            raise ApiError(502, "search_failed", str(exc), error_details)
         if not isinstance(result, list):
-            raise ApiError(502, "search_failed", "pipeline search returned invalid response")
+            raise ApiError(502, "search_failed", "pipeline search returned invalid response", error_details)
         for item in result:
             if not isinstance(item, dict):
-                raise ApiError(502, "search_failed", "pipeline search returned an invalid candidate")
+                raise ApiError(502, "search_failed", "pipeline search returned an invalid candidate", error_details)
         metadata = dict(getattr(result, "metadata", {}) or {})
-        try:
-            capabilities = self.service.search_capabilities()
-        except Exception as exc:
-            raise ApiError(502, "capability_check_failed", str(exc))
-        if not isinstance(capabilities, dict):
-            raise ApiError(502, "capability_check_failed", "pipeline capabilities returned invalid response")
         metadata.update(
             {
                 "source": source,
