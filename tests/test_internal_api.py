@@ -47,9 +47,18 @@ class ResultList(list):
 
 
 class FakePipelineService:
-    def __init__(self, warning=False, missing_media_id=False, sync_delay=0, download_delay=0, duplicate=None):
+    def __init__(
+        self,
+        warning=False,
+        missing_media_id=False,
+        sync_error="",
+        sync_delay=0,
+        download_delay=0,
+        duplicate=None,
+    ):
         self.warning = warning
         self.missing_media_id = missing_media_id
+        self.sync_error = sync_error
         self.sync_delay = sync_delay
         self.download_delay = download_delay
         self.duplicate = duplicate
@@ -150,7 +159,11 @@ class FakePipelineService:
             "msg_scrape_status": "success",
             "subtitle_match_status": "success",
         }
-        if not self.missing_media_id:
+        if self.sync_error:
+            result["msg_sync_status"] = "failed"
+            result["msg_scan_status"] = "failed"
+            result["msg_error"] = self.sync_error
+        elif not self.missing_media_id:
             result["msg_media_id"] = "media-" + task["info_hash"]
             result["msg_media_title"] = "MSG " + title
         if self.warning:
@@ -673,6 +686,23 @@ class ImportResultSemanticsTest(InternalApiTestCase):
         self.assertEqual(completed["status"], "failed")
         self.assertIsNone(completed["msg_media_id"])
         self.assertIn("without msg_media_id", completed["error"])
+
+    def test_msg_sync_error_is_preserved_as_import_error(self):
+        service, store, manager, application = self.build_components(
+            FakePipelineService(sync_error="target OpenList scan failed")
+        )
+        session_id, candidate_id, _ = self.search_candidate(application)
+        task, _ = manager.create_import(
+            "owner-a", "sync-error-key", self.import_payload(session_id, candidate_id)
+        )
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "failed")
+        self.assertEqual(completed["error"], "target OpenList scan failed")
 
 
 class ImportConcurrencyTest(InternalApiTestCase):

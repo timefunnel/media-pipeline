@@ -791,6 +791,9 @@ class ImportTaskManager:
                     self._wait_or_stop()
                     continue
                 if not media_id:
+                    msg_error = str(offline_task.get("msg_error") or "").strip()
+                    if msg_error:
+                        raise RuntimeError(msg_error)
                     raise RuntimeError("MediaStationGo sync completed without msg_media_id")
                 warnings = sync_warnings(offline_task)
                 result["msg_media_id"] = media_id
