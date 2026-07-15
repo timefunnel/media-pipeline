@@ -26,7 +26,7 @@ RETRYABLE_IMPORT_STATUSES = {"completed_with_warning", "failed", "canceled"}
 VALID_IMPORT_STATUSES = {"queued", "running", *FINAL_IMPORT_STATUSES}
 VALID_SEARCH_SOURCES = {"default", "pansou", "bt4g"}
 VALID_CATEGORIES = {"movie", "tv", "anime", "adult", "other"}
-SYNC_STAGES = {"syncing", "scanning", "scraping", "subtitles"}
+SYNC_STAGES = {"syncing", "scanning", "scraping", "subtitles", "removing_old_version"}
 
 
 class ApiError(RuntimeError):
@@ -562,6 +562,7 @@ class ImportTaskManager:
         target["root_openlist_path"] = configured_openlist_path
         force_duplicate = optional_bool(payload.get("force_duplicate"), "force_duplicate", default=False)
         upgrade_media_id = optional_text(payload.get("upgrade_media_id"), "upgrade_media_id", max_length=100)
+        keep_old_version = optional_bool(payload.get("keep_old_version"), "keep_old_version", default=True)
         existing = self.store.get_import_by_idempotency(owner_id, idempotency_key)
         if existing is not None:
             existing_request = existing["request"]
@@ -572,6 +573,7 @@ class ImportTaskManager:
                 "target": target,
                 "force_duplicate": force_duplicate,
                 "upgrade_media_id": upgrade_media_id,
+                "keep_old_version": keep_old_version,
             }
             persisted_identity = {key: existing_request.get(key) for key in incoming_identity}
             if json_dumps(persisted_identity) != json_dumps(incoming_identity):
@@ -594,6 +596,7 @@ class ImportTaskManager:
             "target": target,
             "force_duplicate": force_duplicate,
             "upgrade_media_id": upgrade_media_id,
+            "keep_old_version": keep_old_version,
         }
         self._check_duplicate(request)
         task, created = self.store.create_import(owner_id, idempotency_key, request)
@@ -819,6 +822,25 @@ class ImportTaskManager:
                     raise RuntimeError("MediaStationGo sync completed without msg_media_id")
                 warnings = sync_warnings(offline_task)
                 result["msg_media_id"] = media_id
+                upgrade_media_id = str(request.get("upgrade_media_id") or "").strip()
+                if upgrade_media_id and not bool(request.get("keep_old_version", True)):
+                    self.store.save_running(
+                        task["id"],
+                        "removing_old_version",
+                        result=result,
+                        info_hash=info_hash,
+                        msg_media_id=media_id,
+                    )
+                    try:
+                        result["upgrade_cleanup"] = self.service.remove_upgrade_target(
+                            upgrade_media_id,
+                            media_id,
+                            target,
+                        )
+                    except Exception as exc:
+                        warning = "旧版本移入回收站失败: %s" % exc
+                        if warning not in warnings:
+                            warnings.append(warning)
                 if warnings:
                     result["warnings"] = warnings
                     self.store.finish_import(

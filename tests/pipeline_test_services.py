@@ -848,6 +848,7 @@ class MediaStationClientTest(unittest.TestCase):
                 {"data": {"items": []}},
                 {"data": {"items": []}},
                 {"data": {"id": "media-1"}},
+                {"deleted_id": "media-1"},
             ]
         )
         client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
@@ -855,6 +856,7 @@ class MediaStationClientTest(unittest.TestCase):
         client.search_media("Movie", limit=20)
         client.list_library_media("library-1", page=2, page_size=100, group_versions=0)
         client.get_media("media-1")
+        client.soft_delete_media_version("media-1", "media-1")
 
         self.assertEqual(transport.calls[1]["url"], "http://127.0.0.1:18080/api/media?q=Movie&limit=20")
         self.assertEqual(
@@ -862,6 +864,11 @@ class MediaStationClientTest(unittest.TestCase):
             "http://127.0.0.1:18080/api/libraries/library-1/media?page=2&page_size=100&group_versions=0",
         )
         self.assertEqual(transport.calls[3]["url"], "http://127.0.0.1:18080/api/media/media-1")
+        self.assertEqual(
+            transport.calls[4]["url"],
+            "http://127.0.0.1:18080/api/media/media-1/versions/media-1",
+        )
+        self.assertEqual(transport.calls[4]["method"], "DELETE")
 
     def test_extracts_and_matches_media_items_flexibly(self):
         response = {"data": {"items": [{"id": "media-1", "library_id": "library-1", "title": "GANA-2525"}]}}

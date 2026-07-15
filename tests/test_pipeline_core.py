@@ -390,6 +390,7 @@ class FakeMediaStationClient:
         self.pipeline_maintenance_calls = []
         self.pipeline_ingest_calls = []
         self.pipeline_ingest_jobs = {}
+        self.deleted_version_calls = []
 
     def search_media(self, query, limit=20):
         self.search_calls.append((query, limit))
@@ -517,6 +518,10 @@ class FakeMediaStationClient:
         if self.get_response is None:
             return {"id": media_id}
         return self.get_response
+
+    def soft_delete_media_version(self, anchor_media_id, version_media_id):
+        self.deleted_version_calls.append((anchor_media_id, version_media_id))
+        return {"deleted_id": version_media_id}
 
 
 

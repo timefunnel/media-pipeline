@@ -56,6 +56,7 @@ class FakePipelineService:
         download_delay=0,
         duplicate=None,
         upgrade_target_error=None,
+        upgrade_remove_error=None,
     ):
         self.warning = warning
         self.missing_media_id = missing_media_id
@@ -64,6 +65,7 @@ class FakePipelineService:
         self.download_delay = download_delay
         self.duplicate = duplicate
         self.upgrade_target_error = upgrade_target_error
+        self.upgrade_remove_error = upgrade_remove_error
         self.submit_uris = []
         self.task_status_calls = []
         self.sync_targets = []
@@ -72,6 +74,7 @@ class FakePipelineService:
         self.cancel_calls = []
         self.duplicate_calls = []
         self.upgrade_target_calls = []
+        self.upgrade_remove_calls = []
         self._sequence = 0
         self._lock = threading.Lock()
         self.active = 0
@@ -119,6 +122,12 @@ class FakePipelineService:
         if self.upgrade_target_error:
             raise ValueError(self.upgrade_target_error)
         return {"id": media_id, "library_id": (target or {}).get("library_id"), "title": "Upgrade Target"}
+
+    def remove_upgrade_target(self, old_media_id, new_media_id, target):
+        self.upgrade_remove_calls.append((old_media_id, new_media_id, dict(target or {})))
+        if self.upgrade_remove_error:
+            raise RuntimeError(self.upgrade_remove_error)
+        return {"status": "removed", "media_id": old_media_id}
 
     def task_status(self, category, info_hash):
         self.task_status_calls.append((category, info_hash))
@@ -579,6 +588,63 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertEqual(service.upgrade_target_calls[-1], ("media-upgrade-target", target_for("adult")))
         self.assertEqual(service.sync_titles[-1], "Upgrade Target")
         self.assertEqual(len(service.submit_uris), 1)
+
+    def test_upgrade_can_move_selected_old_version_to_recycle_bin(self):
+        duplicate = {
+            "level": "strong",
+            "reason": "mediastation_code",
+            "source": "MediaStationGo",
+            "title": "SSIS-218",
+            "media_id": "media-upgrade-target",
+            "can_force": False,
+        }
+        service, store, manager, application = self.build_components(FakePipelineService(duplicate=duplicate))
+        session_id, candidate_id, _ = self.search_candidate(application, query="SSIS-218", category="adult")
+        payload = self.import_payload(session_id, candidate_id, category="adult", target=target_for("adult"))
+        payload["upgrade_media_id"] = "media-upgrade-target"
+        payload["keep_old_version"] = False
+
+        task, _ = manager.create_import("owner-a", "adult-upgrade-replace", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(
+            service.upgrade_remove_calls,
+            [("media-upgrade-target", completed["msg_media_id"], target_for("adult"))],
+        )
+        self.assertEqual(completed["result"]["upgrade_cleanup"]["status"], "removed")
+
+    def test_upgrade_cleanup_failure_keeps_old_version_and_reports_warning(self):
+        duplicate = {
+            "level": "strong",
+            "reason": "mediastation_code",
+            "source": "MediaStationGo",
+            "title": "SSIS-218",
+            "media_id": "media-upgrade-target",
+            "can_force": False,
+        }
+        service, store, manager, application = self.build_components(
+            FakePipelineService(duplicate=duplicate, upgrade_remove_error="MSG recycle unavailable")
+        )
+        session_id, candidate_id, _ = self.search_candidate(application, query="SSIS-218", category="adult")
+        payload = self.import_payload(session_id, candidate_id, category="adult", target=target_for("adult"))
+        payload["upgrade_media_id"] = "media-upgrade-target"
+        payload["keep_old_version"] = False
+
+        task, _ = manager.create_import("owner-a", "adult-upgrade-warning", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed_with_warning")
+        self.assertIn("旧版本移入回收站失败", completed["error"])
+        self.assertTrue(completed["msg_media_id"])
 
     def test_upgrade_rejects_duplicate_that_belongs_to_another_media(self):
         duplicate = {

@@ -2059,6 +2059,9 @@ class PipelineBotService:
         }
 
     def validate_upgrade_target(self, media_id, target):
+        return self._validate_upgrade_target_media(self._build_msg_client(), media_id, target)
+
+    def _validate_upgrade_target_media(self, client, media_id, target):
         media_id = str(media_id or "").strip()
         if not media_id:
             raise ValueError("upgrade_media_id is required")
@@ -2068,7 +2071,7 @@ class PipelineBotService:
         if not target_library_id or not target_root_id:
             raise ValueError("升级目标缺少媒体库或目录信息")
 
-        media = extract_media_detail(self._build_msg_client().get_media(media_id))
+        media = extract_media_detail(client.get_media(media_id))
         actual_media_id = str(extract_media_id(media) or "").strip()
         if actual_media_id != media_id:
             raise ValueError("升级目标作品不存在或媒体 ID 不匹配")
@@ -2081,6 +2084,23 @@ class PipelineBotService:
         if actual_root_id and actual_root_id != target_root_id:
             raise ValueError("升级目标作品不属于当前入库目录")
         return media
+
+    def remove_upgrade_target(self, old_media_id, new_media_id, target):
+        old_media_id = str(old_media_id or "").strip()
+        new_media_id = str(new_media_id or "").strip()
+        if not old_media_id or not new_media_id:
+            raise ValueError("升级版本处理缺少媒体 ID")
+        if old_media_id == new_media_id:
+            return {"status": "skipped", "reason": "same_media_id", "media_id": old_media_id}
+        client = self._build_msg_client()
+        try:
+            self._validate_upgrade_target_media(client, old_media_id, target)
+        except MediaStationApiError as exc:
+            if exc.status_code == 404:
+                return {"status": "already_removed", "media_id": old_media_id}
+            raise
+        client.soft_delete_media_version(old_media_id, old_media_id)
+        return {"status": "removed", "media_id": old_media_id}
 
     def collect_openlist_dedupe_entries(self, refresh=True):
         client = self._build_openlist_scan_client()

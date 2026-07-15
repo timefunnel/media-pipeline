@@ -168,6 +168,15 @@ class MediaStationClient:
     def get_media(self, media_id):
         return self._request("GET", "/media/%s" % quote_path(media_id))
 
+    def soft_delete_media(self, media_id):
+        return self._request("DELETE", "/media/%s" % quote_path(media_id))
+
+    def soft_delete_media_version(self, anchor_media_id, version_media_id):
+        return self._request(
+            "DELETE",
+            "/media/%s/versions/%s" % (quote_path(anchor_media_id), quote_path(version_media_id)),
+        )
+
     def _request(self, method, path, data=None, retry=True):
         if not self.access_token:
             self.login()
