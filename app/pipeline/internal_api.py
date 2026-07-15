@@ -561,6 +561,7 @@ class ImportTaskManager:
             )
         target["root_openlist_path"] = configured_openlist_path
         force_duplicate = optional_bool(payload.get("force_duplicate"), "force_duplicate", default=False)
+        upgrade_media_id = optional_text(payload.get("upgrade_media_id"), "upgrade_media_id", max_length=100)
         existing = self.store.get_import_by_idempotency(owner_id, idempotency_key)
         if existing is not None:
             existing_request = existing["request"]
@@ -570,6 +571,7 @@ class ImportTaskManager:
                 "category": category,
                 "target": target,
                 "force_duplicate": force_duplicate,
+                "upgrade_media_id": upgrade_media_id,
             }
             persisted_identity = {key: existing_request.get(key) for key in incoming_identity}
             if json_dumps(persisted_identity) != json_dumps(incoming_identity):
@@ -591,6 +593,7 @@ class ImportTaskManager:
             "candidate": candidate,
             "target": target,
             "force_duplicate": force_duplicate,
+            "upgrade_media_id": upgrade_media_id,
         }
         self._check_duplicate(request)
         task, created = self.store.create_import(owner_id, idempotency_key, request)
@@ -599,6 +602,21 @@ class ImportTaskManager:
         return task, created
 
     def _check_duplicate(self, request):
+        upgrade_media_id = str(request.get("upgrade_media_id") or "").strip()
+        if upgrade_media_id:
+            try:
+                upgrade_target = self.service.validate_upgrade_target(upgrade_media_id, request["target"])
+                if isinstance(upgrade_target, dict):
+                    request["upgrade_target_title"] = str(
+                        upgrade_target.get("display_title")
+                        or upgrade_target.get("title")
+                        or upgrade_target.get("original_name")
+                        or ""
+                    ).strip()
+            except ValueError as exc:
+                raise ApiError(409, "invalid_upgrade_target", str(exc))
+            except Exception as exc:
+                raise ApiError(502, "upgrade_target_check_failed", str(exc))
         try:
             duplicate = self.service.check_duplicate(
                 request["category"],
@@ -612,11 +630,15 @@ class ImportTaskManager:
             if not isinstance(duplicate, dict):
                 raise ApiError(502, "duplicate_check_failed", "pipeline duplicate check returned invalid response")
             summary = duplicate_summary(duplicate)
+            if upgrade_media_id:
+                if summary.get("media_id") == upgrade_media_id:
+                    return
+                summary["can_force"] = False
             if not (request.get("force_duplicate") and summary["can_force"]):
                 raise ApiError(
                     409,
                     "duplicate_media",
-                    "target MediaStationGo library already contains matching media",
+                    "所选资源与其他已入库作品重复" if upgrade_media_id else "target MediaStationGo library already contains matching media",
                     details={"duplicate": summary},
                 )
 
@@ -693,7 +715,7 @@ class ImportTaskManager:
         request = task["request"]
         result = dict(task.get("result") or {})
         category = request["category"]
-        title = request["title"]
+        title = str(request.get("upgrade_target_title") or request["title"]).strip()
         info_hash = str(task.get("info_hash") or "").strip()
         offline_task = dict(result.get("task") or {})
 
@@ -1101,6 +1123,12 @@ def require_text(value, label, max_length):
     if len(text) > int(max_length):
         raise ApiError(400, "invalid_%s" % label.lower().replace("-", "_"), "%s is too long" % label)
     return text
+
+
+def optional_text(value, label, max_length):
+    if value is None or str(value).strip() == "":
+        return ""
+    return require_text(value, label, max_length)
 
 
 def optional_bool(value, label, default=False):

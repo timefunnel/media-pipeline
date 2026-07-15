@@ -2058,6 +2058,30 @@ class PipelineBotService:
             "can_force": not strong_code_match,
         }
 
+    def validate_upgrade_target(self, media_id, target):
+        media_id = str(media_id or "").strip()
+        if not media_id:
+            raise ValueError("upgrade_media_id is required")
+        target = dict(target or {})
+        target_library_id = str(target.get("library_id") or "").strip()
+        target_root_id = str(target.get("root_id") or "").strip()
+        if not target_library_id or not target_root_id:
+            raise ValueError("升级目标缺少媒体库或目录信息")
+
+        media = extract_media_detail(self._build_msg_client().get_media(media_id))
+        actual_media_id = str(extract_media_id(media) or "").strip()
+        if actual_media_id != media_id:
+            raise ValueError("升级目标作品不存在或媒体 ID 不匹配")
+        actual_library_id = str(media_first_value(media, ("library_id", "libraryId")) or "").strip()
+        if actual_library_id != target_library_id:
+            raise ValueError("升级目标作品不属于当前媒体库")
+        actual_root_id = str(
+            media_first_value(media, ("library_root_id", "libraryRootId", "root_id", "rootId")) or ""
+        ).strip()
+        if actual_root_id and actual_root_id != target_root_id:
+            raise ValueError("升级目标作品不属于当前入库目录")
+        return media
+
     def collect_openlist_dedupe_entries(self, refresh=True):
         client = self._build_openlist_scan_client()
         entries = []

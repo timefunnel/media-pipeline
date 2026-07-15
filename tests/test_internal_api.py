@@ -55,6 +55,7 @@ class FakePipelineService:
         sync_delay=0,
         download_delay=0,
         duplicate=None,
+        upgrade_target_error=None,
     ):
         self.warning = warning
         self.missing_media_id = missing_media_id
@@ -62,12 +63,15 @@ class FakePipelineService:
         self.sync_delay = sync_delay
         self.download_delay = download_delay
         self.duplicate = duplicate
+        self.upgrade_target_error = upgrade_target_error
         self.submit_uris = []
         self.task_status_calls = []
         self.sync_targets = []
+        self.sync_titles = []
         self.sync_input_tasks = []
         self.cancel_calls = []
         self.duplicate_calls = []
+        self.upgrade_target_calls = []
         self._sequence = 0
         self._lock = threading.Lock()
         self.active = 0
@@ -110,6 +114,12 @@ class FakePipelineService:
         self.duplicate_calls.append((category, query, dict(candidate), dict(target or {})))
         return dict(self.duplicate) if self.duplicate is not None else None
 
+    def validate_upgrade_target(self, media_id, target):
+        self.upgrade_target_calls.append((media_id, dict(target or {})))
+        if self.upgrade_target_error:
+            raise ValueError(self.upgrade_target_error)
+        return {"id": media_id, "library_id": (target or {}).get("library_id"), "title": "Upgrade Target"}
+
     def task_status(self, category, info_hash):
         self.task_status_calls.append((category, info_hash))
         with self._lock:
@@ -130,6 +140,7 @@ class FakePipelineService:
     def sync_completed_task(self, category, title, task, progress_callback=None, target=None):
         target = dict(target or {})
         self.sync_targets.append(target)
+        self.sync_titles.append(title)
         self.sync_input_tasks.append(dict(task or {}))
         if progress_callback:
             progress_callback({**task, "msg_sync_status": "running", "msg_scan_status": "running"})
@@ -334,6 +345,28 @@ class PipelineTargetOverrideTest(InternalApiTestCase):
         self.assertEqual(duplicate["media_id"], "target-media")
         self.assertTrue(duplicate["can_force"])
 
+    def test_upgrade_target_must_match_explicit_library_and_root(self):
+        config = BotConfig(token="token", allowed_user_ids={1}, msg_enabled=True)
+        service = PipelineBotService(config)
+
+        class Client:
+            def get_media(self, media_id):
+                return {
+                    "id": media_id,
+                    "library_id": TARGET["library_id"],
+                    "library_root_id": TARGET["root_id"],
+                    "title": "Sintel",
+                }
+
+        service._build_msg_client = lambda: Client()
+        media = service.validate_upgrade_target("media-existing", TARGET)
+        self.assertEqual(media["id"], "media-existing")
+
+        with self.assertRaisesRegex(ValueError, "不属于当前媒体库"):
+            service.validate_upgrade_target("media-existing", {**TARGET, "library_id": "other-library"})
+        with self.assertRaisesRegex(ValueError, "不属于当前入库目录"):
+            service.validate_upgrade_target("media-existing", {**TARGET, "root_id": "other-root"})
+
     def test_submit_uses_configured_category_folder_id(self):
         service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
 
@@ -519,6 +552,70 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertEqual(raised.exception.status, 409)
         self.assertFalse(raised.exception.details["duplicate"]["can_force"])
         self.assertEqual(raised.exception.details["duplicate"]["media_id"], "media-strong")
+        self.assertEqual(service.submit_uris, [])
+
+    def test_upgrade_allows_only_the_selected_duplicate_media(self):
+        duplicate = {
+            "level": "strong",
+            "reason": "mediastation_code",
+            "source": "MediaStationGo",
+            "title": "SSIS-218",
+            "media_id": "media-upgrade-target",
+            "can_force": False,
+        }
+        service, store, manager, application = self.build_components(FakePipelineService(duplicate=duplicate))
+        session_id, candidate_id, _ = self.search_candidate(application, query="SSIS-218", category="adult")
+        payload = self.import_payload(session_id, candidate_id, category="adult", target=target_for("adult"))
+        payload["upgrade_media_id"] = "media-upgrade-target"
+
+        task, _ = manager.create_import("owner-a", "adult-upgrade", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(service.upgrade_target_calls[-1], ("media-upgrade-target", target_for("adult")))
+        self.assertEqual(service.sync_titles[-1], "Upgrade Target")
+        self.assertEqual(len(service.submit_uris), 1)
+
+    def test_upgrade_rejects_duplicate_that_belongs_to_another_media(self):
+        duplicate = {
+            "level": "weak",
+            "reason": "mediastation_title",
+            "source": "MediaStationGo",
+            "title": "Other Sintel",
+            "media_id": "media-other",
+            "can_force": True,
+        }
+        service, store, manager, application = self.build_components(FakePipelineService(duplicate=duplicate))
+        session_id, candidate_id, _ = self.search_candidate(application)
+        payload = self.import_payload(session_id, candidate_id)
+        payload["upgrade_media_id"] = "media-upgrade-target"
+        payload["force_duplicate"] = True
+
+        with self.assertRaises(ApiError) as raised:
+            manager.create_import("owner-a", "wrong-upgrade-duplicate", payload)
+
+        self.assertEqual(raised.exception.code, "duplicate_media")
+        self.assertFalse(raised.exception.details["duplicate"]["can_force"])
+        self.assertEqual(raised.exception.details["duplicate"]["media_id"], "media-other")
+        self.assertEqual(service.submit_uris, [])
+
+    def test_upgrade_rejects_invalid_target_before_duplicate_check(self):
+        service, store, manager, application = self.build_components(
+            FakePipelineService(upgrade_target_error="升级目标作品不属于当前媒体库")
+        )
+        session_id, candidate_id, _ = self.search_candidate(application)
+        payload = self.import_payload(session_id, candidate_id)
+        payload["upgrade_media_id"] = "media-invalid"
+
+        with self.assertRaises(ApiError) as raised:
+            manager.create_import("owner-a", "invalid-upgrade-target", payload)
+
+        self.assertEqual(raised.exception.code, "invalid_upgrade_target")
+        self.assertEqual(service.duplicate_calls, [])
         self.assertEqual(service.submit_uris, [])
 
     def test_running_tasks_are_recovered_to_queue(self):
