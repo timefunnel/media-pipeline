@@ -57,13 +57,13 @@ class InternalApiStore:
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("pragma busy_timeout = 30000")
-        conn.execute("pragma journal_mode = wal")
         conn.execute("pragma foreign_keys = on")
         return conn
 
     def _init_schema(self):
         conn = self._connect()
         try:
+            conn.execute("pragma journal_mode = wal")
             conn.execute(
                 """
                 create table if not exists internal_api_search_sessions (
@@ -666,7 +666,13 @@ class ImportTaskManager:
 
     def _worker_loop(self):
         while not self._stop_event.is_set():
-            task = self._claim_task()
+            try:
+                task = self._claim_task()
+            except sqlite3.Error as exc:
+                print("internal API import worker claim failed: %s" % exc, flush=True)
+                with self._condition:
+                    self._condition.wait(timeout=self.poll_seconds)
+                continue
             if task is None:
                 with self._condition:
                     self._condition.wait(timeout=0.5)

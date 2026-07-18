@@ -633,12 +633,12 @@ class CandidateStore:
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.execute("pragma busy_timeout = 30000")
-        conn.execute("pragma journal_mode = wal")
         return conn
 
     def _init_schema(self):
         conn = self._connect()
         try:
+            conn.execute("pragma journal_mode = wal")
             conn.execute(
                 """
                 create table if not exists candidates (
@@ -5428,11 +5428,14 @@ class TelegramBot:
         loop_interval = min(interval, ACTIVE_115_FAST_POLL_INTERVAL_SECONDS)
         last_msg_recovery_at = 0
         while True:
-            now = int(time.time())
-            self.recover_active_115_tasks_once(now=now)
-            if now - last_msg_recovery_at >= interval:
-                self.recover_running_msg_sync_tasks_once()
-                last_msg_recovery_at = now
+            try:
+                now = int(time.time())
+                self.recover_active_115_tasks_once(now=now)
+                if now - last_msg_recovery_at >= interval:
+                    self.recover_running_msg_sync_tasks_once()
+                    last_msg_recovery_at = now
+            except sqlite3.Error as exc:
+                print("sync recovery sqlite access failed: %s" % exc, flush=True)
             time.sleep(loop_interval)
 
     def configure_bot_commands(self):

@@ -868,6 +868,33 @@ class ImportResultSemanticsTest(InternalApiTestCase):
         self.assertEqual(completed["error"], "target OpenList scan failed")
 
 
+class ImportWorkerRecoveryTest(InternalApiTestCase):
+    def test_worker_retries_after_transient_sqlite_claim_error(self):
+        service, store, manager, application = self.build_components(workers=1, owner_workers=1)
+        session_id, candidate_id, _ = self.search_candidate(application)
+        task, _ = manager.create_import(
+            "owner-a", "sqlite-retry-key", self.import_payload(session_id, candidate_id)
+        )
+        original_claim = store.claim_next_import
+        claim_calls = []
+
+        def flaky_claim(blocked_owners):
+            claim_calls.append(set(blocked_owners))
+            if len(claim_calls) == 1:
+                raise sqlite3.OperationalError("disk I/O error")
+            return original_claim(blocked_owners)
+
+        store.claim_next_import = flaky_claim
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertGreaterEqual(len(claim_calls), 2)
+
+
 class ImportConcurrencyTest(InternalApiTestCase):
     def create_task(self, manager, application, owner, key, query, target):
         session_id, candidate_id, _ = self.search_candidate(

@@ -78,6 +78,11 @@ services:
         MEDIA_PIPELINE_VERSION: "${MEDIA_PIPELINE_VERSION:-0.2.1}"
         MEDIA_PIPELINE_REVISION: "${MEDIA_PIPELINE_REVISION:-unknown}"
     container_name: media-pipeline-bot
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     network_mode: host
     environment:
       MEDIA_PIPELINE_VERSION: "${MEDIA_PIPELINE_VERSION:-0.2.1}"
