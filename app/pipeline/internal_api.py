@@ -962,6 +962,100 @@ class InternalApiApplication:
             "capabilities": capabilities,
         }
 
+    def search_subtitles(self, payload):
+        owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
+        media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
+        try:
+            limit = int(payload.get("limit") or 20)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_limit", "limit must be an integer")
+        if limit < 1 or limit > 50:
+            raise ApiError(400, "invalid_limit", "limit must be between 1 and 50")
+        try:
+            result = self.service.subtitle_search_candidates(media_id, limit=limit)
+        except (RuntimeError, ValueError) as exc:
+            raise ApiError(502, "subtitle_search_failed", str(exc))
+        if not isinstance(result, dict) or not isinstance(result.get("candidates"), list):
+            raise ApiError(502, "subtitle_search_failed", "pipeline subtitle search returned invalid response")
+        candidates = result.get("candidates") or []
+        for item in candidates:
+            if not isinstance(item, dict) or str(item.get("media_id") or "").strip() != media_id:
+                raise ApiError(502, "subtitle_search_failed", "pipeline subtitle search returned an invalid candidate")
+        metadata = {
+            "media_id": media_id,
+            "title": str(result.get("title") or ""),
+            "category": str(result.get("category") or ""),
+            "query": str(result.get("query") or ""),
+            "selected_count": len(candidates),
+        }
+        session_id, expires_at, stored = self.store.save_search(
+            owner_id,
+            metadata["query"] or media_id,
+            metadata["category"] or "other",
+            "subtitles",
+            candidates,
+            metadata,
+        )
+        return {
+            "session_id": session_id,
+            "expires_at": expires_at,
+            "media_id": media_id,
+            "title": metadata["title"],
+            "category": metadata["category"],
+            "query": metadata["query"],
+            "items": [public_subtitle_candidate(item) for item in stored],
+        }
+
+    def preview_subtitle(self, payload):
+        _owner_id, media_id, record = self._subtitle_candidate(payload)
+        try:
+            preview = self.service.preview_subtitle_candidate(record, max_chars=8000)
+        except (RuntimeError, ValueError) as exc:
+            raise ApiError(502, "subtitle_preview_failed", str(exc))
+        if not isinstance(preview, dict):
+            raise ApiError(502, "subtitle_preview_failed", "pipeline subtitle preview returned invalid response")
+        out = public_subtitle_candidate({**record, **preview})
+        out.update(
+            {
+                "candidate_id": str(payload.get("candidate_id") or ""),
+                "media_id": media_id,
+                "content_sample": str(preview.get("content_sample") or ""),
+                "preview_char_count": int(preview.get("preview_char_count") or 0),
+                "preview_line_count": int(preview.get("preview_line_count") or 0),
+            }
+        )
+        return out
+
+    def apply_subtitle(self, payload):
+        _owner_id, media_id, record = self._subtitle_candidate(payload)
+        try:
+            result = self.service.apply_subtitle_candidate(record)
+        except (RuntimeError, ValueError) as exc:
+            raise ApiError(502, "subtitle_apply_failed", str(exc))
+        if not isinstance(result, dict):
+            raise ApiError(502, "subtitle_apply_failed", "pipeline subtitle apply returned invalid response")
+        return {
+            "media_id": media_id,
+            "status": str(result.get("subtitle_match_status") or ""),
+            "source": str(result.get("subtitle_match_source") or ""),
+            "filename": str(result.get("subtitle_match_filename") or ""),
+            "count": int(result.get("subtitle_match_count") or 0),
+            "reason": str(result.get("subtitle_match_reason") or ""),
+        }
+
+    def _subtitle_candidate(self, payload):
+        owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
+        media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
+        session_id = require_text(payload.get("search_session_id"), "search_session_id", max_length=200)
+        candidate_id = require_text(payload.get("candidate_id"), "candidate_id", max_length=200)
+        loaded = self.store.load_search_candidate(owner_id, session_id, candidate_id)
+        if loaded.get("source") != "subtitles":
+            raise ApiError(404, "subtitle_candidate_not_found", "subtitle candidate not found")
+        record = loaded.get("candidate")
+        if not isinstance(record, dict) or str(record.get("media_id") or "").strip() != media_id:
+            raise ApiError(409, "subtitle_media_mismatch", "subtitle candidate does not belong to this media")
+        return owner_id, media_id, record
+
 
 class InternalApiServer:
     def __init__(
@@ -1038,6 +1132,15 @@ class InternalApiServer:
             if handler.command == "POST" and path == "/v1/search":
                 self._send_json(handler, 200, self.application.search(self._read_json(handler)))
                 return
+            if handler.command == "POST" and path == "/v1/subtitles/search":
+                self._send_json(handler, 200, self.application.search_subtitles(self._read_json(handler)))
+                return
+            if handler.command == "POST" and path == "/v1/subtitles/preview":
+                self._send_json(handler, 200, self.application.preview_subtitle(self._read_json(handler)))
+                return
+            if handler.command == "POST" and path == "/v1/subtitles/apply":
+                self._send_json(handler, 200, self.application.apply_subtitle(self._read_json(handler)))
+                return
             if handler.command == "POST" and path == "/v1/imports":
                 payload = self._read_json(handler)
                 owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
@@ -1112,6 +1215,19 @@ def import_path_match(path):
     if len(parts) == 4 and parts[:2] == ["v1", "imports"] and parts[3] in {"cancel", "retry"}:
         return parts[2], parts[3]
     return None
+
+
+def public_subtitle_candidate(item):
+    item = item or {}
+    return {
+        "candidate_id": str(item.get("candidate_id") or ""),
+        "provider": str(item.get("provider") or ""),
+        "title": str(item.get("subtitle_title") or item.get("filename") or ""),
+        "filename": str(item.get("filename") or ""),
+        "language": str(item.get("language") or ""),
+        "source_score": int(item.get("source_score") or 0),
+        "rank": int(item.get("rank") or 0),
+    }
 
 
 def owner_from_request(handler, query, body=None):

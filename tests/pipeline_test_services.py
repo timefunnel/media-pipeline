@@ -352,6 +352,29 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertEqual([item["rank"] for item in candidates], [1, 2])
         self.assertEqual(tracks, [])
 
+    def test_manual_subtitle_search_is_not_blocked_by_auto_match_policy(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleMatcher
+
+        class FakeProvider:
+            name = "fake"
+
+            def enabled(self):
+                return True
+
+            def search(self, query, code=""):
+                return [{"id": "movie-subtitle", "filename": "Sintel.zh.srt", "_score": 10}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            matcher = SubtitleMatcher(SubtitleCache(tmp), [FakeProvider()], enabled=False, adult_only=True)
+            candidates = matcher.search_task_candidates(
+                "movie",
+                "Sintel",
+                {"msg_media_id": "media-movie", "msg_media_title": "Sintel"},
+                manual=True,
+            )
+
+        self.assertEqual([item["provider_id"] for item in candidates], ["movie-subtitle"])
+
     def test_subtitle_matcher_apply_candidate_writes_selected_subtitle(self):
         from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
 

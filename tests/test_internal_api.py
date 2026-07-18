@@ -85,6 +85,8 @@ class FakePipelineService:
         self.max_by_owner = {}
         self.download_active = 0
         self.max_download_active = 0
+        self.subtitle_preview_calls = []
+        self.subtitle_apply_calls = []
 
     def search(self, query, category, limit=20):
         return ResultList(
@@ -103,6 +105,49 @@ class FakePipelineService:
             [{"title": query, "download_uri": "magnet:?xt=urn:btih:BT4G%s" % query.upper(), "rank": 1}],
             metadata={"profile": "bt4g"},
         )
+
+    def subtitle_search_candidates(self, media_id, limit=20):
+        return {
+            "media_id": media_id,
+            "title": "MIDE-605",
+            "category": "adult",
+            "code": "MIDE-605",
+            "query": "MIDE-605",
+            "candidates": [
+                {
+                    "media_id": media_id,
+                    "title": "MIDE-605",
+                    "subtitle_title": "MIDE-605 简体中文",
+                    "provider": "subtitlecat",
+                    "provider_id": "https://subtitle.invalid/private-result",
+                    "filename": "MIDE-605.zh-CN.srt",
+                    "language": "zh-CN",
+                    "source_score": 120,
+                    "rank": 1,
+                    "query": "MIDE-605",
+                    "code": "MIDE-605",
+                    "candidate": {"url": "https://subtitle.invalid/private-result"},
+                }
+            ][:limit],
+        }
+
+    def preview_subtitle_candidate(self, candidate, max_chars=8000):
+        self.subtitle_preview_calls.append((dict(candidate), max_chars))
+        return {
+            **candidate,
+            "content_sample": "第一行字幕\n第二行字幕",
+            "preview_char_count": 11,
+            "preview_line_count": 2,
+        }
+
+    def apply_subtitle_candidate(self, candidate):
+        self.subtitle_apply_calls.append(dict(candidate))
+        return {
+            "subtitle_match_status": "success",
+            "subtitle_match_source": candidate.get("provider"),
+            "subtitle_match_filename": candidate.get("filename"),
+            "subtitle_match_count": 1,
+        }
 
     def submit(self, category, download_uri):
         with self._lock:
@@ -270,6 +315,53 @@ class BotApiConfigTest(InternalApiTestCase):
         self.assertEqual(config.internal_api_workers, 3)
         self.assertEqual(config.internal_api_owner_workers, 2)
         self.assertEqual(config.internal_api_search_ttl_seconds, 900)
+
+
+class SubtitleApiTest(InternalApiTestCase):
+    def test_search_preview_and_apply_keep_raw_candidate_server_side(self):
+        service, _store, manager, application = self.build_components()
+        try:
+            search = application.search_subtitles({"owner_id": "admin", "media_id": "media-1", "limit": 10})
+            self.assertEqual(search["media_id"], "media-1")
+            self.assertEqual(search["items"][0]["provider"], "subtitlecat")
+            self.assertNotIn("candidate", search["items"][0])
+            self.assertNotIn("provider_id", search["items"][0])
+
+            selection = {
+                "owner_id": "admin",
+                "media_id": "media-1",
+                "search_session_id": search["session_id"],
+                "candidate_id": search["items"][0]["candidate_id"],
+            }
+            preview = application.preview_subtitle(selection)
+            self.assertEqual(preview["content_sample"], "第一行字幕\n第二行字幕")
+            self.assertEqual(preview["candidate_id"], selection["candidate_id"])
+            applied = application.apply_subtitle(selection)
+            self.assertEqual(applied["status"], "success")
+            self.assertEqual(applied["filename"], "MIDE-605.zh-CN.srt")
+            self.assertEqual(len(service.subtitle_preview_calls), 1)
+            self.assertEqual(len(service.subtitle_apply_calls), 1)
+            self.assertEqual(service.subtitle_apply_calls[0]["candidate"]["url"], "https://subtitle.invalid/private-result")
+        finally:
+            manager.stop()
+
+    def test_candidate_rejects_media_mismatch(self):
+        _service, _store, manager, application = self.build_components()
+        try:
+            search = application.search_subtitles({"owner_id": "admin", "media_id": "media-1"})
+            with self.assertRaises(ApiError) as raised:
+                application.preview_subtitle(
+                    {
+                        "owner_id": "admin",
+                        "media_id": "media-2",
+                        "search_session_id": search["session_id"],
+                        "candidate_id": search["items"][0]["candidate_id"],
+                    }
+                )
+            self.assertEqual(raised.exception.status, 409)
+            self.assertEqual(raised.exception.code, "subtitle_media_mismatch")
+        finally:
+            manager.stop()
 
 
 class SearchResponseTest(InternalApiTestCase):
@@ -1025,6 +1117,23 @@ class HttpAuthenticationTest(InternalApiTestCase):
             self.assertTrue(error["duplicate"]["can_force"])
             self.assertNotIn("path", error["duplicate"])
             self.assertEqual(service.submit_uris, [])
+        finally:
+            server.stop()
+
+    def test_http_subtitle_search_uses_bearer_and_hides_raw_candidate(self):
+        service = FakePipelineService()
+        port = free_tcp_port()
+        server = InternalApiServer(service, self.db_path, token="secret", port=port, workers=1, owner_workers=1)
+        server.start()
+        try:
+            result = http_json(
+                "http://127.0.0.1:%d/v1/subtitles/search" % port,
+                {"owner_id": "admin", "media_id": "media-1"},
+                token="secret",
+            )
+            self.assertEqual(result["items"][0]["provider"], "subtitlecat")
+            self.assertNotIn("candidate", result["items"][0])
+            self.assertNotIn("provider_id", result["items"][0])
         finally:
             server.stop()
 

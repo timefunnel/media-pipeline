@@ -2186,6 +2186,49 @@ class PipelineBotService:
             "candidates": candidates,
         }
 
+    def subtitle_search_candidates(self, media_id, limit=DEFAULT_SUBTITLE_REMATCH_LIMIT):
+        if not self.config.msg_enabled:
+            raise RuntimeError("MediaStationGo is disabled")
+        media_id = str(media_id or "").strip()
+        if not media_id:
+            raise ValueError("media_id is required")
+        limit = max(1, min(int(limit or DEFAULT_SUBTITLE_REMATCH_LIMIT), 50))
+        client = self._build_msg_client()
+        matcher = self._build_subtitle_matcher()
+        media = extract_media_detail(client.get_media(media_id))
+        detail_id = extract_media_id(media)
+        if not detail_id:
+            raise RuntimeError("MediaStationGo media detail missing id: %s" % media_id)
+        if detail_id != media_id:
+            raise RuntimeError("MediaStationGo media id mismatch: expected %s, got %s" % (media_id, detail_id))
+        category = subtitle_category_from_media(media)
+        title = media_display_title(media) or media_id
+        task = subtitle_backfill_task_from_media(media)
+        code = task.get("openlist_adult_code") or ""
+        candidates = matcher.search_task_candidates(category, title, task, limit=limit, manual=True)
+        normalized = []
+        for candidate in candidates:
+            item = dict(candidate)
+            subtitle_title = str(item.get("title") or "").strip()
+            item.update(
+                {
+                    "media_id": media_id,
+                    "title": title,
+                    "subtitle_title": subtitle_title,
+                    "category": category,
+                    "code": code,
+                }
+            )
+            normalized.append(item)
+        return {
+            "media_id": media_id,
+            "title": title,
+            "category": category,
+            "code": code,
+            "query": code or title,
+            "candidates": normalized,
+        }
+
     def subtitle_find_adult(self, query, limit=DEFAULT_SUBTITLE_FIND_LIMIT):
         if not self.config.msg_enabled:
             raise RuntimeError("MediaStationGo is disabled")
@@ -2248,6 +2291,9 @@ class PipelineBotService:
         out = dict(result)
         out.update({"media_id": media_id, "title": title, "code": code})
         return out
+
+    def preview_subtitle_candidate(self, candidate_record, max_chars=8000):
+        return self._build_subtitle_matcher().preview_candidate(candidate_record, max_chars=max_chars)
 
     def preview_subtitle_candidates(self, candidates, limit=DEFAULT_SUBTITLE_LLM_PREVIEW_LIMIT, max_chars=DEFAULT_SUBTITLE_LLM_PREVIEW_CHARS):
         matcher = self._build_subtitle_matcher()
@@ -5942,6 +5988,16 @@ def subtitle_backfill_task_from_media(media):
     if code:
         task["openlist_adult_code"] = code
     return task
+
+
+def subtitle_category_from_media(media):
+    library_id = str(media_first_value(media, ("library_id", "libraryId")) or "").strip()
+    if not library_id:
+        raise RuntimeError("MediaStationGo media detail missing library_id")
+    for category, root in msg_library_roots().items():
+        if str(root.get("library_id") or "").strip() == library_id:
+            return category
+    raise RuntimeError("media library is not configured in pipeline: %s" % library_id)
 
 
 def subtitle_backfill_media_status(media, matcher, records):

@@ -479,10 +479,10 @@ class SubtitleMatcher:
             return subtitle_result("failed", error="; ".join(errors[:3]))
         return subtitle_result("skipped", reason="not_found", query=queries[0])
 
-    def search_task_candidates(self, category, title, task, limit=10):
-        if not self.enabled:
+    def search_task_candidates(self, category, title, task, limit=10, manual=False):
+        if not self.enabled and not manual:
             return []
-        if self.adult_only and category != "adult":
+        if self.adult_only and category != "adult" and not manual:
             return []
         media_id = str((task or {}).get("msg_media_id") or "").strip()
         if not media_id:
