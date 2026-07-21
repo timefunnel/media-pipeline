@@ -6637,6 +6637,60 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(duplicate["identity_type"], "title_query")
         self.assertEqual(duplicate["identity_value"], "Sintel")
 
+    def test_check_duplicate_uses_candidate_year_to_disambiguate_movie_series(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-sequel",
+                            "library_id": "test-movie-library",
+                            "title": "黑衣人2",
+                            "original_name": "Men in Black II",
+                            "path": "cloud://openlist/115/电影/Men.in.Black.II.2002/movie.mkv",
+                        },
+                        {
+                            "id": "media-original",
+                            "library_id": "test-movie-library",
+                            "title": "黑衣人",
+                            "original_name": "Men in Black",
+                            "path": "cloud://openlist/115/电影/Men.in.Black.1997/movie.mkv",
+                        },
+                    ]
+                }
+            }
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                )
+            )
+            duplicate = service.check_duplicate(
+                "movie",
+                "Men in Black",
+                {"title": "Men in Black 1997 2160p BluRay", "download_uri": "magnet:?xt=urn:btih:ABC"},
+                target={
+                    "library_id": "test-movie-library",
+                    "root_id": "test-movie-root",
+                    "root_openlist_path": "/115/电影",
+                    "provider": "tmdb",
+                    "media_type": "movie",
+                },
+            )
+
+        self.assertEqual(fake_msg.search_calls, [("Men in Black 1997", 20)])
+        self.assertEqual(duplicate["media_id"], "media-original")
+        self.assertEqual(duplicate["title"], "黑衣人")
+
     def test_check_duplicate_does_not_use_generic_release_fragments(self):
         from pipeline.bot import BotConfig, PipelineBotService
 

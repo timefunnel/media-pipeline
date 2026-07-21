@@ -5808,7 +5808,16 @@ def duplicate_media_queries(category, query, candidate):
         codes = sorted(extract_codes(" ".join(values + [str((candidate or {}).get("download_uri") or "")])))
         return unique_nonempty_values(codes)
 
+    # A broad search such as "Men in Black" also returns sequels and spin-offs.
+    # Prefer the candidate's title plus release year when it is available so
+    # the MSG lookup can distinguish those works before considering the query.
     queries = []
+    candidate_specific_queries = []
+    for value in values[1:]:
+        specific = duplicate_title_year_query(value)
+        if specific:
+            candidate_specific_queries.append(specific)
+    queries.extend(candidate_specific_queries)
     for value in values:
         cleaned = duplicate_title_query(value)
         if cleaned:
@@ -5824,6 +5833,19 @@ def duplicate_title_query(value):
     if len(normalized) < 4:
         return ""
     return text
+
+
+def duplicate_title_year_query(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", text)
+    if not match:
+        return ""
+    prefix = text[: match.start()].strip(" ._-[]()")
+    if not prefix:
+        return ""
+    return "%s %s" % (prefix, match.group(0))
 
 
 def unique_nonempty_values(values):
