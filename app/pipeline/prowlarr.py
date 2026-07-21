@@ -1,6 +1,9 @@
-import json
+import copy
 import hashlib
+import json
 import re
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -11,6 +14,49 @@ DEFAULT_PROWLARR_URL = "http://127.0.0.1:9696"
 DEFAULT_PROWLARR_CONFIG = "/prowlarr-config/config.xml"
 PROWLARR_DOWNLOAD_SCHEME = "prowlarr-download"
 PROWLARR_DOWNLOAD_PATH_PATTERN = re.compile(r"^/(\d+)/download$")
+DEFAULT_PROWLARR_SEARCH_CACHE_SECONDS = 60
+DEFAULT_PROWLARR_SEARCH_CACHE_ENTRIES = 256
+
+
+class ProwlarrApiError(RuntimeError):
+    def __init__(self, status_code, message):
+        self.status_code = int(status_code)
+        self.message = str(message or "request failed")
+        super().__init__("Prowlarr HTTP %s: %s" % (self.status_code, self.message))
+
+
+class ProwlarrSearchCache:
+    def __init__(self, ttl_seconds=DEFAULT_PROWLARR_SEARCH_CACHE_SECONDS, max_entries=DEFAULT_PROWLARR_SEARCH_CACHE_ENTRIES, clock=None):
+        self.ttl_seconds = max(0, float(ttl_seconds))
+        self.max_entries = max(1, int(max_entries))
+        self.clock = clock or time.monotonic
+        self._entries = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        now = self.clock()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return False, None
+            expires_at, value = entry
+            if expires_at <= now:
+                self._entries.pop(key, None)
+                return False, None
+            return True, copy.deepcopy(value)
+
+    def put(self, key, value):
+        if self.ttl_seconds <= 0:
+            return
+        now = self.clock()
+        with self._lock:
+            expired = [entry_key for entry_key, (expires_at, _) in self._entries.items() if expires_at <= now]
+            for entry_key in expired:
+                self._entries.pop(entry_key, None)
+            if key not in self._entries and len(self._entries) >= self.max_entries:
+                oldest_key = min(self._entries, key=lambda entry_key: self._entries[entry_key][0])
+                self._entries.pop(oldest_key, None)
+            self._entries[key] = (now + self.ttl_seconds, copy.deepcopy(value))
 
 
 def safe_prowlarr_download_uri(value):
@@ -61,8 +107,19 @@ class ProwlarrTransport:
         if data is not None:
             raise ValueError("ProwlarrTransport only supports GET")
         request = urllib.request.Request(url, headers=headers or {}, method=method)
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", "replace")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as error:
+            raw = error.read().decode("utf-8", "replace")
+            message = error.reason
+            try:
+                payload = json.loads(raw)
+                if isinstance(payload, dict) and payload.get("message"):
+                    message = payload["message"]
+            except (TypeError, ValueError):
+                pass
+            raise ProwlarrApiError(error.code, message) from error
         return json.loads(raw)
 
     def resolve_magnet_redirect(self, url, timeout=None):
@@ -89,11 +146,12 @@ class ProwlarrTransport:
 
 
 class ProwlarrClient:
-    def __init__(self, base_url, api_key, transport=None, timeout=30):
+    def __init__(self, base_url, api_key, transport=None, timeout=30, search_cache=None):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.transport = transport or ProwlarrTransport()
         self.timeout = timeout
+        self.search_cache = search_cache
 
     def search(self, query, limit=20, indexer_ids=None, categories=None):
         if not query:
@@ -105,12 +163,20 @@ class ProwlarrClient:
             params.append(("indexerIds", str(indexer_id)))
         params = urllib.parse.urlencode(params)
         url = self.base_url + "/api/v1/search?" + params
-        return self.transport.request(
+        cache_key = url
+        if self.search_cache is not None:
+            hit, cached = self.search_cache.get(cache_key)
+            if hit:
+                return cached
+        results = self.transport.request(
             "GET",
             url,
             headers={"X-Api-Key": self.api_key},
             timeout=self.timeout,
         )
+        if self.search_cache is not None:
+            self.search_cache.put(cache_key, results)
+        return results
 
     def tags(self):
         url = self.base_url + "/api/v1/tag"

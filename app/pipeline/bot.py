@@ -145,6 +145,7 @@ from pipeline.prowlarr import (
     DEFAULT_PROWLARR_URL,
     ProwlarrClient,
     ProwlarrConfig,
+    ProwlarrSearchCache,
     is_prowlarr_download_uri,
 )
 from pipeline.pansou import DEFAULT_PANSOU_CLOUD_TYPES, DEFAULT_PANSOU_TIMEOUT_SECONDS, DEFAULT_PANSOU_URL, PanSouClient
@@ -1653,6 +1654,7 @@ class PipelineBotService:
         self._search_capabilities_lock = threading.Lock()
         self._search_capabilities_cache = None
         self._search_capabilities_cached_at = 0.0
+        self._prowlarr_search_cache = ProwlarrSearchCache()
 
     def search_capabilities(self, cache_seconds=60):
         now = time.monotonic()
@@ -1685,7 +1687,12 @@ class PipelineBotService:
         profile = profile or search_profile_for_query(category, query)
         stats = SearchStats()
         api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
-        prowlarr = ProwlarrClient(self.config.prowlarr_url, api_key, timeout=self.config.prowlarr_search_timeout_seconds)
+        prowlarr = ProwlarrClient(
+            self.config.prowlarr_url,
+            api_key,
+            timeout=self.config.prowlarr_search_timeout_seconds,
+            search_cache=self._prowlarr_search_cache,
+        )
         indexers = prowlarr.indexers()
         tags = safe_prowlarr_tags(prowlarr)
         categories_by_profile = self.config.search_profile_categories or SEARCH_PROFILE_CATEGORIES
@@ -1765,7 +1772,12 @@ class PipelineBotService:
     def search_bt4g(self, query, limit=DEFAULT_SEARCH_LIMIT):
         stats = SearchStats()
         api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
-        prowlarr = ProwlarrClient(self.config.prowlarr_url, api_key, timeout=self.config.prowlarr_search_timeout_seconds)
+        prowlarr = ProwlarrClient(
+            self.config.prowlarr_url,
+            api_key,
+            timeout=self.config.prowlarr_search_timeout_seconds,
+            search_cache=self._prowlarr_search_cache,
+        )
         indexers = prowlarr.indexers()
         bt4g_indexers = [indexer for indexer in indexers if indexer_enabled(indexer) and indexer_matches_label(indexer, "BT4G")]
         if not bt4g_indexers:
