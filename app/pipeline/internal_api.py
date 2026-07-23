@@ -562,6 +562,7 @@ class ImportTaskManager:
         target["root_openlist_path"] = configured_openlist_path
         force_duplicate = optional_bool(payload.get("force_duplicate"), "force_duplicate", default=False)
         upgrade_media_id = optional_text(payload.get("upgrade_media_id"), "upgrade_media_id", max_length=100)
+        upgrade_scope = normalize_upgrade_scope(category, upgrade_media_id, payload.get("upgrade_scope"))
         keep_old_version = optional_bool(payload.get("keep_old_version"), "keep_old_version", default=True)
         existing = self.store.get_import_by_idempotency(owner_id, idempotency_key)
         if existing is not None:
@@ -573,6 +574,7 @@ class ImportTaskManager:
                 "target": target,
                 "force_duplicate": force_duplicate,
                 "upgrade_media_id": upgrade_media_id,
+                "upgrade_scope": upgrade_scope,
                 "keep_old_version": keep_old_version,
             }
             persisted_identity = {key: existing_request.get(key) for key in incoming_identity}
@@ -596,6 +598,7 @@ class ImportTaskManager:
             "target": target,
             "force_duplicate": force_duplicate,
             "upgrade_media_id": upgrade_media_id,
+            "upgrade_scope": upgrade_scope,
             "keep_old_version": keep_old_version,
         }
         self._check_duplicate(request)
@@ -852,9 +855,11 @@ class ImportTaskManager:
                             upgrade_media_id,
                             media_id,
                             target,
+                            upgrade_scope=str(request.get("upgrade_scope") or "media"),
+                            new_source_paths=upgrade_new_source_paths(result.get("task")),
                         )
                     except Exception as exc:
-                        warning = "旧版本移入回收站失败: %s" % exc
+                        warning = "旧片源移入回收站失败: %s" % exc
                         if warning not in warnings:
                             warnings.append(warning)
                 if warnings:
@@ -1291,6 +1296,29 @@ def optional_bool(value, label, default=False):
     if not isinstance(value, bool):
         raise ApiError(400, "invalid_%s" % label, "%s must be a boolean" % label)
     return value
+
+
+def normalize_upgrade_scope(category, upgrade_media_id, value):
+    requested = optional_text(value, "upgrade_scope", max_length=20).lower()
+    if not upgrade_media_id:
+        if requested:
+            raise ApiError(400, "invalid_upgrade_scope", "upgrade_scope requires upgrade_media_id")
+        return ""
+    if category in ("tv", "anime"):
+        if requested not in ("", "work"):
+            raise ApiError(400, "invalid_upgrade_scope", "剧集只支持整剧升级")
+        return "work"
+    if requested not in ("", "media"):
+        raise ApiError(400, "invalid_upgrade_scope", "当前媒体类型只支持单作品升级")
+    return "media"
+
+
+def upgrade_new_source_paths(task):
+    task = dict(task or {})
+    if task.get("msg_target_scan_status") != "success":
+        return []
+    path = normalize_openlist_path(task.get("msg_target_scan_path"))
+    return [path] if path else []
 
 
 def duplicate_summary(duplicate):

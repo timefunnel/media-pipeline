@@ -177,6 +177,16 @@ class MediaStationClient:
             "/media/%s/versions/%s" % (quote_path(anchor_media_id), quote_path(version_media_id)),
         )
 
+    def pipeline_replace_work_source(self, old_media_id, new_media_id, target, new_openlist_paths):
+        payload = dict(target or {})
+        payload["new_media_id"] = str(new_media_id or "").strip()
+        payload["new_openlist_paths"] = list(new_openlist_paths or [])
+        return self._pipeline_request(
+            "POST",
+            "/pipeline/media/%s/replace-work-source" % quote_path(old_media_id),
+            data=payload,
+        )
+
     def _request(self, method, path, data=None, retry=True):
         if not self.access_token:
             self.login()

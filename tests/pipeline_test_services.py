@@ -816,6 +816,7 @@ class MediaStationClientTest(unittest.TestCase):
                 {"code": 0, "message": "ok", "data": {"mode": "smart", "media_id": "media-1"}},
                 {"code": 0, "message": "ok", "data": {"status": "success", "updated": 1}},
                 {"code": 0, "message": "ok", "data": {"status": "success", "updated": 2}},
+                {"code": 0, "message": "ok", "data": {"status": "success", "removed": 14, "preserved": 14}},
                 {"code": 0, "message": "ok", "data": {"status": "success", "deleted": 1}},
                 {"code": 0, "message": "ok", "data": {"items": [{"media_id": "deleted-1"}]}},
                 {"code": 0, "message": "ok", "data": {"items": [{"title": "Show"}]}},
@@ -844,6 +845,10 @@ class MediaStationClientTest(unittest.TestCase):
         self.assertEqual(client.pipeline_scrape_media("media-1", "movie", "Movie", ["Movie"], "tmdb", "movie")["mode"], "smart")
         self.assertEqual(client.pipeline_repair_movie_extras("media-1", target)["updated"], 1)
         self.assertEqual(client.pipeline_repair_episode_visibility("media-1", target)["updated"], 2)
+        self.assertEqual(
+            client.pipeline_replace_work_source("old-episode", "new-episode", target, ["/115/剧集/Show-new"])["removed"],
+            14,
+        )
         self.assertEqual(client.pipeline_prune_deleted_media(target, ["/115/电影/Movie"])["deleted"], 1)
         self.assertEqual(client.pipeline_list_deleted_media_hide_candidates(100)["items"][0]["media_id"], "deleted-1")
         self.assertEqual(client.pipeline_search_migration_candidates("Show", 20)["items"][0]["title"], "Show")
@@ -855,14 +860,17 @@ class MediaStationClientTest(unittest.TestCase):
         self.assertEqual(transport.calls[1]["url"], "http://127.0.0.1:18080/api/pipeline/media/media-1/scrape")
         self.assertEqual(transport.calls[2]["url"], "http://127.0.0.1:18080/api/pipeline/media/media-1/repair-movie-extras")
         self.assertEqual(transport.calls[3]["url"], "http://127.0.0.1:18080/api/pipeline/media/media-1/repair-episode-visibility")
-        self.assertEqual(transport.calls[4]["url"], "http://127.0.0.1:18080/api/pipeline/deleted-media/prune")
-        self.assertEqual(transport.calls[4]["data"]["openlist_paths"], ["/115/电影/Movie"])
-        self.assertEqual(transport.calls[5]["url"], "http://127.0.0.1:18080/api/pipeline/deleted-media/hide-candidates")
-        self.assertEqual(transport.calls[6]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/search")
-        self.assertEqual(transport.calls[7]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/validate")
-        self.assertEqual(transport.calls[8]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/apply")
-        self.assertEqual(transport.calls[9]["url"], "http://127.0.0.1:18080/api/pipeline/ingest")
-        self.assertEqual(transport.calls[10]["url"], "http://127.0.0.1:18080/api/pipeline/ingest/ingest-1")
+        self.assertEqual(transport.calls[4]["url"], "http://127.0.0.1:18080/api/pipeline/media/old-episode/replace-work-source")
+        self.assertEqual(transport.calls[4]["data"]["new_media_id"], "new-episode")
+        self.assertEqual(transport.calls[4]["data"]["new_openlist_paths"], ["/115/剧集/Show-new"])
+        self.assertEqual(transport.calls[5]["url"], "http://127.0.0.1:18080/api/pipeline/deleted-media/prune")
+        self.assertEqual(transport.calls[5]["data"]["openlist_paths"], ["/115/电影/Movie"])
+        self.assertEqual(transport.calls[6]["url"], "http://127.0.0.1:18080/api/pipeline/deleted-media/hide-candidates")
+        self.assertEqual(transport.calls[7]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/search")
+        self.assertEqual(transport.calls[8]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/validate")
+        self.assertEqual(transport.calls[9]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/apply")
+        self.assertEqual(transport.calls[10]["url"], "http://127.0.0.1:18080/api/pipeline/ingest")
+        self.assertEqual(transport.calls[11]["url"], "http://127.0.0.1:18080/api/pipeline/ingest/ingest-1")
 
     def test_media_read_methods_use_authenticated_endpoints(self):
         transport = SequenceTransport(

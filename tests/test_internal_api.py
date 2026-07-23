@@ -179,10 +179,14 @@ class FakePipelineService:
             raise RuntimeError(self.upgrade_duplicate_match_error)
         return self.upgrade_duplicate_match
 
-    def remove_upgrade_target(self, old_media_id, new_media_id, target):
-        self.upgrade_remove_calls.append((old_media_id, new_media_id, dict(target or {})))
+    def remove_upgrade_target(self, old_media_id, new_media_id, target, upgrade_scope="media", new_source_paths=None):
+        self.upgrade_remove_calls.append(
+            (old_media_id, new_media_id, dict(target or {}), upgrade_scope, list(new_source_paths or []))
+        )
         if self.upgrade_remove_error:
             raise RuntimeError(self.upgrade_remove_error)
+        if upgrade_scope == "work":
+            return {"status": "success", "removed": 2, "preserved": 2}
         return {"status": "removed", "media_id": old_media_id}
 
     def task_status(self, category, info_hash):
@@ -242,6 +246,9 @@ class FakePipelineService:
         elif not self.missing_media_id:
             result["msg_media_id"] = "media-" + task["info_hash"]
             result["msg_media_title"] = "MSG " + title
+            if category in ("tv", "anime"):
+                result["msg_target_scan_status"] = "success"
+                result["msg_target_scan_path"] = target["root_openlist_path"].rstrip("/") + "/Imported-Show"
         if self.warning:
             result["subtitle_match_status"] = "failed"
             result["subtitle_match_error"] = "subtitle provider failed"
@@ -717,7 +724,7 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(
             service.upgrade_remove_calls,
-            [("media-upgrade-target", completed["msg_media_id"], target_for("adult"))],
+            [("media-upgrade-target", completed["msg_media_id"], target_for("adult"), "media", [])],
         )
         self.assertEqual(completed["result"]["upgrade_cleanup"]["status"], "removed")
 
@@ -746,7 +753,7 @@ class ImportPersistenceTest(InternalApiTestCase):
             manager.stop()
 
         self.assertEqual(completed["status"], "completed_with_warning")
-        self.assertIn("旧版本移入回收站失败", completed["error"])
+        self.assertIn("旧片源移入回收站失败", completed["error"])
         self.assertTrue(completed["msg_media_id"])
 
     def test_upgrade_rejects_duplicate_that_belongs_to_another_media(self):
@@ -799,6 +806,52 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertEqual(len(service.upgrade_duplicate_match_calls), 1)
         self.assertEqual(service.upgrade_duplicate_match_calls[0][1]["media_id"], "episode-1")
         self.assertEqual(service.upgrade_duplicate_match_calls[0][2], "tv")
+
+    def test_tv_upgrade_always_replaces_the_whole_work(self):
+        service, store, manager, application = self.build_components()
+        session_id, candidate_id, _ = self.search_candidate(
+            application,
+            query="My Royal Enemy",
+            category="tv",
+        )
+        payload = self.import_payload(session_id, candidate_id, category="tv", target=target_for("tv"))
+        payload["upgrade_media_id"] = "episode-7"
+        payload["keep_old_version"] = False
+
+        task, _ = manager.create_import("owner-a", "tv-work-replace", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["result"]["upgrade_cleanup"]["removed"], 2)
+        self.assertEqual(
+            service.upgrade_remove_calls,
+            [
+                (
+                    "episode-7",
+                    completed["msg_media_id"],
+                    target_for("tv"),
+                    "work",
+                    [category_to_openlist_path("tv").rstrip("/") + "/Imported-Show"],
+                )
+            ],
+        )
+
+    def test_tv_upgrade_rejects_single_media_scope(self):
+        service, store, manager, application = self.build_components()
+        session_id, candidate_id, _ = self.search_candidate(application, query="Show", category="tv")
+        payload = self.import_payload(session_id, candidate_id, category="tv", target=target_for("tv"))
+        payload["upgrade_media_id"] = "episode-1"
+        payload["upgrade_scope"] = "media"
+
+        with self.assertRaises(ApiError) as raised:
+            manager.create_import("owner-a", "tv-invalid-media-scope", payload)
+
+        self.assertEqual(raised.exception.code, "invalid_upgrade_scope")
+        self.assertEqual(service.submit_uris, [])
 
     def test_upgrade_rejects_invalid_target_before_duplicate_check(self):
         service, store, manager, application = self.build_components(
