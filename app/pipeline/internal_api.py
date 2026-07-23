@@ -606,6 +606,7 @@ class ImportTaskManager:
 
     def _check_duplicate(self, request):
         upgrade_media_id = str(request.get("upgrade_media_id") or "").strip()
+        upgrade_target = None
         if upgrade_media_id:
             try:
                 upgrade_target = self.service.validate_upgrade_target(upgrade_media_id, request["target"])
@@ -636,6 +637,15 @@ class ImportTaskManager:
             if upgrade_media_id:
                 if summary.get("media_id") == upgrade_media_id:
                     return
+                try:
+                    if self.service.upgrade_duplicate_matches_target(
+                        upgrade_target,
+                        summary,
+                        request["category"],
+                    ):
+                        return
+                except Exception as exc:
+                    raise ApiError(502, "upgrade_duplicate_check_failed", str(exc))
                 summary["can_force"] = False
             if not (request.get("force_duplicate") and summary["can_force"]):
                 raise ApiError(

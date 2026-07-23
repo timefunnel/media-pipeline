@@ -2073,6 +2073,18 @@ class PipelineBotService:
     def validate_upgrade_target(self, media_id, target):
         return self._validate_upgrade_target_media(self._build_msg_client(), media_id, target)
 
+    def upgrade_duplicate_matches_target(self, upgrade_target, duplicate, category):
+        duplicate_media_id = str((duplicate or {}).get("media_id") or "").strip()
+        if not duplicate_media_id:
+            raise ValueError("duplicate media_id is required for upgrade validation")
+        if duplicate_media_id == str(extract_media_id(upgrade_target) or "").strip():
+            return True
+        duplicate_media = extract_media_detail(self._build_msg_client().get_media(duplicate_media_id))
+        actual_duplicate_id = str(extract_media_id(duplicate_media) or "").strip()
+        if actual_duplicate_id != duplicate_media_id:
+            raise RuntimeError("MediaStationGo duplicate media detail is missing or mismatched")
+        return media_is_same_upgrade_work(category, upgrade_target, duplicate_media)
+
     def _validate_upgrade_target_media(self, client, media_id, target):
         media_id = str(media_id or "").strip()
         if not media_id:
@@ -7596,6 +7608,56 @@ def media_first_int(value, keys):
         return int(item)
     except (TypeError, ValueError):
         return None
+
+
+def media_is_same_upgrade_work(category, target, duplicate):
+    if not isinstance(target, dict) or not isinstance(duplicate, dict):
+        return False
+
+    target_library_id = normalized_media_identity(target, ("library_id", "libraryId"))
+    duplicate_library_id = normalized_media_identity(duplicate, ("library_id", "libraryId"))
+    if not target_library_id or target_library_id != duplicate_library_id:
+        return False
+
+    for keys in (
+        ("version_group_key", "versionGroupKey"),
+        ("part_group_key", "partGroupKey"),
+        ("series_id", "seriesId"),
+    ):
+        target_value = normalized_media_identity(target, keys)
+        duplicate_value = normalized_media_identity(duplicate, keys)
+        if target_value and target_value == duplicate_value:
+            return True
+
+    if str(category or "").strip().lower() == "adult":
+        target_codes = extract_codes(media_haystack(target))
+        duplicate_codes = extract_codes(media_haystack(duplicate))
+        if target_codes and target_codes.intersection(duplicate_codes):
+            return True
+
+    compared_external_id = False
+    for keys in (
+        ("tmdb_id", "tmdbId"),
+        ("bangumi_id", "bangumiId"),
+        ("douban_id", "doubanId"),
+        ("thetvdb_id", "thetvdbId", "tvdb_id", "tvdbId"),
+    ):
+        target_value = normalized_media_identity(target, keys)
+        duplicate_value = normalized_media_identity(duplicate, keys)
+        if not target_value or not duplicate_value:
+            continue
+        compared_external_id = True
+        if target_value != duplicate_value:
+            return False
+    return compared_external_id
+
+
+def normalized_media_identity(media, keys):
+    value = media_first_value(media, keys)
+    text = str(value or "").strip().lower()
+    if text in ("", "0", "none", "null"):
+        return ""
+    return text
 
 
 def prioritized_task_records(records):

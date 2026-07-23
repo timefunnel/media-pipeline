@@ -6691,6 +6691,86 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(duplicate["media_id"], "media-original")
         self.assertEqual(duplicate["title"], "黑衣人")
 
+    def test_upgrade_duplicate_matches_another_episode_in_same_tmdb_series(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            get_response={
+                "data": {
+                    "id": "episode-1",
+                    "library_id": "test-tv-library",
+                    "tmdb_id": 303143,
+                    "season_num": 1,
+                    "episode_num": 1,
+                }
+            }
+        )
+        target = {
+            "id": "episode-7",
+            "library_id": "test-tv-library",
+            "tmdb_id": 303143,
+            "season_num": 1,
+            "episode_num": 7,
+        }
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                )
+            )
+            matched = service.upgrade_duplicate_matches_target(
+                target,
+                {"media_id": "episode-1"},
+                "tv",
+            )
+
+        self.assertTrue(matched)
+        self.assertEqual(fake_msg.get_calls, ["episode-1"])
+
+    def test_upgrade_duplicate_rejects_a_different_tmdb_work(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            get_response={
+                "data": {
+                    "id": "media-sequel",
+                    "library_id": "test-movie-library",
+                    "tmdb_id": 608,
+                }
+            }
+        )
+        target = {
+            "id": "media-original",
+            "library_id": "test-movie-library",
+            "tmdb_id": 607,
+        }
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                )
+            )
+            matched = service.upgrade_duplicate_matches_target(
+                target,
+                {"media_id": "media-sequel"},
+                "movie",
+            )
+
+        self.assertFalse(matched)
+        self.assertEqual(fake_msg.get_calls, ["media-sequel"])
+
     def test_check_duplicate_does_not_use_generic_release_fragments(self):
         from pipeline.bot import BotConfig, PipelineBotService
 

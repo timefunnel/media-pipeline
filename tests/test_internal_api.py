@@ -57,6 +57,8 @@ class FakePipelineService:
         duplicate=None,
         upgrade_target_error=None,
         upgrade_remove_error=None,
+        upgrade_duplicate_match=False,
+        upgrade_duplicate_match_error=None,
     ):
         self.warning = warning
         self.missing_media_id = missing_media_id
@@ -66,6 +68,8 @@ class FakePipelineService:
         self.duplicate = duplicate
         self.upgrade_target_error = upgrade_target_error
         self.upgrade_remove_error = upgrade_remove_error
+        self.upgrade_duplicate_match = upgrade_duplicate_match
+        self.upgrade_duplicate_match_error = upgrade_duplicate_match_error
         self.submit_uris = []
         self.task_status_calls = []
         self.sync_targets = []
@@ -74,6 +78,7 @@ class FakePipelineService:
         self.cancel_calls = []
         self.duplicate_calls = []
         self.upgrade_target_calls = []
+        self.upgrade_duplicate_match_calls = []
         self.upgrade_remove_calls = []
         self._sequence = 0
         self._lock = threading.Lock()
@@ -167,6 +172,12 @@ class FakePipelineService:
         if self.upgrade_target_error:
             raise ValueError(self.upgrade_target_error)
         return {"id": media_id, "library_id": (target or {}).get("library_id"), "title": "Upgrade Target"}
+
+    def upgrade_duplicate_matches_target(self, upgrade_target, duplicate, category):
+        self.upgrade_duplicate_match_calls.append((dict(upgrade_target or {}), dict(duplicate or {}), category))
+        if self.upgrade_duplicate_match_error:
+            raise RuntimeError(self.upgrade_duplicate_match_error)
+        return self.upgrade_duplicate_match
 
     def remove_upgrade_target(self, old_media_id, new_media_id, target):
         self.upgrade_remove_calls.append((old_media_id, new_media_id, dict(target or {})))
@@ -760,6 +771,34 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertFalse(raised.exception.details["duplicate"]["can_force"])
         self.assertEqual(raised.exception.details["duplicate"]["media_id"], "media-other")
         self.assertEqual(service.submit_uris, [])
+
+    def test_upgrade_allows_duplicate_episode_from_the_same_tv_work(self):
+        duplicate = {
+            "level": "weak",
+            "reason": "mediastation_title",
+            "source": "MediaStationGo",
+            "title": "My Royal Enemy S01E01",
+            "media_id": "episode-1",
+            "can_force": True,
+        }
+        service, store, manager, application = self.build_components(
+            FakePipelineService(duplicate=duplicate, upgrade_duplicate_match=True)
+        )
+        session_id, candidate_id, _ = self.search_candidate(
+            application,
+            query="My Royal Enemy",
+            category="tv",
+        )
+        payload = self.import_payload(session_id, candidate_id, category="tv", target=target_for("tv"))
+        payload["upgrade_media_id"] = "episode-7"
+
+        task, created = manager.create_import("owner-a", "tv-series-upgrade", payload)
+
+        self.assertTrue(created)
+        self.assertEqual(task["status"], "queued")
+        self.assertEqual(len(service.upgrade_duplicate_match_calls), 1)
+        self.assertEqual(service.upgrade_duplicate_match_calls[0][1]["media_id"], "episode-1")
+        self.assertEqual(service.upgrade_duplicate_match_calls[0][2], "tv")
 
     def test_upgrade_rejects_invalid_target_before_duplicate_check(self):
         service, store, manager, application = self.build_components(
