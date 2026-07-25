@@ -222,6 +222,91 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertEqual(candidates[0]["filename"], "chinese-ready-zh-CN.srt")
         self.assertEqual(len(transport.text_urls), 3)
 
+    def test_subhd_provider_only_returns_chinese_candidates_and_downloads_direct_subtitle(self):
+        from pipeline.external_subtitles import SubHDProvider
+
+        class FakeTransport:
+            def __init__(self):
+                self.text_urls = []
+                self.json_calls = []
+                self.download_urls = []
+
+            def text_request(self, url, headers=None, timeout=None, max_bytes=None):
+                self.text_urls.append(url)
+                if "/search/" not in url:
+                    return "ok"
+                return """
+                <a class="link-dark align-middle" href='/a/chinese1'>恶魔阴谋</a>
+                <div class="view-text text-secondary"><a href='/a/chinese1'>The.Devil.Conspiracy.2022.1080p</a></div>
+                <div class="text-truncate py-2 f11"><span>双语</span><span>简体</span><span>英语</span><span>SRT</span></div>
+                <a class="link-dark align-middle" href='/a/english1'>恶魔阴谋</a>
+                <div class="view-text text-secondary"><a href='/a/english1'>The.Devil.Conspiracy.English</a></div>
+                <div class="text-truncate py-2 f11"><span>英语</span><span>SRT</span></div>
+                """
+
+            def json_request(self, method, url, headers=None, data=None, timeout=None):
+                self.json_calls.append((method, url, data))
+                if url.endswith("/prepare-download"):
+                    return {"success": True, "url": "/down/chinese1"}
+                return {"success": True, "pass": True, "url": "https://dlus.subhd.me/2026/07/chinese1.srt"}
+
+            def download(self, url, headers=None, timeout=None, max_bytes=None):
+                self.download_urls.append(url)
+                return "1\n00:00:01,000 --> 00:00:02,000\n这是中文字幕正文\n".encode("utf-8")
+
+        transport = FakeTransport()
+        provider = SubHDProvider(transport=transport)
+        candidates = provider.search("The Devil Conspiracy")
+        download = provider.download(candidates[0], "The Devil Conspiracy")
+
+        self.assertEqual([item["id"] for item in candidates], ["chinese1"])
+        self.assertIn("简体", candidates[0]["language"])
+        self.assertEqual(download.source, "subhd")
+        self.assertEqual(download.lang, "zh-Hans")
+        self.assertEqual(download.body.decode("utf-8").splitlines()[-1], "这是中文字幕正文")
+        self.assertEqual(len(transport.text_urls), 3)
+        self.assertEqual([item[0] for item in transport.json_calls], ["POST", "POST"])
+        self.assertEqual(transport.download_urls, ["https://dlus.subhd.me/2026/07/chinese1.srt"])
+
+    def test_subhd_zip_selects_chinese_subtitle(self):
+        import io
+        import zipfile
+
+        from pipeline.external_subtitles import extract_chinese_subtitle_from_archive
+
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as output:
+            output.writestr("movie.en.srt", "1\n00:00:01,000 --> 00:00:02,000\nEnglish only\n")
+            output.writestr("movie.chs.srt", "1\n00:00:01,000 --> 00:00:02,000\n这是压缩包中的中文字幕\n")
+
+        filename, body = extract_chinese_subtitle_from_archive(
+            archive.getvalue(),
+            ".zip",
+            {"language": "简体"},
+            1024 * 1024,
+        )
+
+        self.assertEqual(filename, "movie.chs.srt")
+        self.assertIn("中文字幕", body.decode("utf-8"))
+
+    def test_subhd_archive_rejects_path_traversal(self):
+        import io
+        import zipfile
+
+        from pipeline.external_subtitles import extract_chinese_subtitle_from_archive
+
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as output:
+            output.writestr("../outside.chs.srt", "1\n00:00:01,000 --> 00:00:02,000\n这是中文字幕正文\n")
+
+        with self.assertRaisesRegex(RuntimeError, "archive path invalid"):
+            extract_chinese_subtitle_from_archive(
+                archive.getvalue(),
+                ".zip",
+                {"language": "简体"},
+                1024 * 1024,
+            )
+
     def test_assrt_provider_excludes_non_chinese_candidates(self):
         from pipeline.external_subtitles import AssrtSubtitleProvider
 
@@ -289,7 +374,7 @@ class ExternalSubtitleTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertFalse(subtitle_language_value_is_chinese(value))
 
-    def test_build_subtitle_matcher_includes_subtitlecat_by_default(self):
+    def test_build_subtitle_matcher_includes_default_providers(self):
         from pipeline.external_subtitles import build_subtitle_matcher_from_config
 
         class Config:
@@ -297,7 +382,47 @@ class ExternalSubtitleTest(unittest.TestCase):
 
         matcher = build_subtitle_matcher_from_config(Config())
 
-        self.assertEqual([provider.name for provider in matcher.providers], ["subtitlecat", "assrt", "opensubtitles"])
+        self.assertEqual([provider.name for provider in matcher.providers], ["subhd", "subtitlecat", "assrt", "opensubtitles"])
+
+    def test_subtitle_matcher_prioritizes_subhd_for_non_adult_and_excludes_it_for_adult(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
+
+        class FakeProvider:
+            def __init__(self, name):
+                self.name = name
+                self.search_calls = []
+
+            def enabled(self):
+                return True
+
+            def search(self, query, code=""):
+                self.search_calls.append((query, code))
+                return [{"id": self.name + "-candidate", "language": "简体"}]
+
+            def download(self, candidate, query, code=""):
+                return SubtitleDownload(
+                    source=self.name,
+                    provider_id=candidate["id"],
+                    filename=self.name + ".chs.srt",
+                    body="1\n00:00:01,000 --> 00:00:02,000\n这是中文字幕正文\n".encode("utf-8"),
+                    query=query,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fallback = FakeProvider("fallback")
+            subhd = FakeProvider("subhd")
+            matcher = SubtitleMatcher(SubtitleCache(tmp), [fallback, subhd], enabled=True, adult_only=False)
+            movie = matcher.match_task("movie", "Sintel", {"msg_media_id": "movie-1"})
+            adult = matcher.match_task(
+                "adult",
+                "SSIS-218",
+                {"msg_media_id": "adult-1", "openlist_adult_code": "SSIS-218"},
+            )
+
+        self.assertEqual(movie["subtitle_match_source"], "subhd")
+        self.assertEqual(adult["subtitle_match_source"], "fallback")
+        self.assertEqual(subhd.search_calls, [("Sintel", "")])
+        self.assertEqual(fallback.search_calls, [("SSIS-218", "SSIS-218")])
 
     def test_subtitle_matcher_caches_first_matching_subtitle(self):
         from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
