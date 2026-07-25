@@ -347,24 +347,14 @@ class SubtitleCatProvider:
         text = self.transport.text_request(url, headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
         candidates = []
         for item in extract_subtitlecat_search_results(text, self.base_url):
-            score = candidate_code_score(item, code or query)
-            if code and score <= 0:
+            score = candidate_code_score(item, code) if code else candidate_title_score(item, query)
+            if score <= 0:
                 continue
             candidate = dict(item)
             candidate["_score"] = score + subtitlecat_candidate_bonus(item)
+            candidate["language"] = "中文字幕候选（预览确认）"
             candidates.append(candidate)
-        verified = []
-        for candidate in sorted(candidates, key=lambda item: int(item.get("_score") or 0), reverse=True):
-            chinese_download = self._chinese_download(candidate)
-            if not chinese_download:
-                continue
-            candidate["_chinese_download"] = chinese_download
-            candidate["filename"] = chinese_download.get("filename") or candidate.get("filename")
-            candidate["language"] = chinese_download.get("language") or "中文"
-            verified.append(candidate)
-            if len(verified) >= limit:
-                break
-        return verified
+        return sorted(candidates, key=lambda item: int(item.get("_score") or 0), reverse=True)[:limit]
 
     def download(self, candidate, query, code=""):
         detail_url = str((candidate or {}).get("url") or "").strip()
@@ -1390,6 +1380,29 @@ def candidate_code_score(candidate, code):
         return 1000
     extracted = {compact_text(value) for value in extract_codes(haystack)}
     return 800 if compact_code in extracted else 0
+
+
+def candidate_title_score(candidate, query):
+    query_tokens = subtitle_title_tokens(query)
+    if not query_tokens:
+        return 0
+    haystack = " ".join(str((candidate or {}).get(key) or "") for key in ("filename", "title", "release"))
+    candidate_tokens = subtitle_title_tokens(haystack)
+    if not candidate_tokens:
+        return 0
+    compact_query = "".join(query_tokens)
+    compact_candidate = "".join(candidate_tokens)
+    if compact_query in compact_candidate:
+        return 600
+    if set(query_tokens).issubset(set(candidate_tokens)):
+        return 500
+    return 0
+
+
+def subtitle_title_tokens(value):
+    stop_words = {"a", "an", "and", "of", "the"}
+    tokens = re.findall(r"[^\W_]+", str(value or "").casefold(), flags=re.UNICODE)
+    return [token for token in tokens if token not in stop_words and not re.fullmatch(r"(?:19|20)\d{2}", token)]
 
 
 def assrt_file_score(item, code):
