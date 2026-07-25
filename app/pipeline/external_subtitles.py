@@ -330,13 +330,23 @@ class SubtitleCatProvider:
         self.transport = transport or SubtitleHttpTransport()
         self.timeout = timeout
         self.max_bytes = max_bytes
-        self._chinese_download_cache = {}
+        self._download_links_cache = {}
 
     def enabled(self):
         return bool(self.base_url)
 
     def search(self, query, code=""):
-        return self.search_candidates(query, code=code, limit=10)
+        candidates = self.search_candidates(query, code=code, limit=10)
+        verified = []
+        for candidate in candidates:
+            download_item = self._preferred_download(candidate, chinese_only=True)
+            if not download_item:
+                continue
+            candidate["_subtitlecat_download"] = download_item
+            candidate["filename"] = download_item.get("filename") or candidate.get("filename")
+            candidate["language"] = download_item.get("language") or "中文"
+            verified.append(candidate)
+        return verified
 
     def search_candidates(self, query, code="", limit=10):
         search_text = str(code or query or "").strip()
@@ -352,7 +362,7 @@ class SubtitleCatProvider:
                 continue
             candidate = dict(item)
             candidate["_score"] = score + subtitlecat_candidate_bonus(item)
-            candidate["language"] = "中文字幕候选（预览确认）"
+            candidate["language"] = "语言待预览确认"
             candidates.append(candidate)
         return sorted(candidates, key=lambda item: int(item.get("_score") or 0), reverse=True)[:limit]
 
@@ -360,9 +370,9 @@ class SubtitleCatProvider:
         detail_url = str((candidate or {}).get("url") or "").strip()
         if not detail_url:
             return None
-        item = (candidate or {}).get("_chinese_download")
+        item = (candidate or {}).get("_subtitlecat_download")
         if not isinstance(item, dict):
-            item = self._chinese_download(candidate)
+            item = self._preferred_download(candidate)
         if not item:
             return None
         filename = safe_subtitle_filename(item.get("filename"))
@@ -371,7 +381,7 @@ class SubtitleCatProvider:
         if code and candidate_code_score({"filename": filename}, code) <= 0 and candidate_code_score(candidate, code) <= 0:
             return None
         body = self.transport.download(item["url"], headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
-        lang, label = subtitle_lang_label(filename, item.get("language"))
+        lang, label = subtitlecat_download_lang_label(filename, item.get("language"))
         return SubtitleDownload(
             source=self.name,
             provider_id=item.get("provider_id") or item.get("url"),
@@ -383,23 +393,17 @@ class SubtitleCatProvider:
             score=int((candidate or {}).get("_score") or 0),
         )
 
-    def _chinese_download(self, candidate):
+    def _preferred_download(self, candidate, chinese_only=False):
         detail_url = str((candidate or {}).get("url") or "").strip()
         if not detail_url:
             return None
-        if detail_url in self._chinese_download_cache:
-            return self._chinese_download_cache[detail_url]
-        text = self.transport.text_request(detail_url, headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
-        item = next(
-            (
-                link
-                for link in extract_subtitlecat_download_links(text, self.base_url)
-                if subtitle_language_value_is_chinese(link.get("language"))
-            ),
-            None,
-        )
-        self._chinese_download_cache[detail_url] = item
-        return item
+        if detail_url not in self._download_links_cache:
+            text = self.transport.text_request(detail_url, headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
+            self._download_links_cache[detail_url] = extract_subtitlecat_download_links(text, self.base_url)
+        links = self._download_links_cache[detail_url]
+        if chinese_only:
+            return next((link for link in links if subtitle_language_value_is_chinese(link.get("language"))), None)
+        return next(iter(links), None)
 
     def _headers(self):
         return {"User-Agent": "MediaPipeline/0.1", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
@@ -1347,6 +1351,13 @@ def subtitlecat_language_rank(language):
         return SUBTITLECAT_LANGUAGE_ORDER.index(normalized)
     except ValueError:
         return len(SUBTITLECAT_LANGUAGE_ORDER)
+
+
+def subtitlecat_download_lang_label(filename, language):
+    if subtitle_language_value_is_chinese((filename, language)):
+        return subtitle_lang_label(filename, language)
+    normalized = str(language or "").strip()
+    return normalized, normalized or "未知语言"
 
 
 def subtitlecat_candidate_bonus(candidate):

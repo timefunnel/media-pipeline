@@ -131,12 +131,12 @@ class ExternalSubtitleTest(unittest.TestCase):
         download = provider.download(candidates[0], "MIMK-267", code="MIMK-267")
 
         self.assertEqual(candidates[0]["title"], "MIMK-267-C")
-        self.assertEqual(candidates[0]["language"], "中文字幕候选（预览确认）")
+        self.assertEqual(candidates[0]["language"], "zh-CN")
         self.assertEqual(download.source, "subtitlecat")
         self.assertEqual(download.filename, "MIMK-267-C-zh-CN.srt")
         self.assertEqual(download.body, b"subtitlecat-body")
         self.assertEqual(transport.download_urls, ["https://www.subtitlecat.com/subs/1470/MIMK-267-C-zh-CN.srt"])
-        self.assertEqual(len(transport.text_urls), 2)
+        self.assertEqual(len(transport.text_urls), 3)
 
     def test_subtitlecat_provider_quotes_download_url_path(self):
         from pipeline.external_subtitles import SubtitleCatProvider
@@ -169,14 +169,16 @@ class ExternalSubtitleTest(unittest.TestCase):
             ["https://www.subtitlecat.com/subs/494/MIDV-373%20%5Bzh-TW%5D%20%282023%29-zh-CN.srt"],
         )
 
-    def test_subtitlecat_provider_refuses_pages_without_chinese_download(self):
+    def test_subtitlecat_manual_download_allows_user_to_judge_non_chinese_subtitle(self):
         from pipeline.external_subtitles import SubtitleCatProvider
 
         class FakeTransport:
             def __init__(self):
+                self.text_urls = []
                 self.download_urls = []
 
             def text_request(self, url, headers=None, timeout=None, max_bytes=None):
+                self.text_urls.append(url)
                 return '<a id="download_en" href="/subs/467/The-Devil-Conspiracy-en.srt">Download</a>'
 
             def download(self, url, headers=None, timeout=None, max_bytes=None):
@@ -190,8 +192,29 @@ class ExternalSubtitleTest(unittest.TestCase):
             "The Devil Conspiracy",
         )
 
-        self.assertIsNone(download)
-        self.assertEqual(transport.download_urls, [])
+        self.assertEqual(download.filename, "The-Devil-Conspiracy-en.srt")
+        self.assertEqual(download.lang, "en")
+        self.assertEqual(download.label, "en")
+        self.assertEqual(download.body, b"english-subtitle")
+        self.assertEqual(len(transport.text_urls), 1)
+        self.assertEqual(transport.download_urls, ["https://www.subtitlecat.com/subs/467/The-Devil-Conspiracy-en.srt"])
+
+    def test_subtitlecat_automatic_search_does_not_select_non_chinese_subtitle(self):
+        from pipeline.external_subtitles import SubtitleCatProvider
+
+        class FakeTransport:
+            def text_request(self, url, headers=None, timeout=None, max_bytes=None):
+                if "index.php" in url:
+                    return """
+                    <table><tbody>
+                      <tr><td><a href="subs/467/The-Devil-Conspiracy.html">The Devil Conspiracy</a></td></tr>
+                    </tbody></table>
+                    """
+                return '<a id="download_en" href="/subs/467/The-Devil-Conspiracy-en.srt">Download</a>'
+
+        provider = SubtitleCatProvider(transport=FakeTransport())
+
+        self.assertEqual(provider.search("The Devil Conspiracy"), [])
 
     def test_subtitlecat_search_filters_titles_without_opening_detail_pages(self):
         from pipeline.external_subtitles import SubtitleCatProvider
@@ -217,7 +240,7 @@ class ExternalSubtitleTest(unittest.TestCase):
 
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["title"], "The Devil Conspiracy (2022)")
-        self.assertEqual(candidates[0]["language"], "中文字幕候选（预览确认）")
+        self.assertEqual(candidates[0]["language"], "语言待预览确认")
         self.assertEqual(len(transport.text_urls), 1)
 
     def test_subhd_provider_only_returns_chinese_candidates_and_downloads_direct_subtitle(self):
