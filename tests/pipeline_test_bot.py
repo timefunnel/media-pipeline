@@ -52,6 +52,7 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.telegram_timeout, 90)
         self.assertEqual(config.openlist_scan_username, "media_scan")
         self.assertEqual(config.openlist_scan_password, "scan-secret")
+        self.assertFalse(config.subtitle_auto_match_adult_only)
 
     def test_bot_config_enables_mediastation_when_credentials_exist(self):
         from pipeline.bot import BotConfig
@@ -4292,6 +4293,90 @@ class LlmSearchRerankClientTest(unittest.TestCase):
 
 
 class PipelineBotServiceTest(unittest.TestCase):
+    def test_auto_subtitle_match_skips_when_msg_reports_existing_chinese_subtitle(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            subtitle_status_response={
+                "media_id": "media-1",
+                "has_chinese": True,
+                "embedded_checked": False,
+                "embedded": [],
+                "external": [
+                    {
+                        "kind": "external",
+                        "language": "zh-Hans",
+                        "source": "openlist",
+                        "chinese": True,
+                    }
+                ],
+                "unknown_embedded": 0,
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            service = PipelineBotService(BotConfig("token", {700656624}, str(Path(tmp) / "state.db")))
+            matcher_calls = []
+            service.match_task_subtitles = lambda *args, **kwargs: matcher_calls.append((args, kwargs))
+
+            result = service._match_subtitles(
+                fake_msg,
+                "movie",
+                "Movie",
+                {"msg_media_id": "media-1", "info_hash": "ABC"},
+            )
+
+        self.assertEqual(result["subtitle_match_status"], "skipped")
+        self.assertEqual(result["subtitle_match_reason"], "existing_chinese_subtitle")
+        self.assertEqual(result["subtitle_match_existing_external_count"], 1)
+        self.assertEqual(fake_msg.subtitle_status_calls, ["media-1"])
+        self.assertEqual(matcher_calls, [])
+
+    def test_auto_subtitle_match_forces_existing_matcher_after_confirmed_absence(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient()
+        with tempfile.TemporaryDirectory() as tmp:
+            service = PipelineBotService(BotConfig("token", {700656624}, str(Path(tmp) / "state.db")))
+            matcher_calls = []
+
+            def match(category, title, task, force=False):
+                matcher_calls.append((category, title, task["msg_media_id"], force))
+                return {"subtitle_match_status": "success", "subtitle_match_count": 1}
+
+            service.match_task_subtitles = match
+            result = service._match_subtitles(
+                fake_msg,
+                "movie",
+                "Movie",
+                {"msg_media_id": "media-1", "info_hash": "ABC"},
+            )
+
+        self.assertEqual(result["subtitle_match_status"], "success")
+        self.assertTrue(result["subtitle_match_presence_checked"])
+        self.assertEqual(matcher_calls, [("movie", "Movie", "media-1", True)])
+
+    def test_auto_subtitle_match_fails_when_msg_detection_fails(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class FailingSubtitleStatusClient:
+            def pipeline_subtitle_status(self, media_id):
+                raise RuntimeError("ffprobe timeout")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = PipelineBotService(BotConfig("token", {700656624}, str(Path(tmp) / "state.db")))
+            matcher_calls = []
+            service.match_task_subtitles = lambda *args, **kwargs: matcher_calls.append((args, kwargs))
+            result = service._match_subtitles(
+                FailingSubtitleStatusClient(),
+                "movie",
+                "Movie",
+                {"msg_media_id": "media-1", "info_hash": "ABC"},
+            )
+
+        self.assertEqual(result["subtitle_match_status"], "failed")
+        self.assertIn("ffprobe timeout", result["subtitle_match_error"])
+        self.assertEqual(matcher_calls, [])
+
     def test_search_does_not_run_llm_rerank_automatically(self):
         from pipeline.bot import BotConfig, PipelineBotService
 

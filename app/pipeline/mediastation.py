@@ -178,6 +178,12 @@ class MediaStationClient:
             "/media/%s/versions/%s" % (quote_path(anchor_media_id), quote_path(version_media_id)),
         )
 
+    def pipeline_subtitle_status(self, media_id):
+        return self._pipeline_request(
+            "GET",
+            "/pipeline/media/%s/subtitle-status" % quote_path(media_id),
+        )
+
     def pipeline_replace_work_source(self, old_media_id, new_media_id, target, new_openlist_paths):
         payload = dict(target or {})
         payload["new_media_id"] = str(new_media_id or "").strip()

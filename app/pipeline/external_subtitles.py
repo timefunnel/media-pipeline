@@ -773,7 +773,7 @@ def build_subtitle_matcher_from_config(config):
         cache,
         providers,
         enabled=getattr(config, "subtitle_auto_match_enabled", False),
-        adult_only=getattr(config, "subtitle_auto_match_adult_only", True),
+        adult_only=getattr(config, "subtitle_auto_match_adult_only", False),
     )
 
 

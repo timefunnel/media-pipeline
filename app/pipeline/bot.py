@@ -420,7 +420,7 @@ class BotConfig:
     task_workers: int = DEFAULT_TASK_WORKERS
     task_message_edit_min_interval_seconds: float = DEFAULT_TASK_MESSAGE_EDIT_MIN_INTERVAL_SECONDS
     subtitle_auto_match_enabled: bool = False
-    subtitle_auto_match_adult_only: bool = True
+    subtitle_auto_match_adult_only: bool = False
     subtitle_cache_dir: str = DEFAULT_SUBTITLE_CACHE_DIR
     subtitle_providers: tuple = DEFAULT_SUBTITLE_PROVIDERS
     subtitle_search_timeout_seconds: int = DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS
@@ -542,7 +542,7 @@ class BotConfig:
                 ),
             ),
             subtitle_auto_match_enabled=parse_bool(env.get("SUBTITLE_AUTO_MATCH_ENABLED"), False),
-            subtitle_auto_match_adult_only=parse_bool(env.get("SUBTITLE_AUTO_MATCH_ADULT_ONLY"), True),
+            subtitle_auto_match_adult_only=parse_bool(env.get("SUBTITLE_AUTO_MATCH_ADULT_ONLY"), False),
             subtitle_cache_dir=env.get("SUBTITLE_CACHE_DIR", DEFAULT_SUBTITLE_CACHE_DIR),
             subtitle_providers=parse_csv_strings(env.get("SUBTITLE_PROVIDERS"), DEFAULT_SUBTITLE_PROVIDERS),
             subtitle_search_timeout_seconds=max(
@@ -2684,7 +2684,7 @@ class PipelineBotService:
         if self.config.subtitle_auto_match_enabled:
             if not stage_is_complete(progress.get("subtitle_match_status")):
                 emit({"subtitle_match_status": "running", "subtitle_match_error": None, "msg_media_id": media_id, "msg_media_title": media_title})
-                subtitle_result = self._match_subtitles(category, title, progress)
+                subtitle_result = self._match_subtitles(get_msg_client(), category, title, progress)
                 if subtitle_result.get("subtitle_match_status") == "skipped":
                     apply_progress(subtitle_result)
                 else:
@@ -2732,9 +2732,37 @@ class PipelineBotService:
             raise RuntimeError("MediaStationGo media id mismatch: expected %s, got %s" % (media_id, detail_id))
         return media
 
-    def _match_subtitles(self, category, title, task):
+    def _match_subtitles(self, client, category, title, task):
         try:
-            return self.match_task_subtitles(category, title, task)
+            media_id = str((task or {}).get("msg_media_id") or "").strip()
+            if not media_id:
+                raise RuntimeError("MediaStationGo media id missing before subtitle detection")
+            presence = normalize_msg_subtitle_presence(client.pipeline_subtitle_status(media_id), media_id)
+            details = {
+                "subtitle_match_presence_checked": True,
+                "subtitle_match_existing_external_count": len(presence["external"]),
+                "subtitle_match_existing_embedded_count": len(presence["embedded"]),
+                "subtitle_match_unknown_embedded_count": presence["unknown_embedded"],
+            }
+            if presence["has_chinese"]:
+                chinese_tracks = [
+                    track for track in presence["external"] + presence["embedded"] if track.get("chinese") is True
+                ]
+                sources = unique_nonempty_values(track.get("kind") or track.get("source") for track in chinese_tracks)
+                return {
+                    "subtitle_match_status": "skipped",
+                    "subtitle_match_reason": "existing_chinese_subtitle",
+                    "subtitle_match_source": "+".join(sources),
+                    "subtitle_match_count": len(chinese_tracks),
+                    **details,
+                }
+            if presence["unknown_embedded"] > 0:
+                raise RuntimeError(
+                    "MediaStationGo found %d embedded subtitle track(s) without language metadata; "
+                    "cannot confirm that Chinese subtitles are absent" % presence["unknown_embedded"]
+                )
+            result = self.match_task_subtitles(category, title, task, force=True)
+            return {**result, **details}
         except Exception as exc:
             return {"subtitle_match_status": "failed", "subtitle_match_error": str(exc)}
 
@@ -6032,6 +6060,41 @@ def extract_media_detail(response):
     if extract_media_id(response):
         return response
     return {}
+
+
+def normalize_msg_subtitle_presence(value, media_id):
+    if not isinstance(value, dict):
+        raise RuntimeError("MediaStationGo subtitle status returned invalid response")
+    actual_media_id = str(value.get("media_id") or "").strip()
+    if actual_media_id != str(media_id or "").strip():
+        raise RuntimeError("MediaStationGo subtitle status media id mismatch")
+    if not isinstance(value.get("has_chinese"), bool) or not isinstance(value.get("embedded_checked"), bool):
+        raise RuntimeError("MediaStationGo subtitle status is incomplete")
+    external = value.get("external")
+    embedded = value.get("embedded")
+    if not isinstance(external, list) or not isinstance(embedded, list):
+        raise RuntimeError("MediaStationGo subtitle status tracks are invalid")
+    if not value["has_chinese"] and not value["embedded_checked"]:
+        raise RuntimeError("MediaStationGo subtitle status did not inspect embedded tracks")
+    tracks = []
+    for track in external + embedded:
+        if not isinstance(track, dict) or not isinstance(track.get("chinese"), bool):
+            raise RuntimeError("MediaStationGo subtitle status contains an invalid track")
+        tracks.append(dict(track))
+    try:
+        unknown_embedded = int(value.get("unknown_embedded") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("MediaStationGo subtitle status unknown count is invalid") from exc
+    if unknown_embedded < 0:
+        raise RuntimeError("MediaStationGo subtitle status unknown count is invalid")
+    return {
+        "media_id": actual_media_id,
+        "has_chinese": value["has_chinese"],
+        "embedded_checked": value["embedded_checked"],
+        "external": tracks[: len(external)],
+        "embedded": tracks[len(external) :],
+        "unknown_embedded": unknown_embedded,
+    }
 
 
 def subtitle_backfill_task_from_media(media, category="adult"):

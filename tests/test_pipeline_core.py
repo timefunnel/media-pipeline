@@ -354,6 +354,7 @@ class FakeMediaStationClient:
         migration_validate_response=None,
         migration_apply_response=None,
         pipeline_ingest_response=None,
+        subtitle_status_response=None,
     ):
         self.search_response = search_response or {"data": {"items": []}}
         self.list_response = list_response or {"data": {"items": []}}
@@ -379,6 +380,14 @@ class FakeMediaStationClient:
         self.migration_validate_response = migration_validate_response
         self.migration_apply_response = migration_apply_response
         self.pipeline_ingest_response = pipeline_ingest_response
+        self.subtitle_status_response = subtitle_status_response or {
+            "media_id": "",
+            "has_chinese": False,
+            "embedded_checked": True,
+            "embedded": [],
+            "external": [],
+            "unknown_embedded": 0,
+        }
         self.scan_calls = []
         self.search_calls = []
         self.list_calls = []
@@ -390,6 +399,7 @@ class FakeMediaStationClient:
         self.pipeline_maintenance_calls = []
         self.pipeline_ingest_calls = []
         self.pipeline_ingest_jobs = {}
+        self.subtitle_status_calls = []
         self.deleted_version_calls = []
 
     def search_media(self, query, limit=20):
@@ -421,6 +431,13 @@ class FakeMediaStationClient:
     def pipeline_repair_episode_visibility(self, media_id, target):
         self.pipeline_maintenance_calls.append(("repair_episode_visibility", media_id, dict(target or {})))
         return self.episode_visibility_response
+
+    def pipeline_subtitle_status(self, media_id):
+        self.subtitle_status_calls.append(media_id)
+        result = dict(self.subtitle_status_response)
+        if not result.get("media_id"):
+            result["media_id"] = media_id
+        return result
 
     def pipeline_prune_deleted_media(self, target, openlist_paths):
         self.pipeline_maintenance_calls.append(("prune_deleted_media", dict(target or {}), list(openlist_paths or [])))
