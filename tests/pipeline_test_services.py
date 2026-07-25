@@ -365,7 +365,7 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertIn("languages=zh-cn%2Czh-tw%2Cze", transport.urls[0])
 
     def test_chinese_subtitle_language_detection_requires_explicit_marker(self):
-        from pipeline.external_subtitles import subtitle_language_value_is_chinese
+        from pipeline.external_subtitles import subtitle_lang_label, subtitle_language_value_is_chinese
 
         for value in ("zh-cn", "zh_Hant", "简体", "繁體中文", "movie.chs.srt", {"desc": "中文"}):
             with self.subTest(value=value):
@@ -373,6 +373,11 @@ class ExternalSubtitleTest(unittest.TestCase):
         for value in ("", "English", "Chinatown", "movie.en.srt", {"desc": "Japanese"}):
             with self.subTest(value=value):
                 self.assertFalse(subtitle_language_value_is_chinese(value))
+
+        self.assertEqual(
+            subtitle_lang_label("Disclosure.Day.cmn-Hans-简.srt", "简体 繁体"),
+            ("zh-Hans", "简体中文"),
+        )
 
     def test_build_subtitle_matcher_includes_default_providers(self):
         from pipeline.external_subtitles import build_subtitle_matcher_from_config

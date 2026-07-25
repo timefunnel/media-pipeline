@@ -1431,11 +1431,20 @@ def subtitle_language_value_is_chinese(value):
 
 
 def subtitle_lang_label(filename="", language=""):
-    text = ("%s %s" % (filename or "", language or "")).casefold()
-    if any(token in text for token in ("zh-tw", "zht", "cht", ".tc.", "traditional", "繁体", "繁體")):
-        return "zh-Hant", "繁体中文"
-    if any(token in text for token in ("zh-cn", "zhs", "chs", ".sc.", "simplified", "简体", "簡體")):
+    filename_text = str(filename or "").casefold()
+    language_text = str(language or "").casefold()
+    simplified_tokens = ("zh-cn", "zh-hans", "zhs", "chs", ".sc.", "simplified", "简体", "簡體", "-简", "-簡")
+    traditional_tokens = ("zh-tw", "zh-hant", "zht", "cht", ".tc.", "traditional", "繁体", "繁體", "-繁")
+    if any(token in filename_text for token in simplified_tokens):
         return "zh-Hans", "简体中文"
+    if any(token in filename_text for token in traditional_tokens):
+        return "zh-Hant", "繁体中文"
+    simplified = any(token in language_text for token in simplified_tokens)
+    traditional = any(token in language_text for token in traditional_tokens)
+    if simplified and not traditional:
+        return "zh-Hans", "简体中文"
+    if traditional and not simplified:
+        return "zh-Hant", "繁体中文"
     return "zh", "中文字幕"
 
 
