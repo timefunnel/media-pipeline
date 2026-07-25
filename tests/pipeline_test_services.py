@@ -939,9 +939,24 @@ class MediaStationClientTest(unittest.TestCase):
         self.assertEqual(extract_media_id(media), "main-1")
 
     def test_extract_codes_ignores_codec_tags_and_years(self):
-        codes = extract_codes("[HEVC-10bit][H264-1080][Sintel.2010][ABF-363][GANA-2525]")
+        codes = extract_codes("[HEVC-10bit][H264-1080][WEB-DL.1080p][Sintel.2010][ABF-363][GANA-2525]")
 
         self.assertEqual(codes, {"ABF-363", "GANA-2525"})
+
+    def test_movie_subtitle_queries_ignore_release_tokens_as_adult_codes(self):
+        from pipeline.external_subtitles import subtitle_task_queries
+
+        queries, code = subtitle_task_queries(
+            "movie",
+            "The Devil Conspiracy",
+            {
+                "msg_media_title": "恶魔阴谋",
+                "msg_match_path": "/115/电影/The.Devil.Conspiracy.2022.WEB-DL.1080p.mkv",
+            },
+        )
+
+        self.assertEqual(queries, ["The Devil Conspiracy", "恶魔阴谋"])
+        self.assertEqual(code, "")
 
     def test_extract_codes_recognizes_standard_and_fc2_codes_only(self):
         codes = extract_codes(

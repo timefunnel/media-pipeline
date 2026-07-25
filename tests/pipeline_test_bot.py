@@ -7140,6 +7140,64 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertIn("test-file-id", queries)
         self.assertNotIn("HEVC-10", queries)
 
+    def test_media_search_queries_do_not_treat_web_dl_resolution_as_adult_code(self):
+        from pipeline.bot import media_search_queries
+
+        title = "The.Devil.Conspiracy.2022.WEB-DL.1080p.E-AC3+AC3.ITA.ENG.LFi.mkv"
+        queries = media_search_queries(title, {"name": title})
+
+        self.assertNotIn("DL-1080", queries)
+        self.assertIn(title, queries)
+
+    def test_manual_movie_subtitle_search_prefers_original_title_without_adult_code(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        media_id = "media-devil-conspiracy"
+        fake_msg = FakeMediaStationClient(
+            get_response={
+                "data": {
+                    "media": {
+                        "id": media_id,
+                        "library_id": "test-movie-library",
+                        "title": "恶魔阴谋",
+                        "original_name": "The Devil Conspiracy",
+                        "path": "cloud://openlist/115/电影/The.Devil.Conspiracy.2022.WEB-DL.1080p.mkv",
+                    }
+                }
+            }
+        )
+
+        class FakeSubtitleMatcher:
+            def __init__(self):
+                self.calls = []
+
+            def search_task_candidates(self, category, title, task, limit=10, manual=False):
+                self.calls.append((category, title, dict(task), limit, manual))
+                return []
+
+        matcher = FakeSubtitleMatcher()
+        service = PipelineBotService(
+            BotConfig(
+                "token",
+                {700656624},
+                "/tmp/state.db",
+                msg_admin_user="admin",
+                msg_admin_password="secret",
+                msg_enabled=True,
+            )
+        )
+
+        with patch.object(service, "_build_msg_client", return_value=fake_msg), patch.object(
+            service, "_build_subtitle_matcher", return_value=matcher
+        ):
+            result = service.subtitle_search_candidates(media_id)
+
+        self.assertEqual(result["title"], "恶魔阴谋")
+        self.assertEqual(result["query"], "The Devil Conspiracy")
+        self.assertEqual(result["code"], "")
+        self.assertEqual(matcher.calls[0][0:2], ("movie", "The Devil Conspiracy"))
+        self.assertNotIn("openlist_adult_code", matcher.calls[0][2])
+
     def test_media_search_queries_ignores_single_character_chinese_fragment(self):
         from pipeline.bot import media_search_queries
 

@@ -750,7 +750,7 @@ def subtitle_task_queries(category, title, task):
         code = codes[0]
         return [code], code
     queries = unique_values([title, (task or {}).get("msg_media_title")])
-    return queries[:2], codes[0] if codes else ""
+    return queries[:2], ""
 
 
 def adult_source_declares_chinese_subtitles(title, task):

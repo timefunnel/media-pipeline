@@ -2240,9 +2240,10 @@ class PipelineBotService:
             raise RuntimeError("MediaStationGo media id mismatch: expected %s, got %s" % (media_id, detail_id))
         category = subtitle_category_from_media(media)
         title = media_display_title(media) or media_id
-        task = subtitle_backfill_task_from_media(media)
+        search_title = subtitle_search_title(media) or title
+        task = subtitle_backfill_task_from_media(media, category=category)
         code = task.get("openlist_adult_code") or ""
-        candidates = matcher.search_task_candidates(category, title, task, limit=limit, manual=True)
+        candidates = matcher.search_task_candidates(category, search_title, task, limit=limit, manual=True)
         normalized = []
         for candidate in candidates:
             item = dict(candidate)
@@ -2262,7 +2263,7 @@ class PipelineBotService:
             "title": title,
             "category": category,
             "code": code,
-            "query": code or title,
+            "query": code or search_title,
             "candidates": normalized,
         }
 
@@ -6033,7 +6034,7 @@ def extract_media_detail(response):
     return {}
 
 
-def subtitle_backfill_task_from_media(media):
+def subtitle_backfill_task_from_media(media, category="adult"):
     media_id = extract_media_id(media)
     title = media_display_title(media)
     path = media_primary_path(media)
@@ -6043,10 +6044,24 @@ def subtitle_backfill_task_from_media(media):
         "msg_media_title": title,
         "msg_match_path": path,
     }
-    code = first_adult_code([haystack])
-    if code:
-        task["openlist_adult_code"] = code
+    if category == "adult":
+        code = first_adult_code([haystack])
+        if code:
+            task["openlist_adult_code"] = code
     return task
+
+
+def subtitle_search_title(media):
+    if not isinstance(media, dict):
+        return ""
+    for key in ("original_name", "original_title"):
+        value = media.get(key)
+        if value:
+            return str(value).strip()
+    nested = media.get("media")
+    if isinstance(nested, dict):
+        return subtitle_search_title(nested)
+    return media_display_title(media)
 
 
 def subtitle_category_from_media(media):

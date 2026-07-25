@@ -14,6 +14,7 @@ CODE_PREFIX_DENYLIST = {
     "BDRIP",
     "BLURAY",
     "DTS",
+    "DL",
     "FLAC",
     "FULLHD",
     "HDR",
