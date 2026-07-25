@@ -27,6 +27,11 @@ EXPLICIT_CHINESE_SUBTITLE_PATTERN = re.compile(
     r"|(?<![a-z0-9])(?:chs|cht|chinese)(?![a-z0-9])",
     re.IGNORECASE,
 )
+CHINESE_SUBTITLE_LANGUAGE_PATTERN = re.compile(
+    r"中文|中字|简体|簡體|繁体|繁體|中英(?:双语|雙語)?"
+    r"|(?<![a-z0-9])(?:zh(?:[-_](?:cn|tw|hans|hant))?|zho|chi|chs|cht|zhs|zht|ze|sc|tc|chinese)(?![a-z0-9])",
+    re.IGNORECASE,
+)
 ADULT_CODE_CHINESE_SUBTITLE_SUFFIX_PATTERN = re.compile(
     r"(?:^|[^a-z0-9])[a-z]{2,10}[-_\s]?\d{2,8}[\s._-]*ch(?=$|[^a-z0-9])",
     re.IGNORECASE,
@@ -228,6 +233,7 @@ class SubtitleCatProvider:
             if code and score <= 0:
                 continue
             candidate = dict(item)
+            candidate["language"] = "中文"
             candidate["_score"] = score + subtitlecat_candidate_bonus(item)
             candidates.append(candidate)
         return sorted(candidates, key=lambda item: int(item.get("_score") or 0), reverse=True)
@@ -238,6 +244,8 @@ class SubtitleCatProvider:
             return None
         text = self.transport.text_request(detail_url, headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
         for item in extract_subtitlecat_download_links(text, self.base_url):
+            if not subtitle_language_value_is_chinese(item.get("language")):
+                continue
             filename = safe_subtitle_filename(item.get("filename"))
             if not filename:
                 continue
@@ -278,6 +286,8 @@ class AssrtSubtitleProvider:
         payload = self.transport.json_request("GET", "https://api.assrt.net/v1/sub/search?%s" % params, headers=self._headers(), timeout=self.timeout)
         candidates = []
         for item in extract_assrt_subs(payload):
+            if not subtitle_candidate_is_chinese(item):
+                continue
             score = candidate_code_score(item, code or query)
             if code and score <= 0:
                 continue
@@ -287,6 +297,8 @@ class AssrtSubtitleProvider:
         return sorted(candidates, key=lambda item: int(item.get("_score") or 0), reverse=True)
 
     def download(self, candidate, query, code=""):
+        if not subtitle_candidate_is_chinese(candidate):
+            return None
         sub_id = str((candidate or {}).get("id") or "").strip()
         if not sub_id:
             return None
@@ -357,6 +369,8 @@ class OpenSubtitlesProvider:
             candidate = open_subtitles_candidate(item)
             if not candidate:
                 continue
+            if not subtitle_candidate_is_chinese(candidate):
+                continue
             score = candidate_code_score(candidate, code or query)
             if code and score <= 0:
                 continue
@@ -365,6 +379,8 @@ class OpenSubtitlesProvider:
         return sorted(candidates, key=lambda item: int(item.get("_score") or 0), reverse=True)
 
     def download(self, candidate, query, code=""):
+        if not subtitle_candidate_is_chinese(candidate):
+            return None
         file_id = str((candidate or {}).get("file_id") or "").strip()
         if not file_id:
             return None
@@ -931,6 +947,26 @@ def chinese_score(candidate):
         if token in lowered:
             score += 20
     return score
+
+
+def subtitle_candidate_is_chinese(candidate):
+    if not isinstance(candidate, dict):
+        return False
+    for key in ("lang", "language", "language_name"):
+        if subtitle_language_value_is_chinese(candidate.get(key)):
+            return True
+    for key in ("filename", "file_name", "title", "native_name", "release"):
+        if subtitle_language_value_is_chinese(candidate.get(key)):
+            return True
+    return False
+
+
+def subtitle_language_value_is_chinese(value):
+    if isinstance(value, dict):
+        return any(subtitle_language_value_is_chinese(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(subtitle_language_value_is_chinese(item) for item in value)
+    return bool(CHINESE_SUBTITLE_LANGUAGE_PATTERN.search(str(value or "")))
 
 
 def subtitle_lang_label(filename="", language=""):

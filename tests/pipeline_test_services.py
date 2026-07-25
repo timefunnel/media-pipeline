@@ -131,6 +131,7 @@ class ExternalSubtitleTest(unittest.TestCase):
         download = provider.download(candidates[0], "MIMK-267", code="MIMK-267")
 
         self.assertEqual(candidates[0]["title"], "MIMK-267-C")
+        self.assertEqual(candidates[0]["language"], "中文")
         self.assertEqual(download.source, "subtitlecat")
         self.assertEqual(download.filename, "MIMK-267-C-zh-CN.srt")
         self.assertEqual(download.body, b"subtitlecat-body")
@@ -166,6 +167,97 @@ class ExternalSubtitleTest(unittest.TestCase):
             transport.download_urls,
             ["https://www.subtitlecat.com/subs/494/MIDV-373%20%5Bzh-TW%5D%20%282023%29-zh-CN.srt"],
         )
+
+    def test_subtitlecat_provider_refuses_pages_without_chinese_download(self):
+        from pipeline.external_subtitles import SubtitleCatProvider
+
+        class FakeTransport:
+            def __init__(self):
+                self.download_urls = []
+
+            def text_request(self, url, headers=None, timeout=None, max_bytes=None):
+                return '<a id="download_en" href="/subs/467/The-Devil-Conspiracy-en.srt">Download</a>'
+
+            def download(self, url, headers=None, timeout=None, max_bytes=None):
+                self.download_urls.append(url)
+                return b"english-subtitle"
+
+        transport = FakeTransport()
+        provider = SubtitleCatProvider(transport=transport)
+        download = provider.download(
+            {"url": "https://www.subtitlecat.com/subs/467/The-Devil-Conspiracy.html"},
+            "The Devil Conspiracy",
+        )
+
+        self.assertIsNone(download)
+        self.assertEqual(transport.download_urls, [])
+
+    def test_assrt_provider_excludes_non_chinese_candidates(self):
+        from pipeline.external_subtitles import AssrtSubtitleProvider
+
+        class FakeTransport:
+            def json_request(self, method, url, headers=None, data=None, timeout=None):
+                return {
+                    "status": 0,
+                    "sub": {
+                        "subs": [
+                            {"id": 1, "native_name": "The Devil Conspiracy", "lang": {"desc": "English"}},
+                            {"id": 2, "native_name": "恶魔阴谋", "lang": {"desc": "繁体"}},
+                        ]
+                    },
+                }
+
+        provider = AssrtSubtitleProvider("secret-token", transport=FakeTransport())
+        candidates = provider.search("The Devil Conspiracy")
+
+        self.assertEqual([item["id"] for item in candidates], [2])
+
+    def test_opensubtitles_provider_excludes_non_chinese_responses(self):
+        from pipeline.external_subtitles import OpenSubtitlesProvider
+
+        class FakeTransport:
+            def __init__(self):
+                self.urls = []
+
+            def json_request(self, method, url, headers=None, data=None, timeout=None):
+                self.urls.append(url)
+                return {
+                    "data": [
+                        {
+                            "id": "english",
+                            "attributes": {
+                                "language": "en",
+                                "release": "The Devil Conspiracy",
+                                "files": [{"file_id": 1, "file_name": "movie.en.srt"}],
+                            },
+                        },
+                        {
+                            "id": "chinese",
+                            "attributes": {
+                                "language": "zh-cn",
+                                "release": "The Devil Conspiracy",
+                                "files": [{"file_id": 2, "file_name": "movie.zh-cn.srt"}],
+                            },
+                        },
+                    ]
+                }
+
+        transport = FakeTransport()
+        provider = OpenSubtitlesProvider("api-key", transport=transport)
+        candidates = provider.search("The Devil Conspiracy")
+
+        self.assertEqual([item["id"] for item in candidates], ["chinese"])
+        self.assertIn("languages=zh-cn%2Czh-tw%2Cze", transport.urls[0])
+
+    def test_chinese_subtitle_language_detection_requires_explicit_marker(self):
+        from pipeline.external_subtitles import subtitle_language_value_is_chinese
+
+        for value in ("zh-cn", "zh_Hant", "简体", "繁體中文", "movie.chs.srt", {"desc": "中文"}):
+            with self.subTest(value=value):
+                self.assertTrue(subtitle_language_value_is_chinese(value))
+        for value in ("", "English", "Chinatown", "movie.en.srt", {"desc": "Japanese"}):
+            with self.subTest(value=value):
+                self.assertFalse(subtitle_language_value_is_chinese(value))
 
     def test_build_subtitle_matcher_includes_subtitlecat_by_default(self):
         from pipeline.external_subtitles import build_subtitle_matcher_from_config
