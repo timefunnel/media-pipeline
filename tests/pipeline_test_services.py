@@ -131,11 +131,12 @@ class ExternalSubtitleTest(unittest.TestCase):
         download = provider.download(candidates[0], "MIMK-267", code="MIMK-267")
 
         self.assertEqual(candidates[0]["title"], "MIMK-267-C")
-        self.assertEqual(candidates[0]["language"], "中文")
+        self.assertEqual(candidates[0]["language"], "zh-CN")
         self.assertEqual(download.source, "subtitlecat")
         self.assertEqual(download.filename, "MIMK-267-C-zh-CN.srt")
         self.assertEqual(download.body, b"subtitlecat-body")
         self.assertEqual(transport.download_urls, ["https://www.subtitlecat.com/subs/1470/MIMK-267-C-zh-CN.srt"])
+        self.assertEqual(len(transport.text_urls), 3)
 
     def test_subtitlecat_provider_quotes_download_url_path(self):
         from pipeline.external_subtitles import SubtitleCatProvider
@@ -191,6 +192,35 @@ class ExternalSubtitleTest(unittest.TestCase):
 
         self.assertIsNone(download)
         self.assertEqual(transport.download_urls, [])
+
+    def test_subtitlecat_search_only_returns_verified_chinese_candidates(self):
+        from pipeline.external_subtitles import SubtitleCatProvider
+
+        class FakeTransport:
+            def __init__(self):
+                self.text_urls = []
+
+            def text_request(self, url, headers=None, timeout=None, max_bytes=None):
+                self.text_urls.append(url)
+                if "index.php" in url:
+                    return """
+                    <table><tbody>
+                      <tr><td><a href="subs/1/english-only.html">English only</a></td></tr>
+                      <tr><td><a href="subs/2/chinese-ready.html">Chinese ready</a></td></tr>
+                    </tbody></table>
+                    """
+                if "english-only" in url:
+                    return '<a id="download_en" href="/subs/1/english-only-en.srt">Download</a>'
+                return '<a id="download_zh-CN" href="/subs/2/chinese-ready-zh-CN.srt">Download</a>'
+
+        transport = FakeTransport()
+        provider = SubtitleCatProvider(transport=transport)
+        candidates = provider.search_candidates("The Devil Conspiracy", limit=5)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["language"], "zh-CN")
+        self.assertEqual(candidates[0]["filename"], "chinese-ready-zh-CN.srt")
+        self.assertEqual(len(transport.text_urls), 3)
 
     def test_assrt_provider_excludes_non_chinese_candidates(self):
         from pipeline.external_subtitles import AssrtSubtitleProvider
