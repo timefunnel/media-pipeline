@@ -2606,6 +2606,10 @@ class PipelineBotService:
         media_title = progress.get("msg_media_title")
         root = msg_target
         media = None
+        if adult_format_changed_media_path(format_result) and progress.get("msg_scan_status") == "success":
+            emit(stale_msg_media_reset_updates(progress, media_id, reason="formatted_path_changed"))
+            media_id = None
+            media_title = None
         if progress.get("msg_scan_status") == "success" and media_id:
             media = self._load_existing_msg_media(get_msg_client(), media_id)
             if media is None:
@@ -5849,14 +5853,21 @@ STALE_MSG_MEDIA_RESET_KEYS = (
 )
 
 
-def stale_msg_media_reset_updates(task, media_id):
+def stale_msg_media_reset_updates(task, media_id, reason="not_found"):
     updates = {key: None for key in STALE_MSG_MEDIA_RESET_KEYS}
     updates["msg_sync_status"] = "running"
     updates["msg_error"] = None
     updates["msg_stale_media_id"] = media_id
-    updates["msg_stale_media_reason"] = "not_found"
+    updates["msg_stale_media_reason"] = reason
     updates["msg_stale_media_at"] = int(time.time())
     return updates
+
+
+def adult_format_changed_media_path(result):
+    result = result or {}
+    old_path = normalize_openlist_path(result.get("openlist_adult_video_old_path"))
+    new_path = normalize_openlist_path(result.get("openlist_adult_video_new_path"))
+    return bool(old_path and new_path and old_path.casefold() != new_path.casefold())
 
 
 def mark_current_sync_stage_failed(task, error):

@@ -6734,6 +6734,96 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["msg_scrape_status"], "success")
         self.assertIsNone(task["msg_error"])
 
+    def test_adult_upgrade_retry_rescans_when_main_video_is_renamed(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        adult_root = category_to_openlist_path("adult")
+        old_path = adult_root + "/MIMK-267"
+        upgrade_path = adult_root + "/MIMK-267-UC"
+        old_video_path = upgrade_path + "/release.mp4"
+        new_video_path = upgrade_path + "/MIMK-267.mp4"
+        upgrade_size = 6 * 1024 * 1024 * 1024
+        fake_openlist = CleaningOpenList(
+            {
+                adult_root: [
+                    {"name": "MIMK-267", "is_dir": True, "size": 0},
+                    {"name": "MIMK-267-UC", "is_dir": True, "size": 0},
+                ],
+                old_path: [{"name": "MIMK-267.mp4", "is_dir": False, "size": 4 * 1024 * 1024 * 1024}],
+                upgrade_path: [{"name": "release.mp4", "is_dir": False, "size": upgrade_size}],
+            }
+        )
+        fake_msg = FakeMediaStationClient(
+            get_response={
+                "id": "media-1",
+                "library_id": "test-adult-library",
+                "title": "MIMK-267",
+                "path": "cloud://openlist" + old_video_path,
+            },
+            list_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-1",
+                            "library_id": "test-adult-library",
+                            "title": "MIMK-267",
+                            "path": "cloud://openlist" + new_video_path,
+                            "size_bytes": upgrade_size,
+                        }
+                    ]
+                }
+            },
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
+        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    msg_sync_poll_seconds=0,
+                    openlist_pre_scan_clean_enabled=False,
+                    openlist_adult_code_format_enabled=True,
+                )
+            )
+            task = service.sync_completed_task(
+                "adult",
+                "MIMK-267",
+                {
+                    "info_hash": "ABC",
+                    "status_name": "success",
+                    "name": "MIMK-267-UC",
+                    "size": upgrade_size,
+                    "msg_sync_status": "failed",
+                    "msg_scan_status": "success",
+                    "msg_media_id": "media-1",
+                    "msg_media_title": "MIMK-267",
+                    "msg_match_mode": "path",
+                    "msg_match_path": "cloud://openlist" + old_video_path,
+                    "msg_scrape_status": "success",
+                    "openlist_adult_format_status": "failed",
+                    "openlist_adult_format_error": "target name occupied",
+                },
+                upgrade_media_id="old-media",
+            )
+
+        self.assertEqual(fake_openlist.rename_calls, [(old_video_path, "MIMK-267.mp4")])
+        self.assertEqual(fake_msg.get_calls, [])
+        self.assertEqual(fake_msg.scan_calls, [("test-adult-library", "test-adult-root")])
+        self.assertEqual(fake_msg.pipeline_ingest_calls[0]["target_openlist_paths"], [upgrade_path])
+        self.assertEqual(task["openlist_adult_format_status"], "skipped")
+        self.assertEqual(task["openlist_adult_format_reason"], "upgrade_target_name_occupied")
+        self.assertEqual(task["msg_stale_media_id"], "media-1")
+        self.assertEqual(task["msg_stale_media_reason"], "formatted_path_changed")
+        self.assertEqual(task["msg_match_path"], "cloud://openlist" + new_video_path)
+        self.assertEqual(task["msg_scan_status"], "success")
+        self.assertEqual(task["msg_sync_status"], "success")
+
     def test_check_duplicate_marks_adult_code_match_as_strong(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
