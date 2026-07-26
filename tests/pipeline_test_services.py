@@ -29,7 +29,29 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertEqual(tracks[0]["source"], "assrt")
         self.assertEqual(tracks[0]["lang"], "zh-Hans")
         self.assertEqual(body, b"1\n00:00:01,000 --> 00:00:02,000\nhello\n")
-        self.assertTrue(filename.endswith(".srt"))
+        self.assertEqual(filename, "assrt-zh-Hans.srt")
+
+    def test_subtitle_cache_uses_readable_suffix_for_same_source_and_language(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleDownload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SubtitleCache(tmp)
+            first = cache.save_download(
+                "media-1",
+                SubtitleDownload("subhd", "one", "one.srt", b"one", lang="zh-Hans"),
+            )
+            second = cache.save_download(
+                "media-1",
+                SubtitleDownload("subhd", "two", "two.srt", b"two", lang="zh-Hans"),
+            )
+            tracks = cache.list_tracks("media-1")
+
+        self.assertEqual(first["filename"], "subhd-zh-Hans.srt")
+        self.assertEqual(second["filename"], "subhd-zh-Hans-2.srt")
+        self.assertEqual(
+            [item["filename"] for item in tracks],
+            ["subhd-zh-Hans.srt", "subhd-zh-Hans-2.srt"],
+        )
 
     def test_assrt_provider_downloads_exact_adult_code_subtitle(self):
         from pipeline.external_subtitles import AssrtSubtitleProvider
@@ -289,6 +311,23 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertEqual([item[0] for item in transport.json_calls], ["POST", "POST"])
         self.assertEqual(transport.download_urls, ["https://dlus.subhd.me/2026/07/chinese1.srt"])
 
+    def test_subhd_search_excludes_bitmap_only_candidates(self):
+        from pipeline.external_subtitles import extract_subhd_search_results
+
+        html = """
+        <a class="link-dark align-middle" href='/a/sup-only'>SUP only</a>
+        <div class="view-text text-secondary"><a href='/a/sup-only'>SUP only</a></div>
+        <div class="text-truncate py-2 f11"><span>双语</span><span>简体</span><span>SUP</span></div>
+        <a class="link-dark align-middle" href='/a/ass-sup'>ASS and SUP</a>
+        <div class="view-text text-secondary"><a href='/a/ass-sup'>ASS and SUP</a></div>
+        <div class="text-truncate py-2 f11"><span>双语</span><span>简体</span><span>ASS</span><span>SUP</span></div>
+        """
+
+        items = extract_subhd_search_results(html)
+
+        self.assertEqual([item["id"] for item in items], ["ass-sup"])
+        self.assertTrue(items[0]["filename"].endswith(".ass"))
+
     def test_subhd_zip_selects_chinese_subtitle(self):
         import io
         import zipfile
@@ -309,6 +348,61 @@ class ExternalSubtitleTest(unittest.TestCase):
 
         self.assertEqual(filename, "movie.chs.srt")
         self.assertIn("中文字幕", body.decode("utf-8"))
+
+    def test_subhd_manual_review_allows_supported_text_without_chinese_body_gate(self):
+        import io
+        import zipfile
+
+        from pipeline.external_subtitles import extract_chinese_subtitle_from_archive
+
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as output:
+            output.writestr("movie.srt", "1\n00:00:01,000 --> 00:00:02,000\nManual review text\n")
+
+        filename, body = extract_chinese_subtitle_from_archive(
+            archive.getvalue(),
+            ".zip",
+            {"language": "简体"},
+            1024 * 1024,
+            require_chinese_body=False,
+        )
+
+        self.assertEqual(filename, "movie.srt")
+        self.assertIn(b"Manual review text", body)
+
+    def test_subhd_rar_uses_bsdtar_for_supported_text_subtitle(self):
+        import subprocess
+        from pathlib import Path
+        from unittest import mock
+
+        from pipeline.external_subtitles import extract_chinese_subtitle_from_archive
+
+        def fake_run(command, **kwargs):
+            if command[1] == "-tvf":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="-rw-r--r--  0 0 0 76 Jul 27 00:00 movie.chs.srt\n",
+                    stderr="",
+                )
+            extract_root = Path(command[command.index("-C") + 1])
+            (extract_root / "movie.chs.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\n这是中文字幕正文\n",
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with mock.patch("pipeline.external_subtitles.subprocess.run", side_effect=fake_run) as run:
+            filename, body = extract_chinese_subtitle_from_archive(
+                b"Rar!",
+                ".rar",
+                {"language": "简体"},
+                1024 * 1024,
+            )
+
+        self.assertEqual(filename, "movie.chs.srt")
+        self.assertIn("这是中文字幕正文", body.decode("utf-8"))
+        self.assertEqual([call.args[0][0] for call in run.call_args_list], ["bsdtar", "bsdtar"])
 
     def test_subhd_archive_rejects_path_traversal(self):
         import io

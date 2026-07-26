@@ -158,7 +158,17 @@ class SubtitleCache:
             raise RuntimeError("subtitle extension unsupported: %s" % extension)
         media_dir = self._media_dir(media_id)
         media_dir.mkdir(parents=True, exist_ok=True)
-        stored_name = self._stored_filename(download)
+        tracks = self.list_tracks(media_id)
+        key = subtitle_track_key(
+            {
+                "source": download.source,
+                "provider_id": str(download.provider_id or ""),
+                "filename": download.filename,
+            }
+        )
+        replaced_tracks = [item for item in tracks if subtitle_track_key(item) == key]
+        retained_tracks = [item for item in tracks if subtitle_track_key(item) != key]
+        stored_name = self._stored_filename(download, retained_tracks)
         target = media_dir / stored_name
         tmp = media_dir / (stored_name + ".tmp")
         tmp.write_bytes(download.body)
@@ -174,11 +184,15 @@ class SubtitleCache:
             "query": download.query,
             "score": int(download.score or 0),
         }
-        tracks = self.list_tracks(media_id)
-        key = subtitle_track_key(track)
-        tracks = [item for item in tracks if subtitle_track_key(item) != key]
-        tracks.append(track)
-        self._write_index(media_dir, media_id, tracks)
+        retained_tracks.append(track)
+        self._write_index(media_dir, media_id, retained_tracks)
+        retained_names = {safe_subtitle_filename(item.get("filename")) for item in retained_tracks}
+        for item in replaced_tracks:
+            old_name = safe_subtitle_filename(item.get("filename"))
+            if old_name and old_name != stored_name and old_name not in retained_names:
+                old_path = media_dir / old_name
+                if old_path.exists():
+                    old_path.unlink()
         return track
 
     def read_local_uri(self, uri):
@@ -194,13 +208,22 @@ class SubtitleCache:
             raise RuntimeError("local subtitle file missing")
         return target.read_bytes(), filename
 
-    def _stored_filename(self, download):
+    def _stored_filename(self, download, tracks=None):
         extension = subtitle_extension(download.filename)
-        digest = hashlib.sha256(
-            ("%s:%s:%s" % (download.source, download.provider_id, download.filename)).encode("utf-8", "replace")
-        ).hexdigest()[:12]
-        source = re.sub(r"[^0-9A-Za-z_-]+", "-", str(download.source or "subtitle")).strip("-") or "subtitle"
-        return "%s-%s%s" % (source, digest, extension)
+        source = subtitle_storage_token(download.source, "subtitle").casefold()
+        language = subtitle_storage_language(download.lang, download.filename, download.label)
+        stem = "%s-%s" % (source, language)
+        reserved = {
+            safe_subtitle_filename(item.get("filename"))
+            for item in tracks or []
+            if safe_subtitle_filename(item.get("filename"))
+        }
+        candidate = stem + extension
+        suffix = 2
+        while candidate in reserved:
+            candidate = "%s-%d%s" % (stem, suffix, extension)
+            suffix += 1
+        return candidate
 
     def _write_index(self, media_dir, media_id, tracks):
         payload = {"media_id": str(media_id), "tracks": tracks}
@@ -248,10 +271,16 @@ class SubHDProvider:
         return extract_subhd_search_results(text, self.base_url)
 
     def download(self, candidate, query, code=""):
+        return self._download(candidate, query, code=code, require_chinese_body=True)
+
+    def download_for_review(self, candidate, query, code=""):
+        return self._download(candidate, query, code=code, require_chinese_body=False)
+
+    def _download(self, candidate, query, code="", require_chinese_body=True):
         sid = str((candidate or {}).get("id") or (candidate or {}).get("provider_id") or "").strip()
         if not re.fullmatch(r"[0-9A-Za-z_-]{2,32}", sid):
             raise RuntimeError("SubHD subtitle id invalid")
-        if not subtitle_candidate_is_chinese(candidate):
+        if require_chinese_body and not subtitle_candidate_is_chinese(candidate):
             raise RuntimeError("SubHD candidate is not Chinese")
 
         transport = self._transport()
@@ -289,10 +318,11 @@ class SubHDProvider:
                 self.max_bytes,
                 query=query,
                 timeout=self.timeout,
+                require_chinese_body=require_chinese_body,
             )
         elif extension in SUBTITLE_EXTENSIONS:
             filename = subhd_download_filename(candidate, sid, extension)
-            if not subtitle_body_is_chinese(body, filename):
+            if require_chinese_body and not subtitle_body_is_chinese(body, filename):
                 raise RuntimeError("SubHD downloaded subtitle is not Chinese")
         else:
             raise RuntimeError("SubHD subtitle archive unsupported: %s" % (extension or "unknown"))
@@ -692,7 +722,7 @@ class SubtitleMatcher:
         candidate = (candidate_record or {}).get("candidate")
         if not isinstance(candidate, dict):
             raise RuntimeError("subtitle candidate payload missing")
-        download = provider.download(candidate, query, code=code)
+        download = download_subtitle_candidate_for_review(provider, candidate, query, code=code)
         if not download:
             return subtitle_result("skipped", source=provider.name, query=query, reason="download_missing")
         track = self.cache.save_download(media_id, download)
@@ -716,7 +746,7 @@ class SubtitleMatcher:
         candidate = (candidate_record or {}).get("candidate")
         if not isinstance(candidate, dict):
             raise RuntimeError("subtitle candidate payload missing")
-        download = provider.download(candidate, query, code=code)
+        download = download_subtitle_candidate_for_review(provider, candidate, query, code=code)
         if not download:
             raise RuntimeError("subtitle preview download missing")
         preview = dict(candidate_record or {})
@@ -871,6 +901,13 @@ def subtitle_download_preview(download, max_chars=2000):
     }
 
 
+def download_subtitle_candidate_for_review(provider, candidate, query, code=""):
+    review_download = getattr(provider, "download_for_review", None)
+    if callable(review_download):
+        return review_download(candidate, query, code=code)
+    return provider.download(candidate, query, code=code)
+
+
 def decode_subtitle_body(body):
     data = bytes(body or b"")
     for encoding in ("utf-8-sig", "utf-16", "gb18030", "big5"):
@@ -1015,6 +1052,18 @@ def extract_subhd_search_results(text, base_url=SUBHD_BASE_URL):
         metadata = strip_html_text(metadata_match.group("metadata") if metadata_match else "")
         if not subtitle_language_value_is_chinese(metadata):
             continue
+        supported_formats = re.findall(
+            r"(?<![A-Za-z])(?:ASS|SRT|SSA|VTT)(?![A-Za-z])",
+            metadata,
+            flags=re.IGNORECASE,
+        )
+        unsupported_formats = re.findall(
+            r"(?<![A-Za-z])(?:SUP|PGS|VOBSUB|IDX|SUB)(?![A-Za-z])",
+            metadata,
+            flags=re.IGNORECASE,
+        )
+        if unsupported_formats and not supported_formats:
+            continue
         sid = match.group("sid")
         title = strip_html_text(match.group("title"))
         release = strip_html_text(release_match.group("release") if release_match else "") or title
@@ -1077,16 +1126,47 @@ def subhd_download_filename(candidate, sid, extension):
     return safe_subtitle_filename(release + extension) or ("subhd-%s%s" % (sid, extension))
 
 
-def extract_chinese_subtitle_from_archive(body, extension, candidate, max_bytes, query="", timeout=DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS):
+def extract_chinese_subtitle_from_archive(
+    body,
+    extension,
+    candidate,
+    max_bytes,
+    query="",
+    timeout=DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS,
+    require_chinese_body=True,
+):
     extension = str(extension or "").casefold()
     if extension == ".zip":
-        return extract_chinese_subtitle_from_zip(body, candidate, max_bytes, query=query)
-    if extension not in (".7z", ".rar"):
+        return extract_chinese_subtitle_from_zip(
+            body,
+            candidate,
+            max_bytes,
+            query=query,
+            require_chinese_body=require_chinese_body,
+        )
+    if extension == ".rar":
+        return extract_chinese_subtitle_with_bsdtar(
+            body,
+            candidate,
+            max_bytes,
+            query=query,
+            timeout=timeout,
+            require_chinese_body=require_chinese_body,
+        )
+    if extension != ".7z":
         raise RuntimeError("SubHD subtitle archive unsupported: %s" % (extension or "unknown"))
-    return extract_chinese_subtitle_with_7zip(body, extension, candidate, max_bytes, query=query, timeout=timeout)
+    return extract_chinese_subtitle_with_7zip(
+        body,
+        extension,
+        candidate,
+        max_bytes,
+        query=query,
+        timeout=timeout,
+        require_chinese_body=require_chinese_body,
+    )
 
 
-def extract_chinese_subtitle_from_zip(body, candidate, max_bytes, query=""):
+def extract_chinese_subtitle_from_zip(body, candidate, max_bytes, query="", require_chinese_body=True):
     try:
         archive = zipfile.ZipFile(io.BytesIO(bytes(body or b"")))
     except zipfile.BadZipFile as exc:
@@ -1100,12 +1180,22 @@ def extract_chinese_subtitle_from_zip(body, candidate, max_bytes, query=""):
         for entry in rank_subtitle_archive_entries(subtitle_entries, candidate, query=query):
             data = archive.read(entry["path"])
             filename = safe_subtitle_filename(posix_basename(entry["path"]))
-            if filename and subtitle_body_is_chinese(data, filename):
+            if filename and (not require_chinese_body or subtitle_body_is_chinese(data, filename)):
                 return filename, data
-    raise RuntimeError("SubHD archive contains no Chinese subtitle")
+    if require_chinese_body:
+        raise RuntimeError("SubHD archive contains no Chinese subtitle")
+    raise RuntimeError("SubHD archive contains no readable subtitle")
 
 
-def extract_chinese_subtitle_with_7zip(body, extension, candidate, max_bytes, query="", timeout=DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS):
+def extract_chinese_subtitle_with_7zip(
+    body,
+    extension,
+    candidate,
+    max_bytes,
+    query="",
+    timeout=DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS,
+    require_chinese_body=True,
+):
     with tempfile.TemporaryDirectory(prefix="subhd-subtitle-") as tmp:
         root = Path(tmp)
         archive_path = root / ("subtitle" + extension)
@@ -1152,9 +1242,80 @@ def extract_chinese_subtitle_with_7zip(body, extension, candidate, max_bytes, qu
                 continue
             data = target.read_bytes()
             filename = safe_subtitle_filename(posix_basename(entry["path"]))
-            if filename and subtitle_body_is_chinese(data, filename):
+            if filename and (not require_chinese_body or subtitle_body_is_chinese(data, filename)):
                 return filename, data
-    raise RuntimeError("SubHD archive contains no Chinese subtitle")
+    if require_chinese_body:
+        raise RuntimeError("SubHD archive contains no Chinese subtitle")
+    raise RuntimeError("SubHD archive contains no readable subtitle")
+
+
+def extract_chinese_subtitle_with_bsdtar(
+    body,
+    candidate,
+    max_bytes,
+    query="",
+    timeout=DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS,
+    require_chinese_body=True,
+):
+    with tempfile.TemporaryDirectory(prefix="subhd-subtitle-") as tmp:
+        root = Path(tmp)
+        archive_path = root / "subtitle.rar"
+        archive_path.write_bytes(bytes(body or b""))
+        try:
+            listed = subprocess.run(
+                ["bsdtar", "-tvf", str(archive_path)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=max(1, int(timeout or DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS)),
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("SubHD archive extractor missing: bsdtar") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("SubHD archive listing timed out") from exc
+        if listed.returncode != 0:
+            raise RuntimeError("SubHD archive listing failed: %s" % listed.stderr.strip()[:200])
+        entries = parse_bsdtar_archive_entries(listed.stdout)
+        subtitle_entries = validate_subtitle_archive_entries(entries, max_bytes, query=query)
+
+        extract_root = root / "extracted"
+        extract_root.mkdir()
+        try:
+            extracted = subprocess.run(
+                [
+                    "bsdtar",
+                    "-xf",
+                    str(archive_path),
+                    "-C",
+                    str(extract_root),
+                    "--no-same-owner",
+                    "--no-same-permissions",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=max(1, int(timeout or DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS)),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("SubHD archive extraction timed out") from exc
+        if extracted.returncode != 0:
+            raise RuntimeError("SubHD archive extraction failed: %s" % extracted.stderr.strip()[:200])
+        verify_extracted_archive_tree(extract_root, max_bytes)
+        for entry in rank_subtitle_archive_entries(subtitle_entries, candidate, query=query):
+            target = extract_root.joinpath(*archive_member_parts(entry["path"]))
+            if not target.is_file():
+                continue
+            data = target.read_bytes()
+            filename = safe_subtitle_filename(posix_basename(entry["path"]))
+            if filename and (not require_chinese_body or subtitle_body_is_chinese(data, filename)):
+                return filename, data
+    if require_chinese_body:
+        raise RuntimeError("SubHD archive contains no Chinese subtitle")
+    raise RuntimeError("SubHD archive contains no readable subtitle")
 
 
 def parse_7zip_archive_entries(output):
@@ -1176,6 +1337,27 @@ def parse_7zip_archive_entries(output):
         except ValueError as exc:
             raise RuntimeError("SubHD archive entry size invalid") from exc
         entries.append({"path": path, "size": size, "directory": values.get("Folder") == "+"})
+    return entries
+
+
+def parse_bsdtar_archive_entries(output):
+    entries = []
+    for line in str(output or "").replace("\r\n", "\n").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        fields = line.split(None, 8)
+        if len(fields) != 9:
+            raise RuntimeError("SubHD archive listing output invalid")
+        mode, size_text, path = fields[0], fields[4], fields[8]
+        if not mode or mode[0] not in ("-", "d"):
+            raise RuntimeError("SubHD archive contains unsupported entry type")
+        try:
+            size = int(size_text)
+        except ValueError as exc:
+            raise RuntimeError("SubHD archive entry size invalid") from exc
+        directory = mode[0] == "d"
+        entries.append({"path": path.rstrip("/"), "size": size, "directory": directory})
     return entries
 
 
@@ -1234,6 +1416,8 @@ def verify_extracted_archive_tree(root, max_bytes):
     files = 0
     total = 0
     for target in root.rglob("*"):
+        if target.is_symlink():
+            raise RuntimeError("SubHD archive contains symbolic links")
         resolved = target.resolve()
         if os.path.commonpath((str(root), str(resolved))) != str(root):
             raise RuntimeError("SubHD archive extracted outside temporary directory")
@@ -1489,6 +1673,37 @@ def safe_subtitle_filename(value):
     return name[:180]
 
 
+def subtitle_storage_token(value, fallback):
+    token = re.sub(r"[^0-9A-Za-z_-]+", "-", str(value or "").strip()).strip("-_")
+    return token or fallback
+
+
+def subtitle_storage_language(language, filename="", label=""):
+    value = str(language or "").strip().replace("_", "-")
+    normalized = value.casefold()
+    aliases = {
+        "chs": "zh-Hans",
+        "sc": "zh-Hans",
+        "zh-cn": "zh-Hans",
+        "zh-hans": "zh-Hans",
+        "cht": "zh-Hant",
+        "tc": "zh-Hant",
+        "zh-tw": "zh-Hant",
+        "zh-hant": "zh-Hant",
+        "chi": "zh",
+        "zho": "zh",
+        "chinese": "zh",
+        "eng": "en",
+        "jpn": "ja",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    if value:
+        return subtitle_storage_token(value, "und")
+    detected, _ = subtitle_lang_label(filename, label)
+    return subtitle_storage_token(detected, "und")
+
+
 def safe_media_id(value):
     text = str(value or "").strip()
     if re.match(r"^[0-9A-Za-z_.-]{1,128}$", text):
@@ -1509,7 +1724,11 @@ def local_subtitle_uri_valid(value):
 
 
 def subtitle_track_key(track):
-    return "%s:%s:%s" % (track.get("source"), track.get("provider_id"), track.get("filename"))
+    source = str(track.get("source") or "")
+    provider_id = str(track.get("provider_id") or "")
+    if provider_id:
+        return "%s:%s" % (source, provider_id)
+    return "%s:%s" % (source, track.get("filename"))
 
 
 def compact_text(value):

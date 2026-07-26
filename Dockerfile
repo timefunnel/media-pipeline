@@ -3,7 +3,7 @@ FROM python:3.12-alpine
 ARG MEDIA_PIPELINE_VERSION=0.2.1
 ARG MEDIA_PIPELINE_REVISION=unknown
 
-RUN apk add --no-cache 7zip
+RUN apk add --no-cache 7zip libarchive-tools
 
 WORKDIR /app
 COPY app/ /app/
