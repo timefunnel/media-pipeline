@@ -22,7 +22,14 @@ for category in ("movie", "tv", "anime", "adult", "other"):
 
 from pipeline.bot import BotConfig, PipelineBotService
 from pipeline.config import category_to_folder_id, category_to_openlist_path
-from pipeline.internal_api import ApiError, ImportTaskManager, InternalApiApplication, InternalApiServer, InternalApiStore
+from pipeline.internal_api import (
+    ApiError,
+    ImportTaskManager,
+    InternalApiApplication,
+    InternalApiServer,
+    InternalApiStore,
+    upgrade_target_scrape_queries,
+)
 
 
 TARGET = {
@@ -74,6 +81,7 @@ class FakePipelineService:
         self.task_status_calls = []
         self.sync_targets = []
         self.sync_titles = []
+        self.sync_scrape_queries = []
         self.sync_input_tasks = []
         self.cancel_calls = []
         self.duplicate_calls = []
@@ -206,10 +214,19 @@ class FakePipelineService:
         self.cancel_calls.append((category, info_hash))
         return {"info_hash": info_hash, "status_name": "cancelled"}
 
-    def sync_completed_task(self, category, title, task, progress_callback=None, target=None):
+    def sync_completed_task(
+        self,
+        category,
+        title,
+        task,
+        progress_callback=None,
+        target=None,
+        preferred_scrape_queries=None,
+    ):
         target = dict(target or {})
         self.sync_targets.append(target)
         self.sync_titles.append(title)
+        self.sync_scrape_queries.append(list(preferred_scrape_queries or []))
         self.sync_input_tasks.append(dict(task or {}))
         if progress_callback:
             progress_callback({**task, "msg_sync_status": "running", "msg_scan_status": "running"})
@@ -505,6 +522,15 @@ class PipelineTargetOverrideTest(InternalApiTestCase):
 
 
 class ImportPersistenceTest(InternalApiTestCase):
+    def test_upgrade_target_scrape_queries_prefer_exact_tmdb_id(self):
+        self.assertEqual(
+            upgrade_target_scrape_queries(
+                {"tmdb_id": 608, "title": "黑衣人2", "original_name": "Men in Black II"},
+                {"provider": "tmdb"},
+            ),
+            ["[tmdbid-608]", "黑衣人2", "Men in Black II"],
+        )
+
     def test_persisted_candidate_controls_download_uri_and_target_is_forwarded(self):
         service, store, manager, application = self.build_components()
         session_id, candidate_id, search = self.search_candidate(application)
@@ -697,6 +723,7 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(service.upgrade_target_calls[-1], ("media-upgrade-target", target_for("adult")))
         self.assertEqual(service.sync_titles[-1], "Upgrade Target")
+        self.assertEqual(service.sync_scrape_queries[-1], ["Upgrade Target"])
         self.assertEqual(len(service.submit_uris), 1)
 
     def test_upgrade_can_move_selected_old_version_to_recycle_bin(self):

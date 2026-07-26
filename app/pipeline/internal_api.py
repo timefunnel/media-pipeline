@@ -620,6 +620,10 @@ class ImportTaskManager:
                         or upgrade_target.get("original_name")
                         or ""
                     ).strip()
+                    request["upgrade_target_scrape_queries"] = upgrade_target_scrape_queries(
+                        upgrade_target,
+                        request["target"],
+                    )
             except ValueError as exc:
                 raise ApiError(409, "invalid_upgrade_target", str(exc))
             except Exception as exc:
@@ -800,6 +804,7 @@ class ImportTaskManager:
                         offline_task,
                         progress_callback=save_progress,
                         target=target,
+                        preferred_scrape_queries=request.get("upgrade_target_scrape_queries"),
                     )
                 except Exception as exc:
                     current = self.store.get_import(task["owner_id"], task["id"])
@@ -1311,6 +1316,38 @@ def normalize_upgrade_scope(category, upgrade_media_id, value):
     if requested not in ("", "media"):
         raise ApiError(400, "invalid_upgrade_scope", "当前媒体类型只支持单作品升级")
     return "media"
+
+
+def upgrade_target_scrape_queries(media, target):
+    media = dict(media or {})
+    target = dict(target or {})
+    provider = str(target.get("provider") or "").strip().lower()
+    queries = []
+    if provider == "tmdb":
+        tmdb_id = media.get("tmdb_id") or media.get("tm_db_id")
+        try:
+            tmdb_id = int(tmdb_id or 0)
+        except (TypeError, ValueError):
+            tmdb_id = 0
+        if tmdb_id > 0:
+            queries.append("[tmdbid-%d]" % tmdb_id)
+    for key in ("display_title", "title", "original_name"):
+        value = str(media.get(key) or "").strip()
+        if value:
+            queries.append(value)
+    return unique_text_values(queries)
+
+
+def unique_text_values(values):
+    out = []
+    seen = set()
+    for value in values or []:
+        text = str(value or "").strip()
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out
 
 
 def upgrade_new_source_paths(task):

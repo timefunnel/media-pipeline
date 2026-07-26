@@ -4865,9 +4865,10 @@ class PipelineBotServiceTest(unittest.TestCase):
                 "title": "REMUX-2160",
                 "path": "cloud://openlist/115/电影/Люди в черном 2.2002.UHD.Blu-Ray.Remux.2160p.mkv",
             },
+            ["[tmdbid-608]"],
         )
 
-        self.assertEqual(queries[0], "黑衣人2")
+        self.assertEqual(queries[:2], ["[tmdbid-608]", "黑衣人2"])
         self.assertNotIn("BDREMUX-2160", queries)
         self.assertNotIn("REMUX-2160", queries)
 

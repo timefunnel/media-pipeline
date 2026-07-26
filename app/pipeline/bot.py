@@ -2171,7 +2171,15 @@ class PipelineBotService:
         ).load_token()
         return OpenListClient(self.config.openlist_url, token)
 
-    def sync_completed_task(self, category, title, task, progress_callback=None, target=None):
+    def sync_completed_task(
+        self,
+        category,
+        title,
+        task,
+        progress_callback=None,
+        target=None,
+        preferred_scrape_queries=None,
+    ):
         out = dict(task or {})
         if not TASK_STATE.is_offline_success(out):
             return out
@@ -2192,6 +2200,7 @@ class PipelineBotService:
                 out,
                 progress_callback=capture_progress,
                 target=target,
+                preferred_scrape_queries=preferred_scrape_queries,
             )
         except MediaStationIngestPending:
             out["msg_sync_status"] = "running"
@@ -2492,7 +2501,15 @@ class PipelineBotService:
             cookie = self.config.p115_cookie
         return Share115Client(cookie)
 
-    def _sync_mediastation(self, category, title, task, progress_callback=None, target=None):
+    def _sync_mediastation(
+        self,
+        category,
+        title,
+        task,
+        progress_callback=None,
+        target=None,
+        preferred_scrape_queries=None,
+    ):
         progress = dict(task or {})
         msg_target = self._msg_target(category, target)
         root_openlist_path = msg_target["root_openlist_path"]
@@ -2658,7 +2675,14 @@ class PipelineBotService:
             else:
                 emit({"msg_scrape_status": "running", "msg_media_id": media_id, "msg_media_title": media_title})
                 scrape_result = self._scrape_msg_media(
-                    get_msg_client(), category, media_id, title, progress, media, msg_target
+                    get_msg_client(),
+                    category,
+                    media_id,
+                    title,
+                    progress,
+                    media,
+                    msg_target,
+                    preferred_scrape_queries,
                 )
                 emit({"msg_scrape_status": "success", "msg_media_id": media_id, "msg_media_title": media_title, **scrape_result})
         if not stage_is_complete(progress.get("msg_scrape_status")):
@@ -2780,7 +2804,17 @@ class PipelineBotService:
         except Exception as exc:
             return {"subtitle_match_status": "failed", "subtitle_match_error": str(exc)}
 
-    def _scrape_msg_media(self, client, category, media_id, title, task, media=None, target=None):
+    def _scrape_msg_media(
+        self,
+        client,
+        category,
+        media_id,
+        title,
+        task,
+        media=None,
+        target=None,
+        preferred_queries=None,
+    ):
         root = self._msg_target(category, target)
         provider = root.get("provider")
         media_type = root.get("media_type")
@@ -2788,7 +2822,7 @@ class PipelineBotService:
             media_id,
             category,
             title,
-            msg_scrape_queries(title, task, media),
+            msg_scrape_queries(title, task, media, preferred_queries),
             provider,
             media_type,
         )
@@ -5837,7 +5871,7 @@ def media_search_queries(title, task):
     return out
 
 
-def msg_scrape_queries(title, task, media=None):
+def msg_scrape_queries(title, task, media=None, preferred_queries=None):
     values = []
     for value in ((task or {}).get("openlist_adult_code"), title, (task or {}).get("name"), (task or {}).get("file_name")):
         if value:
@@ -5848,7 +5882,7 @@ def msg_scrape_queries(title, task, media=None):
             if value:
                 values.append(str(value))
 
-    candidates = []
+    candidates = [str(value).strip() for value in preferred_queries or [] if str(value or "").strip()]
     preferred_title = preferred_scrape_title(title)
     if preferred_title:
         candidates.append(preferred_title)
