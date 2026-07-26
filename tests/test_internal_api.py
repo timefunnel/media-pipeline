@@ -82,6 +82,7 @@ class FakePipelineService:
         self.sync_targets = []
         self.sync_titles = []
         self.sync_scrape_queries = []
+        self.sync_upgrade_media_ids = []
         self.sync_input_tasks = []
         self.cancel_calls = []
         self.duplicate_calls = []
@@ -222,11 +223,13 @@ class FakePipelineService:
         progress_callback=None,
         target=None,
         preferred_scrape_queries=None,
+        upgrade_media_id=None,
     ):
         target = dict(target or {})
         self.sync_targets.append(target)
         self.sync_titles.append(title)
         self.sync_scrape_queries.append(list(preferred_scrape_queries or []))
+        self.sync_upgrade_media_ids.append(upgrade_media_id)
         self.sync_input_tasks.append(dict(task or {}))
         if progress_callback:
             progress_callback({**task, "msg_sync_status": "running", "msg_scan_status": "running"})
@@ -724,6 +727,7 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertEqual(service.upgrade_target_calls[-1], ("media-upgrade-target", target_for("adult")))
         self.assertEqual(service.sync_titles[-1], "Upgrade Target")
         self.assertEqual(service.sync_scrape_queries[-1], ["Upgrade Target"])
+        self.assertEqual(service.sync_upgrade_media_ids[-1], "media-upgrade-target")
         self.assertEqual(len(service.submit_uris), 1)
 
     def test_upgrade_can_move_selected_old_version_to_recycle_bin(self):

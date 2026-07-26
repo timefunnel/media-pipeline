@@ -5503,6 +5503,70 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(adult_code_formatted_name("HON-001", "olo@SIS001@HON-001"), "HON-001")
         self.assertEqual(adult_code_formatted_name("HON-001", "hon 001 olo@sis001@hon 001.mp4"), "HON-001.mp4")
 
+    def test_adult_upgrade_keeps_unique_directory_when_standard_code_is_occupied(self):
+        from pipeline.bot import format_openlist_adult_code
+
+        root = "/115/成人"
+        old_path = root + "/MIMK-267"
+        upgrade_path = root + "/MIMK-267-UC"
+        upgrade_size = 6 * 1024 * 1024 * 1024
+        fake_openlist = CleaningOpenList(
+            {
+                root: [
+                    {"name": "MIMK-267", "is_dir": True, "size": 0},
+                    {"name": "MIMK-267-UC", "is_dir": True, "size": 0},
+                ],
+                old_path: [{"name": "MIMK-267.mp4", "is_dir": False, "size": 4 * 1024 * 1024 * 1024}],
+                upgrade_path: [{"name": "release.mp4", "is_dir": False, "size": upgrade_size}],
+            }
+        )
+
+        result = format_openlist_adult_code(
+            fake_openlist,
+            root,
+            ["MIMK-267-UC", "MIMK-267"],
+            task={"size": upgrade_size},
+            allow_existing_target=True,
+        )
+
+        self.assertEqual(result["openlist_adult_format_status"], "skipped")
+        self.assertEqual(result["openlist_adult_format_reason"], "upgrade_target_name_occupied")
+        self.assertEqual(result["openlist_adult_format_path"], upgrade_path)
+        self.assertEqual(fake_openlist.rename_calls, [(upgrade_path + "/release.mp4", "MIMK-267.mp4")])
+
+    def test_adult_normal_import_still_reports_occupied_standard_code(self):
+        from pipeline.bot import format_openlist_adult_code
+
+        root = "/115/成人"
+        upgrade_path = root + "/MIMK-267-UC"
+
+        class CollisionOpenList(CleaningOpenList):
+            def rename_path(self, path, name):
+                if path == upgrade_path and name == "MIMK-267":
+                    raise RuntimeError("OpenList rename failed: file [MIMK-267] exists")
+                return super().rename_path(path, name)
+
+        fake_openlist = CollisionOpenList(
+            {
+                root: [
+                    {"name": "MIMK-267", "is_dir": True, "size": 0},
+                    {"name": "MIMK-267-UC", "is_dir": True, "size": 0},
+                ],
+                root + "/MIMK-267": [
+                    {"name": "MIMK-267.mp4", "is_dir": False, "size": 4 * 1024 * 1024 * 1024}
+                ],
+                upgrade_path: [{"name": "release.mp4", "is_dir": False, "size": 6 * 1024 * 1024 * 1024}],
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, r"file \[MIMK-267\] exists"):
+            format_openlist_adult_code(
+                fake_openlist,
+                root,
+                ["MIMK-267-UC", "MIMK-267"],
+                task={"size": 6 * 1024 * 1024 * 1024},
+            )
+
     def test_sync_completed_adult_task_clears_format_running_when_format_is_skipped(self):
         from pipeline.bot import BotConfig, PipelineBotService
 

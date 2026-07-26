@@ -805,6 +805,7 @@ class ImportTaskManager:
                         progress_callback=save_progress,
                         target=target,
                         preferred_scrape_queries=request.get("upgrade_target_scrape_queries"),
+                        upgrade_media_id=request.get("upgrade_media_id"),
                     )
                 except Exception as exc:
                     current = self.store.get_import(task["owner_id"], task["id"])

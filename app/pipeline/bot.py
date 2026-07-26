@@ -2179,6 +2179,7 @@ class PipelineBotService:
         progress_callback=None,
         target=None,
         preferred_scrape_queries=None,
+        upgrade_media_id=None,
     ):
         out = dict(task or {})
         if not TASK_STATE.is_offline_success(out):
@@ -2201,6 +2202,7 @@ class PipelineBotService:
                 progress_callback=capture_progress,
                 target=target,
                 preferred_scrape_queries=preferred_scrape_queries,
+                upgrade_media_id=upgrade_media_id,
             )
         except MediaStationIngestPending:
             out["msg_sync_status"] = "running"
@@ -2509,6 +2511,7 @@ class PipelineBotService:
         progress_callback=None,
         target=None,
         preferred_scrape_queries=None,
+        upgrade_media_id=None,
     ):
         progress = dict(task or {})
         msg_target = self._msg_target(category, target)
@@ -2542,7 +2545,12 @@ class PipelineBotService:
             if not stage_is_complete(progress.get("openlist_adult_format_status")):
                 emit({"openlist_adult_format_status": "running", "openlist_adult_format_error": None})
                 format_result = self._format_openlist_adult_before_msg(
-                    get_openlist_client(), category, title, progress, root_openlist_path
+                    get_openlist_client(),
+                    category,
+                    title,
+                    progress,
+                    root_openlist_path,
+                    is_upgrade=bool(str(upgrade_media_id or "").strip()),
                 )
                 if format_result.get("openlist_adult_format_status") != "skipped":
                     emit(format_result)
@@ -3150,7 +3158,15 @@ class PipelineBotService:
                 "openlist_cleaned_at": int(time.time()),
             }
 
-    def _format_openlist_adult_before_msg(self, client, category, title, task, root_openlist_path=None):
+    def _format_openlist_adult_before_msg(
+        self,
+        client,
+        category,
+        title,
+        task,
+        root_openlist_path=None,
+        is_upgrade=False,
+    ):
         if category != "adult":
             return {}
         if not self.config.openlist_adult_code_format_enabled:
@@ -3161,6 +3177,7 @@ class PipelineBotService:
                 root_openlist_path or category_to_openlist_path(category),
                 media_search_queries(title, task),
                 task=task,
+                allow_existing_target=is_upgrade,
             )
         except (RuntimeError, ValueError) as exc:
             return {
@@ -6873,7 +6890,7 @@ def clean_openlist_task_media(
     }
 
 
-def format_openlist_adult_code(client, category_path, queries, task=None):
+def format_openlist_adult_code(client, category_path, queries, task=None, allow_existing_target=False):
     target = find_openlist_task_target(client, category_path, queries, task=task)
     if target is None:
         return {
@@ -6896,14 +6913,34 @@ def format_openlist_adult_code(client, category_path, queries, task=None):
     new_name = adult_code_formatted_name(code, old_name)
     new_path = old_path
     renamed_target = False
+    target_name_occupied = False
     if new_name != old_name:
         new_path = posixpath.join(str(target_dir).rstrip("/") or "/", new_name)
-        client.rename_path(old_path, new_name)
-        renamed_target = True
+        target_name_occupied = any(
+            openlist_item_name(item).casefold() == new_name.casefold()
+            and openlist_item_path(target_dir, item) != old_path
+            for item in client.list_all(target_dir, refresh=False)
+        )
+        if not (allow_existing_target and target_name_occupied):
+            client.rename_path(old_path, new_name)
+            renamed_target = True
+        else:
+            new_path = old_path
 
     video_rename = None
     if openlist_item_is_dir(target_item):
         video_rename = format_openlist_adult_main_video(client, new_path, code)
+
+    if target_name_occupied and allow_existing_target:
+        return {
+            "openlist_adult_format_status": "skipped",
+            "openlist_adult_format_reason": "upgrade_target_name_occupied",
+            "openlist_adult_code": code,
+            "openlist_adult_format_path": old_path,
+            "openlist_adult_video_old_path": (video_rename or {}).get("old_path"),
+            "openlist_adult_video_new_path": (video_rename or {}).get("new_path"),
+            "openlist_adult_formatted_at": int(time.time()),
+        }
 
     if not renamed_target and not video_rename:
         return {
