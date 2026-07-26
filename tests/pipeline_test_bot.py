@@ -4852,6 +4852,25 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["msg_scrape_mode"], "apply")
         self.assertEqual(task["msg_scrape_query"], "Godzilla Final Wars")
 
+    def test_upgrade_target_title_precedes_release_noise_for_movie_scrape(self):
+        from pipeline.bot import msg_scrape_queries
+
+        queries = msg_scrape_queries(
+            "黑衣人2",
+            {
+                "name": "Люди в черном 2.2002.UHD.Blu-Ray.Remux.2160p.mkv",
+                "file_name": "Люди в черном 2.2002.UHD.Blu-Ray.Remux.2160p.mkv",
+            },
+            {
+                "title": "REMUX-2160",
+                "path": "cloud://openlist/115/电影/Люди в черном 2.2002.UHD.Blu-Ray.Remux.2160p.mkv",
+            },
+        )
+
+        self.assertEqual(queries[0], "黑衣人2")
+        self.assertNotIn("BDREMUX-2160", queries)
+        self.assertNotIn("REMUX-2160", queries)
+
     def test_adult_scrape_applies_unique_code_match(self):
         from pipeline.bot import BotConfig, PipelineBotService
 

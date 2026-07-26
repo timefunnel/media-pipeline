@@ -383,6 +383,20 @@ SCRAPE_QUERY_NOISE = {
     "特典映像",
     "简繁外挂",
 }
+SCRAPE_RELEASE_MARKERS = (
+    "2160p",
+    "1080p",
+    "720p",
+    "bluray",
+    "bdremux",
+    "remux",
+    "uhdbd",
+    "uhdbluray",
+    "webrip",
+    "webdl",
+    "x264",
+    "x265",
+)
 TYPING_ACTION_INTERVAL_SECONDS = 4
 
 
@@ -5835,6 +5849,9 @@ def msg_scrape_queries(title, task, media=None):
                 values.append(str(value))
 
     candidates = []
+    preferred_title = preferred_scrape_title(title)
+    if preferred_title:
+        candidates.append(preferred_title)
     for value in values:
         candidates.extend(extract_codes(value))
         candidates.extend(extract_title_fragments(value, allow_english=True))
@@ -5850,6 +5867,18 @@ def msg_scrape_queries(title, task, media=None):
             seen.add(key)
             out.append(text)
     return out
+
+
+def preferred_scrape_title(value):
+    text = str(value or "").strip()
+    if not is_useful_scrape_query(text) or extract_codes(text):
+        return ""
+    normalized = normalize_fragment(text)
+    if "[" in text or "]" in text:
+        return ""
+    if any(marker in normalized for marker in SCRAPE_RELEASE_MARKERS):
+        return ""
+    return text
 
 
 def duplicate_media_queries(category, query, candidate):

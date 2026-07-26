@@ -11,6 +11,7 @@ FC2_LEGACY_PATTERN = re.compile(r"(?<![A-Za-z0-9])FC2[\s._-]+(\d{5,10})(?:[\s._-
 CODE_PREFIX_DENYLIST = {
     "AAC",
     "BD",
+    "BDREMUX",
     "BDRIP",
     "BLURAY",
     "DTS",
@@ -23,6 +24,7 @@ CODE_PREFIX_DENYLIST = {
     "H265",
     "IMAX",
     "MP4",
+    "REMUX",
     "TRUEHD",
     "UHD",
     "UHDBD",
