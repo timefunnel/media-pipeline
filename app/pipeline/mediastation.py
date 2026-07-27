@@ -34,6 +34,16 @@ CODE_PREFIX_DENYLIST = {
     "X264",
     "X265",
 }
+
+
+def header_positive_int(headers, name):
+    try:
+        value = int(float(str(headers.get(name) or "0")))
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
 class MediaStationTransport:
     def request(self, method, url, headers=None, data=None, timeout=None):
         req_headers = dict(headers or {})
@@ -206,7 +216,27 @@ class MediaStationClient:
             "/pipeline/media/%s/subtitle-status" % quote_path(media_id),
         )
 
-    def download_pipeline_asr_audio(self, media_id, target_path, timeout=1800, max_bytes=250 * 1024 * 1024, retry=True):
+    def pipeline_translate_subtitles(self, provider, model, segments):
+        return self._pipeline_request(
+            "POST",
+            "/pipeline/subtitles/translate",
+            {
+                "provider": str(provider or "").strip(),
+                "model": str(model or "").strip(),
+                "segments": list(segments or []),
+            },
+            timeout=120,
+        )
+
+    def download_pipeline_asr_audio(
+        self,
+        media_id,
+        target_path,
+        timeout=1800,
+        max_bytes=250 * 1024 * 1024,
+        retry=True,
+        progress_callback=None,
+    ):
         if not self.access_token:
             self.login()
         headers = {"Authorization": "Bearer " + self.access_token, "Accept": "audio/mpeg"}
@@ -227,19 +257,30 @@ class MediaStationClient:
                     timeout=timeout,
                     max_bytes=max_bytes,
                     retry=False,
+                    progress_callback=progress_callback,
                 )
             raise
+        duration_seconds = header_positive_int(response.headers, "X-Media-Duration-Seconds")
+        bitrate_bps = header_positive_int(response.headers, "X-ASR-Audio-Bitrate") or 48000
         written = 0
         try:
             with response, open(target_path, "wb") as output:
+                if progress_callback is not None:
+                    progress_callback(0, duration_seconds)
                 while True:
-                    chunk = response.read(1024 * 1024)
+                    chunk = response.read(64 * 1024)
                     if not chunk:
                         break
                     written += len(chunk)
                     if written > int(max_bytes):
                         raise RuntimeError("MediaStationGo ASR audio exceeds the size limit")
                     output.write(chunk)
+                    if progress_callback is not None:
+                        extracted_seconds = int(written * 8 / bitrate_bps)
+                        progress_callback(
+                            min(extracted_seconds, duration_seconds) if duration_seconds > 0 else extracted_seconds,
+                            duration_seconds,
+                        )
         except Exception:
             try:
                 os.unlink(target_path)
@@ -252,6 +293,8 @@ class MediaStationClient:
             except FileNotFoundError:
                 pass
             raise RuntimeError("MediaStationGo ASR audio response was empty")
+        if progress_callback is not None and duration_seconds > 0:
+            progress_callback(duration_seconds, duration_seconds)
         return written
 
     def pipeline_replace_work_source(self, old_media_id, new_media_id, target, new_openlist_paths):
@@ -264,21 +307,27 @@ class MediaStationClient:
             data=payload,
         )
 
-    def _request(self, method, path, data=None, retry=True):
+    def _request(self, method, path, data=None, retry=True, timeout=None):
         if not self.access_token:
             self.login()
         headers = {"Authorization": "Bearer " + self.access_token}
         try:
-            return self.transport.request(method, self._url(path), headers=headers, data=data, timeout=self.timeout)
+            return self.transport.request(
+                method,
+                self._url(path),
+                headers=headers,
+                data=data,
+                timeout=self.timeout if timeout is None else timeout,
+            )
         except MediaStationApiError as exc:
             if retry and exc.status_code == 401:
                 self.access_token = None
                 self.login()
-                return self._request(method, path, data=data, retry=False)
+                return self._request(method, path, data=data, retry=False, timeout=timeout)
             raise
 
-    def _pipeline_request(self, method, path, data=None):
-        response = self._request(method, path, data=data)
+    def _pipeline_request(self, method, path, data=None, timeout=None):
+        response = self._request(method, path, data=data, timeout=timeout)
         if not isinstance(response, dict) or response.get("code") != 0 or not isinstance(response.get("data"), dict):
             raise RuntimeError("MediaStationGo pipeline API returned invalid response")
         return response["data"]

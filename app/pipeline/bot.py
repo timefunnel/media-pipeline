@@ -485,6 +485,7 @@ class BotConfig:
     asr_translation_api_key: str = ""
     asr_translation_timeout_seconds: int = DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS
     asr_translation_thinking_disabled: bool = True
+    asr_cache_dir: str = "/bot-data/subtitle-asr-cache"
     p115_cookie: str = ""
     internal_api_enabled: bool = False
     internal_api_token: str = ""
@@ -671,6 +672,7 @@ class BotConfig:
                 env.get("ASR_TRANSLATION_THINKING_DISABLED"),
                 parse_bool(env.get("LLM_THINKING_DISABLED"), True),
             ),
+            asr_cache_dir=env.get("ASR_CACHE_DIR", "/bot-data/subtitle-asr-cache"),
             p115_cookie=(
                 env.get("P115_COOKIE")
                 or env.get("SHARE115_COOKIE")

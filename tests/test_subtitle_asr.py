@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,7 +21,9 @@ for category in ("movie", "tv", "anime", "adult", "other"):
 from pipeline.bot import BotConfig
 from pipeline.internal_api import InternalApiApplication, InternalApiStore, SubtitleAsrTaskManager
 from pipeline.subtitle_asr import (
+    MediaStationTranslationClient,
     SenseVoiceClient,
+    SubtitleAsrProcessor,
     SubtitleTranslationClient,
     build_srt,
     validate_asr_segments,
@@ -119,22 +122,62 @@ class SubtitleTranslationTest(unittest.TestCase):
                 ]
             )
 
+    def test_cloud_translation_uses_mediastation_proxy(self):
+        msg_client = FakeCloudTranslationClient()
+        client = MediaStationTranslationClient(msg_client, "deepseek", "deepseek-chat")
+        result = client.translate(
+            [{"id": 0, "start": 0.0, "end": 1.0, "text": "hello"}]
+        )
+        self.assertEqual(result[0]["text"], "你好")
+        self.assertEqual(msg_client.calls[0][0:2], ("deepseek", "deepseek-chat"))
+
     def test_asr_segments_require_real_ordered_timeline(self):
         with self.assertRaisesRegex(RuntimeError, "timeline"):
             validate_asr_segments([{"id": 0, "start": 1, "end": 1, "text": "invalid"}])
+
+
+class FakeCloudTranslationClient:
+    def __init__(self):
+        self.calls = []
+
+    def pipeline_translate_subtitles(self, provider, model, segments):
+        self.calls.append((provider, model, segments))
+        return {"translations": [{"id": item["id"], "text": "你好"} for item in segments]}
 
 
 class FakeSubtitleAsrProcessor:
     def __init__(self):
         self.ensure_calls = 0
         self.run_calls = []
+        self.deleted_cache_ids = []
+        self.cache = (True, True)
+        self.config = SimpleNamespace(asr_translation_model="fake-model")
 
-    def ensure_available(self):
+    def ensure_available(self, translation_provider="local", translation_model=""):
         self.ensure_calls += 1
 
-    def run(self, media_id, source_language, progress_callback=None):
+    def translation_models(self):
+        return ["fake-model", "other-model"]
+
+    def cache_state(self, _task_id):
+        return self.cache
+
+    def delete_cache(self, task_id):
+        self.deleted_cache_ids.append(task_id)
+
+    def run(
+        self,
+        task_id,
+        media_id,
+        source_language,
+        translation_provider="local",
+        translation_model="",
+        progress_callback=None,
+        cache_callback=None,
+    ):
         self.run_calls.append((media_id, source_language))
-        progress_callback("extracting_audio", 0, 0)
+        progress_callback("extracting_audio", 30, 120)
+        cache_callback(True, True)
         progress_callback("translating", 1, 1)
         return {
             "filename": "sensevoice-qwen-zh-cn.srt",
@@ -203,6 +246,90 @@ class SubtitleAsrTaskTest(unittest.TestCase):
 
         self.assertEqual([task["id"] for task in listed], [queued["id"], completed["id"]])
         self.assertEqual(listed[1]["result"]["filename"], "completed.zh-CN.srt")
+
+    def test_failed_task_retry_keeps_id_and_cached_artifacts(self):
+        task, _ = self.store.create_subtitle_asr_task(
+            "admin", "media-retry", "ja", "local", "fake-model"
+        )
+        self.store.finish_subtitle_asr_task(task["id"], "failed", "failed", error="translation failed")
+
+        retried = self.manager.retry_task(
+            "admin",
+            task["id"],
+            {"translation_provider": "local", "translation_model": "other-model"},
+        )
+
+        self.assertEqual(retried["id"], task["id"])
+        self.assertEqual(retried["status"], "queued")
+        self.assertEqual(retried["translation_model"], "other-model")
+        self.assertTrue(retried["cached_audio"])
+        self.assertTrue(retried["cached_transcript"])
+
+    def test_finished_task_delete_removes_cache_and_row(self):
+        task, _ = self.store.create_subtitle_asr_task("admin", "media-delete", "auto")
+        self.store.finish_subtitle_asr_task(task["id"], "failed", "failed", error="failed")
+
+        self.manager.delete_task("admin", task["id"])
+
+        self.assertEqual(self.processor.deleted_cache_ids, [task["id"]])
+        with self.assertRaisesRegex(Exception, "not found"):
+            self.store.get_subtitle_asr_task("admin", task["id"])
+
+    def test_active_task_delete_is_rejected(self):
+        task, _ = self.store.create_subtitle_asr_task("admin", "media-active", "auto")
+        with self.assertRaisesRegex(Exception, "active"):
+            self.manager.delete_task("admin", task["id"])
+
+    def test_local_model_list_is_exposed(self):
+        self.assertEqual(self.application.list_subtitle_asr_models(), {"models": ["fake-model", "other-model"]})
+
+
+class SubtitleAsrCacheReuseTest(unittest.TestCase):
+    def test_cached_audio_and_transcript_skip_download_and_transcription(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            cache_dir = root / "cache" / ("a" * 32)
+            cache_dir.mkdir(parents=True)
+            (cache_dir / "audio.mp3").write_bytes(b"audio")
+            (cache_dir / "transcript.json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {"id": 0, "start": 0.0, "end": 1.5, "text": "hello"}
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = SimpleNamespace(
+                asr_cache_dir=str(root / "cache"),
+                subtitle_cache_dir=str(root / "subtitles"),
+            )
+            processor = SubtitleAsrProcessor(config)
+            processor._msg_client = lambda: self.fail("cached audio must skip MediaStationGo download")
+            processor._asr_client = lambda: self.fail("cached transcript must skip SenseVoice")
+            processor._translation_client = lambda _provider, _model: FakeCachedTranslationClient()
+            progress = []
+
+            result = processor.run(
+                "a" * 32,
+                "media-1",
+                "en",
+                translation_provider="local",
+                translation_model="fake-model",
+                progress_callback=lambda stage, current, total: progress.append((stage, current, total)),
+            )
+
+            self.assertEqual(result["translation_model"], "fake-model")
+            self.assertIn(("using_cached_audio", 1, 1), progress)
+            self.assertIn(("using_cached_transcript", 1, 1), progress)
+
+
+class FakeCachedTranslationClient:
+    def translate(self, segments, progress_callback=None):
+        if progress_callback is not None:
+            progress_callback(1, 1)
+        return [{**segment, "text": "你好"} for segment in segments]
 
 
 class SubtitleAsrConfigTest(unittest.TestCase):

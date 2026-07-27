@@ -3,7 +3,6 @@ import json
 import math
 import os
 import shutil
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +23,7 @@ DEFAULT_ASR_MAX_AUDIO_BYTES = 250 * 1024 * 1024
 ASR_SOURCE_LANGUAGES = {"auto", "ja", "en", "zh", "ko"}
 ASR_SUBTITLE_SOURCE = "sensevoice-qwen"
 ASR_SUBTITLE_PROVIDER_ID = "sensevoice-qwen:zh-CN"
+ASR_TRANSLATION_PROVIDERS = {"local", "openai", "deepseek", "siliconflow"}
 
 
 class SenseVoiceClient:
@@ -57,7 +57,42 @@ class SenseVoiceClient:
             raise RuntimeError("AI subtitle translation service is unavailable")
         return payload
 
-    def transcribe(self, audio_path, language="auto"):
+    def models(self):
+        request = urllib.request.Request(
+            self.base_url + "/v1/models",
+            headers={"Authorization": "Bearer " + self.api_token, "Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=min(10, self.timeout)) as response:
+                raw = response.read(4 * 1024 * 1024 + 1)
+        except (OSError, TimeoutError, urllib.error.URLError) as exc:
+            raise RuntimeError("SenseVoice model list is unreachable: %s" % exc) from exc
+        if len(raw) > 4 * 1024 * 1024:
+            raise RuntimeError("SenseVoice model list is too large")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("SenseVoice model list is invalid") from exc
+        values = payload.get("data") if isinstance(payload, dict) else None
+        models = []
+        seen = set()
+        for item in values if isinstance(values, list) else []:
+            model_id = str(item.get("id") or "").strip() if isinstance(item, dict) else ""
+            if model_id and model_id not in seen:
+                seen.add(model_id)
+                models.append(model_id)
+        if not models:
+            raise RuntimeError("SenseVoice service returned no installed translation models")
+        return models
+
+    def transcribe(
+        self,
+        audio_path,
+        language="auto",
+        upload_progress_callback=None,
+        inference_callback=None,
+    ):
         language = str(language or "auto").strip().lower()
         if language not in ASR_SOURCE_LANGUAGES:
             raise RuntimeError("unsupported ASR source language: %s" % language)
@@ -80,13 +115,22 @@ class SenseVoiceClient:
             connection.putheader("Content-Length", str(content_length))
             connection.endheaders()
             connection.send(preamble)
+            sent = 0
+            audio_size = audio_path.stat().st_size
+            if upload_progress_callback is not None:
+                upload_progress_callback(0, audio_size)
             with audio_path.open("rb") as audio:
                 while True:
-                    chunk = audio.read(1024 * 1024)
+                    chunk = audio.read(256 * 1024)
                     if not chunk:
                         break
                     connection.send(chunk)
+                    sent += len(chunk)
+                    if upload_progress_callback is not None:
+                        upload_progress_callback(sent, audio_size)
             connection.send(epilogue)
+            if inference_callback is not None:
+                inference_callback()
             response = connection.getresponse()
             raw = response.read(32 * 1024 * 1024 + 1)
             if len(raw) > 32 * 1024 * 1024:
@@ -178,54 +222,129 @@ class SubtitleTranslationClient:
         values = result.get("translations") if isinstance(result, dict) else None
         if not isinstance(values, list):
             raise RuntimeError("AI translation response is missing translations")
-        expected_ids = [item["id"] for item in segments]
+        return validate_translations(values, [item["id"] for item in segments])
+
+
+class MediaStationTranslationClient:
+    def __init__(self, msg_client, provider, model):
+        self.msg_client = msg_client
+        self.provider = require_translation_provider(provider)
+        self.model = str(model or "").strip()
+        if self.provider == "local":
+            raise RuntimeError("local translation must use the configured local client")
+        if not self.model:
+            raise RuntimeError("AI translation model missing")
+
+    def translate(self, segments, progress_callback=None):
+        segments = validate_asr_segments(segments)
+        batches = translation_batches(segments)
         translated = []
-        seen = set()
-        for item in values:
-            if not isinstance(item, dict) or not isinstance(item.get("id"), int):
-                raise RuntimeError("AI translation returned an invalid segment")
-            segment_id = item["id"]
-            text = str(item.get("text") or "").strip()
-            if segment_id in seen or not text:
-                raise RuntimeError("AI translation returned duplicate or empty segments")
-            seen.add(segment_id)
-            translated.append({"id": segment_id, "text": text})
-        if [item["id"] for item in translated] != expected_ids:
-            raise RuntimeError("AI translation segment IDs do not match the requested batch")
-        return translated
+        for index, batch in enumerate(batches, start=1):
+            response = self.msg_client.pipeline_translate_subtitles(self.provider, self.model, batch)
+            values = response.get("translations") if isinstance(response, dict) else None
+            translated.extend(validate_translations(values, [item["id"] for item in batch]))
+            if progress_callback is not None:
+                progress_callback(index, len(batches))
+        if [item["id"] for item in translated] != [item["id"] for item in segments]:
+            raise RuntimeError("AI translation segment IDs do not match the ASR timeline")
+        by_id = {item["id"]: item["text"] for item in translated}
+        return [{**item, "text": by_id[item["id"]]} for item in segments]
 
 
 class SubtitleAsrProcessor:
     def __init__(self, config):
         self.config = config
 
-    def ensure_available(self):
+    def ensure_available(self, translation_provider="local", translation_model=""):
         if self.config is None or not bool(getattr(self.config, "asr_enabled", False)):
             raise RuntimeError("AI subtitle generation is disabled")
         if not bool(getattr(self.config, "msg_enabled", False)):
             raise RuntimeError("MediaStationGo is disabled in media-pipeline")
         client = self._asr_client()
         client.health()
-        self._translation_client()
+        provider = require_translation_provider(translation_provider)
+        if provider == "local":
+            model = str(translation_model or getattr(self.config, "asr_translation_model", "")).strip()
+            if model not in client.models():
+                raise RuntimeError("local translation model is not installed: %s" % model)
+            self._translation_client(provider, model)
 
-    def run(self, media_id, source_language, progress_callback=None):
+    def translation_models(self):
+        self.ensure_asr_available()
+        return self._asr_client().models()
+
+    def ensure_asr_available(self):
+        if self.config is None or not bool(getattr(self.config, "asr_enabled", False)):
+            raise RuntimeError("AI subtitle generation is disabled")
+        if not bool(getattr(self.config, "msg_enabled", False)):
+            raise RuntimeError("MediaStationGo is disabled in media-pipeline")
+        self._asr_client().health()
+
+    def run(
+        self,
+        task_id,
+        media_id,
+        source_language,
+        translation_provider="local",
+        translation_model="",
+        progress_callback=None,
+        cache_callback=None,
+    ):
         source_language = str(source_language or "auto").strip().lower()
         if source_language not in ASR_SOURCE_LANGUAGES:
             raise RuntimeError("unsupported ASR source language: %s" % source_language)
-        temp_root = tempfile.mkdtemp(prefix="media-pipeline-asr-")
-        audio_path = os.path.join(temp_root, "audio.mp3")
-        try:
+        provider = require_translation_provider(translation_provider)
+        model = str(translation_model or "").strip()
+        if not model:
+            raise RuntimeError("AI translation model missing")
+        cache_dir = self._task_cache_dir(task_id)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = cache_dir / "audio.mp3"
+        transcript_path = cache_dir / "transcript.json"
+        if not audio_path.is_file() or audio_path.stat().st_size <= 0:
+            partial_audio = cache_dir / "audio.mp3.partial"
+            partial_audio.unlink(missing_ok=True)
             emit_progress(progress_callback, "extracting_audio", 0, 0)
             self._msg_client().download_pipeline_asr_audio(
                 media_id,
-                audio_path,
+                partial_audio,
                 timeout=self._timeout(),
                 max_bytes=DEFAULT_ASR_MAX_AUDIO_BYTES,
+                progress_callback=lambda current, total: emit_progress(
+                    progress_callback, "extracting_audio", current, total
+                ),
             )
-            emit_progress(progress_callback, "transcribing", 0, 0)
-            transcript = self._asr_client().transcribe(audio_path, source_language)
+            os.replace(partial_audio, audio_path)
+            emit_cache(cache_callback, True, False)
+        else:
+            emit_progress(progress_callback, "using_cached_audio", 1, 1)
+            emit_cache(cache_callback, True, False)
+
+        if transcript_path.is_file():
+            transcript = load_cached_transcript(transcript_path)
+            emit_progress(progress_callback, "using_cached_transcript", 1, 1)
+            emit_cache(cache_callback, True, True)
+        else:
+            emit_progress(progress_callback, "uploading_audio", 0, audio_path.stat().st_size)
+
+            def uploaded_audio(current, total):
+                emit_progress(progress_callback, "uploading_audio", current, total)
+
+            transcript = self._asr_client().transcribe(
+                audio_path,
+                source_language,
+                upload_progress_callback=uploaded_audio,
+                inference_callback=lambda: emit_progress(
+                    progress_callback, "transcribing", 0, 0
+                ),
+            )
             if not isinstance(transcript, dict):
                 raise RuntimeError("SenseVoice ASR returned an invalid response")
+            validate_asr_segments(transcript.get("segments"))
+            atomic_write_json(transcript_path, transcript)
+            emit_cache(cache_callback, True, True)
+
+        try:
             segments = validate_asr_segments(transcript.get("segments"))
             batch_total = len(translation_batches(segments))
             emit_progress(progress_callback, "translating", 0, batch_total)
@@ -233,7 +352,9 @@ class SubtitleAsrProcessor:
             def translated_batch(current, total):
                 emit_progress(progress_callback, "translating", current, total)
 
-            translated = self._translation_client().translate(segments, progress_callback=translated_batch)
+            translated = self._translation_client(provider, model).translate(
+                segments, progress_callback=translated_batch
+            )
             emit_progress(progress_callback, "saving", batch_total, batch_total)
             subtitle = build_srt(translated)
             track = SubtitleCache(self.config.subtitle_cache_dir).save_download(
@@ -254,9 +375,35 @@ class SubtitleAsrProcessor:
                 "language": "zh-CN",
                 "segment_count": len(translated),
                 "duration": float(translated[-1]["end"]),
+                "translation_provider": provider,
+                "translation_model": model,
             }
-        finally:
-            shutil.rmtree(temp_root, ignore_errors=True)
+        except Exception:
+            emit_cache(cache_callback, audio_path.is_file(), transcript_path.is_file())
+            raise
+
+    def cache_state(self, task_id):
+        cache_dir = self._task_cache_dir(task_id)
+        audio_path = cache_dir / "audio.mp3"
+        transcript_path = cache_dir / "transcript.json"
+        audio_cached = audio_path.is_file() and audio_path.stat().st_size > 0
+        transcript_cached = False
+        if transcript_path.is_file():
+            load_cached_transcript(transcript_path)
+            transcript_cached = True
+        return audio_cached, transcript_cached
+
+    def delete_cache(self, task_id):
+        cache_dir = self._task_cache_dir(task_id)
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+
+    def _task_cache_dir(self, task_id):
+        task_id = str(task_id or "").strip()
+        if not task_id or any(char not in "0123456789abcdef" for char in task_id.lower()):
+            raise RuntimeError("invalid AI subtitle task ID")
+        root = Path(getattr(self.config, "asr_cache_dir", "/bot-data/subtitle-asr-cache"))
+        return root / task_id
 
     def _timeout(self):
         return max(1, int(getattr(self.config, "asr_timeout_seconds", DEFAULT_ASR_TIMEOUT_SECONDS)))
@@ -269,14 +416,16 @@ class SubtitleAsrProcessor:
             timeout=self._timeout(),
         )
 
-    def _translation_client(self):
-        return SubtitleTranslationClient(
-            getattr(self.config, "asr_translation_base_url", ""),
-            getattr(self.config, "asr_translation_api_key", ""),
-            getattr(self.config, "asr_translation_model", ""),
-            getattr(self.config, "asr_translation_timeout_seconds", DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS),
-            thinking_disabled=getattr(self.config, "asr_translation_thinking_disabled", True),
-        )
+    def _translation_client(self, provider, model):
+        if provider == "local":
+            return SubtitleTranslationClient(
+                getattr(self.config, "asr_translation_base_url", ""),
+                getattr(self.config, "asr_translation_api_key", ""),
+                model,
+                getattr(self.config, "asr_translation_timeout_seconds", DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS),
+                thinking_disabled=getattr(self.config, "asr_translation_thinking_disabled", True),
+            )
+        return MediaStationTranslationClient(self._msg_client(), provider, model)
 
     def _msg_client(self):
         username = str(getattr(self.config, "msg_admin_user", "") or "").strip()
@@ -328,6 +477,59 @@ def validate_asr_segments(values):
             raise RuntimeError("SenseVoice ASR returned an invalid segment timeline")
         out.append({"id": segment_id, "start": float(start), "end": float(end), "text": text})
     return out
+
+
+def validate_translations(values, expected_ids):
+    if not isinstance(values, list):
+        raise RuntimeError("AI translation response is missing translations")
+    translated = []
+    seen = set()
+    for item in values:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), int):
+            raise RuntimeError("AI translation returned an invalid segment")
+        segment_id = item["id"]
+        text = str(item.get("text") or "").strip()
+        if segment_id in seen or not text:
+            raise RuntimeError("AI translation returned duplicate or empty segments")
+        seen.add(segment_id)
+        translated.append({"id": segment_id, "text": text})
+    if [item["id"] for item in translated] != list(expected_ids):
+        raise RuntimeError("AI translation segment IDs do not match the requested batch")
+    return translated
+
+
+def require_translation_provider(provider):
+    provider = str(provider or "local").strip().lower()
+    if provider not in ASR_TRANSLATION_PROVIDERS:
+        raise RuntimeError("unsupported AI translation provider: %s" % provider)
+    return provider
+
+
+def load_cached_transcript(path):
+    try:
+        with Path(path).open("r", encoding="utf-8") as source:
+            payload = json.load(source)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("cached SenseVoice transcript is invalid: %s" % exc) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("cached SenseVoice transcript is invalid")
+    validate_asr_segments(payload.get("segments"))
+    return payload
+
+
+def atomic_write_json(path, payload):
+    path = Path(path)
+    partial = path.with_name(path.name + ".partial")
+    with partial.open("w", encoding="utf-8", newline="\n") as output:
+        json.dump(payload, output, ensure_ascii=False, separators=(",", ":"))
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(partial, path)
+
+
+def emit_cache(callback, audio_cached, transcript_cached):
+    if callback is not None:
+        callback(bool(audio_cached), bool(transcript_cached))
 
 
 def translation_batches(segments):
