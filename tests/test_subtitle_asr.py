@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +19,37 @@ for category in ("movie", "tv", "anime", "adult", "other"):
 
 from pipeline.bot import BotConfig
 from pipeline.internal_api import InternalApiApplication, InternalApiStore, SubtitleAsrTaskManager
-from pipeline.subtitle_asr import SubtitleTranslationClient, build_srt, validate_asr_segments
+from pipeline.subtitle_asr import (
+    SenseVoiceClient,
+    SubtitleTranslationClient,
+    build_srt,
+    validate_asr_segments,
+)
+
+
+class FakeHttpResponse:
+    def __init__(self, payload):
+        self.body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self, _limit):
+        return self.body
+
+
+class SenseVoiceHealthTest(unittest.TestCase):
+    @patch("pipeline.subtitle_asr.urllib.request.urlopen")
+    def test_health_rejects_explicitly_unavailable_translation_service(self, urlopen):
+        urlopen.return_value = FakeHttpResponse(
+            {"status": "ok", "cuda_available": True, "llm_available": False}
+        )
+        client = SenseVoiceClient("http://10.77.0.5:17860", "secret")
+        with self.assertRaisesRegex(RuntimeError, "translation service is unavailable"):
+            client.health()
 
 
 class FakeTranslationTransport:

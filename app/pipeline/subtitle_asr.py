@@ -53,6 +53,8 @@ class SenseVoiceClient:
             raise RuntimeError("SenseVoice ASR health check failed")
         if payload.get("cuda_available") is not True:
             raise RuntimeError("SenseVoice ASR reports CUDA unavailable")
+        if payload.get("llm_available") is False:
+            raise RuntimeError("AI subtitle translation service is unavailable")
         return payload
 
     def transcribe(self, audio_path, language="auto"):
