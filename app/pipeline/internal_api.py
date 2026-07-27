@@ -606,6 +606,25 @@ class InternalApiStore:
             raise ApiError(404, "subtitle_asr_task_not_found", "AI subtitle task not found")
         return subtitle_asr_task_row(row)
 
+    def list_subtitle_asr_tasks(self, limit=50):
+        limit = max(1, min(int(limit or 50), 200))
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                select * from internal_api_subtitle_asr_tasks
+                order by
+                    case when status in ('queued', 'running') then 0 else 1 end,
+                    updated_at desc,
+                    id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [subtitle_asr_task_row(row) for row in rows]
+
     def claim_next_subtitle_asr_task(self):
         conn = self._connect()
         try:
@@ -1150,6 +1169,9 @@ class SubtitleAsrTaskManager:
             require_text(task_id, "task_id", max_length=200),
         )
 
+    def list_tasks(self, limit=50):
+        return self.store.list_subtitle_asr_tasks(limit)
+
     def _worker_loop(self):
         while not self._stop_event.is_set():
             try:
@@ -1337,6 +1359,11 @@ class InternalApiApplication:
             raise ApiError(503, "subtitle_asr_unavailable", "AI subtitle task manager unavailable")
         return self.subtitle_asr_manager.get_task(owner_id, task_id)
 
+    def list_subtitle_asr(self, limit=50):
+        if self.subtitle_asr_manager is None:
+            raise ApiError(503, "subtitle_asr_unavailable", "AI subtitle task manager unavailable")
+        return {"items": self.subtitle_asr_manager.list_tasks(limit)}
+
     def _subtitle_candidate(self, payload):
         owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
         media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
@@ -1449,6 +1476,14 @@ class InternalApiServer:
             if handler.command == "POST" and path == "/v1/subtitles/asr":
                 task, created = self.application.create_subtitle_asr(self._read_json(handler))
                 self._send_json(handler, 202 if created else 200, task)
+                return
+            if handler.command == "GET" and path == "/v1/subtitles/asr":
+                raw_limit = (query.get("limit") or ["50"])[0]
+                try:
+                    limit = int(raw_limit)
+                except (TypeError, ValueError):
+                    raise ApiError(400, "invalid_limit", "limit must be an integer")
+                self._send_json(handler, 200, self.application.list_subtitle_asr(limit))
                 return
             subtitle_asr_task_id = subtitle_asr_task_path_match(path)
             if handler.command == "GET" and subtitle_asr_task_id:

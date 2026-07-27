@@ -189,6 +189,21 @@ class SubtitleAsrTaskTest(unittest.TestCase):
         self.assertEqual(recovered["status"], "queued")
         self.assertEqual(recovered["stage"], "queued")
 
+    def test_task_list_keeps_active_tasks_visible_before_recent_results(self):
+        completed, _ = self.store.create_subtitle_asr_task("admin", "media-completed", "ja")
+        self.store.finish_subtitle_asr_task(
+            completed["id"],
+            "completed",
+            "completed",
+            result={"filename": "completed.zh-CN.srt", "segment_count": 8},
+        )
+        queued, _ = self.store.create_subtitle_asr_task("admin", "media-queued", "en")
+
+        listed = self.application.list_subtitle_asr(50)["items"]
+
+        self.assertEqual([task["id"] for task in listed], [queued["id"], completed["id"]])
+        self.assertEqual(listed[1]["result"]["filename"], "completed.zh-CN.srt")
+
 
 class SubtitleAsrConfigTest(unittest.TestCase):
     def base_env(self):
