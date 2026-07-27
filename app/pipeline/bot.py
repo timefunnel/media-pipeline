@@ -480,7 +480,11 @@ class BotConfig:
     asr_api_token: str = ""
     asr_model: str = DEFAULT_ASR_MODEL
     asr_timeout_seconds: int = DEFAULT_ASR_TIMEOUT_SECONDS
+    asr_translation_base_url: str = DEFAULT_LLM_BASE_URL
+    asr_translation_model: str = DEFAULT_LLM_MODEL
+    asr_translation_api_key: str = ""
     asr_translation_timeout_seconds: int = DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS
+    asr_translation_thinking_disabled: bool = True
     p115_cookie: str = ""
     internal_api_enabled: bool = False
     internal_api_token: str = ""
@@ -522,12 +526,25 @@ class BotConfig:
         asr_enabled = parse_bool(env.get("ASR_ENABLED"), False)
         asr_base_url = (env.get("ASR_BASE_URL") or "").strip()
         asr_api_token = (env.get("ASR_API_TOKEN") or "").strip()
+        asr_translation_base_url = (
+            env.get("ASR_TRANSLATION_BASE_URL") or env.get("LLM_BASE_URL") or DEFAULT_LLM_BASE_URL
+        ).strip()
+        asr_translation_model = (
+            env.get("ASR_TRANSLATION_MODEL") or env.get("LLM_MODEL") or DEFAULT_LLM_MODEL
+        ).strip()
+        asr_translation_api_key = (
+            env.get("ASR_TRANSLATION_API_KEY") or llm_api_key
+        ).strip()
         if asr_enabled and not asr_base_url:
             raise RuntimeError("ASR_BASE_URL missing")
         if asr_enabled and not asr_api_token:
             raise RuntimeError("ASR_API_TOKEN missing")
-        if asr_enabled and not llm_api_key:
-            raise RuntimeError("LLM_API_KEY missing for AI subtitle translation")
+        if asr_enabled and not asr_translation_base_url:
+            raise RuntimeError("ASR_TRANSLATION_BASE_URL missing")
+        if asr_enabled and not asr_translation_model:
+            raise RuntimeError("ASR_TRANSLATION_MODEL missing")
+        if asr_enabled and not asr_translation_api_key:
+            raise RuntimeError("ASR_TRANSLATION_API_KEY missing")
 
         return cls(
             token=token,
@@ -638,6 +655,9 @@ class BotConfig:
                 1,
                 int(env.get("ASR_TIMEOUT_SECONDS", str(DEFAULT_ASR_TIMEOUT_SECONDS))),
             ),
+            asr_translation_base_url=asr_translation_base_url,
+            asr_translation_model=asr_translation_model,
+            asr_translation_api_key=asr_translation_api_key,
             asr_translation_timeout_seconds=max(
                 1,
                 int(
@@ -646,6 +666,10 @@ class BotConfig:
                         str(DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS),
                     )
                 ),
+            ),
+            asr_translation_thinking_disabled=parse_bool(
+                env.get("ASR_TRANSLATION_THINKING_DISABLED"),
+                parse_bool(env.get("LLM_THINKING_DISABLED"), True),
             ),
             p115_cookie=(
                 env.get("P115_COOKIE")

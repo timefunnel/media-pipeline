@@ -22,8 +22,8 @@ DEFAULT_ASR_TRANSLATION_BATCH_SEGMENTS = 25
 DEFAULT_ASR_TRANSLATION_BATCH_CHARS = 3500
 DEFAULT_ASR_MAX_AUDIO_BYTES = 250 * 1024 * 1024
 ASR_SOURCE_LANGUAGES = {"auto", "ja", "en", "zh", "ko"}
-ASR_SUBTITLE_SOURCE = "sensevoice-deepseek"
-ASR_SUBTITLE_PROVIDER_ID = "sensevoice-deepseek:zh-CN"
+ASR_SUBTITLE_SOURCE = "sensevoice-qwen"
+ASR_SUBTITLE_PROVIDER_ID = "sensevoice-qwen:zh-CN"
 
 
 class SenseVoiceClient:
@@ -112,11 +112,11 @@ class SubtitleTranslationClient:
         self.thinking_disabled = bool(thinking_disabled)
         self.transport = transport or LlmTransport()
         if not self.base_url:
-            raise RuntimeError("LLM_BASE_URL missing")
+            raise RuntimeError("AI translation base URL missing")
         if not self.api_key:
-            raise RuntimeError("LLM_API_KEY missing for AI subtitle translation")
+            raise RuntimeError("AI translation API key missing")
         if not self.model:
-            raise RuntimeError("LLM_MODEL missing for AI subtitle translation")
+            raise RuntimeError("AI translation model missing")
 
     def translate(self, segments, progress_callback=None):
         segments = validate_asr_segments(segments)
@@ -127,7 +127,7 @@ class SubtitleTranslationClient:
             if progress_callback is not None:
                 progress_callback(index, len(batches))
         if [item["id"] for item in translated] != [item["id"] for item in segments]:
-            raise RuntimeError("DeepSeek translation segment IDs do not match the ASR timeline")
+            raise RuntimeError("AI translation segment IDs do not match the ASR timeline")
         by_id = {item["id"]: item["text"] for item in translated}
         return [{**item, "text": by_id[item["id"]]} for item in segments]
 
@@ -174,24 +174,24 @@ class SubtitleTranslationClient:
         try:
             result = json.loads(content)
         except ValueError as exc:
-            raise RuntimeError("DeepSeek translation returned invalid JSON") from exc
+            raise RuntimeError("AI translation returned invalid JSON") from exc
         values = result.get("translations") if isinstance(result, dict) else None
         if not isinstance(values, list):
-            raise RuntimeError("DeepSeek translation response is missing translations")
+            raise RuntimeError("AI translation response is missing translations")
         expected_ids = [item["id"] for item in segments]
         translated = []
         seen = set()
         for item in values:
             if not isinstance(item, dict) or not isinstance(item.get("id"), int):
-                raise RuntimeError("DeepSeek translation returned an invalid segment")
+                raise RuntimeError("AI translation returned an invalid segment")
             segment_id = item["id"]
             text = str(item.get("text") or "").strip()
             if segment_id in seen or not text:
-                raise RuntimeError("DeepSeek translation returned duplicate or empty segments")
+                raise RuntimeError("AI translation returned duplicate or empty segments")
             seen.add(segment_id)
             translated.append({"id": segment_id, "text": text})
         if [item["id"] for item in translated] != expected_ids:
-            raise RuntimeError("DeepSeek translation segment IDs do not match the requested batch")
+            raise RuntimeError("AI translation segment IDs do not match the requested batch")
         return translated
 
 
@@ -241,7 +241,7 @@ class SubtitleAsrProcessor:
                 SubtitleDownload(
                     source=ASR_SUBTITLE_SOURCE,
                     provider_id=ASR_SUBTITLE_PROVIDER_ID,
-                    filename="sensevoice-deepseek.zh-CN.srt",
+                    filename="sensevoice-qwen.zh-CN.srt",
                     body=subtitle.encode("utf-8"),
                     lang="zh-CN",
                     label="AI 简体中文",
@@ -271,11 +271,11 @@ class SubtitleAsrProcessor:
 
     def _translation_client(self):
         return SubtitleTranslationClient(
-            getattr(self.config, "llm_base_url", ""),
-            getattr(self.config, "llm_api_key", ""),
-            getattr(self.config, "llm_model", ""),
+            getattr(self.config, "asr_translation_base_url", ""),
+            getattr(self.config, "asr_translation_api_key", ""),
+            getattr(self.config, "asr_translation_model", ""),
             getattr(self.config, "asr_translation_timeout_seconds", DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS),
-            thinking_disabled=getattr(self.config, "llm_thinking_disabled", True),
+            thinking_disabled=getattr(self.config, "asr_translation_thinking_disabled", True),
         )
 
     def _msg_client(self):
@@ -354,9 +354,9 @@ def llm_message_content(response):
     try:
         content = response["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError("DeepSeek translation returned an invalid response") from exc
+        raise RuntimeError("AI translation returned an invalid response") from exc
     if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("DeepSeek translation returned empty content")
+        raise RuntimeError("AI translation returned empty content")
     return content.strip()
 
 

@@ -137,8 +137,8 @@ class FakeSubtitleAsrProcessor:
         progress_callback("extracting_audio", 0, 0)
         progress_callback("translating", 1, 1)
         return {
-            "filename": "sensevoice-deepseek-zh-cn.srt",
-            "source": "sensevoice-deepseek",
+            "filename": "sensevoice-qwen-zh-cn.srt",
+            "source": "sensevoice-qwen",
             "language": "zh-CN",
             "segment_count": 2,
             "duration": 3.125,
@@ -177,7 +177,7 @@ class SubtitleAsrTaskTest(unittest.TestCase):
                 break
             time.sleep(0.01)
         self.assertEqual(completed["status"], "completed")
-        self.assertEqual(completed["result"]["source"], "sensevoice-deepseek")
+        self.assertEqual(completed["result"]["source"], "sensevoice-qwen")
         self.assertEqual(self.processor.run_calls, [("media-1", "ja")])
 
     def test_running_task_is_requeued_after_restart(self):
@@ -198,7 +198,9 @@ class SubtitleAsrConfigTest(unittest.TestCase):
             "ASR_ENABLED": "1",
             "ASR_BASE_URL": "http://10.77.0.5:17860",
             "ASR_API_TOKEN": "asr-secret",
-            "LLM_API_KEY": "llm-secret",
+            "ASR_TRANSLATION_BASE_URL": "http://10.77.0.5:17860/v1",
+            "ASR_TRANSLATION_MODEL": "qwen-test",
+            "ASR_TRANSLATION_API_KEY": "translation-secret",
         }
 
     def test_config_reads_asr_settings(self):
@@ -209,13 +211,48 @@ class SubtitleAsrConfigTest(unittest.TestCase):
         self.assertTrue(config.asr_enabled)
         self.assertEqual(config.asr_base_url, "http://10.77.0.5:17860")
         self.assertEqual(config.asr_timeout_seconds, 1200)
+        self.assertEqual(config.asr_translation_base_url, "http://10.77.0.5:17860/v1")
+        self.assertEqual(config.asr_translation_model, "qwen-test")
+        self.assertEqual(config.asr_translation_api_key, "translation-secret")
         self.assertEqual(config.asr_translation_timeout_seconds, 75)
 
-    def test_enabled_asr_requires_llm_key(self):
+    def test_enabled_asr_requires_translation_key(self):
         env = self.base_env()
-        env.pop("LLM_API_KEY")
-        with self.assertRaisesRegex(RuntimeError, "LLM_API_KEY missing"):
+        env.pop("ASR_TRANSLATION_API_KEY")
+        with self.assertRaisesRegex(RuntimeError, "ASR_TRANSLATION_API_KEY missing"):
             BotConfig.from_env(env)
+
+    def test_asr_translation_config_does_not_replace_search_llm_config(self):
+        env = self.base_env()
+        env.update(
+            {
+                "LLM_BASE_URL": "https://search-llm.invalid/v1",
+                "LLM_MODEL": "search-model",
+                "LLM_API_KEY": "search-secret",
+            }
+        )
+        config = BotConfig.from_env(env)
+        self.assertEqual(config.llm_base_url, "https://search-llm.invalid/v1")
+        self.assertEqual(config.llm_model, "search-model")
+        self.assertEqual(config.llm_api_key, "search-secret")
+        self.assertEqual(config.asr_translation_model, "qwen-test")
+
+    def test_asr_translation_config_keeps_legacy_llm_fallback(self):
+        env = self.base_env()
+        env.pop("ASR_TRANSLATION_BASE_URL")
+        env.pop("ASR_TRANSLATION_MODEL")
+        env.pop("ASR_TRANSLATION_API_KEY")
+        env.update(
+            {
+                "LLM_BASE_URL": "https://legacy-llm.invalid/v1",
+                "LLM_MODEL": "legacy-model",
+                "LLM_API_KEY": "legacy-secret",
+            }
+        )
+        config = BotConfig.from_env(env)
+        self.assertEqual(config.asr_translation_base_url, "https://legacy-llm.invalid/v1")
+        self.assertEqual(config.asr_translation_model, "legacy-model")
+        self.assertEqual(config.asr_translation_api_key, "legacy-secret")
 
 
 if __name__ == "__main__":
