@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import urllib.error
 import urllib.parse
@@ -57,6 +58,25 @@ class MediaStationTransport:
         if not raw:
             return {}
         return json.loads(raw)
+
+    def open(self, method, url, headers=None, data=None, timeout=None):
+        req_headers = dict(headers or {})
+        body = None
+        if data is not None:
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            req_headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, data=body, headers=req_headers, method=method)
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", "replace")
+            message = raw
+            try:
+                payload = json.loads(raw)
+                message = payload.get("error") or payload.get("message") or payload.get("msg") or raw
+            except ValueError:
+                pass
+            raise MediaStationApiError(exc.code, message) from exc
 
 
 class MediaStationApiError(RuntimeError):
@@ -185,6 +205,54 @@ class MediaStationClient:
             "GET",
             "/pipeline/media/%s/subtitle-status" % quote_path(media_id),
         )
+
+    def download_pipeline_asr_audio(self, media_id, target_path, timeout=1800, max_bytes=250 * 1024 * 1024, retry=True):
+        if not self.access_token:
+            self.login()
+        headers = {"Authorization": "Bearer " + self.access_token, "Accept": "audio/mpeg"}
+        try:
+            response = self.transport.open(
+                "GET",
+                self._url("/pipeline/media/%s/asr-audio" % quote_path(media_id)),
+                headers=headers,
+                timeout=timeout,
+            )
+        except MediaStationApiError as exc:
+            if retry and exc.status_code == 401:
+                self.access_token = None
+                self.login()
+                return self.download_pipeline_asr_audio(
+                    media_id,
+                    target_path,
+                    timeout=timeout,
+                    max_bytes=max_bytes,
+                    retry=False,
+                )
+            raise
+        written = 0
+        try:
+            with response, open(target_path, "wb") as output:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > int(max_bytes):
+                        raise RuntimeError("MediaStationGo ASR audio exceeds the size limit")
+                    output.write(chunk)
+        except Exception:
+            try:
+                os.unlink(target_path)
+            except FileNotFoundError:
+                pass
+            raise
+        if written == 0:
+            try:
+                os.unlink(target_path)
+            except FileNotFoundError:
+                pass
+            raise RuntimeError("MediaStationGo ASR audio response was empty")
+        return written
 
     def pipeline_replace_work_source(self, old_media_id, new_media_id, target, new_openlist_paths):
         payload = dict(target or {})

@@ -175,6 +175,12 @@ services:
       LLM_TIMEOUT_SECONDS: "${LLM_TIMEOUT_SECONDS:-4}"
       LLM_SEARCH_RERANK_LIMIT: "${LLM_SEARCH_RERANK_LIMIT:-40}"
       LLM_THINKING_DISABLED: "${LLM_THINKING_DISABLED:-1}"
+      ASR_ENABLED: "${ASR_ENABLED:-0}"
+      ASR_BASE_URL: "${ASR_BASE_URL:-}"
+      ASR_API_TOKEN: "${ASR_API_TOKEN:-}"
+      ASR_MODEL: "${ASR_MODEL:-FunAudioLLM/SenseVoiceSmall}"
+      ASR_TIMEOUT_SECONDS: "${ASR_TIMEOUT_SECONDS:-1800}"
+      ASR_TRANSLATION_TIMEOUT_SECONDS: "${ASR_TRANSLATION_TIMEOUT_SECONDS:-90}"
     restart: unless-stopped
     volumes:
       - /data/OpenList/data:/openlist-data:ro

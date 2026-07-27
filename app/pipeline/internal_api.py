@@ -12,6 +12,7 @@ from pathlib import Path
 
 from pipeline.config import category_to_openlist_path
 from pipeline.openlist_utils import normalize_openlist_path
+from pipeline.subtitle_asr import SubtitleAsrProcessor
 from pipeline.telegram_ui import task_from_submit_result
 
 
@@ -24,6 +25,8 @@ OFFLINE_FAILED_STATUSES = {"failed", "cancelled", "canceled"}
 FINAL_IMPORT_STATUSES = {"completed", "completed_with_warning", "failed", "canceled"}
 RETRYABLE_IMPORT_STATUSES = {"completed_with_warning", "failed", "canceled"}
 VALID_IMPORT_STATUSES = {"queued", "running", *FINAL_IMPORT_STATUSES}
+FINAL_SUBTITLE_ASR_STATUSES = {"completed", "failed"}
+VALID_SUBTITLE_ASR_STATUSES = {"queued", "running", *FINAL_SUBTITLE_ASR_STATUSES}
 VALID_SEARCH_SOURCES = {"default", "pansou", "bt4g"}
 VALID_CATEGORIES = {"movie", "tv", "anime", "adult", "other"}
 SYNC_STAGES = {"syncing", "scanning", "scraping", "subtitles", "removing_old_version"}
@@ -136,6 +139,39 @@ class InternalApiStore:
                 """
                 create index if not exists idx_internal_api_imports_owner
                 on internal_api_imports(owner_id, updated_at)
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists internal_api_subtitle_asr_tasks (
+                    id text primary key,
+                    owner_id text not null,
+                    media_id text not null,
+                    source_language text not null,
+                    status text not null,
+                    stage text not null,
+                    progress_current integer not null default 0,
+                    progress_total integer not null default 0,
+                    result_json text,
+                    error text,
+                    attempt_count integer not null default 0,
+                    created_at integer not null,
+                    updated_at integer not null,
+                    started_at integer,
+                    completed_at integer
+                )
+                """
+            )
+            conn.execute(
+                """
+                create index if not exists idx_internal_api_subtitle_asr_tasks_queue
+                on internal_api_subtitle_asr_tasks(status, created_at)
+                """
+            )
+            conn.execute(
+                """
+                create index if not exists idx_internal_api_subtitle_asr_tasks_owner
+                on internal_api_subtitle_asr_tasks(owner_id, media_id, updated_at)
                 """
             )
             conn.commit()
@@ -500,6 +536,144 @@ class InternalApiStore:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    def recover_running_subtitle_asr_tasks(self):
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """
+                update internal_api_subtitle_asr_tasks
+                set status = 'queued', stage = 'queued', progress_current = 0, progress_total = 0,
+                    result_json = null, error = null, updated_at = ?, started_at = null, completed_at = null
+                where status = 'running'
+                """,
+                (now,),
+            )
+            conn.commit()
+            return int(cursor.rowcount or 0)
+        finally:
+            conn.close()
+
+    def create_subtitle_asr_task(self, owner_id, media_id, source_language):
+        task_id = uuid.uuid4().hex
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute("begin immediate")
+            existing = conn.execute(
+                """
+                select * from internal_api_subtitle_asr_tasks
+                where owner_id = ? and media_id = ? and status in ('queued', 'running')
+                order by created_at desc, id desc limit 1
+                """,
+                (owner_id, media_id),
+            ).fetchone()
+            if existing is not None:
+                conn.commit()
+                return subtitle_asr_task_row(existing), False
+            conn.execute(
+                """
+                insert into internal_api_subtitle_asr_tasks
+                    (id, owner_id, media_id, source_language, status, stage, created_at, updated_at)
+                values (?, ?, ?, ?, 'queued', 'queued', ?, ?)
+                """,
+                (task_id, owner_id, media_id, source_language, now, now),
+            )
+            row = conn.execute(
+                "select * from internal_api_subtitle_asr_tasks where id = ?", (task_id,)
+            ).fetchone()
+            conn.commit()
+            return subtitle_asr_task_row(row), True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_subtitle_asr_task(self, owner_id, task_id):
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "select * from internal_api_subtitle_asr_tasks where id = ? and owner_id = ?",
+                (task_id, owner_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            raise ApiError(404, "subtitle_asr_task_not_found", "AI subtitle task not found")
+        return subtitle_asr_task_row(row)
+
+    def claim_next_subtitle_asr_task(self):
+        conn = self._connect()
+        try:
+            conn.execute("begin immediate")
+            row = conn.execute(
+                """
+                select * from internal_api_subtitle_asr_tasks
+                where status = 'queued' order by created_at, id limit 1
+                """
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            now = int(time.time())
+            cursor = conn.execute(
+                """
+                update internal_api_subtitle_asr_tasks
+                set status = 'running', stage = 'starting', attempt_count = attempt_count + 1,
+                    started_at = ?, completed_at = null, updated_at = ?, error = null
+                where id = ? and status = 'queued'
+                """,
+                (now, now, row["id"]),
+            )
+            if cursor.rowcount != 1:
+                conn.commit()
+                return None
+            claimed = conn.execute(
+                "select * from internal_api_subtitle_asr_tasks where id = ?", (row["id"],)
+            ).fetchone()
+            conn.commit()
+            return subtitle_asr_task_row(claimed)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def save_subtitle_asr_progress(self, task_id, stage, current, total):
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                update internal_api_subtitle_asr_tasks
+                set stage = ?, progress_current = ?, progress_total = ?, updated_at = ?
+                where id = ? and status = 'running'
+                """,
+                (str(stage), max(0, int(current)), max(0, int(total)), now, task_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def finish_subtitle_asr_task(self, task_id, status, stage, result=None, error=None):
+        if status not in FINAL_SUBTITLE_ASR_STATUSES:
+            raise ValueError("invalid final subtitle ASR status: %s" % status)
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                update internal_api_subtitle_asr_tasks
+                set status = ?, stage = ?, result_json = ?, error = ?, updated_at = ?, completed_at = ?
+                where id = ?
+                """,
+                (status, stage, json_dumps(result) if result is not None else None, str(error) if error else None, now, now, task_id),
+            )
+            conn.commit()
         finally:
             conn.close()
 
@@ -919,11 +1093,100 @@ class ImportTaskManager:
             self._raise_if_stopping()
 
 
+class SubtitleAsrTaskManager:
+    def __init__(self, processor, store, poll_seconds=1.0):
+        self.processor = processor
+        self.store = store
+        self.poll_seconds = max(0.05, float(poll_seconds))
+        self._condition = threading.Condition()
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self):
+        with self._condition:
+            if self._thread is not None:
+                return
+            self._stop_event.clear()
+            self.store.recover_running_subtitle_asr_tasks()
+            self._thread = threading.Thread(
+                target=self._worker_loop,
+                name="internal-api-subtitle-asr",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        with self._condition:
+            self._condition.notify_all()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    def notify(self):
+        with self._condition:
+            self._condition.notify_all()
+
+    def create_task(self, payload):
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_request", "request body must be a JSON object")
+        owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
+        media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
+        source_language = str(payload.get("source_language") or "auto").strip().lower()
+        if source_language not in {"auto", "ja", "en", "zh", "ko"}:
+            raise ApiError(400, "invalid_source_language", "source_language must be one of: auto, ja, en, zh, ko")
+        try:
+            self.processor.ensure_available()
+        except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
+            raise ApiError(503, "subtitle_asr_unavailable", str(exc))
+        task, created = self.store.create_subtitle_asr_task(owner_id, media_id, source_language)
+        if created:
+            self.notify()
+        return task, created
+
+    def get_task(self, owner_id, task_id):
+        return self.store.get_subtitle_asr_task(
+            require_text(owner_id, "owner_id", max_length=200),
+            require_text(task_id, "task_id", max_length=200),
+        )
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                task = self.store.claim_next_subtitle_asr_task()
+            except sqlite3.Error as exc:
+                print("internal API subtitle ASR worker claim failed: %s" % exc, flush=True)
+                with self._condition:
+                    self._condition.wait(timeout=self.poll_seconds)
+                continue
+            if task is None:
+                with self._condition:
+                    self._condition.wait(timeout=self.poll_seconds)
+                continue
+            try:
+                result = self.processor.run(
+                    task["media_id"],
+                    task["source_language"],
+                    progress_callback=lambda stage, current, total: self.store.save_subtitle_asr_progress(
+                        task["id"], stage, current, total
+                    ),
+                )
+                self.store.finish_subtitle_asr_task(
+                    task["id"], "completed", "completed", result=result
+                )
+            except Exception as exc:
+                print("internal API subtitle ASR %s failed: %s" % (task["id"], exc), flush=True)
+                self.store.finish_subtitle_asr_task(
+                    task["id"], "failed", "failed", error=str(exc)
+                )
+
+
 class InternalApiApplication:
-    def __init__(self, service, store, manager):
+    def __init__(self, service, store, manager, subtitle_asr_manager=None):
         self.service = service
         self.store = store
         self.manager = manager
+        self.subtitle_asr_manager = subtitle_asr_manager
 
     def search(self, payload):
         if not isinstance(payload, dict):
@@ -1064,6 +1327,16 @@ class InternalApiApplication:
             "reason": str(result.get("subtitle_match_reason") or ""),
         }
 
+    def create_subtitle_asr(self, payload):
+        if self.subtitle_asr_manager is None:
+            raise ApiError(503, "subtitle_asr_unavailable", "AI subtitle task manager unavailable")
+        return self.subtitle_asr_manager.create_task(payload)
+
+    def get_subtitle_asr(self, owner_id, task_id):
+        if self.subtitle_asr_manager is None:
+            raise ApiError(503, "subtitle_asr_unavailable", "AI subtitle task manager unavailable")
+        return self.subtitle_asr_manager.get_task(owner_id, task_id)
+
     def _subtitle_candidate(self, payload):
         owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
         media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
@@ -1097,7 +1370,16 @@ class InternalApiServer:
             raise ValueError("INTERNAL_API_PORT must be between 1 and 65535")
         self.store = InternalApiStore(db_path, search_ttl_seconds=search_ttl_seconds)
         self.manager = ImportTaskManager(service, self.store, workers=workers, owner_workers=owner_workers)
-        self.application = InternalApiApplication(service, self.store, self.manager)
+        self.subtitle_asr_manager = SubtitleAsrTaskManager(
+            SubtitleAsrProcessor(getattr(service, "config", None)),
+            self.store,
+        )
+        self.application = InternalApiApplication(
+            service,
+            self.store,
+            self.manager,
+            subtitle_asr_manager=self.subtitle_asr_manager,
+        )
         self._httpd = None
         self._thread = None
 
@@ -1109,6 +1391,7 @@ class InternalApiServer:
         httpd.daemon_threads = True
         self._httpd = httpd
         self.manager.start()
+        self.subtitle_asr_manager.start()
         self._thread = threading.Thread(target=httpd.serve_forever, name="internal-api-http", daemon=True)
         self._thread.start()
         print("internal API listening on http://%s:%d" % (self.host, self.port), flush=True)
@@ -1122,6 +1405,7 @@ class InternalApiServer:
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
+        self.subtitle_asr_manager.stop()
         self.manager.stop()
 
     def _handler_class(self):
@@ -1161,6 +1445,19 @@ class InternalApiServer:
                 return
             if handler.command == "POST" and path == "/v1/subtitles/apply":
                 self._send_json(handler, 200, self.application.apply_subtitle(self._read_json(handler)))
+                return
+            if handler.command == "POST" and path == "/v1/subtitles/asr":
+                task, created = self.application.create_subtitle_asr(self._read_json(handler))
+                self._send_json(handler, 202 if created else 200, task)
+                return
+            subtitle_asr_task_id = subtitle_asr_task_path_match(path)
+            if handler.command == "GET" and subtitle_asr_task_id:
+                owner_id = owner_from_request(handler, query, body=None)
+                self._send_json(
+                    handler,
+                    200,
+                    self.application.get_subtitle_asr(owner_id, subtitle_asr_task_id),
+                )
                 return
             if handler.command == "POST" and path == "/v1/imports":
                 payload = self._read_json(handler)
@@ -1235,6 +1532,13 @@ def import_path_match(path):
         return parts[2], None
     if len(parts) == 4 and parts[:2] == ["v1", "imports"] and parts[3] in {"cancel", "retry"}:
         return parts[2], parts[3]
+    return None
+
+
+def subtitle_asr_task_path_match(path):
+    parts = [part for part in path.split("/") if part]
+    if len(parts) == 4 and parts[:3] == ["v1", "subtitles", "asr"]:
+        return parts[3]
     return None
 
 
@@ -1443,6 +1747,29 @@ def import_row(row):
         "msg_media_id": row["msg_media_id"],
         "msg_media_title": task.get("msg_media_title"),
         "cancel_requested": bool(row["cancel_requested"]),
+        "attempt_count": int(row["attempt_count"] or 0),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+    }
+
+
+def subtitle_asr_task_row(row):
+    status = row["status"]
+    if status not in VALID_SUBTITLE_ASR_STATUSES:
+        raise RuntimeError("invalid persisted subtitle ASR status: %s" % status)
+    return {
+        "id": row["id"],
+        "owner_id": row["owner_id"],
+        "media_id": row["media_id"],
+        "source_language": row["source_language"],
+        "status": status,
+        "stage": row["stage"],
+        "progress_current": int(row["progress_current"] or 0),
+        "progress_total": int(row["progress_total"] or 0),
+        "result": json.loads(row["result_json"]) if row["result_json"] else None,
+        "error": row["error"],
         "attempt_count": int(row["attempt_count"] or 0),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],

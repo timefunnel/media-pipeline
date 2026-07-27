@@ -397,6 +397,11 @@ SCRAPE_RELEASE_MARKERS = (
     "x264",
     "x265",
 )
+from pipeline.subtitle_asr import (
+    DEFAULT_ASR_MODEL,
+    DEFAULT_ASR_TIMEOUT_SECONDS,
+    DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS,
+)
 TYPING_ACTION_INTERVAL_SECONDS = 4
 
 
@@ -470,6 +475,12 @@ class BotConfig:
     llm_timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
     llm_search_rerank_limit: int = DEFAULT_LLM_SEARCH_RERANK_LIMIT
     llm_thinking_disabled: bool = True
+    asr_enabled: bool = False
+    asr_base_url: str = ""
+    asr_api_token: str = ""
+    asr_model: str = DEFAULT_ASR_MODEL
+    asr_timeout_seconds: int = DEFAULT_ASR_TIMEOUT_SECONDS
+    asr_translation_timeout_seconds: int = DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS
     p115_cookie: str = ""
     internal_api_enabled: bool = False
     internal_api_token: str = ""
@@ -508,6 +519,15 @@ class BotConfig:
         internal_api_token = (env.get("INTERNAL_API_TOKEN") or "").strip()
         if internal_api_enabled and not internal_api_token:
             raise RuntimeError("INTERNAL_API_TOKEN missing")
+        asr_enabled = parse_bool(env.get("ASR_ENABLED"), False)
+        asr_base_url = (env.get("ASR_BASE_URL") or "").strip()
+        asr_api_token = (env.get("ASR_API_TOKEN") or "").strip()
+        if asr_enabled and not asr_base_url:
+            raise RuntimeError("ASR_BASE_URL missing")
+        if asr_enabled and not asr_api_token:
+            raise RuntimeError("ASR_API_TOKEN missing")
+        if asr_enabled and not llm_api_key:
+            raise RuntimeError("LLM_API_KEY missing for AI subtitle translation")
 
         return cls(
             token=token,
@@ -610,6 +630,23 @@ class BotConfig:
             llm_timeout_seconds=int(env.get("LLM_TIMEOUT_SECONDS", str(DEFAULT_LLM_TIMEOUT_SECONDS))),
             llm_search_rerank_limit=int(env.get("LLM_SEARCH_RERANK_LIMIT", str(DEFAULT_LLM_SEARCH_RERANK_LIMIT))),
             llm_thinking_disabled=parse_bool(env.get("LLM_THINKING_DISABLED"), True),
+            asr_enabled=asr_enabled,
+            asr_base_url=asr_base_url,
+            asr_api_token=asr_api_token,
+            asr_model=env.get("ASR_MODEL", DEFAULT_ASR_MODEL),
+            asr_timeout_seconds=max(
+                1,
+                int(env.get("ASR_TIMEOUT_SECONDS", str(DEFAULT_ASR_TIMEOUT_SECONDS))),
+            ),
+            asr_translation_timeout_seconds=max(
+                1,
+                int(
+                    env.get(
+                        "ASR_TRANSLATION_TIMEOUT_SECONDS",
+                        str(DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS),
+                    )
+                ),
+            ),
             p115_cookie=(
                 env.get("P115_COOKIE")
                 or env.get("SHARE115_COOKIE")
