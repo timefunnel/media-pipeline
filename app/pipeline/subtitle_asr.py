@@ -245,11 +245,7 @@ class SubtitleTranslationClient:
         )
 
     def _translate_one(self, text, context, glossary, retry_instruction=""):
-        prompt = (
-            text
-            if uses_native_translation_prompt(self.model)
-            else subtitle_translation_prompt(text, context, glossary, retry_instruction)
-        )
+        prompt = subtitle_translation_prompt(text, context, glossary, retry_instruction)
         payload = {
             "model": self.model,
             "max_tokens": 1024,
@@ -1199,10 +1195,6 @@ def require_translation_provider(provider):
     return provider
 
 
-def uses_native_translation_prompt(model):
-    return "sakura" in str(model or "").strip().casefold()
-
-
 def load_cached_transcript(path, expected_model=DEFAULT_ASR_MODEL):
     try:
         with Path(path).open("r", encoding="utf-8") as source:
@@ -1432,21 +1424,19 @@ def subtitle_translation_prompt(text, context, glossary, retry_instruction=""):
     context_text = "\n".join(context) if context else "（无）"
     glossary_text = str(glossary or "").strip() or "（无）"
     retry_text = str(retry_instruction or "").strip()
+    sections = [
+        "参考上下文：\n" + context_text,
+        "术语参考：\n" + glossary_text,
+    ]
     if retry_text:
-        return (
-            "将下面的日文文本翻译成自然、准确的简体中文。\n"
-            + "只输出译文，不要解释：\n\n"
-            + text
-        )
-    return (
-        "参考上下文：\n"
-        + context_text
-        + "\n\n术语参考：\n"
-        + glossary_text
-        + "\n\n将下面的日文翻译成自然、准确的简体中文。\n"
+        sections.append("补充要求：\n" + retry_text)
+    sections.append(
+        "将下面的日文翻译成自然、准确的简体中文。\n"
+        + "参考上下文仅供理解，只翻译当前文本。\n"
         + "只输出译文，不要解释：\n\n"
         + text
     )
+    return "\n\n".join(sections)
 
 
 def llm_message_content(response):

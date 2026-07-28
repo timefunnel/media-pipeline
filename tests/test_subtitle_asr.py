@@ -80,7 +80,7 @@ class FakeTranslationTransport:
 
 
 class SubtitleTranslationTest(unittest.TestCase):
-    def test_local_retry_prompt_contains_only_the_current_text(self):
+    def test_local_retry_prompt_preserves_context_and_retry_requirement(self):
         prompt = subtitle_translation_prompt(
             "こんにちは。",
             ["前の文。"],
@@ -88,15 +88,11 @@ class SubtitleTranslationTest(unittest.TestCase):
             "上次译文仍含日文假名。",
         )
 
-        self.assertEqual(
-            prompt,
-            "将下面的日文文本翻译成自然、准确的简体中文。\n"
-            "只输出译文，不要解释：\n\n"
-            "こんにちは。",
-        )
-        self.assertNotIn("参考上下文", prompt)
-        self.assertNotIn("术语参考", prompt)
-        self.assertNotIn("重试要求", prompt)
+        self.assertIn("参考上下文：\n前の文。", prompt)
+        self.assertIn("术语参考：\n人名：テスト", prompt)
+        self.assertIn("补充要求：\n上次译文仍含日文假名。", prompt)
+        self.assertIn("参考上下文仅供理解，只翻译当前文本。", prompt)
+        self.assertTrue(prompt.endswith("こんにちは。"))
 
     def test_local_generic_model_uses_context_and_server_owned_timeline(self):
         transport = FakeTranslationTransport(
@@ -153,8 +149,10 @@ class SubtitleTranslationTest(unittest.TestCase):
         client.unload_model()
         self.assertTrue(transport.requests[-1][0].endswith("/models/unload"))
 
-    def test_sakura_model_receives_only_the_current_japanese_segment(self):
-        transport = FakeTranslationTransport({"こんにちは。": "你好。"})
+    def test_sakura_model_receives_context_prompt_with_current_segment_target(self):
+        transport = FakeTranslationTransport(
+            {"これを閉": "把这个关上", "めるのを": "关闭"}
+        )
         client = SubtitleTranslationClient(
             "http://127.0.0.1:17860/v1",
             "secret",
@@ -164,15 +162,18 @@ class SubtitleTranslationTest(unittest.TestCase):
         )
 
         result = client.translate(
-            [{"id": 0, "start": 0, "end": 1, "text": "こんにちは。"}],
+            [
+                {"id": 0, "start": 0, "end": 1, "text": "これを閉"},
+                {"id": 1, "start": 1, "end": 2, "text": "めるのを"},
+            ],
             glossary="人名：テスト",
         )
 
-        self.assertEqual(result[0]["text"], "你好。")
-        self.assertEqual(
-            transport.requests[0][1]["messages"],
-            [{"role": "user", "content": "こんにちは。"}],
-        )
+        self.assertEqual([item["text"] for item in result], ["把这个关上", "关闭"])
+        prompts = [item[1]["messages"][0]["content"] for item in transport.requests]
+        continuation_prompt = next(prompt for prompt in prompts if prompt.endswith("めるのを"))
+        self.assertIn("参考上下文：\nこれを閉", continuation_prompt)
+        self.assertIn("术语参考：\n人名：テスト", continuation_prompt)
 
     def test_local_translation_keeps_two_requests_in_flight_and_commits_in_order(
         self,
@@ -186,7 +187,9 @@ class SubtitleTranslationTest(unittest.TestCase):
                 self.completed = []
 
             def request(self, url, payload, headers=None, timeout=None):
-                target = payload["messages"][0]["content"]
+                prompt = payload["messages"][0]["content"]
+                marker = "只输出译文，不要解释：\n\n"
+                target = prompt.split(marker, 1)[1]
                 with self.lock:
                     self.active += 1
                     self.max_active = max(self.max_active, self.active)
