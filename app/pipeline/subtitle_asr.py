@@ -204,6 +204,8 @@ class SubtitleTranslationClient:
         )
 
     def _translate_one(self, text, context, glossary, retry_instruction=""):
+        if retry_instruction:
+            self.unload_model()
         payload = {
             "model": self.model,
             "max_tokens": 1024,

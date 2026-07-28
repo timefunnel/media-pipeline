@@ -142,7 +142,10 @@ class SubtitleTranslationTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "segment 0 after 3 attempts"):
             client.translate([{"id": 0, "start": 0, "end": 1, "text": "こんにちは"}])
-        self.assertEqual(len(transport.requests), 3)
+        chat_requests = [item for item in transport.requests if item[0].endswith("/chat/completions")]
+        unload_requests = [item for item in transport.requests if item[0].endswith("/models/unload")]
+        self.assertEqual(len(chat_requests), 3)
+        self.assertEqual(len(unload_requests), 2)
         self.assertEqual(sleep.call_count, 2)
 
     def test_translation_reuses_completed_segments_and_checkpoints_new_results(self):
