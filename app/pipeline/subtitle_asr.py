@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -240,11 +241,15 @@ class SubtitleTranslationClient:
             cached_translations=cached_translations,
             checkpoint_callback=checkpoint_callback,
             event_callback=event_callback,
+            max_in_flight=2,
         )
 
     def _translate_one(self, text, context, glossary, retry_instruction=""):
-        if retry_instruction:
-            self.unload_model()
+        prompt = (
+            text
+            if uses_native_translation_prompt(self.model)
+            else subtitle_translation_prompt(text, context, glossary, retry_instruction)
+        )
         payload = {
             "model": self.model,
             "max_tokens": 1024,
@@ -254,9 +259,7 @@ class SubtitleTranslationClient:
             "messages": [
                 {
                     "role": "user",
-                    "content": subtitle_translation_prompt(
-                        text, context, glossary, retry_instruction
-                    ),
+                    "content": prompt,
                 },
             ],
         }
@@ -906,6 +909,7 @@ def translate_sequentially(
     checkpoint_callback=None,
     event_callback=None,
     retry_delay_seconds=DEFAULT_ASR_TRANSLATION_RETRY_DELAY_SECONDS,
+    max_in_flight=1,
 ):
     segments = validate_asr_segments(segments)
     cached = validate_cached_translations(cached_translations, segments)
@@ -940,6 +944,7 @@ def translate_sequentially(
     }
     mode_by_id = {item["id"]: item.get("mode", "") for item in cached}
     total = len(segments)
+    max_in_flight = max(1, int(max_in_flight or 1))
     if progress_callback is not None:
         progress_callback(len(handled_ids), total)
 
@@ -959,78 +964,146 @@ def translate_sequentially(
             values.append(value)
         return values
 
-    for index, segment in enumerate(segments):
+    def translation_request(
+        segment, context, retry_instruction="", retry_current_text_only=False
+    ):
+        started = time.monotonic()
+        try:
+            raw_translation = translate_one(
+                segment["text"],
+                [] if retry_current_text_only else context,
+                "" if retry_current_text_only else glossary,
+                retry_instruction,
+            )
+        except Exception as exc:
+            return started, None, exc
+        return started, raw_translation, None
+
+    def commit_program_segment(segment):
         segment_id = segment["id"]
-        if segment_id in handled_ids:
-            continue
         program_mode = subtitle_segment_program_mode(segment["text"])
-        if program_mode:
-            handled_ids.add(segment_id)
-            mode_by_id[segment_id] = program_mode
-            if program_mode == TRANSLATION_MODE_TARGET_LANGUAGE:
-                by_id[segment_id] = segment["text"]
-            if checkpoint_callback is not None:
-                checkpoint_callback(checkpoint_values())
-            if progress_callback is not None:
-                progress_callback(len(handled_ids), total)
-            continue
-        context = [
-            item["text"]
-            for item in segments[
-                max(0, index - DEFAULT_ASR_TRANSLATION_CONTEXT_SEGMENTS) : index
-            ]
-        ]
-        retry_instruction = ""
-        retry_current_text_only = False
-        for attempt in range(1, DEFAULT_ASR_TRANSLATION_ATTEMPTS + 1):
-            started = time.monotonic()
-            try:
-                raw_translation = translate_one(
-                    segment["text"],
-                    [] if retry_current_text_only else context,
-                    "" if retry_current_text_only else glossary,
-                    retry_instruction,
-                )
-                translation = validate_translation_text(segment["text"], raw_translation)
-                validate_repeated_translation(segments, by_id, segment, translation)
-            except Exception as exc:
-                emit_translation_event(
-                    event_callback,
-                    segment_id,
-                    provider,
-                    model,
-                    attempt,
-                    started,
-                    "failed",
-                    str(exc),
-                )
-                if attempt >= DEFAULT_ASR_TRANSLATION_ATTEMPTS:
-                    raise RuntimeError(
-                        "AI translation failed for segment %s after %s attempts: %s"
-                        % (segment_id, attempt, exc)
-                    ) from exc
-                retry_instruction = translation_retry_instruction(exc)
-                retry_current_text_only = True
-                time.sleep(max(0, float(retry_delay_seconds)))
+        if not program_mode:
+            return False
+        handled_ids.add(segment_id)
+        mode_by_id[segment_id] = program_mode
+        if program_mode == TRANSLATION_MODE_TARGET_LANGUAGE:
+            by_id[segment_id] = segment["text"]
+        if checkpoint_callback is not None:
+            checkpoint_callback(checkpoint_values())
+        if progress_callback is not None:
+            progress_callback(len(handled_ids), total)
+        return True
+
+    executor = (
+        ThreadPoolExecutor(max_workers=max_in_flight) if max_in_flight > 1 else None
+    )
+    try:
+        index = 0
+        while index < total:
+            segment = segments[index]
+            if segment["id"] in handled_ids:
+                index += 1
+                continue
+            if commit_program_segment(segment):
+                index += 1
                 continue
 
-            emit_translation_event(
-                event_callback,
-                segment_id,
-                provider,
-                model,
-                attempt,
-                started,
-                "completed",
-                "",
-            )
-            by_id[segment_id] = translation
-            handled_ids.add(segment_id)
-            if checkpoint_callback is not None:
-                checkpoint_callback(checkpoint_values())
-            if progress_callback is not None:
-                progress_callback(len(handled_ids), total)
-            break
+            batch = []
+            scan_index = index
+            while scan_index < total and len(batch) < max_in_flight:
+                candidate = segments[scan_index]
+                if candidate["id"] in handled_ids or subtitle_segment_program_mode(
+                    candidate["text"]
+                ):
+                    break
+                context = [
+                    item["text"]
+                    for item in segments[
+                        max(0, scan_index - DEFAULT_ASR_TRANSLATION_CONTEXT_SEGMENTS) : scan_index
+                    ]
+                ]
+                batch.append((candidate, context))
+                scan_index += 1
+
+            first_attempts = []
+            for candidate, context in batch:
+                if executor is None:
+                    first_attempts.append(translation_request(candidate, context))
+                else:
+                    first_attempts.append(
+                        executor.submit(translation_request, candidate, context)
+                    )
+
+            for batch_index, (candidate, context) in enumerate(batch):
+                first_attempt = first_attempts[batch_index]
+                if executor is not None:
+                    first_attempt = first_attempt.result()
+                retry_instruction = ""
+                retry_current_text_only = False
+                for attempt in range(1, DEFAULT_ASR_TRANSLATION_ATTEMPTS + 1):
+                    if attempt == 1:
+                        started, raw_translation, request_error = first_attempt
+                    else:
+                        started, raw_translation, request_error = translation_request(
+                            candidate,
+                            context,
+                            retry_instruction,
+                            retry_current_text_only,
+                        )
+                    try:
+                        if request_error is not None:
+                            raise request_error
+                        translation = validate_translation_text(
+                            candidate["text"], raw_translation
+                        )
+                        validate_repeated_translation(
+                            segments, by_id, candidate, translation
+                        )
+                    except Exception as exc:
+                        emit_translation_event(
+                            event_callback,
+                            candidate["id"],
+                            provider,
+                            model,
+                            attempt,
+                            started,
+                            "failed",
+                            str(exc),
+                        )
+                        if attempt >= DEFAULT_ASR_TRANSLATION_ATTEMPTS:
+                            raise RuntimeError(
+                                "AI translation failed for segment %s after %s attempts: %s"
+                                % (candidate["id"], attempt, exc)
+                            ) from exc
+                        retry_instruction = translation_retry_instruction(exc)
+                        retry_current_text_only = True
+                        if request_error is not None and should_delay_translation_retry(
+                            exc
+                        ):
+                            time.sleep(max(0, float(retry_delay_seconds)))
+                        continue
+
+                    emit_translation_event(
+                        event_callback,
+                        candidate["id"],
+                        provider,
+                        model,
+                        attempt,
+                        started,
+                        "completed",
+                        "",
+                    )
+                    by_id[candidate["id"]] = translation
+                    handled_ids.add(candidate["id"])
+                    if checkpoint_callback is not None:
+                        checkpoint_callback(checkpoint_values())
+                    if progress_callback is not None:
+                        progress_callback(len(handled_ids), total)
+                    break
+            index = scan_index
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     if len(handled_ids) != total:
         raise RuntimeError("AI translation did not cover the ASR timeline")
@@ -1064,6 +1137,22 @@ def translation_retry_instruction(error):
     if "same text for three different segments" in message:
         return "上次译文与前文异常重复，请根据当前原文重新翻译。"
     return ""
+
+
+def should_delay_translation_retry(error):
+    message = str(error or "")
+    validation_markers = (
+        "empty content",
+        "Japanese kana",
+        "length is abnormally",
+        "untranslated source text",
+        "structured content",
+        "reasoning content",
+        "explanation",
+        "echoed the translation prompt",
+        "same text for three different segments",
+    )
+    return not any(marker in message for marker in validation_markers)
 
 
 def validate_repeated_translation(segments, translated_by_id, current_segment, translation):
@@ -1108,6 +1197,10 @@ def require_translation_provider(provider):
     if provider not in ASR_TRANSLATION_PROVIDERS:
         raise RuntimeError("unsupported AI translation provider: %s" % provider)
     return provider
+
+
+def uses_native_translation_prompt(model):
+    return "sakura" in str(model or "").strip().casefold()
 
 
 def load_cached_transcript(path, expected_model=DEFAULT_ASR_MODEL):

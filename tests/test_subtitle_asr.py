@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -73,7 +74,8 @@ class FakeTranslationTransport:
         if url.endswith("/models/unload"):
             return {"unloaded": payload["model"]}
         prompt = payload["messages"][0]["content"]
-        target = prompt.split("只输出译文，不要解释：\n\n", 1)[1]
+        marker = "只输出译文，不要解释：\n\n"
+        target = prompt.split(marker, 1)[1] if marker in prompt else prompt
         return {"choices": [{"message": {"content": self.translations[target]}}]}
 
 
@@ -96,7 +98,7 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertNotIn("术语参考", prompt)
         self.assertNotIn("重试要求", prompt)
 
-    def test_translation_uses_only_previous_context_and_server_owned_timeline(self):
+    def test_local_generic_model_uses_context_and_server_owned_timeline(self):
         transport = FakeTranslationTransport(
             {"今日は遅かった。": "今天来晚了。", "電車が止まりました。": "电车停运了。"}
         )
@@ -118,8 +120,21 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertEqual(result[1]["end"], 3.125)
         self.assertIn("00:00:00,210 --> 00:00:01,500", build_srt(result))
         self.assertEqual(len(transport.requests), 2)
-        first_payload = transport.requests[0][1]
-        second_payload = transport.requests[1][1]
+        payloads = [
+            item[1]
+            for item in transport.requests
+            if item[0].endswith("/chat/completions")
+        ]
+        first_payload = next(
+            payload
+            for payload in payloads
+            if payload["messages"][0]["content"].endswith("今日は遅かった。")
+        )
+        second_payload = next(
+            payload
+            for payload in payloads
+            if payload["messages"][0]["content"].endswith("電車が止まりました。")
+        )
         self.assertNotIn("response_format", first_payload)
         self.assertEqual(first_payload["temperature"], 0.1)
         self.assertEqual(first_payload["top_p"], 0.9)
@@ -127,10 +142,94 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertEqual(len(first_payload["messages"]), 1)
         self.assertIn("参考上下文：\n（无）", first_payload["messages"][0]["content"])
         self.assertIn("术语参考：\n東京 -> 东京", first_payload["messages"][0]["content"])
-        self.assertIn("参考上下文：\n今日は遅かった。", second_payload["messages"][0]["content"])
-        self.assertNotIn("電車が止まりました。\n\n术语参考", second_payload["messages"][0]["content"])
+        self.assertIn(
+            "参考上下文：\n今日は遅かった。",
+            second_payload["messages"][0]["content"],
+        )
+        self.assertNotIn(
+            "電車が止まりました。\n\n术语参考",
+            second_payload["messages"][0]["content"],
+        )
         client.unload_model()
         self.assertTrue(transport.requests[-1][0].endswith("/models/unload"))
+
+    def test_sakura_model_receives_only_the_current_japanese_segment(self):
+        transport = FakeTranslationTransport({"こんにちは。": "你好。"})
+        client = SubtitleTranslationClient(
+            "http://127.0.0.1:17860/v1",
+            "secret",
+            "quantumcookie/Sakura-qwen2.5-v1.0:7b",
+            30,
+            transport=transport,
+        )
+
+        result = client.translate(
+            [{"id": 0, "start": 0, "end": 1, "text": "こんにちは。"}],
+            glossary="人名：テスト",
+        )
+
+        self.assertEqual(result[0]["text"], "你好。")
+        self.assertEqual(
+            transport.requests[0][1]["messages"],
+            [{"role": "user", "content": "こんにちは。"}],
+        )
+
+    def test_local_translation_keeps_two_requests_in_flight_and_commits_in_order(
+        self,
+    ):
+        class ConcurrentTransport:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.both_started = threading.Event()
+                self.active = 0
+                self.max_active = 0
+                self.completed = []
+
+            def request(self, url, payload, headers=None, timeout=None):
+                target = payload["messages"][0]["content"]
+                with self.lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                    if self.active == 2:
+                        self.both_started.set()
+                try:
+                    if not self.both_started.wait(1):
+                        raise AssertionError("second translation request did not start")
+                    if target == "最初。":
+                        time.sleep(0.05)
+                    with self.lock:
+                        self.completed.append(target)
+                    translations = {"最初。": "第一句。", "次。": "第二句。"}
+                    return {"choices": [{"message": {"content": translations[target]}}]}
+                finally:
+                    with self.lock:
+                        self.active -= 1
+
+        transport = ConcurrentTransport()
+        client = SubtitleTranslationClient(
+            "http://127.0.0.1:17860/v1",
+            "secret",
+            "sakura-test",
+            30,
+            transport=transport,
+        )
+        checkpoints = []
+
+        result = client.translate(
+            [
+                {"id": 0, "start": 0, "end": 1, "text": "最初。"},
+                {"id": 1, "start": 1, "end": 2, "text": "次。"},
+            ],
+            checkpoint_callback=lambda values: checkpoints.append(values),
+        )
+
+        self.assertEqual(transport.max_active, 2)
+        self.assertEqual(transport.completed, ["次。", "最初。"])
+        self.assertEqual([item["text"] for item in result], ["第一句。", "第二句。"])
+        self.assertEqual(
+            checkpoints[-1],
+            [{"id": 0, "text": "第一句。"}, {"id": 1, "text": "第二句。"}],
+        )
 
     @patch("pipeline.subtitle_asr.time.sleep")
     def test_translation_rejects_empty_plain_text_after_current_segment_retry(self, sleep):
@@ -147,8 +246,8 @@ class SubtitleTranslationTest(unittest.TestCase):
         chat_requests = [item for item in transport.requests if item[0].endswith("/chat/completions")]
         unload_requests = [item for item in transport.requests if item[0].endswith("/models/unload")]
         self.assertEqual(len(chat_requests), 3)
-        self.assertEqual(len(unload_requests), 2)
-        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(len(unload_requests), 0)
+        self.assertEqual(sleep.call_count, 0)
 
     def test_translation_reuses_completed_segments_and_checkpoints_new_results(self):
         transport = FakeTranslationTransport({"元気ですか。": "你好吗？"})
@@ -304,8 +403,10 @@ class SubtitleTranslationTest(unittest.TestCase):
                 checkpoint_callback=lambda values: checkpoints.append(values),
                 event_callback=lambda event: events.append(event),
                 retry_delay_seconds=0,
+                max_in_flight=2,
             )
-        self.assertEqual(calls, ["最初。", "最初。", "最初。"])
+        self.assertEqual(calls.count("最初。"), 3)
+        self.assertEqual(calls.count("次。"), 1)
         self.assertEqual(checkpoints, [])
         self.assertEqual([event["status"] for event in events], ["failed", "failed", "failed"])
         self.assertEqual([event["attempt"] for event in events], [1, 2, 3])
@@ -329,6 +430,7 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertEqual(hello_call[3], [])
         self.assertEqual(hello_call[4], "東京 -> 东京")
         self.assertEqual(msg_client.calls[1][3], ["こんにちは。"])
+        self.assertEqual(msg_client.max_active, 1)
 
     def test_translation_rejects_abnormal_repetition(self):
         with self.assertRaisesRegex(RuntimeError, "same text for three different segments"):
@@ -342,6 +444,7 @@ class SubtitleTranslationTest(unittest.TestCase):
                 provider="local",
                 model="test-model",
                 retry_delay_seconds=0,
+                max_in_flight=2,
             )
 
     def test_translation_retry_includes_quality_correction(self):
@@ -472,11 +575,23 @@ class SubtitleTranslationTest(unittest.TestCase):
 class FakeCloudTranslationClient:
     def __init__(self):
         self.calls = []
+        self.active = 0
+        self.max_active = 0
 
-    def pipeline_translate_subtitle(self, provider, model, text, context, glossary, retry_instruction=""):
-        self.calls.append((provider, model, text, context, glossary, retry_instruction))
-        translations = {"こんにちは。": "你好。", "元気ですか。": "你好吗？"}
-        return {"translation": translations[text]}
+    def pipeline_translate_subtitle(
+        self, provider, model, text, context, glossary, retry_instruction=""
+    ):
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            self.calls.append(
+                (provider, model, text, context, glossary, retry_instruction)
+            )
+            time.sleep(0.01)
+            translations = {"こんにちは。": "你好。", "元気ですか。": "你好吗？"}
+            return {"translation": translations[text]}
+        finally:
+            self.active -= 1
 
 
 class FakeSubtitleAsrProcessor:
