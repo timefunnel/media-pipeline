@@ -31,7 +31,9 @@ ASR_SUBTITLE_SOURCE = "sensevoice-qwen"
 ASR_SUBTITLE_PROVIDER_ID = "sensevoice-qwen:zh-CN"
 ASR_TRANSLATION_PROVIDERS = {"local", "openai", "deepseek", "siliconflow"}
 JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
-JAPANESE_STANDALONE_PARTICLES = frozenset({"て", "を", "に", "へ", "と", "が", "の", "も"})
+JAPANESE_NONSEMANTIC_FRAGMENTS = frozenset(
+    {"て", "を", "に", "へ", "と", "が", "の", "も", "い", "丈"}
+)
 TARGET_LANGUAGE_INTERJECTIONS = frozenset({"啊", "嗯", "哦", "呀", "哇", "哈", "诶", "唉", "喂"})
 TRANSLATION_MODE_TARGET_LANGUAGE = "target_language"
 TRANSLATION_MODE_SKIPPED_NONSEMANTIC = "skipped_nonsemantic"
@@ -627,9 +629,9 @@ def subtitle_segment_program_mode(value):
         for char in str(value or "").strip()
         if unicodedata.category(char)[0] in {"L", "N"}
     )
-    if text in JAPANESE_STANDALONE_PARTICLES:
+    if text in JAPANESE_NONSEMANTIC_FRAGMENTS:
         return TRANSLATION_MODE_SKIPPED_NONSEMANTIC
-    if text in TARGET_LANGUAGE_INTERJECTIONS:
+    if text and len(set(text)) == 1 and text[0] in TARGET_LANGUAGE_INTERJECTIONS:
         return TRANSLATION_MODE_TARGET_LANGUAGE
     return ""
 
@@ -806,6 +808,8 @@ def translate_sequentially(
 
 def translation_retry_instruction(error):
     message = str(error or "")
+    if "empty content" in message:
+        return "上次没有返回译文，请根据当前日文和参考上下文输出非空的简体中文译文。"
     if "Japanese kana" in message:
         return "上次译文仍含日文假名，请将全部内容译成自然的简体中文。"
     if "length is abnormally" in message:

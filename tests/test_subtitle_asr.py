@@ -162,8 +162,10 @@ class SubtitleTranslationTest(unittest.TestCase):
         result = translate_sequentially(
             [
                 {"id": 0, "start": 0, "end": 1, "text": "て。"},
-                {"id": 1, "start": 1, "end": 2, "text": "啊。"},
-                {"id": 2, "start": 2, "end": 3, "text": "こんにちは。"},
+                {"id": 1, "start": 1, "end": 2, "text": "丈。"},
+                {"id": 2, "start": 2, "end": 3, "text": "啊。"},
+                {"id": 3, "start": 3, "end": 4, "text": "嗯嗯。"},
+                {"id": 4, "start": 4, "end": 5, "text": "こんにちは。"},
             ],
             translate_one,
             provider="openai",
@@ -176,16 +178,19 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertEqual(
             result,
             [
-                {"id": 1, "start": 1.0, "end": 2.0, "text": "啊。"},
-                {"id": 2, "start": 2.0, "end": 3.0, "text": "你好。"},
+                {"id": 2, "start": 2.0, "end": 3.0, "text": "啊。"},
+                {"id": 3, "start": 3.0, "end": 4.0, "text": "嗯嗯。"},
+                {"id": 4, "start": 4.0, "end": 5.0, "text": "你好。"},
             ],
         )
         self.assertEqual(
             checkpoints[-1],
             [
                 {"id": 0, "mode": "skipped_nonsemantic"},
-                {"id": 1, "text": "啊。", "mode": "target_language"},
-                {"id": 2, "text": "你好。"},
+                {"id": 1, "mode": "skipped_nonsemantic"},
+                {"id": 2, "text": "啊。", "mode": "target_language"},
+                {"id": 3, "text": "嗯嗯。", "mode": "target_language"},
+                {"id": 4, "text": "你好。"},
             ],
         )
 
@@ -288,6 +293,27 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertEqual(result[0]["text"], "你好")
         self.assertEqual(retry_instructions[0], "")
         self.assertIn("未完成翻译", retry_instructions[1])
+
+    def test_translation_retry_corrects_empty_cloud_response(self):
+        retry_instructions = []
+
+        def translate_one(_text, _context, _glossary, retry_instruction):
+            retry_instructions.append(retry_instruction)
+            if not retry_instruction:
+                raise RuntimeError("MediaStationGo API failed: HTTP 502 cloud translation returned empty content")
+            return "这是空气净化器吗？"
+
+        result = translate_sequentially(
+            [{"id": 0, "start": 0, "end": 1, "text": "それ空気清浄機？"}],
+            translate_one,
+            provider="openai",
+            model="deepseek-v4-flash",
+            retry_delay_seconds=0,
+        )
+
+        self.assertEqual(result[0]["text"], "这是空气净化器吗？")
+        self.assertEqual(retry_instructions[0], "")
+        self.assertIn("非空", retry_instructions[1])
 
     def test_non_speech_segments_are_not_sent_for_translation(self):
         selected = select_translatable_asr_segments(
