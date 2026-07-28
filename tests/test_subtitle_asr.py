@@ -149,10 +149,33 @@ class SubtitleTranslationTest(unittest.TestCase):
         client.unload_model()
         self.assertTrue(transport.requests[-1][0].endswith("/models/unload"))
 
-    def test_sakura_model_receives_context_prompt_with_current_segment_target(self):
-        transport = FakeTranslationTransport(
-            {"これを閉": "把这个关上", "めるのを": "关闭"}
-        )
+    def test_sakura_model_retries_fragment_with_context_prompt(self):
+        class NativeRetryTransport:
+            def __init__(self):
+                self.requests = []
+
+            def request(self, url, payload, headers=None, timeout=None):
+                self.requests.append((url, payload, headers, timeout))
+                prompt = payload["messages"][0]["content"]
+                if prompt == "これを閉":
+                    translated = "把这个关上"
+                elif prompt == "めるのを":
+                    translated = "めるのを"
+                else:
+                    self.assert_context_retry_prompt(prompt)
+                    translated = "关闭"
+                return {"choices": [{"message": {"content": translated}}]}
+
+            @staticmethod
+            def assert_context_retry_prompt(prompt):
+                if "参考上下文：\nこれを閉" not in prompt:
+                    raise AssertionError("retry prompt lost source context")
+                if "补充要求：\n上次输出未完成翻译" not in prompt:
+                    raise AssertionError("retry prompt lost validation instruction")
+                if not prompt.endswith("めるのを"):
+                    raise AssertionError("retry prompt changed the current segment")
+
+        transport = NativeRetryTransport()
         client = SubtitleTranslationClient(
             "http://127.0.0.1:17860/v1",
             "secret",
@@ -171,9 +194,9 @@ class SubtitleTranslationTest(unittest.TestCase):
 
         self.assertEqual([item["text"] for item in result], ["把这个关上", "关闭"])
         prompts = [item[1]["messages"][0]["content"] for item in transport.requests]
-        continuation_prompt = next(prompt for prompt in prompts if prompt.endswith("めるのを"))
-        self.assertIn("参考上下文：\nこれを閉", continuation_prompt)
-        self.assertIn("术语参考：\n人名：テスト", continuation_prompt)
+        self.assertEqual(prompts[:2], ["これを閉", "めるのを"])
+        self.assertEqual(len(prompts), 3)
+        self.assertIn("术语参考：\n人名：テスト", prompts[2])
 
     def test_local_translation_keeps_two_requests_in_flight_and_commits_in_order(
         self,
@@ -189,7 +212,7 @@ class SubtitleTranslationTest(unittest.TestCase):
             def request(self, url, payload, headers=None, timeout=None):
                 prompt = payload["messages"][0]["content"]
                 marker = "只输出译文，不要解释：\n\n"
-                target = prompt.split(marker, 1)[1]
+                target = prompt.split(marker, 1)[1] if marker in prompt else prompt
                 with self.lock:
                     self.active += 1
                     self.max_active = max(self.max_active, self.active)
@@ -479,8 +502,8 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertEqual(result[1]["text"], "你好")
         self.assertEqual(retry_instructions[0], "")
         self.assertIn("未完成翻译", retry_instructions[1])
-        self.assertEqual(contexts, [["前の文。"], []])
-        self.assertEqual(glossaries, ["人名：テスト", ""])
+        self.assertEqual(contexts, [["前の文。"], ["前の文。"]])
+        self.assertEqual(glossaries, ["人名：テスト", "人名：テスト"])
 
     def test_translation_retry_corrects_empty_cloud_response(self):
         retry_instructions = []
@@ -511,8 +534,8 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertEqual(result[1]["text"], "这是空气净化器吗？")
         self.assertEqual(retry_instructions[0], "")
         self.assertIn("非空", retry_instructions[1])
-        self.assertEqual(contexts, [["前の文。"], []])
-        self.assertEqual(glossaries, ["作品名：成人作品", ""])
+        self.assertEqual(contexts, [["前の文。"], ["前の文。"]])
+        self.assertEqual(glossaries, ["作品名：成人作品", "作品名：成人作品"])
 
     def test_translation_retry_corrects_prompt_echo(self):
         retry_instructions = []

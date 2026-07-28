@@ -245,7 +245,11 @@ class SubtitleTranslationClient:
         )
 
     def _translate_one(self, text, context, glossary, retry_instruction=""):
-        prompt = subtitle_translation_prompt(text, context, glossary, retry_instruction)
+        prompt = (
+            text
+            if uses_native_translation_prompt(self.model) and not retry_instruction
+            else subtitle_translation_prompt(text, context, glossary, retry_instruction)
+        )
         payload = {
             "model": self.model,
             "max_tokens": 1024,
@@ -962,15 +966,13 @@ def translate_sequentially(
             values.append(value)
         return values
 
-    def translation_request(
-        segment, context, retry_instruction="", retry_current_text_only=False
-    ):
+    def translation_request(segment, context, retry_instruction=""):
         started = time.monotonic()
         try:
             raw_translation = translate_one(
                 segment["text"],
-                [] if retry_current_text_only else context,
-                "" if retry_current_text_only else glossary,
+                context,
+                glossary,
                 retry_instruction,
             )
         except Exception as exc:
@@ -1037,7 +1039,6 @@ def translate_sequentially(
                 if executor is not None:
                     first_attempt = first_attempt.result()
                 retry_instruction = ""
-                retry_current_text_only = False
                 for attempt in range(1, DEFAULT_ASR_TRANSLATION_ATTEMPTS + 1):
                     if attempt == 1:
                         started, raw_translation, request_error = first_attempt
@@ -1046,7 +1047,6 @@ def translate_sequentially(
                             candidate,
                             context,
                             retry_instruction,
-                            retry_current_text_only,
                         )
                     try:
                         if request_error is not None:
@@ -1074,7 +1074,6 @@ def translate_sequentially(
                                 % (candidate["id"], attempt, exc)
                             ) from exc
                         retry_instruction = translation_retry_instruction(exc)
-                        retry_current_text_only = True
                         if request_error is not None and should_delay_translation_retry(
                             exc
                         ):
@@ -1195,6 +1194,10 @@ def require_translation_provider(provider):
     if provider not in ASR_TRANSLATION_PROVIDERS:
         raise RuntimeError("unsupported AI translation provider: %s" % provider)
     return provider
+
+
+def uses_native_translation_prompt(model):
+    return "sakura" in str(model or "").strip().casefold()
 
 
 def load_cached_transcript(path, expected_model=DEFAULT_ASR_MODEL):
