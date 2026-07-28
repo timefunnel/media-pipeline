@@ -134,7 +134,7 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertNotIn("response_format", first_payload)
         self.assertEqual(first_payload["temperature"], 0.1)
         self.assertEqual(first_payload["top_p"], 0.9)
-        self.assertEqual(first_payload["max_tokens"], 1024)
+        self.assertEqual(first_payload["max_tokens"], 16)
         self.assertEqual(len(first_payload["messages"]), 1)
         self.assertIn("参考上下文：\n（无）", first_payload["messages"][0]["content"])
         self.assertIn("术语参考：\n東京 -> 东京", first_payload["messages"][0]["content"])

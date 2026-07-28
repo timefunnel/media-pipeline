@@ -257,7 +257,7 @@ class SubtitleTranslationClient:
             )
         payload = {
             "model": self.model,
-            "max_tokens": 1024,
+            "max_tokens": translation_max_tokens(text),
             "temperature": 0.1,
             "top_p": 0.9,
             "stream": False,
@@ -939,6 +939,7 @@ def translate_sequentially(
                 started,
                 "failed",
                 "cached translation rejected: %s" % exc,
+                translation_max_tokens(segment_by_id[item["id"]]["text"]),
             )
             continue
         reusable_cached.append({"id": item["id"], "text": text})
@@ -1072,6 +1073,7 @@ def translate_sequentially(
                             started,
                             "failed",
                             str(exc),
+                            translation_max_tokens(candidate["text"]),
                         )
                         if attempt >= DEFAULT_ASR_TRANSLATION_ATTEMPTS:
                             raise RuntimeError(
@@ -1094,6 +1096,7 @@ def translate_sequentially(
                         started,
                         "completed",
                         "",
+                        translation_max_tokens(candidate["text"]),
                     )
                     by_id[candidate["id"]] = translation
                     handled_ids.add(candidate["id"])
@@ -1176,14 +1179,32 @@ def validate_repeated_translation(segments, translated_by_id, current_segment, t
         raise RuntimeError("AI translation returned the same text for three different segments")
 
 
-def emit_translation_event(callback, segment_id, provider, model, attempt, started, status, error):
+def translation_max_tokens(text):
+    return max(16, min(256, len(str(text or "").strip()) * 2))
+
+
+def emit_translation_event(
+    callback,
+    segment_id,
+    provider,
+    model,
+    attempt,
+    started,
+    status,
+    error,
+    max_tokens,
+):
     if callback is None:
         return
     event = {
         "segment_id": segment_id,
         "provider": provider,
         "model": model,
-        "parameters": {"temperature": 0.1, "top_p": 0.9, "max_tokens": 1024},
+        "parameters": {
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "max_tokens": max(1, int(max_tokens)),
+        },
         "attempt": attempt,
         "duration_ms": max(0, round((time.monotonic() - started) * 1000)),
         "status": status,
