@@ -399,6 +399,7 @@ class SubtitleAsrProcessor:
         translation_model="",
         progress_callback=None,
         cache_callback=None,
+        legacy_audio_task_ids=None,
     ):
         source_language = str(source_language or "auto").strip().lower()
         if source_language not in ASR_SOURCE_LANGUAGES:
@@ -412,7 +413,10 @@ class SubtitleAsrProcessor:
             raise RuntimeError("AI translation model missing")
         cache_dir = self._task_cache_dir(task_id)
         cache_dir.mkdir(parents=True, exist_ok=True)
-        audio_path = cache_dir / "audio.mp3"
+        audio_path = self._prepare_media_audio_cache(
+            media_id,
+            [task_id] + list(legacy_audio_task_ids or []),
+        )
         transcript_path = cache_dir / "transcript.json"
         translations_path = cache_dir / "translations.json"
         translation_history_path = cache_dir / "translation-history.json"
@@ -426,7 +430,7 @@ class SubtitleAsrProcessor:
             return msg_client
 
         if not audio_path.is_file() or audio_path.stat().st_size <= 0:
-            partial_audio = cache_dir / "audio.mp3.partial"
+            partial_audio = audio_path.with_name("audio.mp3.partial")
             partial_audio.unlink(missing_ok=True)
             emit_progress(progress_callback, "extracting_audio", 0, 0)
             task_msg_client().download_pipeline_asr_audio(
@@ -578,9 +582,13 @@ class SubtitleAsrProcessor:
             emit_cache(cache_callback, audio_path.is_file(), transcript_path.is_file())
             raise
 
-    def cache_state(self, task_id, asr_model=None):
+    def cache_state(self, task_id, asr_model=None, media_id=None):
         cache_dir = self._task_cache_dir(task_id)
-        audio_path = cache_dir / "audio.mp3"
+        audio_path = (
+            self._prepare_media_audio_cache(media_id, [task_id])
+            if media_id
+            else cache_dir / "audio.mp3"
+        )
         transcript_path = cache_dir / "transcript.json"
         audio_cached = audio_path.is_file() and audio_path.stat().st_size > 0
         transcript_cached = False
@@ -604,12 +612,87 @@ class SubtitleAsrProcessor:
         if cache_dir.exists():
             shutil.rmtree(cache_dir)
 
+    def _cache_root(self):
+        return Path(getattr(self.config, "asr_cache_dir", "/bot-data/subtitle-asr-cache"))
+
+    def _media_audio_cache_dir(self, media_id):
+        media_id = str(media_id or "").strip()
+        if not media_id:
+            raise RuntimeError("media ID is required for shared ASR audio cache")
+        cache_key = hashlib.sha256(media_id.encode("utf-8")).hexdigest()
+        return self._cache_root() / "_media" / cache_key
+
+    def _prepare_media_audio_cache(self, media_id, legacy_task_ids):
+        media_id = str(media_id or "").strip()
+        media_dir = self._media_audio_cache_dir(media_id)
+        media_dir.mkdir(parents=True, exist_ok=True)
+        metadata_path = media_dir / "media.json"
+        if metadata_path.is_file():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("shared ASR audio cache metadata is invalid: %s" % exc) from exc
+            if not isinstance(metadata, dict) or metadata.get("media_id") != media_id:
+                raise RuntimeError("shared ASR audio cache metadata does not match media ID")
+        else:
+            atomic_write_json(metadata_path, {"media_id": media_id})
+
+        audio_path = media_dir / "audio.mp3"
+        if audio_path.is_file() and audio_path.stat().st_size <= 0:
+            raise RuntimeError("shared ASR audio cache is empty: %s" % audio_path)
+
+        task_ids = []
+        seen = set()
+        for value in legacy_task_ids or []:
+            task_id = str(value or "").strip()
+            if task_id and task_id not in seen:
+                self._task_cache_dir(task_id)
+                seen.add(task_id)
+                task_ids.append(task_id)
+
+        legacy_paths = []
+        for task_id in task_ids:
+            task_dir = self._task_cache_dir(task_id)
+            partial_path = task_dir / "audio.mp3.partial"
+            partial_path.unlink(missing_ok=True)
+            legacy_path = task_dir / "audio.mp3"
+            if legacy_path.is_file():
+                if legacy_path.stat().st_size <= 0:
+                    raise RuntimeError("legacy ASR audio cache is empty: %s" % legacy_path)
+                legacy_paths.append(legacy_path)
+
+        canonical_path = (
+            audio_path
+            if audio_path.is_file()
+            else (legacy_paths[0] if legacy_paths else None)
+        )
+        if canonical_path is not None:
+            expected_size = canonical_path.stat().st_size
+            expected_hash = file_sha256(canonical_path)
+            for legacy_path in legacy_paths:
+                if legacy_path == canonical_path:
+                    continue
+                if legacy_path.stat().st_size != expected_size:
+                    raise RuntimeError(
+                        "conflicting ASR audio caches for media %s: %s" % (media_id, legacy_path)
+                    )
+                if file_sha256(legacy_path) != expected_hash:
+                    raise RuntimeError(
+                        "conflicting ASR audio caches for media %s: %s" % (media_id, legacy_path)
+                    )
+            if canonical_path != audio_path:
+                os.replace(canonical_path, audio_path)
+            for legacy_path in legacy_paths:
+                if legacy_path == canonical_path:
+                    continue
+                legacy_path.unlink()
+        return audio_path
+
     def _task_cache_dir(self, task_id):
         task_id = str(task_id or "").strip()
         if not task_id or any(char not in "0123456789abcdef" for char in task_id.lower()):
             raise RuntimeError("invalid AI subtitle task ID")
-        root = Path(getattr(self.config, "asr_cache_dir", "/bot-data/subtitle-asr-cache"))
-        return root / task_id
+        return self._cache_root() / task_id
 
     def _timeout(self):
         return max(1, int(getattr(self.config, "asr_timeout_seconds", DEFAULT_ASR_TIMEOUT_SECONDS)))
@@ -1035,6 +1118,17 @@ def load_cached_transcript(path, expected_model=DEFAULT_ASR_MODEL):
         )
     validate_asr_segments(payload.get("segments"))
     return payload
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def translation_source_sha256(segments):

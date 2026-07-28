@@ -674,6 +674,21 @@ class InternalApiStore:
             conn.close()
         return [subtitle_asr_task_row(row) for row in rows]
 
+    def list_subtitle_asr_task_ids_for_media(self, media_id):
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                select id from internal_api_subtitle_asr_tasks
+                where media_id = ?
+                order by updated_at desc, created_at desc, id desc
+                """,
+                (media_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [str(row["id"]) for row in rows]
+
     def claim_next_subtitle_asr_task(self):
         conn = self._connect()
         try:
@@ -1542,7 +1557,9 @@ class SubtitleAsrTaskManager:
             or getattr(getattr(self.processor, "config", None), "asr_model", DEFAULT_ASR_MODEL)
         ).strip()
         try:
-            audio_cached, transcript_cached = self.processor.cache_state(task_id, asr_model)
+            audio_cached, transcript_cached = self.processor.cache_state(
+                task_id, asr_model, current["media_id"]
+            )
             if audio_cached and transcript_cached:
                 self.processor.ensure_translation_available(provider, model)
             else:
@@ -1623,7 +1640,7 @@ class SubtitleAsrTaskManager:
         try:
             self.processor.ensure_translation_available(provider, model)
             audio_cached, transcript_cached = self.processor.cache_state(
-                task_id, current.get("asr_model")
+                task_id, current.get("asr_model"), current["media_id"]
             )
         except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
             raise ApiError(503, "subtitle_asr_unavailable", str(exc))
@@ -1664,6 +1681,9 @@ class SubtitleAsrTaskManager:
                     self._condition.wait(timeout=self.poll_seconds)
                 continue
             try:
+                legacy_audio_task_ids = self.store.list_subtitle_asr_task_ids_for_media(
+                    task["media_id"]
+                )
                 result = self.processor.run(
                     task["id"],
                     task["media_id"],
@@ -1677,6 +1697,7 @@ class SubtitleAsrTaskManager:
                     cache_callback=lambda audio, transcript: self.store.save_subtitle_asr_cache(
                         task["id"], audio, transcript
                     ),
+                    legacy_audio_task_ids=legacy_audio_task_ids,
                 )
                 self.store.finish_subtitle_asr_task(
                     task["id"], "completed", "completed", result=result

@@ -506,7 +506,7 @@ class FakeSubtitleAsrProcessor:
     def asr_models(self):
         return [DEFAULT_ASR_MODEL, "faster-whisper/large-v3"]
 
-    def cache_state(self, _task_id, _asr_model=DEFAULT_ASR_MODEL):
+    def cache_state(self, _task_id, _asr_model=DEFAULT_ASR_MODEL, _media_id=None):
         return self.cache
 
     def delete_cache(self, task_id):
@@ -522,6 +522,7 @@ class FakeSubtitleAsrProcessor:
         translation_model="",
         progress_callback=None,
         cache_callback=None,
+        legacy_audio_task_ids=None,
     ):
         self.run_calls.append((media_id, source_language))
         progress_callback("extracting_audio", 30, 120)
@@ -720,6 +721,98 @@ class SubtitleAsrTaskTest(unittest.TestCase):
 
 
 class SubtitleAsrCacheReuseTest(unittest.TestCase):
+    def test_new_task_migrates_existing_media_audio_without_downloading_again(self):
+        class FakeASRClient:
+            def __init__(self):
+                self.transcribe_calls = 0
+
+            def transcribe(self, *_args, **_kwargs):
+                self.transcribe_calls += 1
+                return {
+                    "segments": [
+                        {"id": 0, "start": 0.0, "end": 2.0, "text": "こんにちは。"}
+                    ]
+                }
+
+            def unload_asr_model(self):
+                return DEFAULT_ASR_MODEL
+
+        class NoDownloadMediaClient(FakeMediaMetadataClient):
+            def download_pipeline_asr_audio(self, *_args, **_kwargs):
+                raise AssertionError("existing media audio must not be downloaded again")
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            old_task_id = "d" * 32
+            new_task_id = "e" * 32
+            old_cache_dir = root / "cache" / old_task_id
+            new_cache_dir = root / "cache" / new_task_id
+            old_cache_dir.mkdir(parents=True)
+            new_cache_dir.mkdir(parents=True)
+            (old_cache_dir / "audio.mp3").write_bytes(b"existing-media-audio")
+            (new_cache_dir / "audio.mp3.partial").write_bytes(b"stale-partial")
+            config = SimpleNamespace(
+                asr_cache_dir=str(root / "cache"),
+                subtitle_cache_dir=str(root / "subtitles"),
+            )
+            processor = SubtitleAsrProcessor(config)
+            asr_client = FakeASRClient()
+            processor._asr_client = lambda _model=None: asr_client
+            processor._msg_client = lambda: NoDownloadMediaClient()
+            processor._translation_client = (
+                lambda _provider, _model, _msg=None: FakeCachedTranslationClient()
+            )
+            progress = []
+
+            processor.run(
+                new_task_id,
+                "shared-media",
+                "ja",
+                translation_provider="local",
+                translation_model="fake-model",
+                progress_callback=lambda stage, current, total: progress.append(
+                    (stage, current, total)
+                ),
+                legacy_audio_task_ids=[new_task_id, old_task_id],
+            )
+
+            shared_dir = processor._media_audio_cache_dir("shared-media")
+            self.assertEqual((shared_dir / "audio.mp3").read_bytes(), b"existing-media-audio")
+            self.assertEqual(
+                json.loads((shared_dir / "media.json").read_text(encoding="utf-8")),
+                {"media_id": "shared-media"},
+            )
+            self.assertFalse((old_cache_dir / "audio.mp3").exists())
+            self.assertFalse((new_cache_dir / "audio.mp3.partial").exists())
+            self.assertIn(("using_cached_audio", 1, 1), progress)
+            self.assertNotIn(("extracting_audio", 0, 0), progress)
+            self.assertEqual(asr_client.transcribe_calls, 1)
+
+    def test_conflicting_legacy_audio_caches_fail_before_migration(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            first_task_id = "1" * 32
+            second_task_id = "2" * 32
+            first_audio = root / "cache" / first_task_id / "audio.mp3"
+            second_audio = root / "cache" / second_task_id / "audio.mp3"
+            first_audio.parent.mkdir(parents=True)
+            second_audio.parent.mkdir(parents=True)
+            first_audio.write_bytes(b"first-audio")
+            second_audio.write_bytes(b"second-audio")
+            processor = SubtitleAsrProcessor(
+                SimpleNamespace(asr_cache_dir=str(root / "cache"))
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "conflicting ASR audio caches"):
+                processor._prepare_media_audio_cache(
+                    "conflicting-media", [first_task_id, second_task_id]
+                )
+
+            shared_audio = processor._media_audio_cache_dir("conflicting-media") / "audio.mp3"
+            self.assertFalse(shared_audio.exists())
+            self.assertTrue(first_audio.is_file())
+            self.assertTrue(second_audio.is_file())
+
     def test_switching_asr_model_reuses_audio_but_replaces_transcript(self):
         class FakeASRClient:
             def __init__(self):
@@ -761,7 +854,9 @@ class SubtitleAsrCacheReuseTest(unittest.TestCase):
             )
             processor = SubtitleAsrProcessor(config)
             self.assertEqual(
-                processor.cache_state(task_id, "faster-whisper/large-v3"),
+                processor.cache_state(
+                    task_id, "faster-whisper/large-v3", "media-whisper"
+                ),
                 (True, False),
             )
             asr_client = FakeASRClient()
@@ -778,9 +873,13 @@ class SubtitleAsrCacheReuseTest(unittest.TestCase):
                 asr_model="faster-whisper/large-v3",
                 translation_provider="local",
                 translation_model="fake-model",
+                legacy_audio_task_ids=[task_id],
             )
 
             transcript = json.loads((cache_dir / "transcript.json").read_text(encoding="utf-8"))
+            shared_audio = processor._media_audio_cache_dir("media-whisper") / "audio.mp3"
+            self.assertTrue(shared_audio.is_file())
+            self.assertFalse((cache_dir / "audio.mp3").exists())
             self.assertEqual(transcript["model"], "faster-whisper/large-v3")
             self.assertEqual(transcript["segments"][0]["text"], "こんにちは。")
             self.assertEqual(result["asr_model"], "faster-whisper/large-v3")
@@ -808,6 +907,10 @@ class SubtitleAsrCacheReuseTest(unittest.TestCase):
                 subtitle_cache_dir=str(root / "subtitles"),
             )
             processor = SubtitleAsrProcessor(config)
+            shared_audio_dir = processor._media_audio_cache_dir("media-1")
+            shared_audio_dir.mkdir(parents=True)
+            (shared_audio_dir / "audio.mp3").write_bytes(b"audio")
+            (cache_dir / "audio.mp3").unlink()
             msg_client = FakeMediaMetadataClient()
             processor._msg_client = lambda: msg_client
             processor._asr_client = lambda: self.fail("cached transcript must skip SenseVoice")
@@ -880,6 +983,10 @@ class SubtitleAsrCacheReuseTest(unittest.TestCase):
                 subtitle_cache_dir=str(root / "subtitles"),
             )
             processor = SubtitleAsrProcessor(config)
+            shared_audio_dir = processor._media_audio_cache_dir("media-2")
+            shared_audio_dir.mkdir(parents=True)
+            (shared_audio_dir / "audio.mp3").write_bytes(b"audio")
+            (cache_dir / "audio.mp3").unlink()
             processor._msg_client = lambda: self.fail("cached inputs must not call MediaStationGo")
             processor._asr_client = lambda: self.fail("cached transcript must skip SenseVoice")
             translation_client = FakeCachedTranslationClient(fail=True)
