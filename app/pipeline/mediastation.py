@@ -216,14 +216,16 @@ class MediaStationClient:
             "/pipeline/media/%s/subtitle-status" % quote_path(media_id),
         )
 
-    def pipeline_translate_subtitles(self, provider, model, segments):
+    def pipeline_translate_subtitle(self, provider, model, text, context, glossary):
         return self._pipeline_request(
             "POST",
             "/pipeline/subtitles/translate",
             {
                 "provider": str(provider or "").strip(),
                 "model": str(model or "").strip(),
-                "segments": list(segments or []),
+                "text": str(text or "").strip(),
+                "context": list(context or []),
+                "glossary": str(glossary or "").strip(),
             },
             timeout=120,
         )

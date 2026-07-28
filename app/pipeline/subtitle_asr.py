@@ -1,12 +1,16 @@
+import hashlib
 import http.client
 import json
 import math
 import os
+import re
 import shutil
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pipeline.external_subtitles import SubtitleCache, SubtitleDownload
@@ -17,13 +21,15 @@ from pipeline.mediastation import MediaStationClient
 DEFAULT_ASR_MODEL = "FunAudioLLM/SenseVoiceSmall"
 DEFAULT_ASR_TIMEOUT_SECONDS = 1800
 DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS = 90
-DEFAULT_ASR_TRANSLATION_BATCH_SEGMENTS = 25
-DEFAULT_ASR_TRANSLATION_BATCH_CHARS = 3500
+DEFAULT_ASR_TRANSLATION_CONTEXT_SEGMENTS = 4
+DEFAULT_ASR_TRANSLATION_ATTEMPTS = 2
+DEFAULT_ASR_TRANSLATION_RETRY_DELAY_SECONDS = 1
 DEFAULT_ASR_MAX_AUDIO_BYTES = 250 * 1024 * 1024
 ASR_SOURCE_LANGUAGES = {"auto", "ja", "en", "zh", "ko"}
 ASR_SUBTITLE_SOURCE = "sensevoice-qwen"
 ASR_SUBTITLE_PROVIDER_ID = "sensevoice-qwen:zh-CN"
 ASR_TRANSLATION_PROVIDERS = {"local", "openai", "deepseek", "siliconflow"}
+JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
 
 
 class SenseVoiceClient:
@@ -162,43 +168,38 @@ class SubtitleTranslationClient:
         if not self.model:
             raise RuntimeError("AI translation model missing")
 
-    def translate(self, segments, progress_callback=None):
-        segments = validate_asr_segments(segments)
-        batches = translation_batches(segments)
-        translated = []
-        for index, batch in enumerate(batches, start=1):
-            translated.extend(self._translate_batch(batch))
-            if progress_callback is not None:
-                progress_callback(index, len(batches))
-        if [item["id"] for item in translated] != [item["id"] for item in segments]:
-            raise RuntimeError("AI translation segment IDs do not match the ASR timeline")
-        by_id = {item["id"]: item["text"] for item in translated}
-        return [{**item, "text": by_id[item["id"]]} for item in segments]
+    def translate(
+        self,
+        segments,
+        glossary="",
+        progress_callback=None,
+        cached_translations=None,
+        checkpoint_callback=None,
+        event_callback=None,
+    ):
+        return translate_sequentially(
+            segments,
+            self._translate_one,
+            provider="local",
+            model=self.model,
+            glossary=glossary,
+            progress_callback=progress_callback,
+            cached_translations=cached_translations,
+            checkpoint_callback=checkpoint_callback,
+            event_callback=event_callback,
+        )
 
-    def _translate_batch(self, segments):
+    def _translate_one(self, text, context, glossary):
         payload = {
             "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": 1024,
+            "temperature": 0.1,
+            "top_p": 0.9,
             "stream": False,
-            "response_format": {"type": "json_object"},
             "messages": [
                 {
-                    "role": "system",
-                    "content": (
-                        "Translate spoken subtitle dialogue into natural Simplified Chinese (zh-CN). "
-                        "Return strict JSON only with schema "
-                        '{"translations":[{"id":0,"text":"translated text"}]}. '
-                        "Keep every input id exactly once and in the same order. Do not add, omit, merge, "
-                        "or split segments. Preserve names, tone, and meaning. Translation text must not be empty."
-                    ),
-                },
-                {
                     "role": "user",
-                    "content": json.dumps(
-                        {"segments": [{"id": item["id"], "text": item["text"]} for item in segments]},
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
+                    "content": subtitle_translation_prompt(text, context, glossary),
                 },
             ],
         }
@@ -214,15 +215,21 @@ class SubtitleTranslationClient:
             },
             timeout=self.timeout,
         )
-        content = llm_message_content(response)
-        try:
-            result = json.loads(content)
-        except ValueError as exc:
-            raise RuntimeError("AI translation returned invalid JSON") from exc
-        values = result.get("translations") if isinstance(result, dict) else None
-        if not isinstance(values, list):
-            raise RuntimeError("AI translation response is missing translations")
-        return validate_translations(values, [item["id"] for item in segments])
+        return llm_message_content(response)
+
+    def unload_model(self):
+        response = self.transport.request(
+            self.base_url + "/models/unload",
+            {"model": self.model},
+            headers={
+                "Authorization": "Bearer " + self.api_key,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=min(30, self.timeout),
+        )
+        if not isinstance(response, dict) or response.get("unloaded") != self.model:
+            raise RuntimeError("AI translation service did not confirm model unload")
 
 
 class MediaStationTranslationClient:
@@ -235,20 +242,37 @@ class MediaStationTranslationClient:
         if not self.model:
             raise RuntimeError("AI translation model missing")
 
-    def translate(self, segments, progress_callback=None):
-        segments = validate_asr_segments(segments)
-        batches = translation_batches(segments)
-        translated = []
-        for index, batch in enumerate(batches, start=1):
-            response = self.msg_client.pipeline_translate_subtitles(self.provider, self.model, batch)
-            values = response.get("translations") if isinstance(response, dict) else None
-            translated.extend(validate_translations(values, [item["id"] for item in batch]))
-            if progress_callback is not None:
-                progress_callback(index, len(batches))
-        if [item["id"] for item in translated] != [item["id"] for item in segments]:
-            raise RuntimeError("AI translation segment IDs do not match the ASR timeline")
-        by_id = {item["id"]: item["text"] for item in translated}
-        return [{**item, "text": by_id[item["id"]]} for item in segments]
+    def translate(
+        self,
+        segments,
+        glossary="",
+        progress_callback=None,
+        cached_translations=None,
+        checkpoint_callback=None,
+        event_callback=None,
+    ):
+        return translate_sequentially(
+            segments,
+            self._translate_one,
+            provider=self.provider,
+            model=self.model,
+            glossary=glossary,
+            progress_callback=progress_callback,
+            cached_translations=cached_translations,
+            checkpoint_callback=checkpoint_callback,
+            event_callback=event_callback,
+        )
+
+    def _translate_one(self, text, context, glossary):
+        response = self.msg_client.pipeline_translate_subtitle(
+            self.provider,
+            self.model,
+            text,
+            context,
+            glossary,
+        )
+        translation = response.get("translation") if isinstance(response, dict) else None
+        return translation
 
 
 class SubtitleAsrProcessor:
@@ -301,11 +325,22 @@ class SubtitleAsrProcessor:
         cache_dir.mkdir(parents=True, exist_ok=True)
         audio_path = cache_dir / "audio.mp3"
         transcript_path = cache_dir / "transcript.json"
+        translations_path = cache_dir / "translations.json"
+        translation_history_path = cache_dir / "translation-history.json"
+        glossary_path = cache_dir / "glossary.json"
+        msg_client = None
+
+        def task_msg_client():
+            nonlocal msg_client
+            if msg_client is None:
+                msg_client = self._msg_client()
+            return msg_client
+
         if not audio_path.is_file() or audio_path.stat().st_size <= 0:
             partial_audio = cache_dir / "audio.mp3.partial"
             partial_audio.unlink(missing_ok=True)
             emit_progress(progress_callback, "extracting_audio", 0, 0)
-            self._msg_client().download_pipeline_asr_audio(
+            task_msg_client().download_pipeline_asr_audio(
                 media_id,
                 partial_audio,
                 timeout=self._timeout(),
@@ -346,16 +381,61 @@ class SubtitleAsrProcessor:
 
         try:
             segments = validate_asr_segments(transcript.get("segments"))
-            batch_total = len(translation_batches(segments))
-            emit_progress(progress_callback, "translating", 0, batch_total)
+            glossary = load_or_create_translation_glossary(
+                glossary_path, media_id, task_msg_client
+            )
+            cached_translations = load_translation_cache(
+                translations_path, provider, model, segments
+            )
+            translation_history = load_translation_history(translation_history_path)
+            save_translation_cache(
+                translations_path, provider, model, segments, cached_translations
+            )
+            translation_total = len(segments)
+            emit_progress(
+                progress_callback, "translating", len(cached_translations), translation_total
+            )
 
-            def translated_batch(current, total):
+            def translated_segment(current, total):
                 emit_progress(progress_callback, "translating", current, total)
 
-            translated = self._translation_client(provider, model).translate(
-                segments, progress_callback=translated_batch
+            def checkpoint_translations(values):
+                save_translation_cache(
+                    translations_path, provider, model, segments, values
+                )
+
+            def record_translation_event(event):
+                translation_history.append(event)
+                save_translation_history(translation_history_path, translation_history)
+
+            translation_client = self._translation_client(
+                provider,
+                model,
+                task_msg_client() if provider != "local" else None,
             )
-            emit_progress(progress_callback, "saving", batch_total, batch_total)
+            translation_requested = len(cached_translations) < translation_total
+            try:
+                translated = translation_client.translate(
+                    segments,
+                    glossary=glossary,
+                    progress_callback=translated_segment,
+                    cached_translations=cached_translations,
+                    checkpoint_callback=checkpoint_translations,
+                    event_callback=record_translation_event,
+                )
+            except Exception as translation_error:
+                if provider == "local" and translation_requested:
+                    try:
+                        translation_client.unload_model()
+                    except Exception as unload_error:
+                        raise RuntimeError(
+                            "AI translation failed and local model unload failed: %s"
+                            % unload_error
+                        ) from translation_error
+                raise
+            if provider == "local" and translation_requested:
+                translation_client.unload_model()
+            emit_progress(progress_callback, "saving", translation_total, translation_total)
             subtitle = build_srt(translated)
             track = SubtitleCache(self.config.subtitle_cache_dir).save_download(
                 media_id,
@@ -416,7 +496,7 @@ class SubtitleAsrProcessor:
             timeout=self._timeout(),
         )
 
-    def _translation_client(self, provider, model):
+    def _translation_client(self, provider, model, msg_client=None):
         if provider == "local":
             return SubtitleTranslationClient(
                 getattr(self.config, "asr_translation_base_url", ""),
@@ -425,7 +505,9 @@ class SubtitleAsrProcessor:
                 getattr(self.config, "asr_translation_timeout_seconds", DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS),
                 thinking_disabled=getattr(self.config, "asr_translation_thinking_disabled", True),
             )
-        return MediaStationTranslationClient(self._msg_client(), provider, model)
+        if msg_client is None:
+            msg_client = self._msg_client()
+        return MediaStationTranslationClient(msg_client, provider, model)
 
     def _msg_client(self):
         username = str(getattr(self.config, "msg_admin_user", "") or "").strip()
@@ -479,23 +561,176 @@ def validate_asr_segments(values):
     return out
 
 
-def validate_translations(values, expected_ids):
+def validate_translation_text(source, value):
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("AI translation returned empty content")
+    translated = value.strip()
+    if "```" in translated or translated.startswith(("{", "[")):
+        raise RuntimeError("AI translation returned structured content instead of plain text")
+    if translated.startswith(("译文：", "翻译：", "翻译结果：", "Translation:")):
+        raise RuntimeError("AI translation returned an explanation instead of plain text")
+    if normalize_translation_text(source) == normalize_translation_text(translated):
+        raise RuntimeError("AI translation returned the untranslated source text")
+    if JAPANESE_KANA_RE.search(translated):
+        raise RuntimeError("AI translation still contains Japanese kana")
+
+    source_length = len(str(source))
+    translated_length = len(translated)
+    maximum_length = max(80, source_length * 4 + 20)
+    if translated_length > maximum_length:
+        raise RuntimeError("AI translation length is abnormally large")
+    if source_length >= 20 and translated_length < source_length // 10:
+        raise RuntimeError("AI translation length is abnormally small")
+    return translated
+
+
+def normalize_translation_text(value):
+    return "".join(str(value or "").split()).casefold()
+
+
+def validate_cached_translations(values, segments):
+    if values is None:
+        return []
     if not isinstance(values, list):
-        raise RuntimeError("AI translation response is missing translations")
+        raise RuntimeError("cached AI translations are invalid")
+    expected_ids = {item["id"] for item in segments}
     translated = []
     seen = set()
     for item in values:
         if not isinstance(item, dict) or not isinstance(item.get("id"), int):
-            raise RuntimeError("AI translation returned an invalid segment")
+            raise RuntimeError("cached AI translations contain an invalid segment")
         segment_id = item["id"]
-        text = str(item.get("text") or "").strip()
-        if segment_id in seen or not text:
-            raise RuntimeError("AI translation returned duplicate or empty segments")
+        if segment_id not in expected_ids or segment_id in seen:
+            raise RuntimeError("cached AI translations contain an unexpected segment")
         seen.add(segment_id)
-        translated.append({"id": segment_id, "text": text})
-    if [item["id"] for item in translated] != list(expected_ids):
-        raise RuntimeError("AI translation segment IDs do not match the requested batch")
-    return translated
+        translated.append(
+            {"id": segment_id, "text": validate_translation_text_for_cache(item.get("text"))}
+        )
+    return sorted(translated, key=lambda item: item["id"])
+
+
+def validate_translation_text_for_cache(value):
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("cached AI translations contain empty content")
+    return value.strip()
+
+
+def translate_sequentially(
+    segments,
+    translate_one,
+    provider,
+    model,
+    glossary="",
+    progress_callback=None,
+    cached_translations=None,
+    checkpoint_callback=None,
+    event_callback=None,
+    retry_delay_seconds=DEFAULT_ASR_TRANSLATION_RETRY_DELAY_SECONDS,
+):
+    segments = validate_asr_segments(segments)
+    cached = validate_cached_translations(cached_translations, segments)
+    by_id = {item["id"]: item["text"] for item in cached}
+    total = len(segments)
+    if progress_callback is not None:
+        progress_callback(len(by_id), total)
+
+    for index, segment in enumerate(segments):
+        segment_id = segment["id"]
+        if segment_id in by_id:
+            continue
+        context = [
+            item["text"]
+            for item in segments[
+                max(0, index - DEFAULT_ASR_TRANSLATION_CONTEXT_SEGMENTS) : index
+            ]
+        ]
+        for attempt in range(1, DEFAULT_ASR_TRANSLATION_ATTEMPTS + 1):
+            started = time.monotonic()
+            try:
+                raw_translation = translate_one(segment["text"], context, glossary)
+                translation = validate_translation_text(segment["text"], raw_translation)
+                validate_repeated_translation(segments, by_id, segment, translation)
+            except Exception as exc:
+                emit_translation_event(
+                    event_callback,
+                    segment_id,
+                    provider,
+                    model,
+                    attempt,
+                    started,
+                    "failed",
+                    str(exc),
+                )
+                if attempt >= DEFAULT_ASR_TRANSLATION_ATTEMPTS:
+                    raise RuntimeError(
+                        "AI translation failed for segment %s after %s attempts: %s"
+                        % (segment_id, attempt, exc)
+                    ) from exc
+                time.sleep(max(0, float(retry_delay_seconds)))
+                continue
+
+            emit_translation_event(
+                event_callback,
+                segment_id,
+                provider,
+                model,
+                attempt,
+                started,
+                "completed",
+                "",
+            )
+            by_id[segment_id] = translation
+            checkpoint = [
+                {"id": item["id"], "text": by_id[item["id"]]}
+                for item in segments
+                if item["id"] in by_id
+            ]
+            if checkpoint_callback is not None:
+                checkpoint_callback(checkpoint)
+            if progress_callback is not None:
+                progress_callback(len(by_id), total)
+            break
+
+    if len(by_id) != total:
+        raise RuntimeError("AI translation did not cover the ASR timeline")
+    return [{**item, "text": by_id[item["id"]]} for item in segments]
+
+
+def validate_repeated_translation(segments, translated_by_id, current_segment, translation):
+    current_id = current_segment["id"]
+    if current_id < 2 or len(translation) < 6:
+        return
+    previous_ids = (current_id - 2, current_id - 1)
+    if any(segment_id not in translated_by_id for segment_id in previous_ids):
+        return
+    normalized = normalize_translation_text(translation)
+    if any(
+        normalize_translation_text(translated_by_id[segment_id]) != normalized
+        for segment_id in previous_ids
+    ):
+        return
+    source_by_id = {item["id"]: normalize_translation_text(item["text"]) for item in segments}
+    sources = {source_by_id[current_id], *(source_by_id[segment_id] for segment_id in previous_ids)}
+    if len(sources) == 3:
+        raise RuntimeError("AI translation returned the same text for three different segments")
+
+
+def emit_translation_event(callback, segment_id, provider, model, attempt, started, status, error):
+    if callback is None:
+        return
+    event = {
+        "segment_id": segment_id,
+        "provider": provider,
+        "model": model,
+        "parameters": {"temperature": 0.1, "top_p": 0.9, "max_tokens": 1024},
+        "attempt": attempt,
+        "duration_ms": max(0, round((time.monotonic() - started) * 1000)),
+        "status": status,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if error:
+        event["error"] = error
+    callback(event)
 
 
 def require_translation_provider(provider):
@@ -517,6 +752,149 @@ def load_cached_transcript(path):
     return payload
 
 
+def translation_source_sha256(segments):
+    source = json.dumps(
+        [{"id": item["id"], "text": item["text"]} for item in segments],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(source).hexdigest()
+
+
+def load_translation_cache(path, provider, model, segments):
+    path = Path(path)
+    if not path.is_file():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as source:
+            payload = json.load(source)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("cached AI translations are invalid: %s" % exc) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("cached AI translations are invalid")
+    if (
+        payload.get("provider") != provider
+        or payload.get("model") != model
+        or payload.get("source_sha256") != translation_source_sha256(segments)
+    ):
+        return []
+    return validate_cached_translations(payload.get("translations"), segments)
+
+
+def save_translation_cache(path, provider, model, segments, translations):
+    validated = validate_cached_translations(translations, segments)
+    atomic_write_json(
+        path,
+        {
+            "provider": provider,
+            "model": model,
+            "source_sha256": translation_source_sha256(segments),
+            "translations": validated,
+        },
+    )
+
+
+def load_or_create_translation_glossary(path, media_id, msg_client_factory):
+    path = Path(path)
+    if path.is_file():
+        try:
+            with path.open("r", encoding="utf-8") as source:
+                payload = json.load(source)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("cached AI translation glossary is invalid: %s" % exc) from exc
+        if not isinstance(payload, dict) or payload.get("media_id") != media_id:
+            raise RuntimeError("cached AI translation glossary is invalid")
+        glossary = payload.get("glossary")
+        if not isinstance(glossary, str):
+            raise RuntimeError("cached AI translation glossary is invalid")
+        return glossary
+
+    media = msg_client_factory().get_media(media_id)
+    if not isinstance(media, dict):
+        raise RuntimeError("MediaStationGo returned invalid media metadata for translation glossary")
+    glossary = build_translation_glossary(media)
+    atomic_write_json(path, {"media_id": media_id, "glossary": glossary})
+    return glossary
+
+
+def build_translation_glossary(media):
+    title = first_nonempty_media_string(media, "display_title", "title")
+    original_name = first_nonempty_media_string(media, "original_name")
+    actors = media.get("actors")
+    if actors is None:
+        actor_names = []
+    elif isinstance(actors, str):
+        actor_names = [item.strip() for item in re.split(r"[,，、;；]", actors) if item.strip()]
+    elif isinstance(actors, list):
+        actor_names = [str(item).strip() for item in actors if str(item).strip()]
+    else:
+        raise RuntimeError("MediaStationGo media actors are invalid for translation glossary")
+
+    lines = []
+    if title:
+        lines.append("作品名：" + title)
+    if original_name and normalize_translation_text(original_name) != normalize_translation_text(title):
+        lines.append("原名：" + original_name)
+    if actor_names:
+        lines.append("人名：" + "、".join(dict.fromkeys(actor_names)))
+    return "\n".join(lines)
+
+
+def first_nonempty_media_string(media, *keys):
+    for key in keys:
+        value = media.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise RuntimeError("MediaStationGo media %s is invalid for translation glossary" % key)
+        if value.strip():
+            return value.strip()
+    return ""
+
+
+def load_translation_history(path):
+    path = Path(path)
+    if not path.is_file():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as source:
+            payload = json.load(source)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("AI translation history is invalid: %s" % exc) from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise RuntimeError("AI translation history is invalid")
+    return validate_translation_history(payload.get("events"))
+
+
+def save_translation_history(path, events):
+    atomic_write_json(path, {"version": 1, "events": validate_translation_history(events)})
+
+
+def validate_translation_history(events):
+    if not isinstance(events, list):
+        raise RuntimeError("AI translation history is invalid")
+    validated = []
+    required = {
+        "segment_id",
+        "provider",
+        "model",
+        "parameters",
+        "attempt",
+        "duration_ms",
+        "status",
+        "recorded_at",
+    }
+    for event in events:
+        if not isinstance(event, dict) or not required.issubset(event):
+            raise RuntimeError("AI translation history contains an invalid event")
+        if event.get("status") not in {"completed", "failed"}:
+            raise RuntimeError("AI translation history contains an invalid event")
+        if event.get("status") == "failed" and not str(event.get("error") or "").strip():
+            raise RuntimeError("AI translation history contains an invalid failure event")
+        validated.append(dict(event))
+    return validated
+
+
 def atomic_write_json(path, payload):
     path = Path(path)
     partial = path.with_name(path.name + ".partial")
@@ -532,24 +910,18 @@ def emit_cache(callback, audio_cached, transcript_cached):
         callback(bool(audio_cached), bool(transcript_cached))
 
 
-def translation_batches(segments):
-    batches = []
-    current = []
-    current_chars = 0
-    for item in segments:
-        text_length = len(item["text"])
-        if current and (
-            len(current) >= DEFAULT_ASR_TRANSLATION_BATCH_SEGMENTS
-            or current_chars + text_length > DEFAULT_ASR_TRANSLATION_BATCH_CHARS
-        ):
-            batches.append(current)
-            current = []
-            current_chars = 0
-        current.append(item)
-        current_chars += text_length
-    if current:
-        batches.append(current)
-    return batches
+def subtitle_translation_prompt(text, context, glossary):
+    context_text = "\n".join(context) if context else "（无）"
+    glossary_text = str(glossary or "").strip() or "（无）"
+    return (
+        "参考上下文：\n"
+        + context_text
+        + "\n\n术语参考：\n"
+        + glossary_text
+        + "\n\n将下面的日文翻译成自然、准确的简体中文。\n"
+        + "只输出译文，不要解释：\n\n"
+        + text
+    )
 
 
 def llm_message_content(response):

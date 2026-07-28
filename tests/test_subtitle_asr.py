@@ -25,7 +25,10 @@ from pipeline.subtitle_asr import (
     SenseVoiceClient,
     SubtitleAsrProcessor,
     SubtitleTranslationClient,
+    build_translation_glossary,
     build_srt,
+    load_translation_history,
+    translate_sequentially,
     validate_asr_segments,
 )
 
@@ -56,35 +59,23 @@ class SenseVoiceHealthTest(unittest.TestCase):
 
 
 class FakeTranslationTransport:
-    def __init__(self, response):
-        self.response = response
+    def __init__(self, translations):
+        self.translations = translations
         self.requests = []
 
     def request(self, url, payload, headers=None, timeout=None):
         self.requests.append((url, payload, headers, timeout))
-        return self.response
+        if url.endswith("/models/unload"):
+            return {"unloaded": payload["model"]}
+        prompt = payload["messages"][0]["content"]
+        target = prompt.split("只输出译文，不要解释：\n\n", 1)[1]
+        return {"choices": [{"message": {"content": self.translations[target]}}]}
 
 
 class SubtitleTranslationTest(unittest.TestCase):
-    def test_translation_keeps_exact_ids_and_timestamps(self):
+    def test_translation_uses_only_previous_context_and_server_owned_timeline(self):
         transport = FakeTranslationTransport(
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "translations": [
-                                        {"id": 0, "text": "第一句"},
-                                        {"id": 1, "text": "第二句"},
-                                    ]
-                                },
-                                ensure_ascii=False,
-                            )
-                        }
-                    }
-                ]
-            }
+            {"今日は遅かった。": "今天来晚了。", "電車が止まりました。": "电车停运了。"}
         )
         client = SubtitleTranslationClient(
             "https://api.deepseek.invalid/v1",
@@ -95,18 +86,32 @@ class SubtitleTranslationTest(unittest.TestCase):
         )
         result = client.translate(
             [
-                {"id": 0, "start": 0.21, "end": 1.5, "text": "hello"},
-                {"id": 1, "start": 1.5, "end": 3.125, "text": "world"},
-            ]
+                {"id": 0, "start": 0.21, "end": 1.5, "text": "今日は遅かった。"},
+                {"id": 1, "start": 1.5, "end": 3.125, "text": "電車が止まりました。"},
+            ],
+            glossary="東京 -> 东京",
         )
-        self.assertEqual([item["text"] for item in result], ["第一句", "第二句"])
+        self.assertEqual([item["text"] for item in result], ["今天来晚了。", "电车停运了。"])
         self.assertEqual(result[1]["end"], 3.125)
         self.assertIn("00:00:00,210 --> 00:00:01,500", build_srt(result))
+        self.assertEqual(len(transport.requests), 2)
+        first_payload = transport.requests[0][1]
+        second_payload = transport.requests[1][1]
+        self.assertNotIn("response_format", first_payload)
+        self.assertEqual(first_payload["temperature"], 0.1)
+        self.assertEqual(first_payload["top_p"], 0.9)
+        self.assertEqual(first_payload["max_tokens"], 1024)
+        self.assertEqual(len(first_payload["messages"]), 1)
+        self.assertIn("参考上下文：\n（无）", first_payload["messages"][0]["content"])
+        self.assertIn("术语参考：\n東京 -> 东京", first_payload["messages"][0]["content"])
+        self.assertIn("参考上下文：\n今日は遅かった。", second_payload["messages"][0]["content"])
+        self.assertNotIn("電車が止まりました。\n\n术语参考", second_payload["messages"][0]["content"])
+        client.unload_model()
+        self.assertTrue(transport.requests[-1][0].endswith("/models/unload"))
 
-    def test_translation_rejects_missing_segment_id(self):
-        transport = FakeTranslationTransport(
-            {"choices": [{"message": {"content": '{"translations":[{"id":0,"text":"第一句"}]}'}}]}
-        )
+    @patch("pipeline.subtitle_asr.time.sleep")
+    def test_translation_rejects_empty_plain_text_after_current_segment_retry(self, sleep):
+        transport = FakeTranslationTransport({"こんにちは": ""})
         client = SubtitleTranslationClient(
             "https://api.deepseek.invalid/v1",
             "secret",
@@ -114,22 +119,96 @@ class SubtitleTranslationTest(unittest.TestCase):
             30,
             transport=transport,
         )
-        with self.assertRaisesRegex(RuntimeError, "segment IDs"):
-            client.translate(
+        with self.assertRaisesRegex(RuntimeError, "segment 0 after 2 attempts"):
+            client.translate([{"id": 0, "start": 0, "end": 1, "text": "こんにちは"}])
+        self.assertEqual(len(transport.requests), 2)
+        sleep.assert_called_once()
+
+    def test_translation_reuses_completed_segments_and_checkpoints_new_results(self):
+        transport = FakeTranslationTransport({"元気ですか。": "你好吗？"})
+        client = SubtitleTranslationClient(
+            "https://api.deepseek.invalid/v1",
+            "secret",
+            "deepseek-test",
+            30,
+            transport=transport,
+        )
+        checkpoints = []
+        result = client.translate(
+            [
+                {"id": 0, "start": 0, "end": 1, "text": "こんにちは。"},
+                {"id": 1, "start": 1, "end": 2, "text": "元気ですか。"},
+            ],
+            cached_translations=[{"id": 0, "text": "你好。"}],
+            checkpoint_callback=lambda values: checkpoints.append(values),
+        )
+        self.assertEqual([item["text"] for item in result], ["你好。", "你好吗？"])
+        self.assertEqual(len(transport.requests), 1)
+        self.assertEqual(
+            checkpoints[-1],
+            [{"id": 0, "text": "你好。"}, {"id": 1, "text": "你好吗？"}],
+        )
+
+    def test_translation_failure_retries_only_current_segment_and_stops(self):
+        calls = []
+        checkpoints = []
+        events = []
+
+        def translate_one(text, _context, _glossary):
+            calls.append(text)
+            raise RuntimeError("translation failed")
+
+        with self.assertRaisesRegex(RuntimeError, "segment 0 after 2 attempts"):
+            translate_sequentially(
                 [
-                    {"id": 0, "start": 0, "end": 1, "text": "one"},
-                    {"id": 1, "start": 1, "end": 2, "text": "two"},
-                ]
+                    {"id": 0, "start": 0, "end": 1, "text": "最初。"},
+                    {"id": 1, "start": 1, "end": 2, "text": "次。"},
+                ],
+                translate_one,
+                provider="local",
+                model="test-model",
+                checkpoint_callback=lambda values: checkpoints.append(values),
+                event_callback=lambda event: events.append(event),
+                retry_delay_seconds=0,
             )
+        self.assertEqual(calls, ["最初。", "最初。"])
+        self.assertEqual(checkpoints, [])
+        self.assertEqual([event["status"] for event in events], ["failed", "failed"])
+        self.assertEqual([event["attempt"] for event in events], [1, 2])
 
     def test_cloud_translation_uses_mediastation_proxy(self):
         msg_client = FakeCloudTranslationClient()
         client = MediaStationTranslationClient(msg_client, "deepseek", "deepseek-chat")
         result = client.translate(
-            [{"id": 0, "start": 0.0, "end": 1.0, "text": "hello"}]
+            [
+                {"id": 0, "start": 0.0, "end": 1.0, "text": "こんにちは。"},
+                {"id": 1, "start": 1.0, "end": 2.0, "text": "元気ですか。"},
+            ],
+            glossary="東京 -> 东京",
         )
-        self.assertEqual(result[0]["text"], "你好")
+        self.assertEqual(
+            [item["text"] for item in result],
+            ["你好。", "你好吗？"],
+        )
         self.assertEqual(msg_client.calls[0][0:2], ("deepseek", "deepseek-chat"))
+        hello_call = next(call for call in msg_client.calls if call[2] == "こんにちは。")
+        self.assertEqual(hello_call[3], [])
+        self.assertEqual(hello_call[4], "東京 -> 东京")
+        self.assertEqual(msg_client.calls[1][3], ["こんにちは。"])
+
+    def test_translation_rejects_abnormal_repetition(self):
+        with self.assertRaisesRegex(RuntimeError, "same text for three different segments"):
+            translate_sequentially(
+                [
+                    {"id": 0, "start": 0, "end": 1, "text": "一つ目。"},
+                    {"id": 1, "start": 1, "end": 2, "text": "二つ目。"},
+                    {"id": 2, "start": 2, "end": 3, "text": "三つ目。"},
+                ],
+                lambda _text, _context, _glossary: "完全相同的异常译文",
+                provider="local",
+                model="test-model",
+                retry_delay_seconds=0,
+            )
 
     def test_asr_segments_require_real_ordered_timeline(self):
         with self.assertRaisesRegex(RuntimeError, "timeline"):
@@ -140,9 +219,10 @@ class FakeCloudTranslationClient:
     def __init__(self):
         self.calls = []
 
-    def pipeline_translate_subtitles(self, provider, model, segments):
-        self.calls.append((provider, model, segments))
-        return {"translations": [{"id": item["id"], "text": "你好"} for item in segments]}
+    def pipeline_translate_subtitle(self, provider, model, text, context, glossary):
+        self.calls.append((provider, model, text, context, glossary))
+        translations = {"こんにちは。": "你好。", "元気ですか。": "你好吗？"}
+        return {"translation": translations[text]}
 
 
 class FakeSubtitleAsrProcessor:
@@ -295,7 +375,7 @@ class SubtitleAsrCacheReuseTest(unittest.TestCase):
                 json.dumps(
                     {
                         "segments": [
-                            {"id": 0, "start": 0.0, "end": 1.5, "text": "hello"}
+                            {"id": 0, "start": 0.0, "end": 1.5, "text": "こんにちは。"}
                         ]
                     }
                 ),
@@ -306,9 +386,11 @@ class SubtitleAsrCacheReuseTest(unittest.TestCase):
                 subtitle_cache_dir=str(root / "subtitles"),
             )
             processor = SubtitleAsrProcessor(config)
-            processor._msg_client = lambda: self.fail("cached audio must skip MediaStationGo download")
+            msg_client = FakeMediaMetadataClient()
+            processor._msg_client = lambda: msg_client
             processor._asr_client = lambda: self.fail("cached transcript must skip SenseVoice")
-            processor._translation_client = lambda _provider, _model: FakeCachedTranslationClient()
+            translation_client = FakeCachedTranslationClient()
+            processor._translation_client = lambda _provider, _model, _msg=None: translation_client
             progress = []
 
             result = processor.run(
@@ -323,13 +405,150 @@ class SubtitleAsrCacheReuseTest(unittest.TestCase):
             self.assertEqual(result["translation_model"], "fake-model")
             self.assertIn(("using_cached_audio", 1, 1), progress)
             self.assertIn(("using_cached_transcript", 1, 1), progress)
+            self.assertEqual(translation_client.calls, ["こんにちは。"])
+            self.assertEqual(translation_client.unload_calls, 1)
+            self.assertTrue((cache_dir / "translations.json").is_file())
+            self.assertTrue((cache_dir / "glossary.json").is_file())
+            history = load_translation_history(cache_dir / "translation-history.json")
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]["status"], "completed")
+            self.assertEqual(history[0]["model"], "fake-model")
+            self.assertEqual(msg_client.get_media_calls, ["media-1"])
+
+            retry_client = FakeCachedTranslationClient()
+            processor._translation_client = lambda _provider, _model, _msg=None: retry_client
+            retry_progress = []
+            processor.run(
+                "a" * 32,
+                "media-1",
+                "en",
+                translation_provider="local",
+                translation_model="fake-model",
+                progress_callback=lambda stage, current, total: retry_progress.append(
+                    (stage, current, total)
+                ),
+            )
+            self.assertEqual(retry_client.calls, [])
+            self.assertEqual(retry_client.unload_calls, 0)
+            self.assertIn(("translating", 1, 1), retry_progress)
+            self.assertEqual(msg_client.get_media_calls, ["media-1"])
+
+    def test_failed_translation_unloads_local_model_once_and_keeps_attempt_history(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            cache_dir = root / "cache" / ("b" * 32)
+            cache_dir.mkdir(parents=True)
+            (cache_dir / "audio.mp3").write_bytes(b"audio")
+            (cache_dir / "transcript.json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {"id": 0, "start": 0.0, "end": 1.5, "text": "こんにちは。"}
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (cache_dir / "glossary.json").write_text(
+                json.dumps({"media_id": "media-2", "glossary": ""}),
+                encoding="utf-8",
+            )
+            config = SimpleNamespace(
+                asr_cache_dir=str(root / "cache"),
+                subtitle_cache_dir=str(root / "subtitles"),
+            )
+            processor = SubtitleAsrProcessor(config)
+            processor._msg_client = lambda: self.fail("cached inputs must not call MediaStationGo")
+            processor._asr_client = lambda: self.fail("cached transcript must skip SenseVoice")
+            translation_client = FakeCachedTranslationClient(fail=True)
+            processor._translation_client = lambda _provider, _model, _msg=None: translation_client
+
+            with self.assertRaisesRegex(RuntimeError, "segment 0 after 2 attempts"):
+                processor.run(
+                    "b" * 32,
+                    "media-2",
+                    "ja",
+                    translation_provider="local",
+                    translation_model="fake-model",
+                )
+
+            self.assertEqual(translation_client.unload_calls, 1)
+            history = load_translation_history(cache_dir / "translation-history.json")
+            self.assertEqual([event["status"] for event in history], ["failed", "failed"])
+
+    def test_corrupt_translation_history_fails_explicitly(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "translation-history.json"
+            path.write_text("{broken", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "history is invalid"):
+                load_translation_history(path)
+
+    def test_glossary_uses_media_titles_and_actor_names(self):
+        glossary = build_translation_glossary(
+            {
+                "display_title": "恶魔阴谋",
+                "title": "恶魔阴谋",
+                "original_name": "The Devil Conspiracy",
+                "actors": "Alice, Bob，Alice",
+            }
+        )
+        self.assertEqual(
+            glossary,
+            "作品名：恶魔阴谋\n原名：The Devil Conspiracy\n人名：Alice、Bob",
+        )
+
+
+class FakeMediaMetadataClient:
+    def __init__(self):
+        self.get_media_calls = []
+
+    def get_media(self, media_id):
+        self.get_media_calls.append(media_id)
+        return {
+            "display_title": "测试作品",
+            "original_name": "テスト作品",
+            "actors": "山田太郎, 佐藤花子",
+        }
 
 
 class FakeCachedTranslationClient:
-    def translate(self, segments, progress_callback=None):
-        if progress_callback is not None:
-            progress_callback(1, 1)
-        return [{**segment, "text": "你好"} for segment in segments]
+    def __init__(self, fail=False):
+        self.calls = []
+        self.unload_calls = 0
+        self.fail = fail
+
+    def translate(
+        self,
+        segments,
+        glossary="",
+        progress_callback=None,
+        cached_translations=None,
+        checkpoint_callback=None,
+        event_callback=None,
+    ):
+        def translate_one(text, _context, received_glossary):
+            self.calls.append(text)
+            if self.fail:
+                raise RuntimeError("translation failed")
+            if "山田太郎" not in received_glossary:
+                raise AssertionError("translation glossary was not passed")
+            return "你好。"
+
+        return translate_sequentially(
+            segments,
+            translate_one,
+            provider="local",
+            model="fake-model",
+            glossary=glossary,
+            progress_callback=progress_callback,
+            cached_translations=cached_translations,
+            checkpoint_callback=checkpoint_callback,
+            event_callback=event_callback,
+            retry_delay_seconds=0,
+        )
+
+    def unload_model(self):
+        self.unload_calls += 1
 
 
 class SubtitleAsrConfigTest(unittest.TestCase):
