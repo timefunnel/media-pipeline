@@ -1080,12 +1080,17 @@ def subtitle_translation_prompt(text, context, glossary, retry_instruction=""):
     context_text = "\n".join(context) if context else "（无）"
     glossary_text = str(glossary or "").strip() or "（无）"
     retry_text = str(retry_instruction or "").strip()
+    if retry_text:
+        return (
+            "将下面的日文文本翻译成自然、准确的简体中文。\n"
+            + "只输出译文，不要解释：\n\n"
+            + text
+        )
     return (
         "参考上下文：\n"
         + context_text
         + "\n\n术语参考：\n"
         + glossary_text
-        + ("\n\n重试要求：\n" + retry_text if retry_text else "")
         + "\n\n将下面的日文翻译成自然、准确的简体中文。\n"
         + "只输出译文，不要解释：\n\n"
         + text

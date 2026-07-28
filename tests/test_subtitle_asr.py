@@ -29,6 +29,7 @@ from pipeline.subtitle_asr import (
     build_srt,
     load_translation_history,
     select_translatable_asr_segments,
+    subtitle_translation_prompt,
     translate_sequentially,
     validate_asr_segments,
     validate_translation_text,
@@ -75,6 +76,24 @@ class FakeTranslationTransport:
 
 
 class SubtitleTranslationTest(unittest.TestCase):
+    def test_local_retry_prompt_contains_only_the_current_text(self):
+        prompt = subtitle_translation_prompt(
+            "こんにちは。",
+            ["前の文。"],
+            "人名：テスト",
+            "上次译文仍含日文假名。",
+        )
+
+        self.assertEqual(
+            prompt,
+            "将下面的日文文本翻译成自然、准确的简体中文。\n"
+            "只输出译文，不要解释：\n\n"
+            "こんにちは。",
+        )
+        self.assertNotIn("参考上下文", prompt)
+        self.assertNotIn("术语参考", prompt)
+        self.assertNotIn("重试要求", prompt)
+
     def test_translation_uses_only_previous_context_and_server_owned_timeline(self):
         transport = FakeTranslationTransport(
             {"今日は遅かった。": "今天来晚了。", "電車が止まりました。": "电车停运了。"}
