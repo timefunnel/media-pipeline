@@ -151,6 +151,64 @@ class SubtitleTranslationTest(unittest.TestCase):
             [{"id": 0, "text": "你好。"}, {"id": 1, "text": "你好吗？"}],
         )
 
+    def test_translation_program_handles_target_interjection_and_standalone_particle(self):
+        calls = []
+        checkpoints = []
+
+        def translate_one(text, _context, _glossary, _retry_instruction):
+            calls.append(text)
+            return "你好。"
+
+        result = translate_sequentially(
+            [
+                {"id": 0, "start": 0, "end": 1, "text": "て。"},
+                {"id": 1, "start": 1, "end": 2, "text": "啊。"},
+                {"id": 2, "start": 2, "end": 3, "text": "こんにちは。"},
+            ],
+            translate_one,
+            provider="openai",
+            model="test-model",
+            checkpoint_callback=lambda values: checkpoints.append(values),
+            retry_delay_seconds=0,
+        )
+
+        self.assertEqual(calls, ["こんにちは。"])
+        self.assertEqual(
+            result,
+            [
+                {"id": 1, "start": 1.0, "end": 2.0, "text": "啊。"},
+                {"id": 2, "start": 2.0, "end": 3.0, "text": "你好。"},
+            ],
+        )
+        self.assertEqual(
+            checkpoints[-1],
+            [
+                {"id": 0, "mode": "skipped_nonsemantic"},
+                {"id": 1, "text": "啊。", "mode": "target_language"},
+                {"id": 2, "text": "你好。"},
+            ],
+        )
+
+    def test_translation_reuses_cached_program_handled_segments(self):
+        calls = []
+        result = translate_sequentially(
+            [
+                {"id": 0, "start": 0, "end": 1, "text": "て。"},
+                {"id": 1, "start": 1, "end": 2, "text": "啊。"},
+            ],
+            lambda *args: calls.append(args),
+            provider="openai",
+            model="test-model",
+            cached_translations=[
+                {"id": 0, "mode": "skipped_nonsemantic"},
+                {"id": 1, "text": "啊。", "mode": "target_language"},
+            ],
+            retry_delay_seconds=0,
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result, [{"id": 1, "start": 1.0, "end": 2.0, "text": "啊。"}])
+
     def test_translation_failure_retries_only_current_segment_and_stops(self):
         calls = []
         checkpoints = []

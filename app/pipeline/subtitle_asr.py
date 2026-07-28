@@ -31,6 +31,10 @@ ASR_SUBTITLE_SOURCE = "sensevoice-qwen"
 ASR_SUBTITLE_PROVIDER_ID = "sensevoice-qwen:zh-CN"
 ASR_TRANSLATION_PROVIDERS = {"local", "openai", "deepseek", "siliconflow"}
 JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
+JAPANESE_STANDALONE_PARTICLES = frozenset({"て", "を", "に", "へ", "と", "が", "の", "も"})
+TARGET_LANGUAGE_INTERJECTIONS = frozenset({"啊", "嗯", "哦", "呀", "哇", "哈", "诶", "唉", "喂"})
+TRANSLATION_MODE_TARGET_LANGUAGE = "target_language"
+TRANSLATION_MODE_SKIPPED_NONSEMANTIC = "skipped_nonsemantic"
 
 
 class SenseVoiceClient:
@@ -617,12 +621,26 @@ def normalize_translation_text(value):
     return "".join(str(value or "").split()).casefold()
 
 
+def subtitle_segment_program_mode(value):
+    text = "".join(
+        char
+        for char in str(value or "").strip()
+        if unicodedata.category(char)[0] in {"L", "N"}
+    )
+    if text in JAPANESE_STANDALONE_PARTICLES:
+        return TRANSLATION_MODE_SKIPPED_NONSEMANTIC
+    if text in TARGET_LANGUAGE_INTERJECTIONS:
+        return TRANSLATION_MODE_TARGET_LANGUAGE
+    return ""
+
+
 def validate_cached_translations(values, segments):
     if values is None:
         return []
     if not isinstance(values, list):
         raise RuntimeError("cached AI translations are invalid")
-    expected_ids = {item["id"] for item in segments}
+    segment_by_id = {item["id"]: item for item in segments}
+    expected_ids = set(segment_by_id)
     translated = []
     seen = set()
     for item in values:
@@ -632,9 +650,30 @@ def validate_cached_translations(values, segments):
         if segment_id not in expected_ids or segment_id in seen:
             raise RuntimeError("cached AI translations contain an unexpected segment")
         seen.add(segment_id)
-        translated.append(
-            {"id": segment_id, "text": validate_translation_text_for_cache(item.get("text"))}
-        )
+        mode = str(item.get("mode") or "").strip()
+        if not mode:
+            translated.append(
+                {"id": segment_id, "text": validate_translation_text_for_cache(item.get("text"))}
+            )
+            continue
+        expected_mode = subtitle_segment_program_mode(segment_by_id[segment_id]["text"])
+        if mode != expected_mode:
+            raise RuntimeError("cached AI translations contain an invalid program-handled segment")
+        if mode == TRANSLATION_MODE_TARGET_LANGUAGE:
+            text = validate_translation_text_for_cache(item.get("text"))
+            if normalize_translation_text(text) != normalize_translation_text(
+                segment_by_id[segment_id]["text"]
+            ):
+                raise RuntimeError("cached AI translations contain an invalid target-language segment")
+            translated.append({"id": segment_id, "text": text, "mode": mode})
+            continue
+        if mode == TRANSLATION_MODE_SKIPPED_NONSEMANTIC:
+            skipped_text = item.get("text")
+            if skipped_text is not None and skipped_text != "":
+                raise RuntimeError("cached AI translations contain an invalid skipped segment")
+            translated.append({"id": segment_id, "mode": mode})
+            continue
+        raise RuntimeError("cached AI translations contain an unsupported program mode")
     return sorted(translated, key=lambda item: item["id"])
 
 
@@ -658,14 +697,47 @@ def translate_sequentially(
 ):
     segments = validate_asr_segments(segments)
     cached = validate_cached_translations(cached_translations, segments)
-    by_id = {item["id"]: item["text"] for item in cached}
+    handled_ids = {item["id"] for item in cached}
+    by_id = {
+        item["id"]: item["text"]
+        for item in cached
+        if item.get("mode") != TRANSLATION_MODE_SKIPPED_NONSEMANTIC
+    }
+    mode_by_id = {item["id"]: item.get("mode", "") for item in cached}
     total = len(segments)
     if progress_callback is not None:
-        progress_callback(len(by_id), total)
+        progress_callback(len(handled_ids), total)
+
+    def checkpoint_values():
+        values = []
+        for item in segments:
+            segment_id = item["id"]
+            if segment_id not in handled_ids:
+                continue
+            mode = mode_by_id.get(segment_id, "")
+            if mode == TRANSLATION_MODE_SKIPPED_NONSEMANTIC:
+                values.append({"id": segment_id, "mode": mode})
+                continue
+            value = {"id": segment_id, "text": by_id[segment_id]}
+            if mode:
+                value["mode"] = mode
+            values.append(value)
+        return values
 
     for index, segment in enumerate(segments):
         segment_id = segment["id"]
-        if segment_id in by_id:
+        if segment_id in handled_ids:
+            continue
+        program_mode = subtitle_segment_program_mode(segment["text"])
+        if program_mode:
+            handled_ids.add(segment_id)
+            mode_by_id[segment_id] = program_mode
+            if program_mode == TRANSLATION_MODE_TARGET_LANGUAGE:
+                by_id[segment_id] = segment["text"]
+            if checkpoint_callback is not None:
+                checkpoint_callback(checkpoint_values())
+            if progress_callback is not None:
+                progress_callback(len(handled_ids), total)
             continue
         context = [
             item["text"]
@@ -713,20 +785,23 @@ def translate_sequentially(
                 "",
             )
             by_id[segment_id] = translation
-            checkpoint = [
-                {"id": item["id"], "text": by_id[item["id"]]}
-                for item in segments
-                if item["id"] in by_id
-            ]
+            handled_ids.add(segment_id)
             if checkpoint_callback is not None:
-                checkpoint_callback(checkpoint)
+                checkpoint_callback(checkpoint_values())
             if progress_callback is not None:
-                progress_callback(len(by_id), total)
+                progress_callback(len(handled_ids), total)
             break
 
-    if len(by_id) != total:
+    if len(handled_ids) != total:
         raise RuntimeError("AI translation did not cover the ASR timeline")
-    return [{**item, "text": by_id[item["id"]]} for item in segments]
+    translated = [
+        {**item, "text": by_id[item["id"]]}
+        for item in segments
+        if mode_by_id.get(item["id"]) != TRANSLATION_MODE_SKIPPED_NONSEMANTIC
+    ]
+    if not translated:
+        raise RuntimeError("AI translation produced no subtitle content after filtering")
+    return translated
 
 
 def translation_retry_instruction(error):
