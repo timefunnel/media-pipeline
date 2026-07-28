@@ -27,8 +27,7 @@ DEFAULT_ASR_TRANSLATION_ATTEMPTS = 3
 DEFAULT_ASR_TRANSLATION_RETRY_DELAY_SECONDS = 1
 DEFAULT_ASR_MAX_AUDIO_BYTES = 250 * 1024 * 1024
 ASR_SOURCE_LANGUAGES = {"auto", "ja", "en", "zh", "ko"}
-ASR_SUBTITLE_SOURCE = "sensevoice-qwen"
-ASR_SUBTITLE_PROVIDER_ID = "sensevoice-qwen:zh-CN"
+ASR_SUBTITLE_PROVIDER_PREFIX = "ai-asr"
 ASR_TRANSLATION_PROVIDERS = {"local", "openai", "deepseek", "siliconflow"}
 JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
 HAN_CHARACTER_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
@@ -556,12 +555,13 @@ class SubtitleAsrProcessor:
                 translation_client.unload_model()
             emit_progress(progress_callback, "saving", translation_total, translation_total)
             subtitle = build_srt(translated)
+            subtitle_identity = asr_subtitle_identity(asr_model, model)
             track = SubtitleCache(self.config.subtitle_cache_dir).save_download(
                 media_id,
                 SubtitleDownload(
-                    source=ASR_SUBTITLE_SOURCE,
-                    provider_id=ASR_SUBTITLE_PROVIDER_ID,
-                    filename="sensevoice-qwen.zh-CN.srt",
+                    source=subtitle_identity["source"],
+                    provider_id=subtitle_identity["provider_id"],
+                    filename=subtitle_identity["filename"],
                     body=subtitle.encode("utf-8"),
                     lang="zh-CN",
                     label="AI 简体中文",
@@ -570,7 +570,7 @@ class SubtitleAsrProcessor:
             )
             return {
                 "filename": str(track.get("filename") or ""),
-                "source": ASR_SUBTITLE_SOURCE,
+                "source": subtitle_identity["source"],
                 "language": "zh-CN",
                 "segment_count": len(translated),
                 "duration": float(translated[-1]["end"]),
@@ -1138,6 +1138,43 @@ def file_sha256(path):
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def asr_subtitle_identity(asr_model, translation_model):
+    asr_label, asr_slug = subtitle_model_identity(asr_model, "asr")
+    translation_label, translation_slug = subtitle_model_identity(
+        translation_model, "translation"
+    )
+    source = "%s + %s" % (asr_label, translation_label)
+    return {
+        "source": source,
+        "provider_id": "%s:%s:%s:zh-CN"
+        % (ASR_SUBTITLE_PROVIDER_PREFIX, asr_slug, translation_slug),
+        "filename": "%s-%s.zh-CN.srt" % (asr_slug, translation_slug),
+    }
+
+
+def subtitle_model_identity(model, kind):
+    value = str(model or "").strip()
+    lowered = value.casefold()
+    if kind == "asr" and "whisper" in lowered:
+        if "large-v3" in lowered:
+            return "Whisper large-v3", "whisper-large-v3"
+        return "Whisper", "whisper"
+    if kind == "asr" and "sensevoice" in lowered:
+        return "SenseVoice Small", "sensevoice-small"
+    if kind == "translation" and "sakura" in lowered:
+        return "Sakura", "sakura"
+    if kind == "translation" and "deepseek" in lowered:
+        return "DeepSeek", "deepseek"
+    if kind == "translation" and "hunyuan" in lowered:
+        return "Hunyuan MT", "hunyuan-mt"
+    if kind == "translation" and "qwen" in lowered:
+        return "Qwen", "qwen"
+
+    name = value.rsplit("/", 1)[-1].split(":", 1)[0].strip() or kind
+    slug = re.sub(r"[^0-9a-z]+", "-", name.casefold()).strip("-") or kind
+    return name, slug
 
 
 def translation_source_sha256(segments):

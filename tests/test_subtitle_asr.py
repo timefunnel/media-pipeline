@@ -26,6 +26,7 @@ from pipeline.subtitle_asr import (
     SenseVoiceClient,
     SubtitleAsrProcessor,
     SubtitleTranslationClient,
+    asr_subtitle_identity,
     build_translation_glossary,
     build_srt,
     load_translation_history,
@@ -733,6 +734,19 @@ class SubtitleAsrTaskTest(unittest.TestCase):
 
 
 class SubtitleAsrCacheReuseTest(unittest.TestCase):
+    def test_whisper_sakura_subtitle_identity_uses_selected_models(self):
+        self.assertEqual(
+            asr_subtitle_identity(
+                "faster-whisper/large-v3",
+                "quantumcookie/Sakura-qwen2.5-v1.0:7b",
+            ),
+            {
+                "source": "Whisper large-v3 + Sakura",
+                "provider_id": "ai-asr:whisper-large-v3:sakura:zh-CN",
+                "filename": "whisper-large-v3-sakura.zh-CN.srt",
+            },
+        )
+
     def test_deleting_legacy_task_migrates_media_audio_before_removing_task_cache(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -913,6 +927,10 @@ class SubtitleAsrCacheReuseTest(unittest.TestCase):
             self.assertEqual(transcript["model"], "faster-whisper/large-v3")
             self.assertEqual(transcript["segments"][0]["text"], "こんにちは。")
             self.assertEqual(result["asr_model"], "faster-whisper/large-v3")
+            self.assertEqual(result["source"], "Whisper large-v3 + fake-model")
+            self.assertEqual(
+                result["filename"], "whisper-large-v3-fake-model-zh-Hans.srt"
+            )
             self.assertEqual(asr_client.transcribe_calls, 1)
             self.assertEqual(asr_client.unload_calls, 1)
 
