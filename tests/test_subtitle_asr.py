@@ -297,10 +297,12 @@ class SubtitleTranslationTest(unittest.TestCase):
     def test_translation_retry_corrects_empty_cloud_response(self):
         retry_instructions = []
         contexts = []
+        glossaries = []
 
-        def translate_one(_text, context, _glossary, retry_instruction):
+        def translate_one(_text, context, glossary, retry_instruction):
             retry_instructions.append(retry_instruction)
             contexts.append(context)
+            glossaries.append(glossary)
             if not retry_instruction:
                 raise RuntimeError("MediaStationGo API failed: HTTP 502 cloud translation returned empty content")
             return "这是空气净化器吗？"
@@ -313,6 +315,7 @@ class SubtitleTranslationTest(unittest.TestCase):
             translate_one,
             provider="openai",
             model="deepseek-v4-flash",
+            glossary="作品名：成人作品",
             cached_translations=[{"id": 0, "text": "前一句。"}],
             retry_delay_seconds=0,
         )
@@ -321,6 +324,7 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertEqual(retry_instructions[0], "")
         self.assertIn("非空", retry_instructions[1])
         self.assertEqual(contexts, [["前の文。"], []])
+        self.assertEqual(glossaries, ["作品名：成人作品", ""])
 
     def test_non_speech_segments_are_not_sent_for_translation(self):
         selected = select_translatable_asr_segments(

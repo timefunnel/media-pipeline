@@ -748,12 +748,15 @@ def translate_sequentially(
             ]
         ]
         retry_instruction = ""
-        retry_without_context = False
+        retry_current_text_only = False
         for attempt in range(1, DEFAULT_ASR_TRANSLATION_ATTEMPTS + 1):
             started = time.monotonic()
             try:
                 raw_translation = translate_one(
-                    segment["text"], [] if retry_without_context else context, glossary, retry_instruction
+                    segment["text"],
+                    [] if retry_current_text_only else context,
+                    "" if retry_current_text_only else glossary,
+                    retry_instruction,
                 )
                 translation = validate_translation_text(segment["text"], raw_translation)
                 validate_repeated_translation(segments, by_id, segment, translation)
@@ -774,7 +777,7 @@ def translate_sequentially(
                         % (segment_id, attempt, exc)
                     ) from exc
                 retry_instruction = translation_retry_instruction(exc)
-                retry_without_context = retry_without_context or "empty content" in str(exc)
+                retry_current_text_only = retry_current_text_only or "empty content" in str(exc)
                 time.sleep(max(0, float(retry_delay_seconds)))
                 continue
 
