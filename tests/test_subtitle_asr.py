@@ -483,6 +483,7 @@ class FakeSubtitleAsrProcessor:
         self.ensure_calls = 0
         self.run_calls = []
         self.deleted_cache_ids = []
+        self.deleted_cache_calls = []
         self.cache = (True, True)
         self.config = SimpleNamespace(
             asr_model=DEFAULT_ASR_MODEL,
@@ -509,8 +510,11 @@ class FakeSubtitleAsrProcessor:
     def cache_state(self, _task_id, _asr_model=DEFAULT_ASR_MODEL, _media_id=None):
         return self.cache
 
-    def delete_cache(self, task_id):
+    def delete_cache(self, task_id, media_id=None, legacy_audio_task_ids=None):
         self.deleted_cache_ids.append(task_id)
+        self.deleted_cache_calls.append(
+            (task_id, media_id, list(legacy_audio_task_ids or []))
+        )
 
     def run(
         self,
@@ -657,6 +661,10 @@ class SubtitleAsrTaskTest(unittest.TestCase):
         self.assertFalse(canceled["cached_transcript"])
         self.assertEqual(self.processor.deleted_cache_ids, [task["id"]])
         self.assertEqual(
+            self.processor.deleted_cache_calls,
+            [(task["id"], "media-cancel", [task["id"]])],
+        )
+        self.assertEqual(
             self.store.get_subtitle_asr_task("admin", task["id"])["status"],
             "canceled",
         )
@@ -702,6 +710,10 @@ class SubtitleAsrTaskTest(unittest.TestCase):
         self.manager.delete_task("admin", task["id"])
 
         self.assertEqual(self.processor.deleted_cache_ids, [task["id"]])
+        self.assertEqual(
+            self.processor.deleted_cache_calls,
+            [(task["id"], "media-delete", [task["id"]])],
+        )
         with self.assertRaisesRegex(Exception, "not found"):
             self.store.get_subtitle_asr_task("admin", task["id"])
 
@@ -721,6 +733,24 @@ class SubtitleAsrTaskTest(unittest.TestCase):
 
 
 class SubtitleAsrCacheReuseTest(unittest.TestCase):
+    def test_deleting_legacy_task_migrates_media_audio_before_removing_task_cache(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            task_id = "f" * 32
+            task_cache_dir = root / "cache" / task_id
+            task_cache_dir.mkdir(parents=True)
+            (task_cache_dir / "audio.mp3").write_bytes(b"legacy-audio")
+            (task_cache_dir / "transcript.json").write_text("{}", encoding="utf-8")
+            processor = SubtitleAsrProcessor(
+                SimpleNamespace(asr_cache_dir=str(root / "cache"))
+            )
+
+            processor.delete_cache(task_id, "delete-media", [task_id])
+
+            shared_audio = processor._media_audio_cache_dir("delete-media") / "audio.mp3"
+            self.assertEqual(shared_audio.read_bytes(), b"legacy-audio")
+            self.assertFalse(task_cache_dir.exists())
+
     def test_new_task_migrates_existing_media_audio_without_downloading_again(self):
         class FakeASRClient:
             def __init__(self):

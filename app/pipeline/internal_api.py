@@ -1614,8 +1614,12 @@ class SubtitleAsrTaskManager:
         task_id = require_text(task_id, "task_id", max_length=200)
         task = self.store.cancel_queued_subtitle_asr_task(owner_id, task_id)
         try:
-            self.processor.delete_cache(task_id)
-        except OSError as exc:
+            self.processor.delete_cache(
+                task_id,
+                task["media_id"],
+                self.store.list_subtitle_asr_task_ids_for_media(task["media_id"]),
+            )
+        except (OSError, RuntimeError) as exc:
             raise ApiError(500, "subtitle_asr_cache_delete_failed", str(exc))
         return self.store.clear_canceled_subtitle_asr_cache_state(owner_id, task_id)
 
@@ -1662,8 +1666,12 @@ class SubtitleAsrTaskManager:
         if current["status"] in {"queued", "running"}:
             raise ApiError(409, "subtitle_asr_active", "active AI subtitle tasks cannot be deleted")
         try:
-            self.processor.delete_cache(task_id)
-        except OSError as exc:
+            self.processor.delete_cache(
+                task_id,
+                current["media_id"],
+                self.store.list_subtitle_asr_task_ids_for_media(current["media_id"]),
+            )
+        except (OSError, RuntimeError) as exc:
             raise ApiError(500, "subtitle_asr_cache_delete_failed", str(exc))
         self.store.delete_subtitle_asr_task(owner_id, task_id)
 

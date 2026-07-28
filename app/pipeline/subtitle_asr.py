@@ -607,8 +607,17 @@ class SubtitleAsrProcessor:
                 transcript_cached = True
         return audio_cached, transcript_cached
 
-    def delete_cache(self, task_id):
+    def delete_cache(self, task_id, media_id=None, legacy_audio_task_ids=None):
         cache_dir = self._task_cache_dir(task_id)
+        if media_id:
+            task_ids = [task_id] + list(legacy_audio_task_ids or [])
+            shared_audio = self._media_audio_cache_dir(media_id) / "audio.mp3"
+            legacy_audio_exists = any(
+                (self._task_cache_dir(value) / "audio.mp3").is_file()
+                for value in task_ids
+            )
+            if shared_audio.is_file() or legacy_audio_exists:
+                self._prepare_media_audio_cache(media_id, task_ids)
         if cache_dir.exists():
             shutil.rmtree(cache_dir)
 
