@@ -41,7 +41,7 @@ TRANSLATION_MODE_SKIPPED_NONSEMANTIC = "skipped_nonsemantic"
 TRANSLATION_PROMPT_MARKERS = (
     "参考上下文：",
     "术语参考：",
-    "重试要求：",
+    "补充要求：",
     "只输出译文，不要解释",
 )
 
@@ -832,6 +832,8 @@ def subtitle_segment_program_mode(value):
         if unicodedata.category(char)[0] in {"L", "N"}
     )
     if text in JAPANESE_NONSEMANTIC_FRAGMENTS:
+        return TRANSLATION_MODE_SKIPPED_NONSEMANTIC
+    if len(text) == 1 and JAPANESE_KANA_RE.fullmatch(text):
         return TRANSLATION_MODE_SKIPPED_NONSEMANTIC
     has_symbol = any(unicodedata.category(char) == "So" for char in raw_text)
     if (

@@ -314,9 +314,10 @@ class SubtitleTranslationTest(unittest.TestCase):
             [
                 {"id": 0, "start": 0, "end": 1, "text": "て。"},
                 {"id": 1, "start": 1, "end": 2, "text": "丈。"},
-                {"id": 2, "start": 2, "end": 3, "text": "啊。"},
-                {"id": 3, "start": 3, "end": 4, "text": "嗯嗯。"},
-                {"id": 4, "start": 4, "end": 5, "text": "こんにちは。"},
+                {"id": 2, "start": 2, "end": 3, "text": "お。"},
+                {"id": 3, "start": 3, "end": 4, "text": "啊。"},
+                {"id": 4, "start": 4, "end": 5, "text": "嗯嗯。"},
+                {"id": 5, "start": 5, "end": 6, "text": "こんにちは。"},
             ],
             translate_one,
             provider="openai",
@@ -329,9 +330,9 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertEqual(
             result,
             [
-                {"id": 2, "start": 2.0, "end": 3.0, "text": "啊。"},
-                {"id": 3, "start": 3.0, "end": 4.0, "text": "嗯嗯。"},
-                {"id": 4, "start": 4.0, "end": 5.0, "text": "你好。"},
+                {"id": 3, "start": 3.0, "end": 4.0, "text": "啊。"},
+                {"id": 4, "start": 4.0, "end": 5.0, "text": "嗯嗯。"},
+                {"id": 5, "start": 5.0, "end": 6.0, "text": "你好。"},
             ],
         )
         self.assertEqual(
@@ -339,9 +340,10 @@ class SubtitleTranslationTest(unittest.TestCase):
             [
                 {"id": 0, "mode": "skipped_nonsemantic"},
                 {"id": 1, "mode": "skipped_nonsemantic"},
-                {"id": 2, "text": "啊。", "mode": "target_language"},
-                {"id": 3, "text": "嗯嗯。", "mode": "target_language"},
-                {"id": 4, "text": "你好。"},
+                {"id": 2, "mode": "skipped_nonsemantic"},
+                {"id": 3, "text": "啊。", "mode": "target_language"},
+                {"id": 4, "text": "嗯嗯。", "mode": "target_language"},
+                {"id": 5, "text": "你好。"},
             ],
         )
 
