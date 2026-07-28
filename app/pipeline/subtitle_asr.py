@@ -637,12 +637,20 @@ def normalize_translation_text(value):
 
 
 def subtitle_segment_program_mode(value):
+    raw_text = str(value or "").strip()
     text = "".join(
         char
-        for char in str(value or "").strip()
+        for char in raw_text
         if unicodedata.category(char)[0] in {"L", "N"}
     )
     if text in JAPANESE_NONSEMANTIC_FRAGMENTS:
+        return TRANSLATION_MODE_SKIPPED_NONSEMANTIC
+    has_symbol = any(unicodedata.category(char) == "So" for char in raw_text)
+    if (
+        has_symbol
+        and 0 < len(text) <= 3
+        and len(JAPANESE_KANA_RE.findall(text)) == len(text)
+    ):
         return TRANSLATION_MODE_SKIPPED_NONSEMANTIC
     if text and len(set(text)) == 1 and text[0] in TARGET_LANGUAGE_INTERJECTIONS:
         return TRANSLATION_MODE_TARGET_LANGUAGE

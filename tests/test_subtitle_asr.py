@@ -261,6 +261,26 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(result, [{"id": 1, "start": 1.0, "end": 2.0, "text": "啊。"}])
 
+    def test_translation_skips_short_emoji_sound_fragment_only(self):
+        calls = []
+
+        result = translate_sequentially(
+            [
+                {"id": 0, "start": 0, "end": 1, "text": "🤧った。"},
+                {"id": 1, "start": 1, "end": 2, "text": "🤧大丈夫ですか。"},
+            ],
+            lambda text, _context, _glossary, _retry: calls.append(text) or "没事吧？",
+            provider="local",
+            model="test-model",
+            retry_delay_seconds=0,
+        )
+
+        self.assertEqual(calls, ["🤧大丈夫ですか。"])
+        self.assertEqual(
+            result,
+            [{"id": 1, "start": 1.0, "end": 2.0, "text": "没事吧？"}],
+        )
+
     def test_translation_failure_retries_only_current_segment_and_stops(self):
         calls = []
         checkpoints = []
