@@ -277,22 +277,33 @@ class SubtitleTranslationTest(unittest.TestCase):
 
     def test_translation_retry_includes_quality_correction(self):
         retry_instructions = []
+        contexts = []
+        glossaries = []
 
-        def translate_one(_text, _context, _glossary, retry_instruction):
+        def translate_one(_text, context, glossary, retry_instruction):
             retry_instructions.append(retry_instruction)
+            contexts.append(context)
+            glossaries.append(glossary)
             return "こんにちは" if not retry_instruction else "你好"
 
         result = translate_sequentially(
-            [{"id": 0, "start": 0, "end": 1, "text": "こんにちは"}],
+            [
+                {"id": 0, "start": 0, "end": 1, "text": "前の文。"},
+                {"id": 1, "start": 1, "end": 2, "text": "こんにちは"},
+            ],
             translate_one,
             provider="local",
             model="test-model",
+            glossary="人名：テスト",
+            cached_translations=[{"id": 0, "text": "前一句。"}],
             retry_delay_seconds=0,
         )
 
-        self.assertEqual(result[0]["text"], "你好")
+        self.assertEqual(result[1]["text"], "你好")
         self.assertEqual(retry_instructions[0], "")
         self.assertIn("未完成翻译", retry_instructions[1])
+        self.assertEqual(contexts, [["前の文。"], []])
+        self.assertEqual(glossaries, ["人名：テスト", ""])
 
     def test_translation_retry_corrects_empty_cloud_response(self):
         retry_instructions = []

@@ -777,7 +777,7 @@ def translate_sequentially(
                         % (segment_id, attempt, exc)
                     ) from exc
                 retry_instruction = translation_retry_instruction(exc)
-                retry_current_text_only = retry_current_text_only or "empty content" in str(exc)
+                retry_current_text_only = True
                 time.sleep(max(0, float(retry_delay_seconds)))
                 continue
 
