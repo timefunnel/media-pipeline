@@ -855,7 +855,12 @@ def translation_retry_instruction(error):
         return "上次译文长度异常，请只翻译当前字幕并保持简洁。"
     if "untranslated source text" in message:
         return "上次输出未完成翻译，请输出对应的简体中文译文。"
-    if "structured content" in message or "reasoning content" in message or "explanation" in message:
+    if (
+        "structured content" in message
+        or "reasoning content" in message
+        or "explanation" in message
+        or "echoed the translation prompt" in message
+    ):
         return "上次输出包含格式或解释，请只输出纯中文译文。"
     if "same text for three different segments" in message:
         return "上次译文与前文异常重复，请根据当前原文重新翻译。"

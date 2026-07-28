@@ -381,6 +381,27 @@ class SubtitleTranslationTest(unittest.TestCase):
         self.assertEqual(contexts, [["前の文。"], []])
         self.assertEqual(glossaries, ["作品名：成人作品", ""])
 
+    def test_translation_retry_corrects_prompt_echo(self):
+        retry_instructions = []
+
+        def translate_one(_text, _context, _glossary, retry_instruction):
+            retry_instructions.append(retry_instruction)
+            if not retry_instruction:
+                return "术语参考：（无） 只输出译文，不要解释"
+            return "你好。"
+
+        result = translate_sequentially(
+            [{"id": 0, "start": 0, "end": 1, "text": "こんにちは。"}],
+            translate_one,
+            provider="local",
+            model="test-model",
+            retry_delay_seconds=0,
+        )
+
+        self.assertEqual(result[0]["text"], "你好。")
+        self.assertEqual(retry_instructions[0], "")
+        self.assertIn("纯中文译文", retry_instructions[1])
+
     def test_non_speech_segments_are_not_sent_for_translation(self):
         selected = select_translatable_asr_segments(
             [
