@@ -78,8 +78,14 @@ class SenseVoiceClient:
         return payload
 
     def models(self):
+        return self._list_models("/v1/models", "translation")
+
+    def asr_models(self):
+        return self._list_models("/v1/audio/models", "ASR")
+
+    def _list_models(self, path, label):
         request = urllib.request.Request(
-            self.base_url + "/v1/models",
+            self.base_url + path,
             headers={"Authorization": "Bearer " + self.api_token, "Accept": "application/json"},
             method="GET",
         )
@@ -87,13 +93,13 @@ class SenseVoiceClient:
             with urllib.request.urlopen(request, timeout=min(10, self.timeout)) as response:
                 raw = response.read(4 * 1024 * 1024 + 1)
         except (OSError, TimeoutError, urllib.error.URLError) as exc:
-            raise RuntimeError("SenseVoice model list is unreachable: %s" % exc) from exc
+            raise RuntimeError("local %s model list is unreachable: %s" % (label, exc)) from exc
         if len(raw) > 4 * 1024 * 1024:
-            raise RuntimeError("SenseVoice model list is too large")
+            raise RuntimeError("local %s model list is too large" % label)
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
-            raise RuntimeError("SenseVoice model list is invalid") from exc
+            raise RuntimeError("local %s model list is invalid" % label) from exc
         values = payload.get("data") if isinstance(payload, dict) else None
         models = []
         seen = set()
@@ -103,8 +109,42 @@ class SenseVoiceClient:
                 seen.add(model_id)
                 models.append(model_id)
         if not models:
-            raise RuntimeError("SenseVoice service returned no installed translation models")
+            raise RuntimeError("local service returned no available %s models" % label)
         return models
+
+    def unload_asr_model(self):
+        body = json.dumps({"model": self.model}, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            self.base_url + "/v1/audio/models/unload",
+            data=body,
+            headers={
+                "Authorization": "Bearer " + self.api_token,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=min(30, self.timeout)) as response:
+                raw = response.read(1024 * 1024 + 1)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read(1024 * 1024)
+            raise RuntimeError(
+                "local ASR model unload failed: HTTP %s %s"
+                % (exc.code, asr_error_message(raw))
+            ) from exc
+        except (OSError, TimeoutError, urllib.error.URLError) as exc:
+            raise RuntimeError("local ASR model unload failed: %s" % exc) from exc
+        if len(raw) > 1024 * 1024:
+            raise RuntimeError("local ASR model unload response is too large")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("local ASR model unload response is invalid") from exc
+        unloaded = str(payload.get("unloaded") or "") if isinstance(payload, dict) else ""
+        if unloaded and unloaded != self.model:
+            raise RuntimeError("local ASR service unloaded an unexpected model: %s" % unloaded)
+        return unloaded
 
     def transcribe(
         self,
@@ -294,12 +334,18 @@ class MediaStationTranslationClient:
         return translation
 
 
+class CachedTranscriptModelMismatch(RuntimeError):
+    pass
+
+
 class SubtitleAsrProcessor:
     def __init__(self, config):
         self.config = config
 
-    def ensure_available(self, translation_provider="local", translation_model=""):
-        self.ensure_asr_available()
+    def ensure_available(
+        self, translation_provider="local", translation_model="", asr_model=DEFAULT_ASR_MODEL
+    ):
+        self.ensure_asr_available(asr_model)
         self.ensure_translation_available(translation_provider, translation_model)
 
     def ensure_translation_available(self, translation_provider="local", translation_model=""):
@@ -326,18 +372,29 @@ class SubtitleAsrProcessor:
         self.ensure_asr_available()
         return self._asr_client().models()
 
-    def ensure_asr_available(self):
+    def asr_models(self):
+        self.ensure_asr_available()
+        return self._asr_client().asr_models()
+
+    def ensure_asr_available(self, asr_model=None):
         if self.config is None or not bool(getattr(self.config, "asr_enabled", False)):
             raise RuntimeError("AI subtitle generation is disabled")
         if not bool(getattr(self.config, "msg_enabled", False)):
             raise RuntimeError("MediaStationGo is disabled in media-pipeline")
-        self._asr_client().health()
+        model = str(
+            asr_model or getattr(self.config, "asr_model", DEFAULT_ASR_MODEL)
+        ).strip()
+        client = self._asr_client(model)
+        client.health()
+        if model not in client.asr_models():
+            raise RuntimeError("local ASR model is not available: %s" % model)
 
     def run(
         self,
         task_id,
         media_id,
         source_language,
+        asr_model=DEFAULT_ASR_MODEL,
         translation_provider="local",
         translation_model="",
         progress_callback=None,
@@ -346,6 +403,9 @@ class SubtitleAsrProcessor:
         source_language = str(source_language or "auto").strip().lower()
         if source_language not in ASR_SOURCE_LANGUAGES:
             raise RuntimeError("unsupported ASR source language: %s" % source_language)
+        asr_model = str(asr_model or DEFAULT_ASR_MODEL).strip()
+        if not asr_model:
+            raise RuntimeError("ASR model missing")
         provider = require_translation_provider(translation_provider)
         model = str(translation_model or "").strip()
         if not model:
@@ -384,26 +444,50 @@ class SubtitleAsrProcessor:
             emit_progress(progress_callback, "using_cached_audio", 1, 1)
             emit_cache(cache_callback, True, False)
 
+        transcript = None
         if transcript_path.is_file():
-            transcript = load_cached_transcript(transcript_path)
-            emit_progress(progress_callback, "using_cached_transcript", 1, 1)
-            emit_cache(cache_callback, True, True)
-        else:
+            try:
+                transcript = load_cached_transcript(transcript_path, asr_model)
+            except CachedTranscriptModelMismatch:
+                transcript_path.unlink()
+                translations_path.unlink(missing_ok=True)
+                translation_history_path.unlink(missing_ok=True)
+                emit_cache(cache_callback, True, False)
+            else:
+                emit_progress(progress_callback, "using_cached_transcript", 1, 1)
+                emit_cache(cache_callback, True, True)
+        if transcript is None:
             emit_progress(progress_callback, "uploading_audio", 0, audio_path.stat().st_size)
 
             def uploaded_audio(current, total):
                 emit_progress(progress_callback, "uploading_audio", current, total)
 
-            transcript = self._asr_client().transcribe(
-                audio_path,
-                source_language,
-                upload_progress_callback=uploaded_audio,
-                inference_callback=lambda: emit_progress(
-                    progress_callback, "transcribing", 0, 0
-                ),
-            )
+            asr_client = self._asr_client(asr_model)
+            try:
+                transcript = asr_client.transcribe(
+                    audio_path,
+                    source_language,
+                    upload_progress_callback=uploaded_audio,
+                    inference_callback=lambda: emit_progress(
+                        progress_callback, "transcribing", 0, 0
+                    ),
+                )
+            except Exception as transcription_error:
+                try:
+                    asr_client.unload_asr_model()
+                except Exception as unload_error:
+                    raise RuntimeError(
+                        "ASR transcription failed and model unload failed: %s" % unload_error
+                    ) from transcription_error
+                raise
+            unloaded_asr_model = asr_client.unload_asr_model()
+            if unloaded_asr_model != asr_model:
+                raise RuntimeError(
+                    "local ASR service did not confirm model unload: %s" % asr_model
+                )
             if not isinstance(transcript, dict):
-                raise RuntimeError("SenseVoice ASR returned an invalid response")
+                raise RuntimeError("local ASR returned an invalid response")
+            transcript["model"] = asr_model
             validate_asr_segments(transcript.get("segments"))
             atomic_write_json(transcript_path, transcript)
             emit_cache(cache_callback, True, True)
@@ -488,20 +572,31 @@ class SubtitleAsrProcessor:
                 "duration": float(translated[-1]["end"]),
                 "translation_provider": provider,
                 "translation_model": model,
+                "asr_model": asr_model,
             }
         except Exception:
             emit_cache(cache_callback, audio_path.is_file(), transcript_path.is_file())
             raise
 
-    def cache_state(self, task_id):
+    def cache_state(self, task_id, asr_model=None):
         cache_dir = self._task_cache_dir(task_id)
         audio_path = cache_dir / "audio.mp3"
         transcript_path = cache_dir / "transcript.json"
         audio_cached = audio_path.is_file() and audio_path.stat().st_size > 0
         transcript_cached = False
         if transcript_path.is_file():
-            load_cached_transcript(transcript_path)
-            transcript_cached = True
+            try:
+                load_cached_transcript(
+                    transcript_path,
+                    str(
+                        asr_model
+                        or getattr(self.config, "asr_model", DEFAULT_ASR_MODEL)
+                    ).strip(),
+                )
+            except CachedTranscriptModelMismatch:
+                transcript_cached = False
+            else:
+                transcript_cached = True
         return audio_cached, transcript_cached
 
     def delete_cache(self, task_id):
@@ -519,11 +614,13 @@ class SubtitleAsrProcessor:
     def _timeout(self):
         return max(1, int(getattr(self.config, "asr_timeout_seconds", DEFAULT_ASR_TIMEOUT_SECONDS)))
 
-    def _asr_client(self):
+    def _asr_client(self, asr_model=None):
         return SenseVoiceClient(
             getattr(self.config, "asr_base_url", ""),
             getattr(self.config, "asr_api_token", ""),
-            model=getattr(self.config, "asr_model", DEFAULT_ASR_MODEL),
+            model=str(
+                asr_model or getattr(self.config, "asr_model", DEFAULT_ASR_MODEL)
+            ).strip(),
             timeout=self._timeout(),
         )
 
@@ -921,7 +1018,7 @@ def require_translation_provider(provider):
     return provider
 
 
-def load_cached_transcript(path):
+def load_cached_transcript(path, expected_model=DEFAULT_ASR_MODEL):
     try:
         with Path(path).open("r", encoding="utf-8") as source:
             payload = json.load(source)
@@ -929,6 +1026,13 @@ def load_cached_transcript(path):
         raise RuntimeError("cached SenseVoice transcript is invalid: %s" % exc) from exc
     if not isinstance(payload, dict):
         raise RuntimeError("cached SenseVoice transcript is invalid")
+    cached_model = str(payload.get("model") or DEFAULT_ASR_MODEL).strip()
+    expected_model = str(expected_model or DEFAULT_ASR_MODEL).strip()
+    if cached_model != expected_model:
+        raise CachedTranscriptModelMismatch(
+            "cached ASR transcript uses %s, task requests %s"
+            % (cached_model, expected_model)
+        )
     validate_asr_segments(payload.get("segments"))
     return payload
 

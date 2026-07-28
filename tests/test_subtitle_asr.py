@@ -21,6 +21,7 @@ for category in ("movie", "tv", "anime", "adult", "other"):
 from pipeline.bot import BotConfig
 from pipeline.internal_api import InternalApiApplication, InternalApiStore, SubtitleAsrTaskManager
 from pipeline.subtitle_asr import (
+    DEFAULT_ASR_MODEL,
     MediaStationTranslationClient,
     SenseVoiceClient,
     SubtitleAsrProcessor,
@@ -483,9 +484,17 @@ class FakeSubtitleAsrProcessor:
         self.run_calls = []
         self.deleted_cache_ids = []
         self.cache = (True, True)
-        self.config = SimpleNamespace(asr_translation_model="fake-model")
+        self.config = SimpleNamespace(
+            asr_model=DEFAULT_ASR_MODEL,
+            asr_translation_model="fake-model",
+        )
 
-    def ensure_available(self, translation_provider="local", translation_model=""):
+    def ensure_available(
+        self,
+        translation_provider="local",
+        translation_model="",
+        asr_model=DEFAULT_ASR_MODEL,
+    ):
         self.ensure_calls += 1
 
     def ensure_translation_available(self, translation_provider="local", translation_model=""):
@@ -494,7 +503,10 @@ class FakeSubtitleAsrProcessor:
     def translation_models(self):
         return ["fake-model", "other-model"]
 
-    def cache_state(self, _task_id):
+    def asr_models(self):
+        return [DEFAULT_ASR_MODEL, "faster-whisper/large-v3"]
+
+    def cache_state(self, _task_id, _asr_model=DEFAULT_ASR_MODEL):
         return self.cache
 
     def delete_cache(self, task_id):
@@ -505,6 +517,7 @@ class FakeSubtitleAsrProcessor:
         task_id,
         media_id,
         source_language,
+        asr_model=DEFAULT_ASR_MODEL,
         translation_provider="local",
         translation_model="",
         progress_callback=None,
@@ -520,6 +533,7 @@ class FakeSubtitleAsrProcessor:
             "language": "zh-CN",
             "segment_count": 2,
             "duration": 3.125,
+            "asr_model": asr_model,
         }
 
 
@@ -698,8 +712,81 @@ class SubtitleAsrTaskTest(unittest.TestCase):
     def test_local_model_list_is_exposed(self):
         self.assertEqual(self.application.list_subtitle_asr_models(), {"models": ["fake-model", "other-model"]})
 
+    def test_asr_model_list_is_exposed(self):
+        self.assertEqual(
+            self.application.list_subtitle_asr_engines(),
+            {"models": [DEFAULT_ASR_MODEL, "faster-whisper/large-v3"]},
+        )
+
 
 class SubtitleAsrCacheReuseTest(unittest.TestCase):
+    def test_switching_asr_model_reuses_audio_but_replaces_transcript(self):
+        class FakeASRClient:
+            def __init__(self):
+                self.transcribe_calls = 0
+                self.unload_calls = 0
+
+            def transcribe(self, *_args, **_kwargs):
+                self.transcribe_calls += 1
+                return {
+                    "segments": [
+                        {"id": 0, "start": 0.0, "end": 2.0, "text": "こんにちは。"}
+                    ]
+                }
+
+            def unload_asr_model(self):
+                self.unload_calls += 1
+                return "faster-whisper/large-v3"
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            task_id = "c" * 32
+            cache_dir = root / "cache" / task_id
+            cache_dir.mkdir(parents=True)
+            (cache_dir / "audio.mp3").write_bytes(b"audio")
+            (cache_dir / "transcript.json").write_text(
+                json.dumps(
+                    {
+                        "model": DEFAULT_ASR_MODEL,
+                        "segments": [
+                            {"id": 0, "start": 0.0, "end": 1.0, "text": "旧结果"}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = SimpleNamespace(
+                asr_cache_dir=str(root / "cache"),
+                subtitle_cache_dir=str(root / "subtitles"),
+            )
+            processor = SubtitleAsrProcessor(config)
+            self.assertEqual(
+                processor.cache_state(task_id, "faster-whisper/large-v3"),
+                (True, False),
+            )
+            asr_client = FakeASRClient()
+            processor._asr_client = lambda _model=None: asr_client
+            processor._msg_client = lambda: FakeMediaMetadataClient()
+            processor._translation_client = (
+                lambda _provider, _model, _msg=None: FakeCachedTranslationClient()
+            )
+
+            result = processor.run(
+                task_id,
+                "media-whisper",
+                "ja",
+                asr_model="faster-whisper/large-v3",
+                translation_provider="local",
+                translation_model="fake-model",
+            )
+
+            transcript = json.loads((cache_dir / "transcript.json").read_text(encoding="utf-8"))
+            self.assertEqual(transcript["model"], "faster-whisper/large-v3")
+            self.assertEqual(transcript["segments"][0]["text"], "こんにちは。")
+            self.assertEqual(result["asr_model"], "faster-whisper/large-v3")
+            self.assertEqual(asr_client.transcribe_calls, 1)
+            self.assertEqual(asr_client.unload_calls, 1)
+
     def test_cached_audio_and_transcript_skip_download_and_transcription(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)

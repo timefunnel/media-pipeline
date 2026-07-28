@@ -12,7 +12,7 @@ from pathlib import Path
 
 from pipeline.config import category_to_openlist_path
 from pipeline.openlist_utils import normalize_openlist_path
-from pipeline.subtitle_asr import SubtitleAsrProcessor
+from pipeline.subtitle_asr import DEFAULT_ASR_MODEL, SubtitleAsrProcessor
 from pipeline.telegram_ui import task_from_submit_result
 
 
@@ -161,6 +161,12 @@ class InternalApiStore:
                     completed_at integer
                 )
                 """
+            )
+            ensure_sqlite_column(
+                conn,
+                "internal_api_subtitle_asr_tasks",
+                "asr_model",
+                "text not null default 'FunAudioLLM/SenseVoiceSmall'",
             )
             ensure_sqlite_column(
                 conn,
@@ -586,6 +592,7 @@ class InternalApiStore:
         owner_id,
         media_id,
         source_language,
+        asr_model=DEFAULT_ASR_MODEL,
         translation_provider="local",
         translation_model="",
     ):
@@ -608,15 +615,16 @@ class InternalApiStore:
             conn.execute(
                 """
                 insert into internal_api_subtitle_asr_tasks
-                    (id, owner_id, media_id, source_language, translation_provider,
-                     translation_model, status, stage, created_at, updated_at)
-                values (?, ?, ?, ?, ?, ?, 'queued', 'queued', ?, ?)
+                    (id, owner_id, media_id, source_language, asr_model,
+                     translation_provider, translation_model, status, stage, created_at, updated_at)
+                values (?, ?, ?, ?, ?, ?, ?, 'queued', 'queued', ?, ?)
                 """,
                 (
                     task_id,
                     owner_id,
                     media_id,
                     source_language,
+                    asr_model,
                     translation_provider,
                     translation_model,
                     now,
@@ -739,6 +747,7 @@ class InternalApiStore:
         self,
         owner_id,
         task_id,
+        asr_model,
         translation_provider,
         translation_model,
         audio_cached,
@@ -761,12 +770,13 @@ class InternalApiStore:
                 update internal_api_subtitle_asr_tasks
                 set status = 'queued', stage = 'queued', progress_current = 0,
                     progress_total = 0, result_json = null, error = null,
-                    translation_provider = ?, translation_model = ?,
+                    asr_model = ?, translation_provider = ?, translation_model = ?,
                     cached_audio = ?, cached_transcript = ?, updated_at = ?,
                     started_at = null, completed_at = null
                 where id = ?
                 """,
                 (
+                    asr_model,
                     translation_provider,
                     translation_model,
                     bool(audio_cached),
@@ -787,7 +797,7 @@ class InternalApiStore:
             conn.close()
 
     def update_queued_subtitle_asr_task_model(
-        self, owner_id, task_id, translation_provider, translation_model
+        self, owner_id, task_id, asr_model, translation_provider, translation_model
     ):
         now = int(time.time())
         conn = self._connect()
@@ -803,15 +813,15 @@ class InternalApiStore:
                 raise ApiError(
                     409,
                     "subtitle_asr_model_not_editable",
-                    "only queued AI subtitle tasks can change translation model",
+                    "only queued AI subtitle tasks can change ASR or translation model",
                 )
             conn.execute(
                 """
                 update internal_api_subtitle_asr_tasks
-                set translation_provider = ?, translation_model = ?, updated_at = ?
+                set asr_model = ?, translation_provider = ?, translation_model = ?, updated_at = ?
                 where id = ? and status = 'queued'
                 """,
-                (translation_provider, translation_model, now, task_id),
+                (asr_model, translation_provider, translation_model, now, task_id),
             )
             updated = conn.execute(
                 "select * from internal_api_subtitle_asr_tasks where id = ?", (task_id,)
@@ -1461,14 +1471,19 @@ class SubtitleAsrTaskManager:
             payload.get("translation_model")
             or getattr(getattr(self.processor, "config", None), "asr_translation_model", "")
         ).strip()
+        asr_model = str(
+            payload.get("asr_model")
+            or getattr(getattr(self.processor, "config", None), "asr_model", DEFAULT_ASR_MODEL)
+        ).strip()
         try:
-            self.processor.ensure_available(translation_provider, translation_model)
+            self.processor.ensure_available(translation_provider, translation_model, asr_model)
         except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
             raise ApiError(503, "subtitle_asr_unavailable", str(exc))
         task, created = self.store.create_subtitle_asr_task(
             owner_id,
             media_id,
             source_language,
+            asr_model,
             translation_provider,
             translation_model,
         )
@@ -1488,6 +1503,12 @@ class SubtitleAsrTaskManager:
     def list_models(self):
         try:
             return self.processor.translation_models()
+        except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
+            raise ApiError(503, "subtitle_asr_unavailable", str(exc))
+
+    def list_asr_models(self):
+        try:
+            return self.processor.asr_models()
         except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
             raise ApiError(503, "subtitle_asr_unavailable", str(exc))
 
@@ -1515,17 +1536,23 @@ class SubtitleAsrTaskManager:
             or current.get("translation_model")
             or getattr(getattr(self.processor, "config", None), "asr_translation_model", "")
         ).strip()
+        asr_model = str(
+            payload.get("asr_model")
+            or current.get("asr_model")
+            or getattr(getattr(self.processor, "config", None), "asr_model", DEFAULT_ASR_MODEL)
+        ).strip()
         try:
-            audio_cached, transcript_cached = self.processor.cache_state(task_id)
+            audio_cached, transcript_cached = self.processor.cache_state(task_id, asr_model)
             if audio_cached and transcript_cached:
                 self.processor.ensure_translation_available(provider, model)
             else:
-                self.processor.ensure_available(provider, model)
+                self.processor.ensure_available(provider, model, asr_model)
         except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
             raise ApiError(503, "subtitle_asr_unavailable", str(exc))
         task = self.store.retry_subtitle_asr_task(
             owner_id,
             task_id,
+            asr_model,
             provider,
             model,
             audio_cached,
@@ -1546,18 +1573,23 @@ class SubtitleAsrTaskManager:
             payload.get("translation_model"), "translation_model", max_length=200
         )
         current = self.store.get_subtitle_asr_task(owner_id, task_id)
+        asr_model = require_text(
+            payload.get("asr_model") or current.get("asr_model") or DEFAULT_ASR_MODEL,
+            "asr_model",
+            max_length=200,
+        )
         if current["status"] != "queued":
             raise ApiError(
                 409,
                 "subtitle_asr_model_not_editable",
-                "only queued AI subtitle tasks can change translation model",
+                "only queued AI subtitle tasks can change ASR or translation model",
             )
         try:
-            self.processor.ensure_translation_available(provider, model)
+            self.processor.ensure_available(provider, model, asr_model)
         except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
             raise ApiError(503, "subtitle_asr_unavailable", str(exc))
         return self.store.update_queued_subtitle_asr_task_model(
-            owner_id, task_id, provider, model
+            owner_id, task_id, asr_model, provider, model
         )
 
     def cancel_task(self, owner_id, task_id):
@@ -1590,7 +1622,9 @@ class SubtitleAsrTaskManager:
             )
         try:
             self.processor.ensure_translation_available(provider, model)
-            audio_cached, transcript_cached = self.processor.cache_state(task_id)
+            audio_cached, transcript_cached = self.processor.cache_state(
+                task_id, current.get("asr_model")
+            )
         except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
             raise ApiError(503, "subtitle_asr_unavailable", str(exc))
         task = self.store.retranslate_completed_subtitle_asr_task(
@@ -1634,6 +1668,7 @@ class SubtitleAsrTaskManager:
                     task["id"],
                     task["media_id"],
                     task["source_language"],
+                    asr_model=task["asr_model"],
                     translation_provider=task["translation_provider"],
                     translation_model=task["translation_model"],
                     progress_callback=lambda stage, current, total: self.store.save_subtitle_asr_progress(
@@ -1819,6 +1854,11 @@ class InternalApiApplication:
             raise ApiError(503, "subtitle_asr_unavailable", "AI subtitle task manager unavailable")
         return {"models": self.subtitle_asr_manager.list_models()}
 
+    def list_subtitle_asr_engines(self):
+        if self.subtitle_asr_manager is None:
+            raise ApiError(503, "subtitle_asr_unavailable", "AI subtitle task manager unavailable")
+        return {"models": self.subtitle_asr_manager.list_asr_models()}
+
     def retry_subtitle_asr(self, owner_id, task_id, payload):
         if self.subtitle_asr_manager is None:
             raise ApiError(503, "subtitle_asr_unavailable", "AI subtitle task manager unavailable")
@@ -1962,6 +2002,9 @@ class InternalApiServer:
                 return
             if handler.command == "GET" and path == "/v1/subtitles/asr/models":
                 self._send_json(handler, 200, self.application.list_subtitle_asr_models())
+                return
+            if handler.command == "GET" and path == "/v1/subtitles/asr/asr-models":
+                self._send_json(handler, 200, self.application.list_subtitle_asr_engines())
                 return
             if handler.command == "GET" and path == "/v1/subtitles/asr":
                 raw_limit = (query.get("limit") or ["50"])[0]
@@ -2331,6 +2374,7 @@ def subtitle_asr_task_row(row):
         "owner_id": row["owner_id"],
         "media_id": row["media_id"],
         "source_language": row["source_language"],
+        "asr_model": row["asr_model"] or DEFAULT_ASR_MODEL,
         "translation_provider": row["translation_provider"] or "local",
         "translation_model": row["translation_model"] or "",
         "status": status,
