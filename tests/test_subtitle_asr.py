@@ -359,6 +359,14 @@ class SubtitleTranslationTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "reasoning content"):
             validate_translation_text("こんにちは", "<think>分析</think>你好")
 
+    def test_translation_allows_small_readable_kana_residue(self):
+        translated = "才没有这回事呢，のし一先生如果真的好吃的话，就原谅你吧。"
+        self.assertEqual(validate_translation_text("そんなことないでしょ。", translated), translated)
+
+    def test_translation_rejects_kana_dominated_output(self):
+        with self.assertRaisesRegex(RuntimeError, "Japanese kana"):
+            validate_translation_text("これはテストです。", "这是翻译，但まだほとんど日本語です。")
+
 
 class FakeCloudTranslationClient:
     def __init__(self):

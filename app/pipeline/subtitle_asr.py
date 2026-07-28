@@ -31,6 +31,7 @@ ASR_SUBTITLE_SOURCE = "sensevoice-qwen"
 ASR_SUBTITLE_PROVIDER_ID = "sensevoice-qwen:zh-CN"
 ASR_TRANSLATION_PROVIDERS = {"local", "openai", "deepseek", "siliconflow"}
 JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
+HAN_CHARACTER_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 JAPANESE_NONSEMANTIC_FRAGMENTS = frozenset(
     {"て", "を", "に", "へ", "と", "が", "の", "も", "い", "丈"}
 )
@@ -606,7 +607,9 @@ def validate_translation_text(source, value):
         raise RuntimeError("AI translation returned an explanation instead of plain text")
     if normalize_translation_text(source) == normalize_translation_text(translated):
         raise RuntimeError("AI translation returned the untranslated source text")
-    if JAPANESE_KANA_RE.search(translated):
+    kana_count = len(JAPANESE_KANA_RE.findall(translated))
+    han_count = len(HAN_CHARACTER_RE.findall(translated))
+    if kana_count > 4 or (kana_count > 0 and kana_count * 10 > han_count):
         raise RuntimeError("AI translation still contains Japanese kana")
 
     source_length = len(str(source))
