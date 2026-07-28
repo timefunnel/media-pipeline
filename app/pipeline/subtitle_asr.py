@@ -748,11 +748,12 @@ def translate_sequentially(
             ]
         ]
         retry_instruction = ""
+        retry_without_context = False
         for attempt in range(1, DEFAULT_ASR_TRANSLATION_ATTEMPTS + 1):
             started = time.monotonic()
             try:
                 raw_translation = translate_one(
-                    segment["text"], context, glossary, retry_instruction
+                    segment["text"], [] if retry_without_context else context, glossary, retry_instruction
                 )
                 translation = validate_translation_text(segment["text"], raw_translation)
                 validate_repeated_translation(segments, by_id, segment, translation)
@@ -773,6 +774,7 @@ def translate_sequentially(
                         % (segment_id, attempt, exc)
                     ) from exc
                 retry_instruction = translation_retry_instruction(exc)
+                retry_without_context = retry_without_context or "empty content" in str(exc)
                 time.sleep(max(0, float(retry_delay_seconds)))
                 continue
 
@@ -809,7 +811,7 @@ def translate_sequentially(
 def translation_retry_instruction(error):
     message = str(error or "")
     if "empty content" in message:
-        return "上次没有返回译文，请根据当前日文和参考上下文输出非空的简体中文译文。"
+        return "上次没有返回译文，请只翻译当前日文并输出非空的简体中文译文。"
     if "Japanese kana" in message:
         return "上次译文仍含日文假名，请将全部内容译成自然的简体中文。"
     if "length is abnormally" in message:
