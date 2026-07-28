@@ -170,8 +170,8 @@ class SubtitleTranslationTest(unittest.TestCase):
             def assert_context_retry_prompt(prompt):
                 if "参考上下文：\nこれを閉" not in prompt:
                     raise AssertionError("retry prompt lost source context")
-                if "补充要求：\n上次输出未完成翻译" not in prompt:
-                    raise AssertionError("retry prompt lost validation instruction")
+                if "补充要求：" in prompt:
+                    raise AssertionError("native retry prompt included model-hostile metadata")
                 if not prompt.endswith("めるのを"):
                     raise AssertionError("retry prompt changed the current segment")
 

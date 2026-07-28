@@ -245,11 +245,16 @@ class SubtitleTranslationClient:
         )
 
     def _translate_one(self, text, context, glossary, retry_instruction=""):
-        prompt = (
-            text
-            if uses_native_translation_prompt(self.model) and not retry_instruction
-            else subtitle_translation_prompt(text, context, glossary, retry_instruction)
-        )
+        native_prompt = uses_native_translation_prompt(self.model)
+        if native_prompt and not retry_instruction:
+            prompt = text
+        else:
+            prompt = subtitle_translation_prompt(
+                text,
+                context,
+                glossary,
+                "" if native_prompt else retry_instruction,
+            )
         payload = {
             "model": self.model,
             "max_tokens": 1024,
