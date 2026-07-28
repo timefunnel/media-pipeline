@@ -151,6 +151,31 @@ class SubtitleTranslationTest(unittest.TestCase):
             [{"id": 0, "text": "你好。"}, {"id": 1, "text": "你好吗？"}],
         )
 
+    def test_translation_rejects_bad_cached_prompt_echo_and_retranslates_only_that_segment(self):
+        calls = []
+        events = []
+
+        result = translate_sequentially(
+            [
+                {"id": 0, "start": 0, "end": 1, "text": "こんにちは。"},
+                {"id": 1, "start": 1, "end": 2, "text": "元気ですか。"},
+            ],
+            lambda text, _context, _glossary, _retry: calls.append(text) or "你好。",
+            provider="local",
+            model="test-model",
+            cached_translations=[
+                {"id": 0, "text": "术语参考：（无） 只输出译文，不要解释"},
+                {"id": 1, "text": "你好吗？"},
+            ],
+            event_callback=lambda event: events.append(event),
+            retry_delay_seconds=0,
+        )
+
+        self.assertEqual(calls, ["こんにちは。"])
+        self.assertEqual([item["text"] for item in result], ["你好。", "你好吗？"])
+        self.assertEqual(events[0]["attempt"], 0)
+        self.assertIn("cached translation rejected", events[0]["error"])
+
     def test_translation_program_handles_target_interjection_and_standalone_particle(self):
         calls = []
         checkpoints = []
@@ -358,6 +383,17 @@ class SubtitleTranslationTest(unittest.TestCase):
     def test_translation_rejects_reasoning_tags(self):
         with self.assertRaisesRegex(RuntimeError, "reasoning content"):
             validate_translation_text("こんにちは", "<think>分析</think>你好")
+
+    def test_translation_rejects_prompt_echo(self):
+        with self.assertRaisesRegex(RuntimeError, "echoed the translation prompt"):
+            validate_translation_text("こんにちは", "术语参考：（无） 只输出译文，不要解释")
+
+    def test_srt_layout_collapses_translation_blank_lines(self):
+        rendered = build_srt(
+            [{"id": 0, "start": 0, "end": 1, "text": "第一行\n\n第二行"}]
+        )
+        self.assertIn("第一行 第二行", rendered)
+        self.assertEqual(len([block for block in rendered.split("\n\n") if block.strip()]), 1)
 
     def test_translation_allows_small_readable_kana_residue(self):
         translated = "才没有这回事呢，のし一先生如果真的好吃的话，就原谅你吧。"

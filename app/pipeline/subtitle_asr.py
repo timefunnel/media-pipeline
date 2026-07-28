@@ -38,6 +38,12 @@ JAPANESE_NONSEMANTIC_FRAGMENTS = frozenset(
 TARGET_LANGUAGE_INTERJECTIONS = frozenset({"啊", "嗯", "哦", "呀", "哇", "哈", "诶", "唉", "喂"})
 TRANSLATION_MODE_TARGET_LANGUAGE = "target_language"
 TRANSLATION_MODE_SKIPPED_NONSEMANTIC = "skipped_nonsemantic"
+TRANSLATION_PROMPT_MARKERS = (
+    "参考上下文：",
+    "术语参考：",
+    "重试要求：",
+    "只输出译文，不要解释",
+)
 
 
 class SenseVoiceClient:
@@ -605,6 +611,8 @@ def validate_translation_text(source, value):
         raise RuntimeError("AI translation returned reasoning content instead of plain text")
     if translated.startswith(("译文：", "翻译：", "翻译结果：", "Translation:")):
         raise RuntimeError("AI translation returned an explanation instead of plain text")
+    if any(marker in translated for marker in TRANSLATION_PROMPT_MARKERS):
+        raise RuntimeError("AI translation echoed the translation prompt")
     if normalize_translation_text(source) == normalize_translation_text(translated):
         raise RuntimeError("AI translation returned the untranslated source text")
     kana_count = len(JAPANESE_KANA_RE.findall(translated))
@@ -702,6 +710,29 @@ def translate_sequentially(
 ):
     segments = validate_asr_segments(segments)
     cached = validate_cached_translations(cached_translations, segments)
+    segment_by_id = {item["id"]: item for item in segments}
+    reusable_cached = []
+    for item in cached:
+        if item.get("mode"):
+            reusable_cached.append(item)
+            continue
+        started = time.monotonic()
+        try:
+            text = validate_translation_text(segment_by_id[item["id"]]["text"], item["text"])
+        except Exception as exc:
+            emit_translation_event(
+                event_callback,
+                item["id"],
+                provider,
+                model,
+                0,
+                started,
+                "failed",
+                "cached translation rejected: %s" % exc,
+            )
+            continue
+        reusable_cached.append({"id": item["id"], "text": text})
+    cached = reusable_cached
     handled_ids = {item["id"] for item in cached}
     by_id = {
         item["id"]: item["text"]
@@ -1074,11 +1105,12 @@ def llm_message_content(response):
 def build_srt(segments):
     lines = []
     for index, item in enumerate(segments, start=1):
+        subtitle_text = " ".join(str(item["text"]).split())
         lines.extend(
             [
                 str(index),
                 "%s --> %s" % (format_srt_timestamp(item["start"]), format_srt_timestamp(item["end"])),
-                str(item["text"]).strip(),
+                subtitle_text,
                 "",
             ]
         )
