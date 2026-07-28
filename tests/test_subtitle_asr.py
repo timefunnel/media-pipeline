@@ -121,10 +121,10 @@ class SubtitleTranslationTest(unittest.TestCase):
             30,
             transport=transport,
         )
-        with self.assertRaisesRegex(RuntimeError, "segment 0 after 2 attempts"):
+        with self.assertRaisesRegex(RuntimeError, "segment 0 after 3 attempts"):
             client.translate([{"id": 0, "start": 0, "end": 1, "text": "こんにちは"}])
-        self.assertEqual(len(transport.requests), 2)
-        sleep.assert_called_once()
+        self.assertEqual(len(transport.requests), 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_translation_reuses_completed_segments_and_checkpoints_new_results(self):
         transport = FakeTranslationTransport({"元気ですか。": "你好吗？"})
@@ -223,7 +223,7 @@ class SubtitleTranslationTest(unittest.TestCase):
             calls.append(text)
             raise RuntimeError("translation failed")
 
-        with self.assertRaisesRegex(RuntimeError, "segment 0 after 2 attempts"):
+        with self.assertRaisesRegex(RuntimeError, "segment 0 after 3 attempts"):
             translate_sequentially(
                 [
                     {"id": 0, "start": 0, "end": 1, "text": "最初。"},
@@ -236,10 +236,10 @@ class SubtitleTranslationTest(unittest.TestCase):
                 event_callback=lambda event: events.append(event),
                 retry_delay_seconds=0,
             )
-        self.assertEqual(calls, ["最初。", "最初。"])
+        self.assertEqual(calls, ["最初。", "最初。", "最初。"])
         self.assertEqual(checkpoints, [])
-        self.assertEqual([event["status"] for event in events], ["failed", "failed"])
-        self.assertEqual([event["attempt"] for event in events], [1, 2])
+        self.assertEqual([event["status"] for event in events], ["failed", "failed", "failed"])
+        self.assertEqual([event["attempt"] for event in events], [1, 2, 3])
 
     def test_cloud_translation_uses_mediastation_proxy(self):
         msg_client = FakeCloudTranslationClient()
@@ -669,7 +669,7 @@ class SubtitleAsrCacheReuseTest(unittest.TestCase):
             translation_client = FakeCachedTranslationClient(fail=True)
             processor._translation_client = lambda _provider, _model, _msg=None: translation_client
 
-            with self.assertRaisesRegex(RuntimeError, "segment 0 after 2 attempts"):
+            with self.assertRaisesRegex(RuntimeError, "segment 0 after 3 attempts"):
                 processor.run(
                     "b" * 32,
                     "media-2",
@@ -680,7 +680,9 @@ class SubtitleAsrCacheReuseTest(unittest.TestCase):
 
             self.assertEqual(translation_client.unload_calls, 1)
             history = load_translation_history(cache_dir / "translation-history.json")
-            self.assertEqual([event["status"] for event in history], ["failed", "failed"])
+            self.assertEqual(
+                [event["status"] for event in history], ["failed", "failed", "failed"]
+            )
 
     def test_corrupt_translation_history_fails_explicitly(self):
         with tempfile.TemporaryDirectory() as tempdir:
