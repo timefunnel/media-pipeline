@@ -693,6 +693,14 @@ class SubtitleAsrTaskTest(unittest.TestCase):
         self.assertEqual(completed["result"]["source"], "sensevoice-qwen")
         self.assertEqual(self.processor.run_calls, [("media-1", "ja")])
 
+    def test_task_defaults_source_language_to_japanese(self):
+        task, created = self.application.create_subtitle_asr(
+            {"owner_id": "admin", "media_id": "media-default-language"}
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(task["source_language"], "ja")
+
     def test_running_task_is_requeued_after_restart(self):
         task, _ = self.store.create_subtitle_asr_task("admin", "media-2", "auto")
         claimed = self.store.claim_next_subtitle_asr_task()

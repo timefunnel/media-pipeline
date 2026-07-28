@@ -1478,7 +1478,7 @@ class SubtitleAsrTaskManager:
             raise ApiError(400, "invalid_request", "request body must be a JSON object")
         owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
         media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
-        source_language = str(payload.get("source_language") or "auto").strip().lower()
+        source_language = str(payload.get("source_language") or "ja").strip().lower()
         if source_language not in {"auto", "ja", "en", "zh", "ko"}:
             raise ApiError(400, "invalid_source_language", "source_language must be one of: auto, ja, en, zh, ko")
         translation_provider = str(payload.get("translation_provider") or "local").strip().lower()
