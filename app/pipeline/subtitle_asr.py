@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -189,7 +190,7 @@ class SubtitleTranslationClient:
             event_callback=event_callback,
         )
 
-    def _translate_one(self, text, context, glossary):
+    def _translate_one(self, text, context, glossary, retry_instruction=""):
         payload = {
             "model": self.model,
             "max_tokens": 1024,
@@ -199,7 +200,9 @@ class SubtitleTranslationClient:
             "messages": [
                 {
                     "role": "user",
-                    "content": subtitle_translation_prompt(text, context, glossary),
+                    "content": subtitle_translation_prompt(
+                        text, context, glossary, retry_instruction
+                    ),
                 },
             ],
         }
@@ -263,13 +266,14 @@ class MediaStationTranslationClient:
             event_callback=event_callback,
         )
 
-    def _translate_one(self, text, context, glossary):
+    def _translate_one(self, text, context, glossary, retry_instruction=""):
         response = self.msg_client.pipeline_translate_subtitle(
             self.provider,
             self.model,
             text,
             context,
             glossary,
+            retry_instruction,
         )
         translation = response.get("translation") if isinstance(response, dict) else None
         return translation
@@ -280,18 +284,28 @@ class SubtitleAsrProcessor:
         self.config = config
 
     def ensure_available(self, translation_provider="local", translation_model=""):
+        self.ensure_asr_available()
+        self.ensure_translation_available(translation_provider, translation_model)
+
+    def ensure_translation_available(self, translation_provider="local", translation_model=""):
         if self.config is None or not bool(getattr(self.config, "asr_enabled", False)):
             raise RuntimeError("AI subtitle generation is disabled")
         if not bool(getattr(self.config, "msg_enabled", False)):
             raise RuntimeError("MediaStationGo is disabled in media-pipeline")
-        client = self._asr_client()
-        client.health()
         provider = require_translation_provider(translation_provider)
+        model = str(
+            translation_model or getattr(self.config, "asr_translation_model", "")
+        ).strip()
+        if not model:
+            raise RuntimeError("AI translation model missing")
         if provider == "local":
-            model = str(translation_model or getattr(self.config, "asr_translation_model", "")).strip()
+            client = self._asr_client()
+            client.health()
             if model not in client.models():
                 raise RuntimeError("local translation model is not installed: %s" % model)
-            self._translation_client(provider, model)
+        self._translation_client(
+            provider, model, self._msg_client() if provider != "local" else None
+        )
 
     def translation_models(self):
         self.ensure_asr_available()
@@ -380,7 +394,9 @@ class SubtitleAsrProcessor:
             emit_cache(cache_callback, True, True)
 
         try:
-            segments = validate_asr_segments(transcript.get("segments"))
+            segments = select_translatable_asr_segments(
+                validate_asr_segments(transcript.get("segments"))
+            )
             glossary = load_or_create_translation_glossary(
                 glossary_path, media_id, task_msg_client
             )
@@ -561,12 +577,25 @@ def validate_asr_segments(values):
     return out
 
 
+def select_translatable_asr_segments(segments):
+    selected = []
+    for item in validate_asr_segments(segments):
+        if not any(unicodedata.category(char)[0] in {"L", "N"} for char in item["text"]):
+            continue
+        selected.append({**item, "id": len(selected)})
+    if not selected:
+        raise RuntimeError("SenseVoice ASR returned no translatable speech segments")
+    return selected
+
+
 def validate_translation_text(source, value):
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError("AI translation returned empty content")
     translated = value.strip()
     if "```" in translated or translated.startswith(("{", "[")):
         raise RuntimeError("AI translation returned structured content instead of plain text")
+    if "<think" in translated.lower() or "</think>" in translated.lower():
+        raise RuntimeError("AI translation returned reasoning content instead of plain text")
     if translated.startswith(("译文：", "翻译：", "翻译结果：", "Translation:")):
         raise RuntimeError("AI translation returned an explanation instead of plain text")
     if normalize_translation_text(source) == normalize_translation_text(translated):
@@ -644,10 +673,13 @@ def translate_sequentially(
                 max(0, index - DEFAULT_ASR_TRANSLATION_CONTEXT_SEGMENTS) : index
             ]
         ]
+        retry_instruction = ""
         for attempt in range(1, DEFAULT_ASR_TRANSLATION_ATTEMPTS + 1):
             started = time.monotonic()
             try:
-                raw_translation = translate_one(segment["text"], context, glossary)
+                raw_translation = translate_one(
+                    segment["text"], context, glossary, retry_instruction
+                )
                 translation = validate_translation_text(segment["text"], raw_translation)
                 validate_repeated_translation(segments, by_id, segment, translation)
             except Exception as exc:
@@ -666,6 +698,7 @@ def translate_sequentially(
                         "AI translation failed for segment %s after %s attempts: %s"
                         % (segment_id, attempt, exc)
                     ) from exc
+                retry_instruction = translation_retry_instruction(exc)
                 time.sleep(max(0, float(retry_delay_seconds)))
                 continue
 
@@ -694,6 +727,21 @@ def translate_sequentially(
     if len(by_id) != total:
         raise RuntimeError("AI translation did not cover the ASR timeline")
     return [{**item, "text": by_id[item["id"]]} for item in segments]
+
+
+def translation_retry_instruction(error):
+    message = str(error or "")
+    if "Japanese kana" in message:
+        return "上次译文仍含日文假名，请将全部内容译成自然的简体中文。"
+    if "length is abnormally" in message:
+        return "上次译文长度异常，请只翻译当前字幕并保持简洁。"
+    if "untranslated source text" in message:
+        return "上次输出未完成翻译，请输出对应的简体中文译文。"
+    if "structured content" in message or "reasoning content" in message or "explanation" in message:
+        return "上次输出包含格式或解释，请只输出纯中文译文。"
+    if "same text for three different segments" in message:
+        return "上次译文与前文异常重复，请根据当前原文重新翻译。"
+    return ""
 
 
 def validate_repeated_translation(segments, translated_by_id, current_segment, translation):
@@ -910,14 +958,16 @@ def emit_cache(callback, audio_cached, transcript_cached):
         callback(bool(audio_cached), bool(transcript_cached))
 
 
-def subtitle_translation_prompt(text, context, glossary):
+def subtitle_translation_prompt(text, context, glossary, retry_instruction=""):
     context_text = "\n".join(context) if context else "（无）"
     glossary_text = str(glossary or "").strip() or "（无）"
+    retry_text = str(retry_instruction or "").strip()
     return (
         "参考上下文：\n"
         + context_text
         + "\n\n术语参考：\n"
         + glossary_text
+        + ("\n\n重试要求：\n" + retry_text if retry_text else "")
         + "\n\n将下面的日文翻译成自然、准确的简体中文。\n"
         + "只输出译文，不要解释：\n\n"
         + text

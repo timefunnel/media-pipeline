@@ -25,7 +25,7 @@ OFFLINE_FAILED_STATUSES = {"failed", "cancelled", "canceled"}
 FINAL_IMPORT_STATUSES = {"completed", "completed_with_warning", "failed", "canceled"}
 RETRYABLE_IMPORT_STATUSES = {"completed_with_warning", "failed", "canceled"}
 VALID_IMPORT_STATUSES = {"queued", "running", *FINAL_IMPORT_STATUSES}
-FINAL_SUBTITLE_ASR_STATUSES = {"completed", "failed"}
+FINAL_SUBTITLE_ASR_STATUSES = {"completed", "failed", "canceled"}
 VALID_SUBTITLE_ASR_STATUSES = {"queued", "running", *FINAL_SUBTITLE_ASR_STATUSES}
 VALID_SEARCH_SOURCES = {"default", "pansou", "bt4g"}
 VALID_CATEGORIES = {"movie", "tv", "anime", "adult", "other"}
@@ -786,6 +786,179 @@ class InternalApiStore:
         finally:
             conn.close()
 
+    def update_queued_subtitle_asr_task_model(
+        self, owner_id, task_id, translation_provider, translation_model
+    ):
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute("begin immediate")
+            row = conn.execute(
+                "select * from internal_api_subtitle_asr_tasks where id = ? and owner_id = ?",
+                (task_id, owner_id),
+            ).fetchone()
+            if row is None:
+                raise ApiError(404, "subtitle_asr_task_not_found", "AI subtitle task not found")
+            if row["status"] != "queued":
+                raise ApiError(
+                    409,
+                    "subtitle_asr_model_not_editable",
+                    "only queued AI subtitle tasks can change translation model",
+                )
+            conn.execute(
+                """
+                update internal_api_subtitle_asr_tasks
+                set translation_provider = ?, translation_model = ?, updated_at = ?
+                where id = ? and status = 'queued'
+                """,
+                (translation_provider, translation_model, now, task_id),
+            )
+            updated = conn.execute(
+                "select * from internal_api_subtitle_asr_tasks where id = ?", (task_id,)
+            ).fetchone()
+            conn.commit()
+            return subtitle_asr_task_row(updated)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def cancel_queued_subtitle_asr_task(self, owner_id, task_id):
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute("begin immediate")
+            row = conn.execute(
+                "select * from internal_api_subtitle_asr_tasks where id = ? and owner_id = ?",
+                (task_id, owner_id),
+            ).fetchone()
+            if row is None:
+                raise ApiError(404, "subtitle_asr_task_not_found", "AI subtitle task not found")
+            if row["status"] != "queued":
+                raise ApiError(
+                    409,
+                    "subtitle_asr_not_cancelable",
+                    "only queued AI subtitle tasks can be canceled",
+                )
+            conn.execute(
+                """
+                update internal_api_subtitle_asr_tasks
+                set status = 'canceled', stage = 'canceled', progress_current = 0,
+                    progress_total = 0, result_json = null, error = null,
+                    updated_at = ?, started_at = null, completed_at = ?
+                where id = ? and status = 'queued'
+                """,
+                (now, now, task_id),
+            )
+            updated = conn.execute(
+                "select * from internal_api_subtitle_asr_tasks where id = ?", (task_id,)
+            ).fetchone()
+            conn.commit()
+            return subtitle_asr_task_row(updated)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def clear_canceled_subtitle_asr_cache_state(self, owner_id, task_id):
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """
+                update internal_api_subtitle_asr_tasks
+                set cached_audio = 0, cached_transcript = 0, updated_at = ?
+                where id = ? and owner_id = ? and status = 'canceled'
+                """,
+                (now, task_id, owner_id),
+            )
+            if cursor.rowcount != 1:
+                raise ApiError(
+                    409,
+                    "subtitle_asr_cache_state_conflict",
+                    "canceled AI subtitle task cache state changed unexpectedly",
+                )
+            row = conn.execute(
+                "select * from internal_api_subtitle_asr_tasks where id = ?", (task_id,)
+            ).fetchone()
+            conn.commit()
+            return subtitle_asr_task_row(row)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def retranslate_completed_subtitle_asr_task(
+        self,
+        owner_id,
+        task_id,
+        translation_provider,
+        translation_model,
+        audio_cached,
+        transcript_cached,
+    ):
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute("begin immediate")
+            row = conn.execute(
+                "select * from internal_api_subtitle_asr_tasks where id = ? and owner_id = ?",
+                (task_id, owner_id),
+            ).fetchone()
+            if row is None:
+                raise ApiError(404, "subtitle_asr_task_not_found", "AI subtitle task not found")
+            if row["status"] != "completed":
+                raise ApiError(
+                    409,
+                    "subtitle_asr_not_retranslatable",
+                    "only completed AI subtitle tasks can be retranslated",
+                )
+            if not audio_cached or not transcript_cached:
+                raise ApiError(
+                    409,
+                    "subtitle_asr_cache_incomplete",
+                    "cached audio and SenseVoice transcript are both required for retranslation",
+                )
+            active = conn.execute(
+                """
+                select id from internal_api_subtitle_asr_tasks
+                where owner_id = ? and media_id = ? and status in ('queued', 'running') and id != ?
+                limit 1
+                """,
+                (owner_id, row["media_id"], task_id),
+            ).fetchone()
+            if active is not None:
+                raise ApiError(
+                    409,
+                    "subtitle_asr_active",
+                    "another AI subtitle task is already active for this media",
+                )
+            conn.execute(
+                """
+                update internal_api_subtitle_asr_tasks
+                set status = 'queued', stage = 'queued', progress_current = 0,
+                    progress_total = 0, result_json = null, error = null,
+                    translation_provider = ?, translation_model = ?,
+                    cached_audio = 1, cached_transcript = 1, updated_at = ?,
+                    started_at = null, completed_at = null
+                where id = ? and status = 'completed'
+                """,
+                (translation_provider, translation_model, now, task_id),
+            )
+            updated = conn.execute(
+                "select * from internal_api_subtitle_asr_tasks where id = ?", (task_id,)
+            ).fetchone()
+            conn.commit()
+            return subtitle_asr_task_row(updated)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def delete_subtitle_asr_task(self, owner_id, task_id):
         conn = self._connect()
         try:
@@ -1326,6 +1499,12 @@ class SubtitleAsrTaskManager:
         if not isinstance(payload, dict):
             raise ApiError(400, "invalid_request", "request body must be a JSON object")
         current = self.store.get_subtitle_asr_task(owner_id, task_id)
+        if current["status"] != "failed":
+            raise ApiError(
+                409,
+                "subtitle_asr_not_retryable",
+                "only failed AI subtitle tasks can be retried",
+            )
         provider = str(
             payload.get("translation_provider")
             or current.get("translation_provider")
@@ -1337,11 +1516,84 @@ class SubtitleAsrTaskManager:
             or getattr(getattr(self.processor, "config", None), "asr_translation_model", "")
         ).strip()
         try:
-            self.processor.ensure_available(provider, model)
             audio_cached, transcript_cached = self.processor.cache_state(task_id)
+            if audio_cached and transcript_cached:
+                self.processor.ensure_translation_available(provider, model)
+            else:
+                self.processor.ensure_available(provider, model)
         except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
             raise ApiError(503, "subtitle_asr_unavailable", str(exc))
         task = self.store.retry_subtitle_asr_task(
+            owner_id,
+            task_id,
+            provider,
+            model,
+            audio_cached,
+            transcript_cached,
+        )
+        self.notify()
+        return task
+
+    def update_task_model(self, owner_id, task_id, payload):
+        owner_id = require_text(owner_id, "owner_id", max_length=200)
+        task_id = require_text(task_id, "task_id", max_length=200)
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_request", "request body must be a JSON object")
+        provider = require_text(
+            payload.get("translation_provider"), "translation_provider", max_length=50
+        ).lower()
+        model = require_text(
+            payload.get("translation_model"), "translation_model", max_length=200
+        )
+        current = self.store.get_subtitle_asr_task(owner_id, task_id)
+        if current["status"] != "queued":
+            raise ApiError(
+                409,
+                "subtitle_asr_model_not_editable",
+                "only queued AI subtitle tasks can change translation model",
+            )
+        try:
+            self.processor.ensure_translation_available(provider, model)
+        except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
+            raise ApiError(503, "subtitle_asr_unavailable", str(exc))
+        return self.store.update_queued_subtitle_asr_task_model(
+            owner_id, task_id, provider, model
+        )
+
+    def cancel_task(self, owner_id, task_id):
+        owner_id = require_text(owner_id, "owner_id", max_length=200)
+        task_id = require_text(task_id, "task_id", max_length=200)
+        task = self.store.cancel_queued_subtitle_asr_task(owner_id, task_id)
+        try:
+            self.processor.delete_cache(task_id)
+        except OSError as exc:
+            raise ApiError(500, "subtitle_asr_cache_delete_failed", str(exc))
+        return self.store.clear_canceled_subtitle_asr_cache_state(owner_id, task_id)
+
+    def retranslate_task(self, owner_id, task_id, payload):
+        owner_id = require_text(owner_id, "owner_id", max_length=200)
+        task_id = require_text(task_id, "task_id", max_length=200)
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_request", "request body must be a JSON object")
+        provider = require_text(
+            payload.get("translation_provider"), "translation_provider", max_length=50
+        ).lower()
+        model = require_text(
+            payload.get("translation_model"), "translation_model", max_length=200
+        )
+        current = self.store.get_subtitle_asr_task(owner_id, task_id)
+        if current["status"] != "completed":
+            raise ApiError(
+                409,
+                "subtitle_asr_not_retranslatable",
+                "only completed AI subtitle tasks can be retranslated",
+            )
+        try:
+            self.processor.ensure_translation_available(provider, model)
+            audio_cached, transcript_cached = self.processor.cache_state(task_id)
+        except (RuntimeError, OSError, TimeoutError, ValueError) as exc:
+            raise ApiError(503, "subtitle_asr_unavailable", str(exc))
+        task = self.store.retranslate_completed_subtitle_asr_task(
             owner_id,
             task_id,
             provider,
@@ -1572,6 +1824,21 @@ class InternalApiApplication:
             raise ApiError(503, "subtitle_asr_unavailable", "AI subtitle task manager unavailable")
         return self.subtitle_asr_manager.retry_task(owner_id, task_id, payload)
 
+    def update_subtitle_asr_model(self, owner_id, task_id, payload):
+        if self.subtitle_asr_manager is None:
+            raise ApiError(503, "subtitle_asr_unavailable", "AI subtitle task manager unavailable")
+        return self.subtitle_asr_manager.update_task_model(owner_id, task_id, payload)
+
+    def cancel_subtitle_asr(self, owner_id, task_id):
+        if self.subtitle_asr_manager is None:
+            raise ApiError(503, "subtitle_asr_unavailable", "AI subtitle task manager unavailable")
+        return self.subtitle_asr_manager.cancel_task(owner_id, task_id)
+
+    def retranslate_subtitle_asr(self, owner_id, task_id, payload):
+        if self.subtitle_asr_manager is None:
+            raise ApiError(503, "subtitle_asr_unavailable", "AI subtitle task manager unavailable")
+        return self.subtitle_asr_manager.retranslate_task(owner_id, task_id, payload)
+
     def delete_subtitle_asr(self, owner_id, task_id):
         if self.subtitle_asr_manager is None:
             raise ApiError(503, "subtitle_asr_unavailable", "AI subtitle task manager unavailable")
@@ -1724,6 +1991,30 @@ class InternalApiServer:
                         self.application.retry_subtitle_asr(owner_id, subtitle_asr_task_id, payload),
                     )
                     return
+                if handler.command == "POST" and subtitle_action in {"model", "retranslate"}:
+                    payload = self._read_json(handler)
+                    owner_id = owner_from_request(handler, query, body=payload)
+                    if subtitle_action == "model":
+                        task = self.application.update_subtitle_asr_model(
+                            owner_id, subtitle_asr_task_id, payload
+                        )
+                        status = 200
+                    else:
+                        task = self.application.retranslate_subtitle_asr(
+                            owner_id, subtitle_asr_task_id, payload
+                        )
+                        status = 202
+                    self._send_json(handler, status, task)
+                    return
+                if handler.command == "POST" and subtitle_action == "cancel":
+                    payload = self._read_json(handler)
+                    owner_id = owner_from_request(handler, query, body=payload)
+                    self._send_json(
+                        handler,
+                        200,
+                        self.application.cancel_subtitle_asr(owner_id, subtitle_asr_task_id),
+                    )
+                    return
                 if handler.command == "DELETE" and subtitle_action is None:
                     owner_id = owner_from_request(handler, query, body=None)
                     self.application.delete_subtitle_asr(owner_id, subtitle_asr_task_id)
@@ -1809,7 +2100,11 @@ def subtitle_asr_task_path_match(path):
     parts = [part for part in path.split("/") if part]
     if len(parts) == 4 and parts[:3] == ["v1", "subtitles", "asr"]:
         return parts[3], None
-    if len(parts) == 5 and parts[:3] == ["v1", "subtitles", "asr"] and parts[4] == "retry":
+    if (
+        len(parts) == 5
+        and parts[:3] == ["v1", "subtitles", "asr"]
+        and parts[4] in {"retry", "model", "cancel", "retranslate"}
+    ):
         return parts[3], parts[4]
     return None
 

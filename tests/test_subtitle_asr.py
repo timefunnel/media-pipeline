@@ -28,8 +28,10 @@ from pipeline.subtitle_asr import (
     build_translation_glossary,
     build_srt,
     load_translation_history,
+    select_translatable_asr_segments,
     translate_sequentially,
     validate_asr_segments,
+    validate_translation_text,
 )
 
 
@@ -154,7 +156,7 @@ class SubtitleTranslationTest(unittest.TestCase):
         checkpoints = []
         events = []
 
-        def translate_one(text, _context, _glossary):
+        def translate_one(text, _context, _glossary, _retry_instruction):
             calls.append(text)
             raise RuntimeError("translation failed")
 
@@ -204,23 +206,60 @@ class SubtitleTranslationTest(unittest.TestCase):
                     {"id": 1, "start": 1, "end": 2, "text": "二つ目。"},
                     {"id": 2, "start": 2, "end": 3, "text": "三つ目。"},
                 ],
-                lambda _text, _context, _glossary: "完全相同的异常译文",
+                lambda _text, _context, _glossary, _retry_instruction: "完全相同的异常译文",
                 provider="local",
                 model="test-model",
                 retry_delay_seconds=0,
             )
 
+    def test_translation_retry_includes_quality_correction(self):
+        retry_instructions = []
+
+        def translate_one(_text, _context, _glossary, retry_instruction):
+            retry_instructions.append(retry_instruction)
+            return "こんにちは" if not retry_instruction else "你好"
+
+        result = translate_sequentially(
+            [{"id": 0, "start": 0, "end": 1, "text": "こんにちは"}],
+            translate_one,
+            provider="local",
+            model="test-model",
+            retry_delay_seconds=0,
+        )
+
+        self.assertEqual(result[0]["text"], "你好")
+        self.assertEqual(retry_instructions[0], "")
+        self.assertIn("未完成翻译", retry_instructions[1])
+
+    def test_non_speech_segments_are_not_sent_for_translation(self):
+        selected = select_translatable_asr_segments(
+            [
+                {"id": 0, "start": 0, "end": 1, "text": "🎼."},
+                {"id": 1, "start": 1, "end": 2, "text": "こんにちは"},
+                {"id": 2, "start": 2, "end": 3, "text": "."},
+            ]
+        )
+
+        self.assertEqual(
+            selected,
+            [{"id": 0, "start": 1.0, "end": 2.0, "text": "こんにちは"}],
+        )
+
     def test_asr_segments_require_real_ordered_timeline(self):
         with self.assertRaisesRegex(RuntimeError, "timeline"):
             validate_asr_segments([{"id": 0, "start": 1, "end": 1, "text": "invalid"}])
+
+    def test_translation_rejects_reasoning_tags(self):
+        with self.assertRaisesRegex(RuntimeError, "reasoning content"):
+            validate_translation_text("こんにちは", "<think>分析</think>你好")
 
 
 class FakeCloudTranslationClient:
     def __init__(self):
         self.calls = []
 
-    def pipeline_translate_subtitle(self, provider, model, text, context, glossary):
-        self.calls.append((provider, model, text, context, glossary))
+    def pipeline_translate_subtitle(self, provider, model, text, context, glossary, retry_instruction=""):
+        self.calls.append((provider, model, text, context, glossary, retry_instruction))
         translations = {"こんにちは。": "你好。", "元気ですか。": "你好吗？"}
         return {"translation": translations[text]}
 
@@ -234,6 +273,9 @@ class FakeSubtitleAsrProcessor:
         self.config = SimpleNamespace(asr_translation_model="fake-model")
 
     def ensure_available(self, translation_provider="local", translation_model=""):
+        self.ensure_calls += 1
+
+    def ensure_translation_available(self, translation_provider="local", translation_model=""):
         self.ensure_calls += 1
 
     def translation_models(self):
@@ -344,6 +386,86 @@ class SubtitleAsrTaskTest(unittest.TestCase):
         self.assertEqual(retried["translation_model"], "other-model")
         self.assertTrue(retried["cached_audio"])
         self.assertTrue(retried["cached_transcript"])
+
+    def test_queued_task_model_can_change_before_worker_claim(self):
+        task, _ = self.store.create_subtitle_asr_task(
+            "admin", "media-edit-model", "ja", "local", "fake-model"
+        )
+
+        updated = self.manager.update_task_model(
+            "admin",
+            task["id"],
+            {"translation_provider": "local", "translation_model": "other-model"},
+        )
+        claimed = self.store.claim_next_subtitle_asr_task()
+
+        self.assertEqual(updated["translation_model"], "other-model")
+        self.assertEqual(claimed["translation_model"], "other-model")
+
+    def test_running_task_model_change_and_cancel_are_rejected(self):
+        task, _ = self.store.create_subtitle_asr_task(
+            "admin", "media-running", "ja", "local", "fake-model"
+        )
+        self.store.claim_next_subtitle_asr_task()
+
+        with self.assertRaisesRegex(Exception, "only queued"):
+            self.manager.update_task_model(
+                "admin",
+                task["id"],
+                {"translation_provider": "local", "translation_model": "other-model"},
+            )
+        with self.assertRaisesRegex(Exception, "only queued"):
+            self.manager.cancel_task("admin", task["id"])
+
+    def test_queued_task_cancel_clears_cache_and_keeps_audit_row(self):
+        task, _ = self.store.create_subtitle_asr_task("admin", "media-cancel", "ja")
+        self.store.save_subtitle_asr_cache(task["id"], True, True)
+
+        canceled = self.manager.cancel_task("admin", task["id"])
+
+        self.assertEqual(canceled["status"], "canceled")
+        self.assertEqual(canceled["stage"], "canceled")
+        self.assertFalse(canceled["cached_audio"])
+        self.assertFalse(canceled["cached_transcript"])
+        self.assertEqual(self.processor.deleted_cache_ids, [task["id"]])
+        self.assertEqual(
+            self.store.get_subtitle_asr_task("admin", task["id"])["status"],
+            "canceled",
+        )
+
+    def test_completed_task_retranslation_requires_and_reuses_asr_cache(self):
+        task, _ = self.store.create_subtitle_asr_task(
+            "admin", "media-retranslate", "ja", "local", "fake-model"
+        )
+        self.store.finish_subtitle_asr_task(
+            task["id"], "completed", "completed", result={"filename": "old.srt"}
+        )
+
+        requeued = self.manager.retranslate_task(
+            "admin",
+            task["id"],
+            {"translation_provider": "local", "translation_model": "other-model"},
+        )
+
+        self.assertEqual(requeued["status"], "queued")
+        self.assertEqual(requeued["translation_model"], "other-model")
+        self.assertIsNone(requeued["result"])
+        self.assertTrue(requeued["cached_audio"])
+        self.assertTrue(requeued["cached_transcript"])
+
+    def test_completed_task_retranslation_rejects_incomplete_cache(self):
+        task, _ = self.store.create_subtitle_asr_task(
+            "admin", "media-no-transcript", "ja", "local", "fake-model"
+        )
+        self.store.finish_subtitle_asr_task(task["id"], "completed", "completed")
+        self.processor.cache = (True, False)
+
+        with self.assertRaisesRegex(Exception, "both required"):
+            self.manager.retranslate_task(
+                "admin",
+                task["id"],
+                {"translation_provider": "local", "translation_model": "other-model"},
+            )
 
     def test_finished_task_delete_removes_cache_and_row(self):
         task, _ = self.store.create_subtitle_asr_task("admin", "media-delete", "auto")
@@ -526,7 +648,7 @@ class FakeCachedTranslationClient:
         checkpoint_callback=None,
         event_callback=None,
     ):
-        def translate_one(text, _context, received_glossary):
+        def translate_one(text, _context, received_glossary, _retry_instruction):
             self.calls.append(text)
             if self.fail:
                 raise RuntimeError("translation failed")

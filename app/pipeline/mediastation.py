@@ -216,19 +216,25 @@ class MediaStationClient:
             "/pipeline/media/%s/subtitle-status" % quote_path(media_id),
         )
 
-    def pipeline_translate_subtitle(self, provider, model, text, context, glossary):
-        return self._pipeline_request(
+    def pipeline_translate_subtitle(
+        self, provider, model, text, context, glossary, retry_instruction=""
+    ):
+        response = self._request(
             "POST",
             "/pipeline/subtitles/translate",
-            {
+            data={
                 "provider": str(provider or "").strip(),
                 "model": str(model or "").strip(),
                 "text": str(text or "").strip(),
                 "context": list(context or []),
                 "glossary": str(glossary or "").strip(),
+                "retry_instruction": str(retry_instruction or "").strip(),
             },
             timeout=120,
         )
+        if not isinstance(response, dict) or not isinstance(response.get("translation"), str):
+            raise RuntimeError("MediaStationGo subtitle translation API returned invalid response")
+        return response
 
     def download_pipeline_asr_audio(
         self,

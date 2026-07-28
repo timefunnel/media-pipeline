@@ -1176,6 +1176,31 @@ class OpenListClientTest(unittest.TestCase):
 
 
 class MediaStationClientTest(unittest.TestCase):
+    def test_subtitle_translation_accepts_direct_msg_response(self):
+        transport = SequenceTransport(
+            [
+                {"tokens": {"access_token": "msg-token"}},
+                {"translation": "不，挺好的，基本上刚刚好。"},
+            ]
+        )
+        client = MediaStationClient(
+            "http://127.0.0.1:18080/api", "admin", "secret", transport=transport
+        )
+
+        result = client.pipeline_translate_subtitle(
+            "openai",
+            "deepseek-v4-flash",
+            "いやいいな 基本ちょうどいいわ。",
+            [],
+            "",
+            "上次译文仍含日文假名，请全部翻译。",
+        )
+
+        self.assertEqual(result["translation"], "不，挺好的，基本上刚刚好。")
+        call = transport.calls[1]
+        self.assertEqual(call["url"], "http://127.0.0.1:18080/api/pipeline/subtitles/translate")
+        self.assertEqual(call["data"]["retry_instruction"], "上次译文仍含日文假名，请全部翻译。")
+
     def test_pipeline_methods_use_authenticated_msg_endpoints(self):
         transport = SequenceTransport(
             [
