@@ -2355,6 +2355,47 @@ class PipelineBotService:
             "candidates": normalized,
         }
 
+    def subtitle_search_season_candidates(self, media_id, season, title="", limit=DEFAULT_SUBTITLE_REMATCH_LIMIT):
+        if not self.config.msg_enabled:
+            raise RuntimeError("MediaStationGo is disabled")
+        media_id = str(media_id or "").strip()
+        if not media_id:
+            raise ValueError("media_id is required")
+        try:
+            season = int(season)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("season must be an integer") from exc
+        if season < 1 or season > 99:
+            raise ValueError("season must be between 1 and 99")
+        client = self._build_msg_client()
+        media = extract_media_detail(client.get_media(media_id))
+        detail_id = extract_media_id(media)
+        if not detail_id:
+            raise RuntimeError("MediaStationGo media detail missing id: %s" % media_id)
+        if detail_id != media_id:
+            raise RuntimeError("MediaStationGo media id mismatch: expected %s, got %s" % (media_id, detail_id))
+        category = subtitle_category_from_media(media)
+        if category not in ("tv", "anime"):
+            raise ValueError("season subtitle search is only available for TV or anime media")
+        query = subtitle_season_search_query(media, season, title)
+        task = subtitle_backfill_task_from_media(media, category=category)
+        candidates = self._build_subtitle_matcher().search_task_candidates(
+            category, query, task, limit=limit, manual=True, provider_names=("subhd",),
+        )
+        return {
+            "media_id": media_id,
+            "category": category,
+            "season": season,
+            "query": query,
+            "candidates": candidates,
+        }
+
+    def subtitle_download_season_candidate(self, candidate_record):
+        return self._build_subtitle_matcher().download_season_candidate(candidate_record)
+
+    def subtitle_cache_season_download(self, media_id, download):
+        return self._build_subtitle_matcher().save_download(media_id, download)
+
     def subtitle_find_adult(self, query, limit=DEFAULT_SUBTITLE_FIND_LIMIT):
         if not self.config.msg_enabled:
             raise RuntimeError("MediaStationGo is disabled")
@@ -6284,6 +6325,22 @@ def subtitle_search_title(media):
     if isinstance(nested, dict):
         return subtitle_search_title(nested)
     return media_display_title(media)
+
+def subtitle_season_search_query(media, season, title=""):
+    try:
+        season = int(season)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("season must be an integer") from exc
+    if season < 1 or season > 99:
+        raise ValueError("season must be between 1 and 99")
+    base = str(title or "").strip() or subtitle_search_title(media)
+    if not base:
+        raise RuntimeError("MediaStationGo media detail missing title for season subtitle search")
+    base = re.sub(r"(?<![A-Za-z0-9])S\d{1,2}[ ._-]*E\d{1,3}(?![A-Za-z0-9])", " ", base, flags=re.IGNORECASE)
+    base = re.sub(r"\s+", " ", base).strip(" ._-")
+    if not base:
+        raise RuntimeError("MediaStationGo media title has no usable season subtitle query")
+    return "%s S%02d" % (base, season)
 
 
 def subtitle_category_from_media(media):

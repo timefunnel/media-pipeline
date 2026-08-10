@@ -12,6 +12,7 @@ from pathlib import Path
 
 from pipeline.config import category_to_openlist_path
 from pipeline.openlist_utils import normalize_openlist_path
+from pipeline.season_subtitles import SeasonSubtitleTaskManager
 from pipeline.subtitle_asr import DEFAULT_ASR_MODEL, SubtitleAsrProcessor
 from pipeline.telegram_ui import task_from_submit_result
 
@@ -1718,11 +1719,12 @@ class SubtitleAsrTaskManager:
 
 
 class InternalApiApplication:
-    def __init__(self, service, store, manager, subtitle_asr_manager=None):
+    def __init__(self, service, store, manager, subtitle_asr_manager=None, season_subtitle_manager=None):
         self.service = service
         self.store = store
         self.manager = manager
         self.subtitle_asr_manager = subtitle_asr_manager
+        self.season_subtitle_manager = season_subtitle_manager
 
     def search(self, payload):
         if not isinstance(payload, dict):
@@ -1825,6 +1827,95 @@ class InternalApiApplication:
             "query": metadata["query"],
             "items": [public_subtitle_candidate(item) for item in stored],
         }
+
+    def search_season_subtitles(self, payload):
+        owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
+        media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
+        try:
+            season = int(payload.get("season"))
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_season", "season must be an integer")
+        if season < 1 or season > 99:
+            raise ApiError(400, "invalid_season", "season must be between 1 and 99")
+        title = str(payload.get("title") or "").strip()
+        if len(title) > 500:
+            raise ApiError(400, "invalid_title", "title is too long")
+        try:
+            limit = int(payload.get("limit") or 20)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_limit", "limit must be an integer")
+        if limit < 1 or limit > 50:
+            raise ApiError(400, "invalid_limit", "limit must be between 1 and 50")
+        try:
+            result = self.service.subtitle_search_season_candidates(media_id, season, title=title, limit=limit)
+        except (RuntimeError, ValueError) as exc:
+            raise ApiError(502, "subtitle_season_search_failed", str(exc))
+        if not isinstance(result, dict) or not isinstance(result.get("candidates"), list):
+            raise ApiError(502, "subtitle_season_search_failed", "pipeline season subtitle search returned invalid response")
+        candidates = []
+        for item in result.get("candidates") or []:
+            if not isinstance(item, dict) or str(item.get("provider") or "") != "subhd":
+                raise ApiError(502, "subtitle_season_search_failed", "pipeline season subtitle search returned an invalid candidate")
+            candidates.append({**item, "media_id": media_id, "season": season})
+        metadata = {
+            "media_id": media_id,
+            "season": season,
+            "title": title,
+            "query": str(result.get("query") or ""),
+            "category": str(result.get("category") or ""),
+            "selected_count": len(candidates),
+        }
+        session_id, expires_at, stored = self.store.save_search(
+            owner_id, metadata["query"] or media_id, metadata["category"] or "tv",
+            "subtitle_season", candidates, metadata,
+        )
+        return {
+            "session_id": session_id,
+            "expires_at": expires_at,
+            **metadata,
+            "items": [public_subtitle_candidate(item) for item in stored],
+        }
+
+    def create_season_subtitle_task(self, payload):
+        if self.season_subtitle_manager is None:
+            raise ApiError(503, "season_subtitle_unavailable", "season subtitle task manager unavailable")
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_request", "request body must be a JSON object")
+        owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
+        media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
+        session_id = require_text(payload.get("search_session_id"), "search_session_id", max_length=200)
+        candidate_id = require_text(payload.get("candidate_id"), "candidate_id", max_length=200)
+        try:
+            season = int(payload.get("season"))
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_season", "season must be an integer")
+        if season < 1 or season > 99:
+            raise ApiError(400, "invalid_season", "season must be between 1 and 99")
+        loaded = self.store.load_search_candidate(owner_id, session_id, candidate_id)
+        if loaded.get("source") != "subtitle_season":
+            raise ApiError(404, "season_subtitle_candidate_not_found", "season subtitle candidate not found")
+        candidate = loaded.get("candidate")
+        if (
+            not isinstance(candidate, dict)
+            or str(candidate.get("media_id") or "").strip() != media_id
+            or int(candidate.get("season") or 0) != season
+            or str(candidate.get("provider") or "") != "subhd"
+        ):
+            raise ApiError(409, "season_subtitle_candidate_mismatch", "season subtitle candidate does not match this request")
+        try:
+            return self.season_subtitle_manager.create_task(
+                owner_id, media_id, season, candidate, payload.get("episodes"),
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise ApiError(400, "season_subtitle_task_invalid", str(exc))
+
+    def get_season_subtitle_task(self, owner_id, task_id):
+        if self.season_subtitle_manager is None:
+            raise ApiError(503, "season_subtitle_unavailable", "season subtitle task manager unavailable")
+        try:
+            return self.season_subtitle_manager.get_task(owner_id, task_id)
+        except (RuntimeError, ValueError) as exc:
+            raise ApiError(404, "season_subtitle_task_not_found", str(exc))
 
     def preview_subtitle(self, payload):
         _owner_id, media_id, record = self._subtitle_candidate(payload)
@@ -1950,11 +2041,13 @@ class InternalApiServer:
             SubtitleAsrProcessor(getattr(service, "config", None)),
             self.store,
         )
+        self.season_subtitle_manager = SeasonSubtitleTaskManager(service, db_path)
         self.application = InternalApiApplication(
             service,
             self.store,
             self.manager,
             subtitle_asr_manager=self.subtitle_asr_manager,
+            season_subtitle_manager=self.season_subtitle_manager,
         )
         self._httpd = None
         self._thread = None
@@ -1968,6 +2061,7 @@ class InternalApiServer:
         self._httpd = httpd
         self.manager.start()
         self.subtitle_asr_manager.start()
+        self.season_subtitle_manager.start()
         self._thread = threading.Thread(target=httpd.serve_forever, name="internal-api-http", daemon=True)
         self._thread.start()
         print("internal API listening on http://%s:%d" % (self.host, self.port), flush=True)
@@ -1981,6 +2075,7 @@ class InternalApiServer:
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
+        self.season_subtitle_manager.stop()
         self.subtitle_asr_manager.stop()
         self.manager.stop()
 
@@ -2018,6 +2113,18 @@ class InternalApiServer:
                 return
             if handler.command == "POST" and path == "/v1/subtitles/search":
                 self._send_json(handler, 200, self.application.search_subtitles(self._read_json(handler)))
+                return
+            if handler.command == "POST" and path == "/v1/subtitles/season/search":
+                self._send_json(handler, 200, self.application.search_season_subtitles(self._read_json(handler)))
+                return
+            if handler.command == "POST" and path == "/v1/subtitles/season/apply":
+                task, created = self.application.create_season_subtitle_task(self._read_json(handler))
+                self._send_json(handler, 202 if created else 200, task)
+                return
+            if handler.command == "GET" and path.startswith("/v1/subtitles/season/tasks/"):
+                task_id = path.rsplit("/", 1)[-1]
+                owner_id = (query.get("owner_id") or [""])[0]
+                self._send_json(handler, 200, self.application.get_season_subtitle_task(owner_id, task_id))
                 return
             if handler.command == "POST" and path == "/v1/subtitles/preview":
                 self._send_json(handler, 200, self.application.preview_subtitle(self._read_json(handler)))
