@@ -139,8 +139,7 @@ services:
       OPENLIST_PRE_SCAN_CLEAN_ENABLED: "${OPENLIST_PRE_SCAN_CLEAN_ENABLED:-1}"
       OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES: "${OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES:-20971520}"
       OPENLIST_ADULT_CODE_FORMAT_ENABLED: "${OPENLIST_ADULT_CODE_FORMAT_ENABLED:-1}"
-      OPENLIST_DB: "${OPENLIST_DB:-/openlist-data/data.db}"
-      OPENLIST_URL: "${OPENLIST_URL:-http://127.0.0.1:5244}"
+      OPENLIST_URL: "${OPENLIST_URL:-https://hk-openlist.timefunnel.top}"
       PROWLARR_URL: "${PROWLARR_URL:-http://127.0.0.1:9696}"
       PROWLARR_CONFIG: "${PROWLARR_CONFIG:-/prowlarr-config/config.xml}"
       PROWLARR_SEARCH_TIMEOUT_SECONDS: "${PROWLARR_SEARCH_TIMEOUT_SECONDS:-4}"
@@ -187,7 +186,6 @@ services:
       ASR_TRANSLATION_THINKING_DISABLED: "${ASR_TRANSLATION_THINKING_DISABLED:-1}"
     restart: unless-stopped
     volumes:
-      - /data/OpenList/data:/openlist-data:ro
       - /data/Prowlarr/config:/prowlarr-config:ro
       - /data/media-pipeline/bot:/bot-data
       - /data/media-pipeline/subtitles:/subtitle-cache

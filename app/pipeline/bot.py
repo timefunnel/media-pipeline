@@ -139,7 +139,7 @@ from pipeline.mediastation import (
 )
 from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider
-from pipeline.openlist_tokens import OpenListTokenStore
+from pipeline.openlist_tokens import load_access_token_from_api
 from pipeline.prowlarr import (
     DEFAULT_PROWLARR_CONFIG,
     DEFAULT_PROWLARR_URL,
@@ -2554,8 +2554,10 @@ class PipelineBotService:
         return result
 
     def _build_115_client(self, category, refresh=False):
-        OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token()).list_path(category_to_openlist_path(category), refresh=refresh)
-        token = OpenListTokenStore(self.config.openlist_db).load_access_token()
+        openlist_token = OpenListTokenProvider().load_token()
+        client = OpenListClient(self.config.openlist_url, openlist_token)
+        client.list_path(category_to_openlist_path(category), refresh=refresh)
+        token = load_access_token_from_api(self.config.openlist_url, openlist_token)
         return Client115(token.access_token)
 
     def _build_115_share_client(self):
