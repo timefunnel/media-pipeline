@@ -2905,6 +2905,9 @@ class PipelineBotService:
         )
         if not isinstance(result, dict) or result.get("mode") not in ("apply", "smart"):
             raise RuntimeError("MediaStationGo pipeline scrape returned invalid response")
+        scrape_status = str(result.get("scrape_status") or "").strip().lower()
+        if scrape_status != "matched":
+            raise RuntimeError("MediaStationGo metadata scrape %s" % (scrape_status or "returned no match status"))
         return {
             "msg_scrape_mode": result.get("mode"),
             "msg_scrape_query": result.get("query"),

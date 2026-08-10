@@ -420,9 +420,9 @@ class FakeMediaStationClient:
             matches = response.get("items") or (response.get("data") or {}).get("items") or []
             if len(matches) == 1:
                 self.scrape_apply_calls.append((media_id, matches[0]))
-                return {"mode": "apply", "query": query, "applied_count": 1}
+                return {"mode": "apply", "query": query, "applied_count": 1, "scrape_status": "matched"}
         self.scrape_calls.append(media_id)
-        return {"mode": "smart", "applied_count": 1}
+        return {"mode": "smart", "applied_count": 1, "scrape_status": "matched"}
 
     def pipeline_repair_movie_extras(self, media_id, target):
         self.pipeline_maintenance_calls.append(("repair_movie_extras", media_id, dict(target or {})))

@@ -444,7 +444,7 @@ class PipelineTargetOverrideTest(InternalApiTestCase):
 
             def pipeline_scrape_media(self, *args):
                 self.call = args
-                return {"mode": "smart", "query": "Sintel", "applied_count": 1}
+                return {"mode": "smart", "query": "Sintel", "applied_count": 1, "scrape_status": "matched"}
 
         client = Client()
         service._scrape_msg_media(client, "movie", "media-1", "Sintel", {}, target=TARGET)
