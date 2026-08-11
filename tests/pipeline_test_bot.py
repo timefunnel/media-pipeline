@@ -4377,6 +4377,87 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertIn("ffprobe timeout", result["subtitle_match_error"])
         self.assertEqual(matcher_calls, [])
 
+    def test_sync_completed_task_adult_only_auto_subtitles_skip_non_adult_without_probe(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(get_response={"data": {"id": "media-1", "title": "Movie"}})
+        with tempfile.TemporaryDirectory() as tmp, patch("pipeline.bot.MediaStationClient", return_value=fake_msg):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    str(Path(tmp) / "state.db"),
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    openlist_pre_scan_clean_enabled=False,
+                    subtitle_auto_match_enabled=True,
+                    subtitle_auto_match_adult_only=True,
+                )
+            )
+            matcher_calls = []
+            service.match_task_subtitles = lambda *args, **kwargs: matcher_calls.append((args, kwargs))
+            result = service.sync_completed_task(
+                "movie",
+                "Movie",
+                {
+                    "info_hash": "ABC",
+                    "status_name": "success",
+                    "msg_scan_status": "success",
+                    "msg_scrape_status": "success",
+                    "msg_media_id": "media-1",
+                    "msg_media_title": "Movie",
+                },
+            )
+
+        self.assertEqual(result["subtitle_match_status"], "skipped")
+        self.assertEqual(result["subtitle_match_reason"], "adult_only")
+        self.assertEqual(fake_msg.subtitle_status_calls, [])
+        self.assertEqual(matcher_calls, [])
+
+    def test_sync_completed_task_adult_only_auto_subtitles_still_probe_adult(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(get_response={"data": {"id": "media-1", "title": "SSIS-218"}})
+        with tempfile.TemporaryDirectory() as tmp, patch("pipeline.bot.MediaStationClient", return_value=fake_msg):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    str(Path(tmp) / "state.db"),
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                    openlist_pre_scan_clean_enabled=False,
+                    openlist_adult_code_format_enabled=False,
+                    subtitle_auto_match_enabled=True,
+                    subtitle_auto_match_adult_only=True,
+                )
+            )
+            matcher_calls = []
+
+            def match(category, title, task, force=False):
+                matcher_calls.append((category, title, task["msg_media_id"], force))
+                return {"subtitle_match_status": "success", "subtitle_match_count": 1}
+
+            service.match_task_subtitles = match
+            result = service.sync_completed_task(
+                "adult",
+                "SSIS-218",
+                {
+                    "info_hash": "ABC",
+                    "status_name": "success",
+                    "msg_scan_status": "success",
+                    "msg_scrape_status": "success",
+                    "msg_media_id": "media-1",
+                    "msg_media_title": "SSIS-218",
+                },
+            )
+
+        self.assertEqual(result["subtitle_match_status"], "success")
+        self.assertEqual(fake_msg.subtitle_status_calls, ["media-1"])
+        self.assertEqual(matcher_calls, [("adult", "SSIS-218", "media-1", True)])
+
     def test_search_does_not_run_llm_rerank_automatically(self):
         from pipeline.bot import BotConfig, PipelineBotService
 

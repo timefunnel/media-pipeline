@@ -2838,7 +2838,13 @@ class PipelineBotService:
         msg_root_id = (root or {}).get("root_id") or progress.get("msg_root_id")
         subtitle_result = prefixed_task_fields(progress, "subtitle_match_")
         if self.config.subtitle_auto_match_enabled:
-            if not stage_is_complete(progress.get("subtitle_match_status")):
+            if self.config.subtitle_auto_match_adult_only and category != "adult":
+                if not stage_is_complete(progress.get("subtitle_match_status")):
+                    subtitle_result = {"subtitle_match_status": "skipped", "subtitle_match_reason": "adult_only"}
+                    apply_progress(subtitle_result)
+                else:
+                    apply_progress(subtitle_result)
+            elif not stage_is_complete(progress.get("subtitle_match_status")):
                 emit({"subtitle_match_status": "running", "subtitle_match_error": None, "msg_media_id": media_id, "msg_media_title": media_title})
                 subtitle_result = self._match_subtitles(get_msg_client(), category, title, progress)
                 if subtitle_result.get("subtitle_match_status") == "skipped":
