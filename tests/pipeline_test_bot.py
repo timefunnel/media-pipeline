@@ -179,6 +179,7 @@ class BotConfigTest(unittest.TestCase):
                 "BOT_TASK_LIST_PAGE_SIZE": "7",
                 "BOT_TASK_LIST_FETCH_LIMIT": "77",
                 "PROWLARR_UPSTREAM_SEARCH_LIMIT": "150",
+                "PROWLARR_BT4G_SEARCH_TIMEOUT_SECONDS": "9",
                 "PROWLARR_MAX_WORKERS": "3",
                 "PROWLARR_EARLY_RETURN_AFTER_SECONDS": "1.5",
                 "PROWLARR_EARLY_RETURN_MIN_RESULTS": "55",
@@ -205,6 +206,7 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.task_list_page_size, 7)
         self.assertEqual(config.task_list_fetch_limit, 77)
         self.assertEqual(config.prowlarr_upstream_search_limit, 150)
+        self.assertEqual(config.prowlarr_bt4g_search_timeout_seconds, 9)
         self.assertEqual(config.prowlarr_max_workers, 3)
         self.assertEqual(config.prowlarr_early_return_after_seconds, 1.5)
         self.assertEqual(config.prowlarr_early_return_min_results, 55)

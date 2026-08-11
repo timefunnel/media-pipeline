@@ -96,13 +96,14 @@ class EmptySearchResultTest(unittest.TestCase):
 
         with patch("pipeline.bot.ProwlarrConfig") as config_cls, patch(
             "pipeline.bot.ProwlarrClient", return_value=fake_prowlarr
-        ):
+        ) as client_cls:
             config_cls.return_value.load_api_key.return_value = "prowlarr-key"
             service = PipelineBotService(
                 BotConfig(
                     "token",
                     {700656624},
                     "/tmp/state.db",
+                    prowlarr_bt4g_search_timeout_seconds=9,
                     search_profile_upstream_limits={SEARCH_PROFILE_GENERAL: 40},
                 )
             )
@@ -114,6 +115,8 @@ class EmptySearchResultTest(unittest.TestCase):
         self.assertEqual(metadata["success_count"], 1)
         self.assertEqual(metadata["raw_count"], 0)
         self.assertEqual(metadata["selected_count"], 0)
+        self.assertEqual(metadata["settings"]["timeout_seconds"], 9)
+        self.assertEqual(client_cls.call_args.kwargs["timeout"], 9)
 
 
 if __name__ == "__main__":

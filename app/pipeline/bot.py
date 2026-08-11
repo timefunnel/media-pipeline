@@ -403,6 +403,7 @@ from pipeline.subtitle_asr import (
     DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS,
 )
 TYPING_ACTION_INTERVAL_SECONDS = 4
+DEFAULT_BT4G_SEARCH_TIMEOUT_SECONDS = 12
 
 
 @dataclass
@@ -416,6 +417,7 @@ class BotConfig:
     prowlarr_url: str = DEFAULT_PROWLARR_URL
     prowlarr_config: str = DEFAULT_PROWLARR_CONFIG
     prowlarr_search_timeout_seconds: int = DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS
+    prowlarr_bt4g_search_timeout_seconds: int = DEFAULT_BT4G_SEARCH_TIMEOUT_SECONDS
     pansou_enabled: bool = False
     pansou_url: str = DEFAULT_PANSOU_URL
     pansou_token: str = ""
@@ -560,6 +562,15 @@ class BotConfig:
             prowlarr_config=env.get("PROWLARR_CONFIG", DEFAULT_PROWLARR_CONFIG),
             prowlarr_search_timeout_seconds=int(
                 env.get("PROWLARR_SEARCH_TIMEOUT_SECONDS", str(DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS))
+            ),
+            prowlarr_bt4g_search_timeout_seconds=max(
+                1,
+                int(
+                    env.get(
+                        "PROWLARR_BT4G_SEARCH_TIMEOUT_SECONDS",
+                        str(DEFAULT_BT4G_SEARCH_TIMEOUT_SECONDS),
+                    )
+                ),
             ),
             pansou_enabled=parse_bool(env.get("PANSOU_ENABLED"), bool((env.get("PANSOU_URL") or "").strip())),
             pansou_url=env.get("PANSOU_URL", DEFAULT_PANSOU_URL),
@@ -1860,7 +1871,7 @@ class PipelineBotService:
         prowlarr = ProwlarrClient(
             self.config.prowlarr_url,
             api_key,
-            timeout=self.config.prowlarr_search_timeout_seconds,
+            timeout=self.config.prowlarr_bt4g_search_timeout_seconds,
             search_cache=self._prowlarr_search_cache,
         )
         indexers = prowlarr.indexers()
@@ -1878,6 +1889,7 @@ class PipelineBotService:
         request_limit = max(int(limit), int(upstream_limit))
         search_settings = {
             "upstream_limit": int(upstream_limit),
+            "timeout_seconds": int(self.config.prowlarr_bt4g_search_timeout_seconds),
             "categories": list(categories),
             "indexers": [indexer.get("name") or indexer.get("id") for indexer in bt4g_indexers],
         }
