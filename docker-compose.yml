@@ -85,8 +85,7 @@ services:
         max-file: "3"
     network_mode: host
     environment:
-      MEDIA_PIPELINE_VERSION: "${MEDIA_PIPELINE_VERSION:-0.2.1}"
-      MEDIA_PIPELINE_REVISION: "${MEDIA_PIPELINE_REVISION:-unknown}"
+      # Version metadata is baked into the immutable image; do not override it at runtime.
       OPENLIST_TOKEN: "${OPENLIST_TOKEN:?OPENLIST_TOKEN missing}"
       OPENLIST_MEDIA_SCAN_USERNAME: "${OPENLIST_MEDIA_SCAN_USERNAME:?OPENLIST_MEDIA_SCAN_USERNAME missing}"
       OPENLIST_MEDIA_SCAN_PASSWORD: "${OPENLIST_MEDIA_SCAN_PASSWORD:?OPENLIST_MEDIA_SCAN_PASSWORD missing}"
