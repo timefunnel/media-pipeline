@@ -1712,10 +1712,36 @@ def candidate_code_score(candidate, code):
     compact_code = compact_text(code)
     if not compact_code:
         return 0
-    if compact_code in compact_text(haystack):
-        return 1000
     extracted = {compact_text(value) for value in extract_codes(haystack)}
-    return 800 if compact_code in extracted else 0
+    if compact_code in extracted:
+        return 1000
+    if compact_code_boundary_match(haystack, compact_code):
+        return 900
+    return 0
+
+
+def compact_code_boundary_match(value, compact_code):
+    if not compact_code:
+        return False
+    tokens = [compact_text(token) for token in re.findall(r"[0-9A-Za-z]+", str(value or ""))]
+    tokens = [token for token in tokens if token]
+    for start in range(len(tokens)):
+        combined = ""
+        for token in tokens[start:]:
+            combined += token
+            if combined == compact_code:
+                return True
+            if combined.startswith(compact_code):
+                suffix = combined[len(compact_code) :]
+                if suffix and not suffix[0].isdigit():
+                    return True
+            if len(combined) > len(compact_code) + 8:
+                break
+        if tokens[start].startswith(compact_code):
+            suffix = tokens[start][len(compact_code) :]
+            if suffix and not suffix[0].isdigit():
+                return True
+    return False
 
 
 def candidate_title_score(candidate, query):

@@ -583,6 +583,50 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertEqual(len(tracks), 1)
         self.assertEqual(tracks[0]["source"], "fake")
 
+    def test_subtitle_matcher_allows_unrelated_download_filename_when_candidate_matches(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
+
+        class FakeProvider:
+            name = "fake"
+
+            def enabled(self):
+                return True
+
+            def search(self, query, code=""):
+                return [{"id": "candidate-1", "title": code, "language": "zh-cn"}]
+
+            def download(self, candidate, query, code=""):
+                return SubtitleDownload(
+                    source=self.name,
+                    provider_id="candidate-1",
+                    filename="unrelated.zh.srt",
+                    body=b"[Script Info]\n",
+                    query=query,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SubtitleCache(tmp)
+            matcher = SubtitleMatcher(cache, [FakeProvider()], enabled=True, adult_only=True)
+            result = matcher.match_task(
+                "adult",
+                "SSIS-218",
+                {"msg_media_id": "media-1", "openlist_adult_code": "SSIS-218"},
+            )
+            tracks = cache.list_tracks("media-1")
+
+        self.assertEqual(result["subtitle_match_status"], "success")
+        self.assertEqual(result["subtitle_match_source"], "fake")
+        self.assertEqual(len(tracks), 1)
+
+    def test_candidate_code_score_rejects_adjacent_number_suffix(self):
+        from pipeline.external_subtitles import candidate_code_score
+
+        self.assertGreater(candidate_code_score({"title": "SSIS-218 CHS"}, "SSIS-218"), 0)
+        self.assertGreater(candidate_code_score({"title": "SSIS-218-C CHS"}, "SSIS-218"), 0)
+        self.assertGreater(candidate_code_score({"title": "SSIS 218 CHS"}, "SSIS-218"), 0)
+        self.assertEqual(candidate_code_score({"title": "SSIS-2180 CHS"}, "SSIS-218"), 0)
+        self.assertEqual(candidate_code_score({"title": "SSIS2180 CHS"}, "SSIS-218"), 0)
+
     def test_adult_source_declares_chinese_subtitles_from_explicit_markers_and_code_suffix(self):
         from pipeline.external_subtitles import adult_source_declares_chinese_subtitles
 
@@ -741,6 +785,36 @@ class ExternalSubtitleTest(unittest.TestCase):
             )
 
         self.assertEqual([item["provider_id"] for item in candidates], ["movie-subtitle"])
+
+    def test_manual_subtitle_search_can_restrict_to_subhd(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleMatcher
+
+        class FakeProvider:
+            def __init__(self, name):
+                self.name = name
+
+            def enabled(self):
+                return True
+
+            def search(self, query, code=""):
+                return [{"id": self.name + "-1", "filename": query + ".zh.srt", "_score": 10}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            matcher = SubtitleMatcher(
+                SubtitleCache(tmp),
+                [FakeProvider("subhd"), FakeProvider("subtitlecat")],
+                enabled=False,
+                adult_only=False,
+            )
+            candidates = matcher.search_task_candidates(
+                "tv",
+                "Alien: Earth S01",
+                {"msg_media_id": "media-episode"},
+                manual=True,
+                provider_names=("subhd",),
+            )
+
+        self.assertEqual([item["provider"] for item in candidates], ["subhd"])
 
     def test_subtitle_matcher_apply_candidate_writes_selected_subtitle(self):
         from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
@@ -1002,6 +1076,33 @@ class CategoryConfigTest(unittest.TestCase):
 
 
 class OpenListTokenStoreTest(unittest.TestCase):
+    def test_reads_access_token_from_openlist_admin_api(self):
+        transport = FakeTransport(
+            {
+                "code": 200,
+                "data": {
+                    "content": [
+                        {
+                            "id": 7,
+                            "mount_path": "/115",
+                            "driver": "115 Open",
+                            "disabled": False,
+                            "addition": json.dumps({"access_token": "api-access-token"}),
+                        }
+                    ]
+                },
+            }
+        )
+
+        token = load_access_token_from_api("https://openlist.example", "admin-token", transport=transport)
+
+        self.assertEqual(token.storage_id, 7)
+        self.assertEqual(token.mount_path, "/115")
+        self.assertEqual(token.access_token, "api-access-token")
+        self.assertEqual(transport.calls[0]["method"], "GET")
+        self.assertEqual(transport.calls[0]["url"], "https://openlist.example/api/admin/storage/list")
+        self.assertEqual(transport.calls[0]["headers"]["Authorization"], "admin-token")
+
     def test_reads_access_token_from_enabled_115_open_storage(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "data.db"

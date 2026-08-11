@@ -4808,7 +4808,9 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         with patch("pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()), patch(
             "pipeline.bot.OpenListClient", side_effect=lambda url, token: RetryOpenList(events)
-        ), patch("pipeline.bot.OpenListTokenStore", return_value=token_store), patch(
+        ), patch(
+            "pipeline.bot.load_access_token_from_api", side_effect=lambda *args, **kwargs: token_store.load_access_token()
+        ), patch(
             "pipeline.bot.Client115", side_effect=lambda token: Retry115Client(token, events)
         ):
             service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
