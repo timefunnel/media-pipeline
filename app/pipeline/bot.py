@@ -1817,6 +1817,14 @@ class PipelineBotService:
             early_return_min_results=self.config.prowlarr_early_return_min_results,
             early_return_required_priority=self.config.prowlarr_early_return_required_priority,
         )
+        empty_metadata = stats.to_metadata(
+            profile=profile,
+            raw_count=len(candidates),
+            selected_count=0,
+            settings=search_settings,
+        )
+        if not candidates and empty_metadata["success_count"] > 0:
+            return SearchResultList([], metadata=empty_metadata)
         try:
             ranked = ResourceSelector(indexer_priorities=indexer_priority_map(indexers)).select_ranked_limited(candidates, query=query, limit=limit)
         except RuntimeError as exc:
@@ -1891,6 +1899,14 @@ class PipelineBotService:
                 )
             )
 
+        empty_metadata = stats.to_metadata(
+            profile="bt4g",
+            raw_count=len(candidates),
+            selected_count=0,
+            settings=search_settings,
+        )
+        if not candidates and empty_metadata["success_count"] > 0:
+            return SearchResultList([], metadata=empty_metadata)
         try:
             ranked = ResourceSelector(indexer_priorities=indexer_priority_map(indexers)).select_ranked_limited(candidates, query=query, limit=limit)
         except RuntimeError as exc:
