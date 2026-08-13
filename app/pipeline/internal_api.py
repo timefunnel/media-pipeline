@@ -30,7 +30,18 @@ FINAL_SUBTITLE_ASR_STATUSES = {"completed", "failed", "canceled"}
 VALID_SUBTITLE_ASR_STATUSES = {"queued", "running", *FINAL_SUBTITLE_ASR_STATUSES}
 VALID_SEARCH_SOURCES = {"default", "pansou", "bt4g"}
 VALID_CATEGORIES = {"movie", "tv", "anime", "adult", "other"}
-SYNC_STAGES = {"syncing", "scanning", "scraping", "subtitles", "removing_old_version"}
+SYNC_STAGES = {
+    "staging",
+    "verifying_staging",
+    "promoting",
+    "syncing",
+    "scanning",
+    "verifying_scan",
+    "scraping",
+    "subtitles",
+    "removing_old_version",
+    "cleanup",
+}
 
 
 class ApiError(RuntimeError):
@@ -1085,6 +1096,7 @@ class ImportTaskManager:
         upgrade_media_id = optional_text(payload.get("upgrade_media_id"), "upgrade_media_id", max_length=100)
         upgrade_scope = normalize_upgrade_scope(category, upgrade_media_id, payload.get("upgrade_scope"))
         keep_old_version = optional_bool(payload.get("keep_old_version"), "keep_old_version", default=True)
+        subscription_follow = normalize_subscription_follow(payload, category, target, force_duplicate, upgrade_media_id)
         existing = self.store.get_import_by_idempotency(owner_id, idempotency_key)
         if existing is not None:
             existing_request = existing["request"]
@@ -1097,6 +1109,7 @@ class ImportTaskManager:
                 "upgrade_media_id": upgrade_media_id,
                 "upgrade_scope": upgrade_scope,
                 "keep_old_version": keep_old_version,
+                "subscription_follow": subscription_follow,
             }
             persisted_identity = {key: existing_request.get(key) for key in incoming_identity}
             if json_dumps(persisted_identity) != json_dumps(incoming_identity):
@@ -1121,8 +1134,10 @@ class ImportTaskManager:
             "upgrade_media_id": upgrade_media_id,
             "upgrade_scope": upgrade_scope,
             "keep_old_version": keep_old_version,
+            "subscription_follow": subscription_follow,
         }
-        self._check_duplicate(request)
+        if not subscription_follow:
+            self._check_duplicate(request)
         task, created = self.store.create_import(owner_id, idempotency_key, request)
         if created:
             self.notify()
@@ -1194,7 +1209,7 @@ class ImportTaskManager:
     def retry_import(self, owner_id, import_id):
         owner_id = require_text(owner_id, "owner_id", 200)
         current = self.store.get_import(owner_id, import_id)
-        if current["status"] in RETRYABLE_IMPORT_STATUSES and not (
+        if current["status"] in RETRYABLE_IMPORT_STATUSES and not current["request"].get("subscription_follow") and not (
             current.get("msg_media_id") or result_task_is_offline_success(current.get("result"))
         ):
             self._check_duplicate(current["request"])
@@ -1234,11 +1249,26 @@ class ImportTaskManager:
             except Exception as exc:
                 print("internal API import %s failed: %s" % (task["id"], exc), flush=True)
                 current = self.store.get_import(owner_id, task["id"])
+                failed_result = dict(current.get("result") or {})
+                follow_audit = failed_result.get("subscription_follow")
+                if isinstance(follow_audit, dict):
+                    follow_audit = dict(follow_audit)
+                    follow_audit.setdefault("outcome", "failed")
+                    attempts = list(follow_audit.get("attempts") or [])
+                    if attempts:
+                        attempts[-1] = {
+                            **dict(attempts[-1]),
+                            "outcome": follow_audit["outcome"],
+                            "error": str(exc),
+                            "finished_at": int(time.time()),
+                        }
+                        follow_audit["attempts"] = attempts
+                    failed_result["subscription_follow"] = follow_audit
                 self.store.finish_import(
                     task["id"],
                     "failed",
                     "failed",
-                    result=current.get("result"),
+                    result=failed_result,
                     error=str(exc),
                     info_hash=current.get("info_hash"),
                     msg_media_id=current.get("msg_media_id"),
@@ -1260,6 +1290,8 @@ class ImportTaskManager:
 
     def _execute_task(self, task):
         request = task["request"]
+        if request.get("subscription_follow"):
+            return self._execute_subscription_follow_task(task)
         result = dict(task.get("result") or {})
         category = request["category"]
         title = str(request.get("upgrade_target_title") or request["title"]).strip()
@@ -1411,6 +1443,212 @@ class ImportTaskManager:
                         msg_media_id=media_id,
                     )
                 return
+        finally:
+            target_lock.release()
+
+    def _execute_subscription_follow_task(self, task):
+        request = task["request"]
+        follow = dict(request.get("subscription_follow") or {})
+        result = dict(task.get("result") or {})
+        audit = dict(result.get("subscription_follow") or {})
+        category = request["category"]
+        title = str(request["title"]).strip()
+        target_path = follow["target_openlist_path"]
+        season = int(follow["season"])
+        existing = {int(value) for value in follow.get("existing_episodes") or []}
+        reserved = {int(value) for value in follow.get("reserved_episodes") or []}
+        info_hash = str(task.get("info_hash") or "").strip()
+        offline_task = dict(result.get("task") or {})
+        target_lock = self._target_lock(
+            {
+                "library_id": "subscription:%s" % follow["work_key"],
+                "root_id": "season:%s" % season,
+            }
+        )
+        self._acquire_target_lock(target_lock)
+        try:
+            self._raise_if_stopping()
+            self._raise_if_cancel_requested(task["owner_id"], task["id"], category, info_hash)
+            attempts = list(audit.get("attempts") or [])
+            attempt_number = int(task.get("attempt_count") or 1)
+            if not attempts or int(attempts[-1].get("attempt") or 0) != attempt_number:
+                attempts.append({"attempt": attempt_number, "started_at": int(time.time())})
+            audit.update(
+                {
+                    "subscription_id": follow["subscription_id"],
+                    "work_key": follow["work_key"],
+                    "season": season,
+                    "title_class": follow["title_class"],
+                    "baseline_episodes": sorted(existing),
+                    "reserved_episodes": sorted(reserved),
+                    "target_openlist_path": target_path,
+                    "attempts": attempts,
+                }
+            )
+
+            staging = dict(audit.get("staging") or {})
+            if not staging.get("folder_id"):
+                staging = self.service.prepare_subscription_staging(
+                    category,
+                    task["id"],
+                    follow["work_key"],
+                )
+                audit["staging"] = staging
+                result["subscription_follow"] = audit
+                self.store.save_running(task["id"], "staging", result=result, info_hash=info_hash or None)
+
+            staging_state = self.service.inspect_subscription_staging(category, staging["folder_id"], season)
+            has_staged_files = bool(staging_state.get("entries"))
+            if not info_hash and not has_staged_files:
+                self.store.save_running(task["id"], "submitting", result=result)
+                submit_result = self.service.submit(
+                    category,
+                    request["candidate"]["download_uri"],
+                    target_folder_id=staging["folder_id"],
+                )
+                info_hash = first_submit_info_hash(submit_result)
+                if not info_hash:
+                    raise RuntimeError("pipeline submit returned no info_hash")
+                offline_task = task_from_submit_result(submit_result, info_hash)
+                result.update({"submit": submit_result, "task": offline_task})
+                self.store.save_running(task["id"], "submitted", result=result, info_hash=info_hash)
+            elif not info_hash and has_staged_files:
+                info_hash = "subscription-staging:%s" % task["id"]
+                offline_task = {
+                    "info_hash": info_hash,
+                    "status_name": OFFLINE_SUCCESS_STATUS,
+                    "source_kind": "subscription_staging_recovery",
+                    "percent_done": 100,
+                }
+                result["task"] = offline_task
+                self.store.save_running(task["id"], "submitted", result=result, info_hash=info_hash)
+
+            while offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
+                status_name = offline_task.get("status_name")
+                if status_name in OFFLINE_FAILED_STATUSES:
+                    raise RuntimeError("115 offline task ended with status: %s" % status_name)
+                if status_name not in OFFLINE_ACTIVE_STATUSES:
+                    raise RuntimeError("115 offline task returned invalid status: %s" % (status_name or "-"))
+                self._raise_if_stopping()
+                self._raise_if_cancel_requested(task["owner_id"], task["id"], category, info_hash)
+                self.store.save_running(task["id"], "waiting_download", result=result, info_hash=info_hash)
+                offline_task = self.service.task_status(category, info_hash)
+                if not isinstance(offline_task, dict):
+                    raise RuntimeError("pipeline task_status returned invalid response")
+                offline_task = dict(offline_task)
+                offline_task.setdefault("info_hash", info_hash)
+                result["task"] = offline_task
+                self.store.save_running(task["id"], "waiting_download", result=result, info_hash=info_hash)
+                if offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
+                    self._wait_or_stop()
+
+            self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
+            staging_state = self.service.inspect_subscription_staging(category, staging["folder_id"], season)
+            verified = {int(value) for value in staging_state.get("verified_episodes") or []}
+            audit.update(
+                {
+                    "verified_episodes": sorted(verified),
+                    "unknown_videos": list(staging_state.get("unknown_videos") or []),
+                    "duplicate_episodes": dict(staging_state.get("duplicate_episodes") or {}),
+                }
+            )
+            selected = verified - existing - reserved
+            audit["selected_episodes"] = sorted(selected)
+            if audit["unknown_videos"]:
+                audit["outcome"] = "rejected"
+                result["subscription_follow"] = audit
+                self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
+                raise RuntimeError("115 staging contains unrecognized video names")
+            if audit["duplicate_episodes"]:
+                audit["outcome"] = "rejected"
+                result["subscription_follow"] = audit
+                self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
+                raise RuntimeError("115 staging contains multiple videos for one episode")
+            if not selected:
+                audit["outcome"] = "no_new_episodes"
+                attempts[-1].update({"outcome": "no_new_episodes", "finished_at": int(time.time())})
+                result["subscription_follow"] = audit
+                self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
+                raise RuntimeError("115 staging contains no new episodes")
+
+            plan = self.service.plan_subscription_promotion(staging_state, selected, season)
+            audit["planned_files"] = list(plan.get("files") or [])
+            result["subscription_follow"] = audit
+            self.store.save_running(task["id"], "promoting", result=result, info_hash=info_hash)
+            promotion = self.service.promote_subscription_episodes(
+                category,
+                staging_state,
+                target_path,
+                selected,
+                season,
+                plan=plan,
+            )
+            audit["promotion"] = promotion
+            audit["moved_episodes"] = list(promotion.get("moved_episodes") or [])
+            result["subscription_follow"] = audit
+            self.service.refresh_subscription_target(target_path)
+
+            sync_input = dict(offline_task)
+            sync_input["subscription_target_openlist_path"] = target_path
+
+            def save_progress(progress):
+                current = dict(result)
+                current["task"] = dict(progress or {})
+                current["subscription_follow"] = audit
+                media_id = str((progress or {}).get("msg_media_id") or "").strip()
+                self.store.save_running(
+                    task["id"],
+                    sync_stage(progress),
+                    result=current,
+                    info_hash=info_hash,
+                    msg_media_id=media_id,
+                )
+
+            self.store.save_running(task["id"], "scanning", result=result, info_hash=info_hash)
+            synced = self.service.sync_completed_task(
+                category,
+                title,
+                sync_input,
+                progress_callback=save_progress,
+                target=request["target"],
+            )
+            if not isinstance(synced, dict):
+                raise RuntimeError("pipeline sync_completed_task returned invalid response")
+            synced = dict(synced)
+            result["task"] = synced
+            media_id = str(synced.get("msg_media_id") or "").strip()
+            scan_added = int(synced.get("msg_ingest_scan_added") or 0)
+            audit["scan_added"] = scan_added
+            if scan_added != len(selected):
+                audit["outcome"] = "failed"
+                result["subscription_follow"] = audit
+                self.store.save_running(task["id"], "verifying_scan", result=result, info_hash=info_hash, msg_media_id=media_id)
+                raise RuntimeError(
+                    "MediaStationGo scan added %d episodes, expected %d" % (scan_added, len(selected))
+                )
+            verified_msg = self.service.verify_subscription_msg_episodes(category, target_path, season, selected)
+            audit["msg_verification"] = verified_msg
+            if verified_msg.get("missing_episodes") or verified_msg.get("duplicate_episodes"):
+                audit["outcome"] = "failed"
+                result["subscription_follow"] = audit
+                self.store.save_running(task["id"], "verifying_scan", result=result, info_hash=info_hash, msg_media_id=media_id)
+                raise RuntimeError("MediaStationGo episode verification did not match the promotion plan")
+
+            self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash, msg_media_id=media_id)
+            self.service.cleanup_subscription_staging(category, staging["folder_id"])
+            audit["staging_cleaned_at"] = int(time.time())
+            audit["outcome"] = "imported"
+            attempts[-1].update({"outcome": "imported", "finished_at": int(time.time())})
+            result["subscription_follow"] = audit
+            result["msg_media_id"] = media_id
+            self.store.finish_import(
+                task["id"],
+                "completed",
+                "completed",
+                result=result,
+                info_hash=info_hash,
+                msg_media_id=media_id,
+            )
         finally:
             target_lock.release()
 
@@ -2323,6 +2561,60 @@ def normalize_target(payload):
     return target
 
 
+def normalize_subscription_follow(payload, category, target, force_duplicate, upgrade_media_id):
+    enabled = optional_bool(payload.get("subscription_follow"), "subscription_follow", default=False)
+    if not enabled:
+        return None
+    if category not in {"tv", "anime"}:
+        raise ApiError(400, "invalid_subscription_follow", "subscription follow only supports TV or anime")
+    if force_duplicate:
+        raise ApiError(400, "invalid_subscription_follow", "subscription follow cannot force duplicate imports")
+    if upgrade_media_id:
+        raise ApiError(400, "invalid_subscription_follow", "subscription follow cannot be an upgrade import")
+    subscription_id = require_text(payload.get("subscription_id"), "subscription_id", max_length=100)
+    work_key = require_text(payload.get("work_key"), "work_key", max_length=300)
+    season = require_positive_int(payload.get("season"), "season", max_value=99)
+    existing = normalize_episode_numbers(payload.get("existing_episodes"), "existing_episodes")
+    reserved = normalize_episode_numbers(payload.get("reserved_episodes"), "reserved_episodes")
+    target_path = normalize_openlist_path(
+        require_text(payload.get("target_openlist_path"), "target_openlist_path", max_length=2000)
+    )
+    root_path = normalize_openlist_path(target.get("root_openlist_path"))
+    if not target_path or not root_path or not target_path.startswith(root_path.rstrip("/") + "/"):
+        raise ApiError(
+            409,
+            "invalid_subscription_target",
+            "subscription target must be an existing directory below the configured library root",
+        )
+    title_class = str(payload.get("title_class") or "unknown").strip().lower()
+    if title_class not in {"single", "range", "cumulative_pack", "season_pack", "unknown"}:
+        raise ApiError(400, "invalid_title_class", "invalid subscription candidate title class")
+    return {
+        "subscription_id": subscription_id,
+        "work_key": work_key,
+        "season": season,
+        "existing_episodes": existing,
+        "reserved_episodes": reserved,
+        "target_openlist_path": target_path,
+        "title_class": title_class,
+    }
+
+
+def normalize_episode_numbers(value, field):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ApiError(400, "invalid_request", "%s must be an array" % field)
+    out = []
+    seen = set()
+    for item in value:
+        episode = require_positive_int(item, field, max_value=9999)
+        if episode not in seen:
+            seen.add(episode)
+            out.append(episode)
+    return sorted(out)
+
+
 def require_category(value):
     category = str(value or "").strip().lower()
     if category not in VALID_CATEGORIES:
@@ -2338,6 +2630,18 @@ def require_text(value, label, max_length):
     if len(text) > int(max_length):
         raise ApiError(400, "invalid_%s" % label.lower().replace("-", "_"), "%s is too long" % label)
     return text
+
+
+def require_positive_int(value, label, max_value=None):
+    if isinstance(value, bool):
+        raise ApiError(400, "invalid_request", "%s must be a positive integer" % label)
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ApiError(400, "invalid_request", "%s must be a positive integer" % label)
+    if number <= 0 or (max_value is not None and number > int(max_value)):
+        raise ApiError(400, "invalid_request", "%s must be a positive integer" % label)
+    return number
 
 
 def optional_text(value, label, max_length):

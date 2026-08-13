@@ -14,6 +14,10 @@ DELETE_OFFLINE_TASK = API_BASE + "/open/offline/del_task"
 OFFLINE_TASK_LIST = API_BASE + "/open/offline/get_task_list"
 OFFLINE_QUOTA_INFO = API_BASE + "/open/offline/get_quota_info"
 FOLDER_INFO = API_BASE + "/open/folder/get_info"
+FOLDER_ADD = API_BASE + "/open/folder/add"
+FILE_LIST = API_BASE + "/open/ufile/files"
+FILE_MOVE = API_BASE + "/open/ufile/move"
+FILE_DELETE = API_BASE + "/open/ufile/delete"
 QRCODE_TOKEN = "https://qrcodeapi.115.com/api/1.0/web/1.0/token"
 QRCODE_STATUS = "https://qrcodeapi.115.com/get/status/"
 QRCODE_LOGIN_WITH_APP = "https://passportapi.115.com/app/1.0/%s/1.0/login/qrcode"
@@ -116,6 +120,72 @@ class Client115:
     def get_folder_info(self, folder_id):
         query = urllib.parse.urlencode({"file_id": folder_id})
         return self._get(FOLDER_INFO + "?" + query)
+
+    def create_folder(self, name, parent_id):
+        name = str(name or "").strip()
+        parent_id = str(parent_id or "").strip()
+        if not name:
+            raise ValueError("115 folder name must not be empty")
+        if not parent_id:
+            raise ValueError("115 parent folder id must not be empty")
+        response = self._post(FOLDER_ADD, {"file_name": name, "pid": parent_id})
+        ensure_115_open_success(response, "create folder")
+        return response
+
+    def list_files(self, folder_id, limit=1000, offset=0):
+        folder_id = str(folder_id or "").strip()
+        if not folder_id:
+            raise ValueError("115 folder id must not be empty")
+        query = urllib.parse.urlencode(
+            {
+                "cid": folder_id,
+                "limit": max(1, min(int(limit), 7000)),
+                "offset": max(0, int(offset)),
+                "show_dir": 1,
+                "count_folders": 1,
+            }
+        )
+        response = self._get(FILE_LIST + "?" + query)
+        ensure_115_open_success(response, "list folder")
+        return response
+
+    def list_all_files(self, folder_id, page_size=1000):
+        offset = 0
+        out = []
+        while True:
+            response = self.list_files(folder_id, limit=page_size, offset=offset)
+            raw_data = response.get("data") or []
+            data = raw_data
+            if isinstance(raw_data, dict):
+                data = raw_data.get("data") or raw_data.get("list") or raw_data.get("content") or []
+            if not isinstance(data, list):
+                raise RuntimeError("115 list folder returned invalid data")
+            out.extend(data)
+            count = int(response.get("count") or (raw_data.get("count") if isinstance(raw_data, dict) else 0) or len(out))
+            if not data or len(out) >= count:
+                return out
+            offset += len(data)
+
+    def move_files(self, file_ids, target_folder_id):
+        ids = [str(value or "").strip() for value in file_ids]
+        ids = [value for value in ids if value]
+        target_folder_id = str(target_folder_id or "").strip()
+        if not ids:
+            raise ValueError("115 move file ids must not be empty")
+        if not target_folder_id:
+            raise ValueError("115 move target folder id must not be empty")
+        response = self._post(FILE_MOVE, {"file_ids": ",".join(ids), "to_cid": target_folder_id})
+        ensure_115_open_success(response, "move files")
+        return response
+
+    def delete_files(self, file_ids):
+        ids = [str(value or "").strip() for value in file_ids]
+        ids = [value for value in ids if value]
+        if not ids:
+            raise ValueError("115 delete file ids must not be empty")
+        response = self._post(FILE_DELETE, {"file_ids": ",".join(ids)})
+        ensure_115_open_success(response, "delete files")
+        return response
 
     def _get(self, url):
         return self.transport.request("GET", url, headers=self._headers(), timeout=self.timeout)
@@ -354,6 +424,17 @@ def extract_115_share_items(response):
             }
         )
     return out
+
+
+def ensure_115_open_success(response, operation):
+    if not isinstance(response, dict):
+        raise RuntimeError("115 %s returned invalid response" % operation)
+    if response.get("state") is True and int(response.get("code") or 0) == 0:
+        return response
+    raise RuntimeError(
+        "115 %s failed: %s"
+        % (operation, response.get("message") or response.get("error") or response.get("code"))
+    )
 
 
 def merge_cookie_header(cookie_jar, user_cookie):

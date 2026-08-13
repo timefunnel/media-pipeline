@@ -2029,9 +2029,11 @@ class PipelineBotService:
             raise ValueError("MediaStationGo media id missing")
         return self._build_msg_client().get_media(media_id)
 
-    def submit(self, category, download_uri):
+    def submit(self, category, download_uri, target_folder_id=None):
         if is_115_share_url(download_uri):
-            return self._submit_115_share(category, download_uri)
+            return self._submit_115_share(category, download_uri, target_folder_id=target_folder_id)
+        if target_folder_id:
+            raise RuntimeError("115 temporary staging only supports 115 share resources")
         download_uri = self._resolve_download_uri(download_uri)
         result = summarize_submit(
             self._call_115(category, lambda client: client.add_offline_urls([download_uri], category_to_folder_id(category)))
@@ -2045,8 +2047,8 @@ class PipelineBotService:
         api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
         return ProwlarrClient(self.config.prowlarr_url, api_key).resolve_download_uri(download_uri)
 
-    def _submit_115_share(self, category, download_uri):
-        folder_id = category_to_folder_id(category)
+    def _submit_115_share(self, category, download_uri, target_folder_id=None):
+        folder_id = str(target_folder_id or category_to_folder_id(category)).strip()
         client = self._build_115_share_client()
         response = client.receive_share_url(download_uri, folder_id)
         data = response.get("data") or {}
@@ -2075,6 +2077,198 @@ class PipelineBotService:
             "task_status": task,
             "raw": response,
         }
+
+    def prepare_subscription_staging(self, category, import_id, work_key):
+        client = self._build_115_client(category)
+        root_id = self._ensure_115_child_folder(client, category_to_folder_id(category), "temp")
+        work_id = self._ensure_115_child_folder(client, root_id, safe_115_folder_name(work_key, "subscription"))
+        task_name = safe_115_folder_name(import_id, "task")
+        existing = self._find_115_child(client, work_id, task_name, directories_only=True)
+        if existing is not None:
+            task_id = file115_id(existing)
+        else:
+            response = client.create_folder(task_name, work_id)
+            task_id = created_115_folder_id(response)
+        if not task_id:
+            raise RuntimeError("115 temporary task folder id missing")
+        return {
+            "folder_id": task_id,
+            "openlist_path": normalize_openlist_path(
+                posixpath.join(category_to_openlist_path(category), "temp", safe_115_folder_name(work_key, "subscription"), task_name)
+            ),
+        }
+
+    def inspect_subscription_staging(self, category, folder_id, season):
+        client = self._build_115_client(category)
+        entries = list_115_descendants(client, folder_id)
+        videos = []
+        unknown = []
+        duplicates = {}
+        by_episode = {}
+        for item in entries:
+            if file115_is_dir(item):
+                continue
+            name = file115_name(item)
+            if not is_video_filename(name):
+                continue
+            episode = parse_follow_episode(name, season)
+            if episode is None:
+                unknown.append(name)
+                continue
+            videos.append({"file_id": file115_id(item), "name": name, "episode": episode})
+            by_episode.setdefault(episode, []).append(name)
+        for episode, names in by_episode.items():
+            if len(names) > 1:
+                duplicates[str(episode)] = names
+        return {
+            "entries": entries,
+            "videos": videos,
+            "verified_episodes": sorted(by_episode),
+            "unknown_videos": sorted(unknown),
+            "duplicate_episodes": duplicates,
+        }
+
+    def plan_subscription_promotion(self, staging, selected_episodes, season):
+        selected = {int(value) for value in selected_episodes or []}
+        entries = list((staging or {}).get("entries") or [])
+        selected_videos = []
+        video_stems = []
+        for item in entries:
+            if file115_is_dir(item):
+                continue
+            name = file115_name(item)
+            episode = parse_follow_episode(name, season) if is_video_filename(name) else None
+            if episode in selected:
+                selected_videos.append(
+                    {"file_id": file115_id(item), "name": name, "episode": episode, "kind": "video"}
+                )
+                video_stems.append(posixpath.splitext(name)[0].casefold())
+        files = list(selected_videos)
+        for item in entries:
+            if file115_is_dir(item):
+                continue
+            name = file115_name(item)
+            if is_video_filename(name):
+                continue
+            stem = posixpath.splitext(name)[0].casefold()
+            if any(stem == video_stem or stem.startswith(video_stem + ".") for video_stem in video_stems):
+                files.append({"file_id": file115_id(item), "name": name, "kind": "sidecar"})
+        names = [str(item.get("name") or "").casefold() for item in files]
+        if len(names) != len(set(names)):
+            raise RuntimeError("115 staging contains duplicate selected file names")
+        if sorted(int(item["episode"]) for item in selected_videos) != sorted(selected):
+            raise RuntimeError("115 staging promotion plan does not match selected episodes")
+        return {"files": files, "episodes": sorted(selected)}
+
+    def promote_subscription_episodes(self, category, staging, target_openlist_path, selected_episodes, season, plan=None):
+        client = self._build_115_client(category)
+        target_id = resolve_115_path_from_category(
+            client,
+            category_to_folder_id(category),
+            category_to_openlist_path(category),
+            target_openlist_path,
+        )
+        plan = dict(plan or self.plan_subscription_promotion(staging, selected_episodes, season))
+        planned_files = list(plan.get("files") or [])
+        if not planned_files:
+            raise RuntimeError("115 staging contains no files for selected episodes")
+        target_items = [item for item in client.list_all_files(target_id) if not file115_is_dir(item)]
+        target_names = {file115_name(item).casefold(): file115_id(item) for item in target_items}
+        staging_ids = {file115_id(item) for item in (staging or {}).get("entries") or [] if not file115_is_dir(item)}
+        pending = []
+        reused = []
+        for item in planned_files:
+            name = str(item.get("name") or "").strip()
+            file_id = str(item.get("file_id") or "").strip()
+            if name.casefold() in target_names:
+                reused.append(name)
+                continue
+            if file_id and file_id in staging_ids:
+                pending.append(file_id)
+                continue
+            raise RuntimeError("115 selected file is missing from staging and target: %s" % name)
+        if pending:
+            client.move_files(unique_nonempty_values(pending), target_id)
+        after = [item for item in client.list_all_files(target_id) if not file115_is_dir(item)]
+        after_names = {file115_name(item).casefold() for item in after}
+        missing = [item.get("name") for item in planned_files if str(item.get("name") or "").casefold() not in after_names]
+        if missing:
+            raise RuntimeError("115 move verification failed: %s" % ", ".join(str(value) for value in missing))
+        return {
+            "target_folder_id": target_id,
+            "moved_file_ids": unique_nonempty_values(pending),
+            "moved_names": [item.get("name") for item in planned_files],
+            "reused_names": reused,
+            "moved_episodes": sorted(int(value) for value in selected_episodes or []),
+        }
+
+    def refresh_subscription_target(self, target_openlist_path):
+        path = normalize_openlist_path(target_openlist_path)
+        if not path:
+            raise ValueError("subscription target OpenList path missing")
+        client = OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
+        client.list_path(path, refresh=True)
+        return {"path": path, "refreshed_at": int(time.time())}
+
+    def verify_subscription_msg_episodes(self, category, target_openlist_path, season, expected_episodes):
+        root = category_to_msg_library_root(category)
+        client = self._build_msg_client()
+        expected = {int(value) for value in expected_episodes or []}
+        target = normalize_openlist_path(target_openlist_path)
+        matched = defaultdict(list)
+        page = 1
+        page_size = 200
+        while True:
+            rows = extract_media_items(client.list_library_media(root["library_id"], page=page, page_size=page_size, group_versions=0))
+            if not rows:
+                break
+            for media in rows:
+                episode = int(media.get("episode_num") or media.get("episode") or 0)
+                item_season = int(media.get("season_num") or media.get("season") or 1)
+                if episode not in expected or item_season != int(season or 1):
+                    continue
+                paths = [msg_media_openlist_path(value) for value in media_path_values(media)]
+                if any(posixpath.dirname(value) == target for value in paths if value):
+                    matched[episode].append(extract_media_id(media) or media_primary_path(media))
+            if len(rows) < page_size:
+                break
+            page += 1
+            if page > 50:
+                raise RuntimeError("MediaStationGo episode verification page limit exceeded")
+        missing = sorted(expected - set(matched))
+        duplicates = {str(episode): values for episode, values in matched.items() if len(values) != 1}
+        return {
+            "verified_episodes": sorted(matched),
+            "missing_episodes": missing,
+            "duplicate_episodes": duplicates,
+        }
+
+    def cleanup_subscription_staging(self, category, folder_id):
+        client = self._build_115_client(category)
+        client.delete_files([folder_id])
+
+    def _ensure_115_child_folder(self, client, parent_id, name):
+        existing = self._find_115_child(client, parent_id, name, directories_only=True)
+        if existing is not None:
+            return file115_id(existing)
+        response = client.create_folder(name, parent_id)
+        folder_id = created_115_folder_id(response)
+        if not folder_id:
+            existing = self._find_115_child(client, parent_id, name, directories_only=True)
+            folder_id = file115_id(existing) if existing is not None else ""
+        if not folder_id:
+            raise RuntimeError("115 created folder id missing: %s" % name)
+        return folder_id
+
+    def _find_115_child(self, client, parent_id, name, directories_only=False):
+        expected = str(name or "").casefold()
+        for item in client.list_all_files(parent_id):
+            if file115_name(item).casefold() != expected:
+                continue
+            if directories_only and not file115_is_dir(item):
+                continue
+            return item
+        return None
 
     def task_status(self, category, info_hash):
         return self._call_115(category, lambda client: find_task_by_info_hash(client, info_hash, max_pages=10))
@@ -2770,6 +2964,9 @@ class PipelineBotService:
                 apply_progress(adult_extra_hide_result)
 
         require_target_path = bool(msg_authoritative_openlist_paths(progress))
+        subscription_target_path = normalize_openlist_path(progress.get("subscription_target_openlist_path"))
+        if subscription_target_path:
+            require_target_path = True
         deleted_media_prune_result = prefixed_task_fields(progress, "msg_deleted_media_prune_")
         target_scan_result = prefixed_task_fields(progress, "msg_target_scan_")
         ingest_result = prefixed_task_fields(progress, "msg_ingest_")
@@ -2777,6 +2974,8 @@ class PipelineBotService:
         if progress.get("msg_scan_status") != "success" or not media_id:
             client = get_msg_client()
             authoritative_paths = msg_authoritative_openlist_paths(progress) if require_target_path else []
+            if subscription_target_path:
+                authoritative_paths = [subscription_target_path]
             emit({"msg_scan_status": "running", "msg_error": None})
             ingest_result = self._run_msg_pipeline_ingest(
                 client,
@@ -3362,6 +3561,101 @@ def msg_target_openlist_paths(category, task):
     return unique_openlist_paths(paths)
 
 
+def safe_115_folder_name(value, fallback):
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", str(value or "").strip())
+    value = re.sub(r"\s+", " ", value).strip(" .-")
+    return (value or fallback)[:120]
+
+
+def created_115_folder_id(response):
+    data = (response or {}).get("data") or {}
+    if isinstance(data, dict):
+        return str(data.get("file_id") or data.get("cid") or data.get("fid") or "").strip()
+    return ""
+
+
+def file115_id(item):
+    return str((item or {}).get("fid") or (item or {}).get("cid") or (item or {}).get("file_id") or "").strip()
+
+
+def file115_name(item):
+    return str((item or {}).get("fn") or (item or {}).get("file_name") or (item or {}).get("name") or "").strip()
+
+
+def file115_is_dir(item):
+    item = item or {}
+    if item.get("is_dir") is not None:
+        return bool(item.get("is_dir"))
+    return str(item.get("fc") or "") == "0"
+
+
+def list_115_descendants(client, folder_id, max_entries=20000):
+    out = []
+    stack = [str(folder_id)]
+    while stack:
+        current = stack.pop()
+        for item in client.list_all_files(current):
+            row = dict(item or {})
+            out.append(row)
+            if len(out) > int(max_entries):
+                raise RuntimeError("115 staging entry limit exceeded")
+            if file115_is_dir(row):
+                child_id = file115_id(row)
+                if child_id:
+                    stack.append(child_id)
+    return out
+
+
+def resolve_115_path_from_category(client, category_folder_id, category_openlist_path, target_openlist_path):
+    root = normalize_openlist_path(category_openlist_path).rstrip("/")
+    target = normalize_openlist_path(target_openlist_path)
+    if not root or not target or not (target == root or target.startswith(root + "/")):
+        raise RuntimeError("subscription target path is outside configured category root")
+    current = str(category_folder_id or "").strip()
+    relative = target[len(root) :].strip("/")
+    for part in [value for value in relative.split("/") if value]:
+        matches = [
+            item
+            for item in client.list_all_files(current)
+            if file115_is_dir(item) and file115_name(item).casefold() == part.casefold()
+        ]
+        if len(matches) != 1:
+            raise RuntimeError("115 target directory is missing or ambiguous: %s" % target)
+        current = file115_id(matches[0])
+    if not current:
+        raise RuntimeError("115 target directory id missing")
+    return current
+
+
+FOLLOW_VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".wmv", ".ts", ".m2ts", ".webm"}
+FOLLOW_EPISODE_PATTERNS = (
+    re.compile(r"(?i)S(?P<season>\d{1,2})E(?P<episode>\d{1,4})"),
+    re.compile(r"(?i)(?:^|[^A-Za-z])EP?[ ._-]?(?P<episode>\d{1,4})(?:[^0-9]|$)"),
+    re.compile(r"第\s*(?P<episode>\d{1,4})\s*[集话話]"),
+)
+
+
+def is_video_filename(name):
+    return posixpath.splitext(str(name or ""))[1].lower() in FOLLOW_VIDEO_EXTENSIONS
+
+
+def parse_follow_episode(name, expected_season):
+    stem = posixpath.splitext(str(name or ""))[0]
+    for pattern in FOLLOW_EPISODE_PATTERNS:
+        match = pattern.search(stem)
+        if not match:
+            continue
+        season = int(match.groupdict().get("season") or expected_season or 1)
+        episode = int(match.group("episode"))
+        if season != int(expected_season or 1) or episode <= 0:
+            return None
+        return episode
+    if re.fullmatch(r"0*\d{1,4}", stem.strip()):
+        episode = int(stem.strip())
+        return episode if episode > 0 else None
+    return None
+
+
 def msg_authoritative_openlist_paths(task):
     task = task or {}
     paths = []
@@ -3420,6 +3714,15 @@ def media_path_values(value):
 def media_primary_path(media):
     paths = media_path_values(media)
     return paths[0] if paths else ""
+
+
+def msg_media_openlist_path(value):
+    raw = str(value or "").strip().replace("\\", "/")
+    prefix = "cloud://openlist"
+    if raw.startswith(prefix):
+        raw = raw[len(prefix) :]
+    raw = raw.split("?", 1)[0]
+    return normalize_openlist_path(urllib.parse.unquote(raw))
 
 
 def media_item_size_bytes(item):

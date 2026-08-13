@@ -1869,6 +1869,32 @@ class ResourceSelectorTest(unittest.TestCase):
             selector.select_best([{"title": "Sintel 1080p", "seeders": 0, "magnetUrl": "magnet:?xt=urn:btih:abc"}])
 
 class Client115Test(unittest.TestCase):
+    def test_folder_file_move_and_delete_use_official_open_endpoints(self):
+        transport = FakeTransport({"state": True, "data": {"file_id": "task-folder"}})
+        client = Client115("access-token-value", transport=transport)
+
+        client.create_folder("task", "parent")
+        client.move_files(["video-1", "subtitle-1"], "formal")
+        client.delete_files(["task-folder"])
+
+        self.assertEqual(transport.calls[0]["url"], "https://proapi.115.com/open/folder/add")
+        self.assertEqual(transport.calls[0]["data"], {"file_name": "task", "pid": "parent"})
+        self.assertEqual(transport.calls[1]["url"], "https://proapi.115.com/open/ufile/move")
+        self.assertEqual(transport.calls[1]["data"], {"file_ids": "video-1,subtitle-1", "to_cid": "formal"})
+        self.assertEqual(transport.calls[2]["url"], "https://proapi.115.com/open/ufile/delete")
+        self.assertEqual(transport.calls[2]["data"], {"file_ids": "task-folder"})
+
+    def test_list_all_files_accepts_nested_open_api_shape(self):
+        transport = FakeTransport(
+            {"state": True, "data": {"count": 2, "data": [{"fid": "1", "fn": "a"}, {"fid": "2", "fn": "b"}]}}
+        )
+        client = Client115("access-token-value", transport=transport)
+
+        rows = client.list_all_files("parent")
+
+        self.assertEqual([row["fid"] for row in rows], ["1", "2"])
+        self.assertIn("/open/ufile/files?", transport.calls[0]["url"])
+
     def test_add_offline_task_uses_official_endpoint_and_target_folder(self):
         transport = FakeTransport({"state": True, "data": [{"info_hash": "abc", "url": "magnet:?xt=urn:btih:abc"}]})
         client = Client115("access-token-value", transport=transport)
