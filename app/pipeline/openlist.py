@@ -148,6 +148,18 @@ class OpenListClient:
             raise RuntimeError("OpenList get failed: %s" % (response.get("message") or response.get("code")))
         return response
 
+    def mkdir_path(self, path):
+        response = self.transport.request(
+            "POST",
+            self.base_url + "/api/fs/mkdir",
+            headers={"Authorization": self.token},
+            data={"path": path},
+            timeout=self.timeout,
+        )
+        if response.get("code") != 200:
+            raise RuntimeError("OpenList mkdir failed: %s" % (response.get("message") or response.get("code")))
+        return response
+
     def remove_names(self, dir_path, names, batch_size=DEFAULT_REMOVE_BATCH_SIZE):
         names = [str(name) for name in names if str(name or "").strip()]
         responses = []
@@ -271,7 +283,6 @@ class OpenListClient:
         if response.get("code") != 200:
             raise RuntimeError("OpenList move failed: %s" % (response.get("message") or response.get("code")))
         return response
-
 
 def merge_meta_hide_patterns(existing_hide, patterns):
     lines = []

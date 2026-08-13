@@ -1275,6 +1275,20 @@ class OpenListClientTest(unittest.TestCase):
         self.assertEqual(call["headers"]["Authorization"], "openlist-token-value")
         self.assertEqual(call["data"], {"src_dir": "/115/剧集", "dst_dir": "/115/动漫", "names": ["成龙历险记"]})
 
+    def test_mkdir_path_uses_openlist_mkdir_endpoint(self):
+        transport = FakeTransport({"code": 200, "message": "success", "data": None})
+        client = OpenListClient("http://127.0.0.1:5244", "openlist-token-value", transport=transport)
+
+        client.mkdir_path("/115/动漫/temp/凡人修仙传/import-1")
+
+        call = transport.calls[0]
+        self.assertEqual(call["url"], "http://127.0.0.1:5244/api/fs/mkdir")
+        self.assertEqual(call["data"], {"path": "/115/动漫/temp/凡人修仙传/import-1"})
+
+    def test_client_has_no_storage_resolution_or_move_task_api(self):
+        self.assertFalse(hasattr(OpenListClient, "resolve_storage_path"))
+        self.assertFalse(hasattr(OpenListClient, "move_task_info"))
+
 
 class MediaStationClientTest(unittest.TestCase):
     def test_subtitle_translation_accepts_direct_msg_response(self):

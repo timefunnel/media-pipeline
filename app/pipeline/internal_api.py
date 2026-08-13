@@ -32,6 +32,7 @@ VALID_SEARCH_SOURCES = {"default", "pansou", "bt4g"}
 VALID_CATEGORIES = {"movie", "tv", "anime", "adult", "other"}
 SYNC_STAGES = {
     "staging",
+    "received_unclaimed",
     "verifying_staging",
     "promoting",
     "syncing",
@@ -1049,6 +1050,7 @@ class ImportTaskManager:
         self._active_by_owner = defaultdict(int)
         self._target_locks = {}
         self._target_locks_guard = threading.Lock()
+        self._subscription_receive_lock = threading.Lock()
 
     def start(self):
         with self._condition:
@@ -1487,7 +1489,7 @@ class ImportTaskManager:
             )
 
             staging = dict(audit.get("staging") or {})
-            if not staging.get("folder_id"):
+            if not staging.get("openlist_path") or not staging.get("receive_root_folder_id"):
                 staging = self.service.prepare_subscription_staging(
                     category,
                     task["id"],
@@ -1497,22 +1499,50 @@ class ImportTaskManager:
                 result["subscription_follow"] = audit
                 self.store.save_running(task["id"], "staging", result=result, info_hash=info_hash or None)
 
-            staging_state = self.service.inspect_subscription_staging(category, staging["folder_id"], season)
+            staging_state = self.service.inspect_subscription_staging(category, staging, season)
             has_staged_files = bool(staging_state.get("entries"))
-            if not info_hash and not has_staged_files:
-                self.store.save_running(task["id"], "submitting", result=result)
-                submit_result = self.service.submit(
-                    category,
-                    request["candidate"]["download_uri"],
-                    target_folder_id=staging["folder_id"],
-                )
-                info_hash = first_submit_info_hash(submit_result)
-                if not info_hash:
-                    raise RuntimeError("pipeline submit returned no info_hash")
-                offline_task = task_from_submit_result(submit_result, info_hash)
-                result.update({"submit": submit_result, "task": offline_task})
-                self.store.save_running(task["id"], "submitted", result=result, info_hash=info_hash)
-            elif not info_hash and has_staged_files:
+            if not staging.get("claimed_at"):
+                self._acquire_target_lock(self._subscription_receive_lock)
+                try:
+                    staging_state = self.service.inspect_subscription_staging(category, staging, season)
+                    has_staged_files = bool(staging_state.get("entries"))
+                    if has_staged_files:
+                        self.service.validate_subscription_receive_root(staging)
+                        staging["recovered_at"] = int(time.time())
+                        staging["claimed_at"] = staging["recovered_at"]
+                        audit["staging"] = staging
+                        result["subscription_follow"] = audit
+                        self.store.save_running(task["id"], "staging", result=result, info_hash=info_hash or None)
+                    else:
+                        submit_result = dict(result.get("submit") or {})
+                        if not submit_result:
+                            self.service.validate_subscription_receive_root(staging)
+                            self.store.save_running(task["id"], "submitting", result=result)
+                            submit_result = self.service.submit(
+                                category,
+                                request["candidate"]["download_uri"],
+                                target_folder_id=staging["receive_root_folder_id"],
+                            )
+                            info_hash = first_submit_info_hash(submit_result)
+                            if not info_hash:
+                                raise RuntimeError("pipeline submit returned no info_hash")
+                            offline_task = task_from_submit_result(submit_result, info_hash)
+                            result.update({"submit": submit_result, "task": offline_task})
+                            self.store.save_running(
+                                task["id"],
+                                "received_unclaimed",
+                                result=result,
+                                info_hash=info_hash,
+                            )
+                        staging = self.service.claim_subscription_transfer(staging, submit_result)
+                        audit["staging"] = staging
+                        result["subscription_follow"] = audit
+                        self.store.save_running(task["id"], "staging", result=result, info_hash=info_hash)
+                finally:
+                    self._subscription_receive_lock.release()
+            staging_state = self.service.inspect_subscription_staging(category, staging, season)
+            has_staged_files = bool(staging_state.get("entries"))
+            if not info_hash and has_staged_files:
                 info_hash = "subscription-staging:%s" % task["id"]
                 offline_task = {
                     "info_hash": info_hash,
@@ -1543,7 +1573,7 @@ class ImportTaskManager:
                     self._wait_or_stop()
 
             self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
-            staging_state = self.service.inspect_subscription_staging(category, staging["folder_id"], season)
+            staging_state = self.service.inspect_subscription_staging(category, staging, season)
             verified = {int(value) for value in staging_state.get("verified_episodes") or []}
             audit.update(
                 {
@@ -1558,18 +1588,18 @@ class ImportTaskManager:
                 audit["outcome"] = "rejected"
                 result["subscription_follow"] = audit
                 self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
-                raise RuntimeError("115 staging contains unrecognized video names")
+                raise RuntimeError("OpenList staging contains unrecognized video names")
             if audit["duplicate_episodes"]:
                 audit["outcome"] = "rejected"
                 result["subscription_follow"] = audit
                 self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
-                raise RuntimeError("115 staging contains multiple videos for one episode")
+                raise RuntimeError("OpenList staging contains multiple videos for one episode")
             if not selected:
                 audit["outcome"] = "no_new_episodes"
                 attempts[-1].update({"outcome": "no_new_episodes", "finished_at": int(time.time())})
                 result["subscription_follow"] = audit
                 self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
-                raise RuntimeError("115 staging contains no new episodes")
+                raise RuntimeError("OpenList staging contains no new episodes")
 
             plan = self.service.plan_subscription_promotion(staging_state, selected, season)
             audit["planned_files"] = list(plan.get("files") or [])
@@ -1635,7 +1665,7 @@ class ImportTaskManager:
                 raise RuntimeError("MediaStationGo episode verification did not match the promotion plan")
 
             self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash, msg_media_id=media_id)
-            self.service.cleanup_subscription_staging(category, staging["folder_id"])
+            self.service.cleanup_subscription_staging(category, staging)
             audit["staging_cleaned_at"] = int(time.time())
             audit["outcome"] = "imported"
             attempts[-1].update({"outcome": "imported", "finished_at": int(time.time())})

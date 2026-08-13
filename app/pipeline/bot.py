@@ -404,6 +404,7 @@ from pipeline.subtitle_asr import (
 )
 TYPING_ACTION_INTERVAL_SECONDS = 4
 DEFAULT_BT4G_SEARCH_TIMEOUT_SECONDS = 12
+DEFAULT_SUBSCRIPTION_STAGING_ROOT = "/115/临时"
 
 
 @dataclass
@@ -489,6 +490,10 @@ class BotConfig:
     asr_translation_thinking_disabled: bool = True
     asr_cache_dir: str = "/bot-data/subtitle-asr-cache"
     p115_cookie: str = ""
+    subscription_staging_root: str = DEFAULT_SUBSCRIPTION_STAGING_ROOT
+    subscription_staging_folder_id: str = ""
+    subscription_move_timeout_seconds: float = 300
+    subscription_move_poll_seconds: float = 1
     internal_api_enabled: bool = False
     internal_api_token: str = ""
     internal_api_host: str = "127.0.0.1"
@@ -690,6 +695,20 @@ class BotConfig:
                 or env.get("CLOUD115_COOKIE")
                 or env.get("PAN115_COOKIE")
                 or ""
+            ),
+            subscription_staging_root=normalize_openlist_path(
+                env.get("MEDIA_PIPELINE_SUBSCRIPTION_STAGING_ROOT", DEFAULT_SUBSCRIPTION_STAGING_ROOT)
+            ),
+            subscription_staging_folder_id=(
+                env.get("MEDIA_PIPELINE_SUBSCRIPTION_STAGING_FOLDER_ID") or ""
+            ).strip(),
+            subscription_move_timeout_seconds=max(
+                0.0,
+                float(env.get("MEDIA_PIPELINE_SUBSCRIPTION_MOVE_TIMEOUT_SECONDS", "300")),
+            ),
+            subscription_move_poll_seconds=max(
+                0.01,
+                float(env.get("MEDIA_PIPELINE_SUBSCRIPTION_MOVE_POLL_SECONDS", "1")),
             ),
             internal_api_enabled=internal_api_enabled,
             internal_api_token=internal_api_token,
@@ -2079,43 +2098,108 @@ class PipelineBotService:
         }
 
     def prepare_subscription_staging(self, category, import_id, work_key):
-        client = self._build_115_client(category)
-        root_id = self._ensure_115_child_folder(client, category_to_folder_id(category), "temp")
-        work_id = self._ensure_115_child_folder(client, root_id, safe_115_folder_name(work_key, "subscription"))
+        receive_root_path = normalize_openlist_path(self.config.subscription_staging_root)
+        receive_root_folder_id = str(self.config.subscription_staging_folder_id or "").strip()
+        if not receive_root_path:
+            raise RuntimeError("subscription staging root path missing")
+        if not receive_root_folder_id:
+            raise RuntimeError("MEDIA_PIPELINE_SUBSCRIPTION_STAGING_FOLDER_ID missing")
         task_name = safe_115_folder_name(import_id, "task")
-        existing = self._find_115_child(client, work_id, task_name, directories_only=True)
-        if existing is not None:
-            task_id = file115_id(existing)
-        else:
-            response = client.create_folder(task_name, work_id)
-            task_id = created_115_folder_id(response)
-        if not task_id:
-            raise RuntimeError("115 temporary task folder id missing")
+        staging_path = normalize_openlist_path(
+            posixpath.join(
+                receive_root_path,
+                "追更任务",
+                safe_115_folder_name(work_key, "subscription"),
+                task_name,
+            )
+        )
+        client = self._build_openlist_client()
+        root = client.get_path(receive_root_path)
+        if not openlist_response_is_dir(root):
+            raise RuntimeError("OpenList subscription staging root is not a directory")
+        validate_subscription_root_entries(client.list_all(receive_root_path, refresh=True))
+        client.mkdir_path(staging_path)
+        task = client.get_path(staging_path)
+        if not openlist_response_is_dir(task):
+            raise RuntimeError("OpenList subscription staging path is not a directory")
         return {
-            "folder_id": task_id,
-            "openlist_path": normalize_openlist_path(
-                posixpath.join(category_to_openlist_path(category), "temp", safe_115_folder_name(work_key, "subscription"), task_name)
-            ),
+            "receive_root_folder_id": receive_root_folder_id,
+            "receive_root_path": receive_root_path,
+            "openlist_path": staging_path,
         }
 
-    def inspect_subscription_staging(self, category, folder_id, season):
-        client = self._build_115_client(category)
-        entries = list_115_descendants(client, folder_id)
+    def validate_subscription_receive_root(self, staging):
+        client = self._build_openlist_client()
+        root_path = subscription_receive_root_path(staging)
+        items = client.list_all(root_path, refresh=True)
+        validate_subscription_root_entries(items)
+        names = [openlist_item_name(item) for item in items]
+        return {"receive_root_path": root_path, "entries": names}
+
+    def claim_subscription_transfer(self, staging, submit_result):
+        client = self._build_openlist_client()
+        root_path = subscription_receive_root_path(staging)
+        task_path = subscription_staging_path(staging)
+        received_names = subscription_received_names(submit_result)
+        if not received_names:
+            raise RuntimeError("115 share receive returned no top-level item names")
+        if len(received_names) != len({name.casefold() for name in received_names}):
+            raise RuntimeError("115 share receive returned duplicate top-level item names")
+        if any(name == "追更任务" for name in received_names):
+            raise RuntimeError("115 share top-level item conflicts with reserved staging directory")
+
+        root_items = client.list_all(root_path, refresh=True)
+        root_counts = defaultdict(int)
+        for item in root_items:
+            root_counts[openlist_item_name(item).casefold()] += 1
+        expected = {name.casefold() for name in received_names}
+        unexpected = sorted(
+            openlist_item_name(item)
+            for item in root_items
+            if openlist_item_name(item) != "追更任务" and openlist_item_name(item).casefold() not in expected
+        )
+        ambiguous = sorted(name for name in received_names if root_counts[name.casefold()] != 1)
+        if unexpected or ambiguous:
+            details = []
+            if unexpected:
+                details.append("unexpected=" + ", ".join(unexpected))
+            if ambiguous:
+                details.append("missing_or_ambiguous=" + ", ".join(ambiguous))
+            raise RuntimeError("subscription receive root cannot be claimed: %s" % "; ".join(details))
+
+        client.move_names(root_path, task_path, received_names)
+        wait_openlist_names_moved(
+            client,
+            root_path,
+            task_path,
+            received_names,
+            timeout_seconds=self.config.subscription_move_timeout_seconds,
+            poll_seconds=self.config.subscription_move_poll_seconds,
+        )
+        claimed = dict(staging or {})
+        claimed["received_names"] = received_names
+        claimed["claimed_at"] = int(time.time())
+        return claimed
+
+    def inspect_subscription_staging(self, category, staging, season):
+        client = self._build_openlist_client()
+        staging_path = subscription_staging_path(staging)
+        entries = list_openlist_descendants(client, staging_path)
         videos = []
         unknown = []
         duplicates = {}
         by_episode = {}
         for item in entries:
-            if file115_is_dir(item):
+            if openlist_item_is_dir(item):
                 continue
-            name = file115_name(item)
+            name = openlist_item_name(item)
             if not is_video_filename(name):
                 continue
             episode = parse_follow_episode(name, season)
             if episode is None:
                 unknown.append(name)
                 continue
-            videos.append({"file_id": file115_id(item), "name": name, "episode": episode})
+            videos.append({"path": item.get("path"), "name": name, "episode": episode})
             by_episode.setdefault(episode, []).append(name)
         for episode, names in by_episode.items():
             if len(names) > 1:
@@ -2134,69 +2218,77 @@ class PipelineBotService:
         selected_videos = []
         video_stems = []
         for item in entries:
-            if file115_is_dir(item):
+            if openlist_item_is_dir(item):
                 continue
-            name = file115_name(item)
+            name = openlist_item_name(item)
             episode = parse_follow_episode(name, season) if is_video_filename(name) else None
             if episode in selected:
                 selected_videos.append(
-                    {"file_id": file115_id(item), "name": name, "episode": episode, "kind": "video"}
+                    {"path": item.get("path"), "name": name, "episode": episode, "kind": "video"}
                 )
                 video_stems.append(posixpath.splitext(name)[0].casefold())
         files = list(selected_videos)
         for item in entries:
-            if file115_is_dir(item):
+            if openlist_item_is_dir(item):
                 continue
-            name = file115_name(item)
+            name = openlist_item_name(item)
             if is_video_filename(name):
                 continue
             stem = posixpath.splitext(name)[0].casefold()
             if any(stem == video_stem or stem.startswith(video_stem + ".") for video_stem in video_stems):
-                files.append({"file_id": file115_id(item), "name": name, "kind": "sidecar"})
+                files.append({"path": item.get("path"), "name": name, "kind": "sidecar"})
         names = [str(item.get("name") or "").casefold() for item in files]
         if len(names) != len(set(names)):
-            raise RuntimeError("115 staging contains duplicate selected file names")
+            raise RuntimeError("OpenList staging contains duplicate selected file names")
         if sorted(int(item["episode"]) for item in selected_videos) != sorted(selected):
-            raise RuntimeError("115 staging promotion plan does not match selected episodes")
+            raise RuntimeError("OpenList staging promotion plan does not match selected episodes")
         return {"files": files, "episodes": sorted(selected)}
 
     def promote_subscription_episodes(self, category, staging, target_openlist_path, selected_episodes, season, plan=None):
-        client = self._build_115_client(category)
-        target_id = resolve_115_path_from_category(
-            client,
-            category_to_folder_id(category),
-            category_to_openlist_path(category),
-            target_openlist_path,
-        )
+        client = self._build_openlist_client()
+        target_path = normalize_openlist_path(target_openlist_path)
+        client.get_path(target_path)
         plan = dict(plan or self.plan_subscription_promotion(staging, selected_episodes, season))
         planned_files = list(plan.get("files") or [])
         if not planned_files:
-            raise RuntimeError("115 staging contains no files for selected episodes")
-        target_items = [item for item in client.list_all_files(target_id) if not file115_is_dir(item)]
-        target_names = {file115_name(item).casefold(): file115_id(item) for item in target_items}
-        staging_ids = {file115_id(item) for item in (staging or {}).get("entries") or [] if not file115_is_dir(item)}
-        pending = []
+            raise RuntimeError("OpenList staging contains no files for selected episodes")
+        target_items = [item for item in client.list_all(target_path, refresh=False) if not openlist_item_is_dir(item)]
+        target_names = {openlist_item_name(item).casefold() for item in target_items}
+        entries_by_path = {
+            normalize_openlist_path(item.get("path")): item
+            for item in (staging or {}).get("entries") or []
+            if not openlist_item_is_dir(item) and item.get("path")
+        }
+        pending_by_dir = defaultdict(list)
         reused = []
         for item in planned_files:
             name = str(item.get("name") or "").strip()
-            file_id = str(item.get("file_id") or "").strip()
+            path = normalize_openlist_path(item.get("path"))
             if name.casefold() in target_names:
                 reused.append(name)
                 continue
-            if file_id and file_id in staging_ids:
-                pending.append(file_id)
+            if path and path in entries_by_path:
+                pending_by_dir[posixpath.dirname(path)].append(name)
                 continue
-            raise RuntimeError("115 selected file is missing from staging and target: %s" % name)
-        if pending:
-            client.move_files(unique_nonempty_values(pending), target_id)
-        after = [item for item in client.list_all_files(target_id) if not file115_is_dir(item)]
-        after_names = {file115_name(item).casefold() for item in after}
+            raise RuntimeError("OpenList selected file is missing from staging and target: %s" % name)
+        for src_dir, names in sorted(pending_by_dir.items()):
+            client.move_names(src_dir, target_path, names)
+            wait_openlist_names_moved(
+                client,
+                src_dir,
+                target_path,
+                names,
+                timeout_seconds=self.config.subscription_move_timeout_seconds,
+                poll_seconds=self.config.subscription_move_poll_seconds,
+            )
+        after = [item for item in client.list_all(target_path, refresh=True) if not openlist_item_is_dir(item)]
+        after_names = {openlist_item_name(item).casefold() for item in after}
         missing = [item.get("name") for item in planned_files if str(item.get("name") or "").casefold() not in after_names]
         if missing:
-            raise RuntimeError("115 move verification failed: %s" % ", ".join(str(value) for value in missing))
+            raise RuntimeError("OpenList move verification failed: %s" % ", ".join(str(value) for value in missing))
         return {
-            "target_folder_id": target_id,
-            "moved_file_ids": unique_nonempty_values(pending),
+            "target_openlist_path": target_path,
+            "moved_paths": [posixpath.join(src_dir, name) for src_dir, names in sorted(pending_by_dir.items()) for name in names],
             "moved_names": [item.get("name") for item in planned_files],
             "reused_names": reused,
             "moved_episodes": sorted(int(value) for value in selected_episodes or []),
@@ -2243,32 +2335,13 @@ class PipelineBotService:
             "duplicate_episodes": duplicates,
         }
 
-    def cleanup_subscription_staging(self, category, folder_id):
-        client = self._build_115_client(category)
-        client.delete_files([folder_id])
+    def cleanup_subscription_staging(self, category, staging):
+        client = self._build_openlist_client()
+        staging_path = subscription_staging_path(staging)
+        client.remove_names(posixpath.dirname(staging_path), [posixpath.basename(staging_path)])
 
-    def _ensure_115_child_folder(self, client, parent_id, name):
-        existing = self._find_115_child(client, parent_id, name, directories_only=True)
-        if existing is not None:
-            return file115_id(existing)
-        response = client.create_folder(name, parent_id)
-        folder_id = created_115_folder_id(response)
-        if not folder_id:
-            existing = self._find_115_child(client, parent_id, name, directories_only=True)
-            folder_id = file115_id(existing) if existing is not None else ""
-        if not folder_id:
-            raise RuntimeError("115 created folder id missing: %s" % name)
-        return folder_id
-
-    def _find_115_child(self, client, parent_id, name, directories_only=False):
-        expected = str(name or "").casefold()
-        for item in client.list_all_files(parent_id):
-            if file115_name(item).casefold() != expected:
-                continue
-            if directories_only and not file115_is_dir(item):
-                continue
-            return item
-        return None
+    def _build_openlist_client(self):
+        return OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
 
     def task_status(self, category, info_hash):
         return self._call_115(category, lambda client: find_task_by_info_hash(client, info_hash, max_pages=10))
@@ -3567,64 +3640,100 @@ def safe_115_folder_name(value, fallback):
     return (value or fallback)[:120]
 
 
-def created_115_folder_id(response):
+def subscription_staging_path(staging):
+    path = normalize_openlist_path((staging or {}).get("openlist_path"))
+    if not path:
+        raise RuntimeError("OpenList subscription staging path missing")
+    return path
+
+
+def subscription_receive_root_path(staging):
+    path = normalize_openlist_path((staging or {}).get("receive_root_path"))
+    if not path:
+        raise RuntimeError("OpenList subscription receive root path missing")
+    return path
+
+
+def subscription_received_names(submit_result):
+    data = ((submit_result or {}).get("raw") or {}).get("data") or {}
+    names = []
+    for item in data.get("items") or []:
+        name = str((item or {}).get("name") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def openlist_response_is_dir(response):
     data = (response or {}).get("data") or {}
-    if isinstance(data, dict):
-        return str(data.get("file_id") or data.get("cid") or data.get("fid") or "").strip()
-    return ""
+    return bool(data.get("is_dir"))
 
 
-def file115_id(item):
-    return str((item or {}).get("fid") or (item or {}).get("cid") or (item or {}).get("file_id") or "").strip()
+def validate_subscription_root_entries(items):
+    items = list(items or [])
+    names = [openlist_item_name(item) for item in items]
+    unexpected = sorted(name for name in names if name != "追更任务")
+    reserved = [item for item in items if openlist_item_name(item) == "追更任务"]
+    if unexpected:
+        raise RuntimeError(
+            "subscription receive root contains unclaimed items: %s" % ", ".join(unexpected)
+        )
+    if len(reserved) > 1:
+        raise RuntimeError("subscription receive root contains duplicate reserved directories")
+    if reserved and not openlist_item_is_dir(reserved[0]):
+        raise RuntimeError("subscription receive root reserved entry is not a directory")
 
 
-def file115_name(item):
-    return str((item or {}).get("fn") or (item or {}).get("file_name") or (item or {}).get("name") or "").strip()
+def wait_openlist_names_moved(client, src_dir, dst_dir, names, timeout_seconds=300, poll_seconds=1):
+    expected_by_key = {
+        str(name).casefold(): str(name)
+        for name in names
+        if str(name or "").strip()
+    }
+    expected = set(expected_by_key)
+    if not expected:
+        raise RuntimeError("OpenList move verification names missing")
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        source_counts = defaultdict(int)
+        for item in client.list_all(src_dir, refresh=True):
+            source_counts[openlist_item_name(item).casefold()] += 1
+        target_counts = defaultdict(int)
+        for item in client.list_all(dst_dir, refresh=True):
+            target_counts[openlist_item_name(item).casefold()] += 1
+        if all(source_counts[name] == 0 and target_counts[name] == 1 for name in expected):
+            return
+        if time.monotonic() >= deadline:
+            remaining = sorted(expected_by_key[name] for name in expected if source_counts[name] != 0)
+            missing_or_ambiguous = sorted(
+                expected_by_key[name] for name in expected if target_counts[name] != 1
+            )
+            details = []
+            if remaining:
+                details.append("source_remaining=" + ", ".join(remaining))
+            if missing_or_ambiguous:
+                details.append("target_missing_or_ambiguous=" + ", ".join(missing_or_ambiguous))
+            raise RuntimeError("OpenList move verification failed: %s" % "; ".join(details))
+        time.sleep(max(0.01, float(poll_seconds)))
 
 
-def file115_is_dir(item):
-    item = item or {}
-    if item.get("is_dir") is not None:
-        return bool(item.get("is_dir"))
-    return str(item.get("fc") or "") == "0"
-
-
-def list_115_descendants(client, folder_id, max_entries=20000):
+def list_openlist_descendants(client, root_path, max_entries=20000):
+    root = normalize_openlist_path(root_path)
+    if not root:
+        raise RuntimeError("OpenList staging root path missing")
     out = []
-    stack = [str(folder_id)]
+    stack = [root]
     while stack:
         current = stack.pop()
-        for item in client.list_all_files(current):
+        for item in client.list_all(current, refresh=True):
             row = dict(item or {})
+            row["path"] = openlist_item_path(current, row)
             out.append(row)
             if len(out) > int(max_entries):
-                raise RuntimeError("115 staging entry limit exceeded")
-            if file115_is_dir(row):
-                child_id = file115_id(row)
-                if child_id:
-                    stack.append(child_id)
+                raise RuntimeError("OpenList staging entry limit exceeded")
+            if openlist_item_is_dir(row):
+                stack.append(row["path"])
     return out
-
-
-def resolve_115_path_from_category(client, category_folder_id, category_openlist_path, target_openlist_path):
-    root = normalize_openlist_path(category_openlist_path).rstrip("/")
-    target = normalize_openlist_path(target_openlist_path)
-    if not root or not target or not (target == root or target.startswith(root + "/")):
-        raise RuntimeError("subscription target path is outside configured category root")
-    current = str(category_folder_id or "").strip()
-    relative = target[len(root) :].strip("/")
-    for part in [value for value in relative.split("/") if value]:
-        matches = [
-            item
-            for item in client.list_all_files(current)
-            if file115_is_dir(item) and file115_name(item).casefold() == part.casefold()
-        ]
-        if len(matches) != 1:
-            raise RuntimeError("115 target directory is missing or ambiguous: %s" % target)
-        current = file115_id(matches[0])
-    if not current:
-        raise RuntimeError("115 target directory id missing")
-    return current
 
 
 FOLLOW_VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".wmv", ".ts", ".m2ts", ".webm"}

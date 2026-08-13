@@ -52,7 +52,28 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.telegram_timeout, 90)
         self.assertEqual(config.openlist_scan_username, "media_scan")
         self.assertEqual(config.openlist_scan_password, "scan-secret")
+        self.assertEqual(config.subscription_staging_root, "/115/临时")
+        self.assertEqual(config.subscription_staging_folder_id, "")
         self.assertFalse(config.subtitle_auto_match_adult_only)
+
+    def test_bot_config_reads_subscription_staging_settings(self):
+        from pipeline.bot import BotConfig
+
+        config = BotConfig.from_env(
+            {
+                "TG_BOT_TOKEN": "123:token",
+                "TG_ALLOWED_USER_IDS": "700656624",
+                "MEDIA_PIPELINE_SUBSCRIPTION_STAGING_ROOT": "/115/临时/",
+                "MEDIA_PIPELINE_SUBSCRIPTION_STAGING_FOLDER_ID": "cid-123",
+                "MEDIA_PIPELINE_SUBSCRIPTION_MOVE_TIMEOUT_SECONDS": "15",
+                "MEDIA_PIPELINE_SUBSCRIPTION_MOVE_POLL_SECONDS": "0.05",
+            }
+        )
+
+        self.assertEqual(config.subscription_staging_root, "/115/临时")
+        self.assertEqual(config.subscription_staging_folder_id, "cid-123")
+        self.assertEqual(config.subscription_move_timeout_seconds, 15)
+        self.assertEqual(config.subscription_move_poll_seconds, 0.05)
 
     def test_bot_config_enables_mediastation_when_credentials_exist(self):
         from pipeline.bot import BotConfig

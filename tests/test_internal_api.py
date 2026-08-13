@@ -103,10 +103,15 @@ class FakePipelineService:
         self.subtitle_preview_calls = []
         self.subtitle_apply_calls = []
         self.subscription_staging = None
+        self.subscription_stagings = {}
         self.subscription_entries = []
         self.subscription_prepare_calls = []
+        self.subscription_validate_root_calls = []
+        self.subscription_claim_calls = []
         self.subscription_cleanup_calls = []
         self.subscription_verify_result = None
+        self.subscription_receive_active = 0
+        self.subscription_receive_max_active = 0
 
     def search(self, query, category, limit=20):
         return ResultList(
@@ -174,21 +179,51 @@ class FakePipelineService:
             self._sequence += 1
             info_hash = "HASH%03d" % self._sequence
             self.submit_uris.append(download_uri)
+            self.last_submit_target_folder_id = target_folder_id
         status_name = "submitted" if self.download_delay else "success"
         task = {"info_hash": info_hash, "status_name": status_name, "percent_done": 0 if self.download_delay else 100}
-        return {"state": True, "tasks": [task], "task_status": task}
+        return {
+            "state": True,
+            "tasks": [task],
+            "task_status": task,
+            "raw": {"data": {"items": [{"name": "120集全"}]}},
+        }
 
     def prepare_subscription_staging(self, category, import_id, work_key):
         self.subscription_prepare_calls.append((category, import_id, work_key))
-        if self.subscription_staging is None:
-            self.subscription_staging = {
-                "folder_id": "staging-" + import_id,
-                "openlist_path": "/115/anime/temp/%s/%s" % (work_key, import_id),
+        if import_id not in self.subscription_stagings:
+            self.subscription_stagings[import_id] = {
+                "receive_root_folder_id": "temporary-root-cid",
+                "receive_root_path": "/115/临时",
+                "openlist_path": "/115/临时/追更任务/%s/%s" % (work_key, import_id),
             }
+        self.subscription_staging = self.subscription_stagings[import_id]
         return dict(self.subscription_staging)
 
-    def inspect_subscription_staging(self, category, folder_id, season):
-        entries = [dict(item) for item in self.subscription_entries]
+    def validate_subscription_receive_root(self, staging):
+        self.subscription_validate_root_calls.append(dict(staging))
+        self.subscription_receive_active += 1
+        self.subscription_receive_max_active = max(
+            self.subscription_receive_max_active,
+            self.subscription_receive_active,
+        )
+        time.sleep(0.03)
+        self.subscription_receive_active -= 1
+        return {"receive_root_path": staging["receive_root_path"], "entries": ["追更任务"]}
+
+    def claim_subscription_transfer(self, staging, submit_result):
+        self.subscription_claim_calls.append((dict(staging), dict(submit_result)))
+        claimed = dict(staging)
+        claimed.update({"received_names": ["120集全"], "claimed_at": int(time.time())})
+        self.subscription_staging = dict(claimed)
+        for import_id, candidate in self.subscription_stagings.items():
+            if candidate.get("openlist_path") == staging.get("openlist_path"):
+                self.subscription_stagings[import_id] = dict(claimed)
+                break
+        return claimed
+
+    def inspect_subscription_staging(self, category, staging, season):
+        entries = [dict(item) for item in self.subscription_entries] if staging.get("claimed_at") else []
         by_episode = {}
         unknown = []
         for item in entries:
@@ -210,7 +245,12 @@ class FakePipelineService:
     def plan_subscription_promotion(self, staging, selected_episodes, season):
         selected = set(selected_episodes)
         files = [
-            {"file_id": item["fid"], "name": item["fn"], "episode": item.get("episode"), "kind": item.get("kind")}
+            {
+                "path": item.get("path") or "/115/anime/temp/test/" + item["fn"],
+                "name": item["fn"],
+                "episode": item.get("episode"),
+                "kind": item.get("kind"),
+            }
             for item in staging.get("entries") or []
             if item.get("episode") in selected or item.get("sidecar_episode") in selected
         ]
@@ -218,8 +258,8 @@ class FakePipelineService:
 
     def promote_subscription_episodes(self, category, staging, target_openlist_path, selected_episodes, season, plan=None):
         return {
-            "target_folder_id": "formal-target",
-            "moved_file_ids": [item["file_id"] for item in (plan or {}).get("files") or []],
+            "target_openlist_path": target_openlist_path,
+            "moved_paths": [item["path"] for item in (plan or {}).get("files") or []],
             "moved_names": [item["name"] for item in (plan or {}).get("files") or []],
             "reused_names": [],
             "moved_episodes": sorted(selected_episodes),
@@ -233,8 +273,8 @@ class FakePipelineService:
             return dict(self.subscription_verify_result)
         return {"verified_episodes": sorted(expected_episodes), "missing_episodes": [], "duplicate_episodes": {}}
 
-    def cleanup_subscription_staging(self, category, folder_id):
-        self.subscription_cleanup_calls.append((category, folder_id))
+    def cleanup_subscription_staging(self, category, staging):
+        self.subscription_cleanup_calls.append((category, dict(staging)))
 
     def check_duplicate(self, category, query, candidate, target=None):
         self.duplicate_calls.append((category, query, dict(candidate), dict(target or {})))
@@ -1210,7 +1250,11 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(audit["moved_episodes"], [115, 116, 117, 118, 119, 120])
         self.assertEqual(audit["scan_added"], 6)
         self.assertEqual(audit["outcome"], "imported")
-        self.assertEqual(service.subscription_cleanup_calls, [("anime", "staging-" + task["id"])])
+        self.assertEqual(service.last_submit_target_folder_id, "temporary-root-cid")
+        self.assertEqual(len(service.subscription_claim_calls), 1)
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        self.assertEqual(service.subscription_cleanup_calls[0][0], "anime")
+        self.assertEqual(service.subscription_cleanup_calls[0][1]["openlist_path"], audit["staging"]["openlist_path"])
         self.assertEqual(service.duplicate_calls, [])
 
     def test_no_new_episodes_is_failed_business_result_and_keeps_staging(self):
@@ -1275,8 +1319,10 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         payload = self.payload(application, service)
         task, _ = manager.create_import("owner-a", "fanren-staging-recovery", payload)
         staging = {
-            "folder_id": "existing-staging-folder",
-            "openlist_path": "/115/动漫/temp/凡人修仙传/%s" % task["id"],
+            "receive_root_folder_id": "temporary-root-cid",
+            "receive_root_path": "/115/临时",
+            "openlist_path": "/115/临时/追更任务/凡人修仙传/%s" % task["id"],
+            "claimed_at": int(time.time()),
         }
         conn = sqlite3.connect(self.db_path)
         try:
@@ -1303,6 +1349,98 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(service.subscription_prepare_calls, [])
         self.assertEqual(completed["result"]["subscription_follow"]["staging"], staging)
 
+    def test_received_share_is_claimed_after_restart_without_resubmitting(self):
+        service, store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115}
+        ]
+        payload = self.payload(application, service)
+        task, _ = manager.create_import("owner-a", "fanren-unclaimed-recovery", payload)
+        staging = {
+            "receive_root_folder_id": "temporary-root-cid",
+            "receive_root_path": "/115/临时",
+            "openlist_path": "/115/临时/追更任务/凡人修仙传/%s" % task["id"],
+        }
+        submit_result = {
+            "tasks": [{"info_hash": "share:abc", "status_name": "success"}],
+            "task_status": {"info_hash": "share:abc", "status_name": "success"},
+            "raw": {"data": {"items": [{"name": "120集全"}]}},
+        }
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                update internal_api_imports
+                set status = 'running', stage = 'received_unclaimed', result_json = ?, info_hash = ?
+                where id = ?
+                """,
+                (
+                    json.dumps({"submit": submit_result, "subscription_follow": {"staging": staging}}),
+                    "share:abc",
+                    task["id"],
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(service.submit_uris, [])
+        self.assertEqual(len(service.subscription_claim_calls), 1)
+
+    def test_received_share_with_unknown_root_item_fails_without_resubmitting(self):
+        service, store, manager, application = self.build_components()
+        payload = self.payload(application, service)
+        task, _ = manager.create_import("owner-a", "fanren-unclaimed-conflict", payload)
+        staging = {
+            "receive_root_folder_id": "temporary-root-cid",
+            "receive_root_path": "/115/临时",
+            "openlist_path": "/115/临时/追更任务/凡人修仙传/%s" % task["id"],
+        }
+        submit_result = {
+            "tasks": [{"info_hash": "share:abc", "status_name": "success"}],
+            "task_status": {"info_hash": "share:abc", "status_name": "success"},
+            "raw": {"data": {"items": [{"name": "120集全"}]}},
+        }
+
+        def reject_claim(_staging, _submit_result):
+            raise RuntimeError("subscription receive root cannot be claimed: unexpected=未知目录")
+
+        service.claim_subscription_transfer = reject_claim
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                update internal_api_imports
+                set status = 'running', stage = 'received_unclaimed', result_json = ?, info_hash = ?
+                where id = ?
+                """,
+                (
+                    json.dumps({"submit": submit_result, "subscription_follow": {"staging": staging}}),
+                    "share:abc",
+                    task["id"],
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        manager.start()
+        try:
+            failed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("cannot be claimed", failed["error"])
+        self.assertEqual(service.submit_uris, [])
+
     def test_force_duplicate_is_rejected_for_subscription_follow(self):
         service, store, manager, application = self.build_components()
         payload = self.payload(application, service)
@@ -1311,50 +1449,176 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             manager.create_import("owner-a", "fanren-force", payload)
         self.assertEqual(raised.exception.code, "invalid_subscription_follow")
 
+    def test_different_subscription_works_serialize_shared_receive_root(self):
+        service, store, manager, application = self.build_components(workers=2, owner_workers=2)
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115}
+        ]
+        first_payload = self.payload(application, service)
+        session_id, candidate_id, _ = self.search_candidate(
+            application,
+            owner_id="owner-b",
+            query="另一部动画 更新至120集",
+            category="anime",
+        )
+        second_payload = self.import_payload(
+            session_id,
+            candidate_id,
+            category="anime",
+            target=target_for("anime"),
+        )
+        second_payload.update(first_payload)
+        second_payload["search_session_id"] = session_id
+        second_payload["candidate_id"] = candidate_id
+        second_payload["work_key"] = "另一部动画"
+        second_payload["subscription_id"] = "subscription-other"
+        first, _ = manager.create_import("owner-a", "fanren-shared-root-1", first_payload)
+        second, _ = manager.create_import("owner-b", "fanren-shared-root-2", second_payload)
+
+        manager.start()
+        try:
+            self.wait_final(manager, "owner-a", first["id"], timeout=5)
+            self.wait_final(manager, "owner-b", second["id"], timeout=5)
+        finally:
+            manager.stop()
+
+        self.assertEqual(service.subscription_receive_max_active, 1)
+
 
 class SubscriptionPromotionTest(unittest.TestCase):
-    def test_partial_115_move_is_detected_by_target_verification(self):
-        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
-        category_root_id = category_to_folder_id("anime")
+    def test_partial_openlist_move_is_detected_by_target_verification(self):
+        service = PipelineBotService(
+            BotConfig(token="token", allowed_user_ids={1}, subscription_move_timeout_seconds=0)
+        )
         target_path = category_to_openlist_path("anime").rstrip("/") + "/凡人修仙传 (2020)/Season 1"
+        staging_path = category_to_openlist_path("anime").rstrip("/") + "/temp/凡人修仙传/task-1"
 
         class PartialMoveClient:
             def __init__(self):
                 self.moved = []
                 self.target_items = []
 
-            def list_all_files(self, folder_id):
-                if folder_id == category_root_id:
-                    return [{"fid": "work-folder", "fn": "凡人修仙传 (2020)", "is_dir": True}]
-                if folder_id == "work-folder":
-                    return [{"fid": "target-folder", "fn": "Season 1", "is_dir": True}]
-                if folder_id == "target-folder":
+            def get_path(self, path):
+                return {"code": 200, "data": {"name": "Season 1", "is_dir": True}}
+
+            def list_all(self, path, refresh=False):
+                if path == target_path:
                     return list(self.target_items)
                 return []
 
-            def move_files(self, file_ids, target_folder_id):
-                self.moved.append((list(file_ids), target_folder_id))
-                self.target_items.append({"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "is_dir": False})
+            def move_names(self, src_dir, dst_dir, names):
+                self.moved.append((src_dir, dst_dir, list(names)))
+                self.target_items.append({"name": "凡人修仙传.S01E115.mkv", "is_dir": False})
+                return {"code": 200, "data": {"message": "completed"}}
 
         client = PartialMoveClient()
-        service._build_115_client = lambda _category: client
+        service._build_openlist_client = lambda: client
+        service._build_115_client = lambda _category: (_ for _ in ()).throw(AssertionError("115 Open API must not be used"))
         staging = {
+            "openlist_path": staging_path,
             "entries": [
-                {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "is_dir": False},
-                {"fid": "subtitle-115", "fn": "凡人修仙传.S01E115.zh-CN.srt", "is_dir": False},
+                {"path": staging_path + "/凡人修仙传.S01E115.mkv", "name": "凡人修仙传.S01E115.mkv", "is_dir": False},
+                {"path": staging_path + "/凡人修仙传.S01E115.zh-CN.srt", "name": "凡人修仙传.S01E115.zh-CN.srt", "is_dir": False},
             ]
         }
         plan = {
             "files": [
-                {"file_id": "video-115", "name": "凡人修仙传.S01E115.mkv", "episode": 115, "kind": "video"},
-                {"file_id": "subtitle-115", "name": "凡人修仙传.S01E115.zh-CN.srt", "kind": "sidecar"},
+                {"path": staging_path + "/凡人修仙传.S01E115.mkv", "name": "凡人修仙传.S01E115.mkv", "episode": 115, "kind": "video"},
+                {"path": staging_path + "/凡人修仙传.S01E115.zh-CN.srt", "name": "凡人修仙传.S01E115.zh-CN.srt", "kind": "sidecar"},
             ],
             "episodes": [115],
         }
 
-        with self.assertRaisesRegex(RuntimeError, "115 move verification failed.*zh-CN.srt"):
+        with self.assertRaisesRegex(RuntimeError, "OpenList move verification failed.*zh-(?:CN|cn)\\.srt"):
             service.promote_subscription_episodes("anime", staging, target_path, [115], 1, plan=plan)
-        self.assertEqual(client.moved, [(["video-115", "subtitle-115"], "target-folder")])
+        self.assertEqual(
+            client.moved,
+            [(staging_path, target_path, ["凡人修仙传.S01E115.mkv", "凡人修仙传.S01E115.zh-CN.srt"])],
+        )
+
+    def test_prepare_subscription_staging_uses_openlist_path_and_configured_receive_root_id(self):
+        service = PipelineBotService(
+            BotConfig(token="token", allowed_user_ids={1}, subscription_staging_folder_id="temporary-root-cid")
+        )
+
+        class FakeOpenList:
+            def __init__(self):
+                self.created = []
+
+            def mkdir_path(self, path):
+                self.created.append(path)
+
+            def get_path(self, path):
+                return {"code": 200, "data": {"name": path.rsplit("/", 1)[-1], "is_dir": True}}
+
+            def list_all(self, path, refresh=False):
+                return []
+
+        client = FakeOpenList()
+        service._build_openlist_client = lambda: client
+        service._build_115_client = lambda _category: (_ for _ in ()).throw(AssertionError("115 Open API must not be used"))
+
+        staging = service.prepare_subscription_staging("anime", "import-1", "凡人修仙传")
+
+        self.assertEqual(staging["receive_root_folder_id"], "temporary-root-cid")
+        self.assertEqual(staging["receive_root_path"], "/115/临时")
+        self.assertTrue(staging["openlist_path"].startswith("/115/临时/追更任务/凡人修仙传/"))
+        self.assertEqual(client.created, [staging["openlist_path"]])
+
+    def test_staging_inspection_and_cleanup_use_only_openlist_paths(self):
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        staging = {
+            "receive_root_folder_id": "temporary-root-cid",
+            "receive_root_path": "/115/临时",
+            "openlist_path": "/115/临时/追更任务/凡人修仙传/import-1",
+        }
+
+        class FakeOpenList:
+            def __init__(self):
+                self.removed = []
+
+            def list_all(self, path, refresh=False):
+                self.last_list = (path, refresh)
+                return [{"name": "凡人修仙传.S01E115.mkv", "is_dir": False}]
+
+            def remove_names(self, parent, names):
+                self.removed.append((parent, list(names)))
+
+        client = FakeOpenList()
+        service._build_openlist_client = lambda: client
+        service._build_115_client = lambda _category: (_ for _ in ()).throw(AssertionError("115 Open API must not be used"))
+
+        inspected = service.inspect_subscription_staging("anime", staging, 1)
+        service.cleanup_subscription_staging("anime", staging)
+
+        self.assertEqual(inspected["verified_episodes"], [115])
+        self.assertEqual(client.last_list, (staging["openlist_path"], True))
+        self.assertEqual(client.removed, [("/115/临时/追更任务/凡人修仙传", ["import-1"])])
+
+    def test_subscription_follow_path_does_not_build_115_open_api_client(self):
+        service = PipelineBotService(
+            BotConfig(token="token", allowed_user_ids={1}, subscription_staging_folder_id="temporary-root-cid")
+        )
+
+        class FakeOpenList:
+            def get_path(self, path):
+                return {"code": 200, "data": {"is_dir": True}}
+
+            def list_all(self, path, refresh=False):
+                return []
+
+            def mkdir_path(self, path):
+                return {"code": 200}
+
+        service._build_openlist_client = lambda: FakeOpenList()
+        service._build_115_client = lambda _category: (_ for _ in ()).throw(
+            AssertionError("115 Open API must not be used")
+        )
+
+        staging = service.prepare_subscription_staging("anime", "import-1", "凡人修仙传")
+        inspected = service.inspect_subscription_staging("anime", {**staging, "claimed_at": 1}, 1)
+
+        self.assertEqual(inspected["entries"], [])
 
 
 class ImportWorkerRecoveryTest(InternalApiTestCase):
