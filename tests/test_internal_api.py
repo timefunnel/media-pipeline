@@ -21,7 +21,12 @@ for category in ("movie", "tv", "anime", "adult", "other"):
     os.environ.setdefault(prefix + "_MSG_ROOT_ID", "test-%s-root" % category)
 
 from pipeline.bot import BotConfig, PipelineBotService
-from pipeline.bot import parse_follow_episode, wait_openlist_receive_move, wait_openlist_receive_root_entries
+from pipeline.bot import (
+    parse_follow_episode,
+    wait_openlist_offline_result_names,
+    wait_openlist_receive_move,
+    wait_openlist_receive_root_entries,
+)
 from pipeline.config import category_to_folder_id, category_to_openlist_path
 from pipeline.internal_api import (
     ApiError,
@@ -125,6 +130,68 @@ class OpenListReceiveMoveWaitTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "permission denied"):
             wait_openlist_receive_root_entries(client, "/115/temp")
         self.assertEqual(client.calls, 1)
+
+    def test_offline_result_wait_matches_the_completed_task_name(self):
+        class FakeOpenList:
+            def __init__(self):
+                self.calls = 0
+
+            def list_all(self, path, refresh=False):
+                self.calls += 1
+                self.assert_request = (path, refresh)
+                if self.calls == 1:
+                    return [{"name": "追更任务", "is_dir": True}]
+                return [
+                    {"name": "追更任务", "is_dir": True},
+                    {"name": "凡人修仙传.115-120", "is_dir": True},
+                ]
+
+        client = FakeOpenList()
+        names = wait_openlist_offline_result_names(
+            client,
+            "/115/临时",
+            "凡人修仙传.115-120",
+            timeout_seconds=1,
+            poll_seconds=0,
+            wait_fn=lambda _seconds: None,
+        )
+
+        self.assertEqual(names, ["凡人修仙传.115-120"])
+        self.assertEqual(client.assert_request, ("/115/临时", True))
+        self.assertEqual(client.calls, 2)
+
+    def test_offline_result_wait_rejects_a_different_result_name(self):
+        class FakeOpenList:
+            def list_all(self, _path, refresh=False):
+                return [{"name": "另一部动画", "is_dir": True}]
+
+        with self.assertRaisesRegex(RuntimeError, "does not match task"):
+            wait_openlist_offline_result_names(
+                FakeOpenList(), "/115/临时", "凡人修仙传", timeout_seconds=0
+            )
+
+    def test_offline_result_wait_rejects_multiple_unclaimed_entries(self):
+        class FakeOpenList:
+            def list_all(self, _path, refresh=False):
+                return [
+                    {"name": "凡人修仙传", "is_dir": True},
+                    {"name": "未知目录", "is_dir": True},
+                ]
+
+        with self.assertRaisesRegex(RuntimeError, "multiple offline results"):
+            wait_openlist_offline_result_names(
+                FakeOpenList(), "/115/临时", "凡人修仙传", timeout_seconds=0
+            )
+
+    def test_offline_result_wait_times_out_without_an_unclaimed_entry(self):
+        class FakeOpenList:
+            def list_all(self, _path, refresh=False):
+                return [{"name": "追更任务", "is_dir": True}]
+
+        with self.assertRaisesRegex(RuntimeError, "did not appear"):
+            wait_openlist_offline_result_names(
+                FakeOpenList(), "/115/临时", "凡人修仙传", timeout_seconds=0
+            )
 
 
 class ResultList(list):
@@ -264,9 +331,15 @@ class FakePipelineService:
             self.submit_uris.append(download_uri)
             self.last_submit_target_folder_id = target_folder_id
         status_name = "submitted" if self.download_delay else "success"
-        task = {"info_hash": info_hash, "status_name": status_name, "percent_done": 0 if self.download_delay else 100}
+        task = {
+            "info_hash": info_hash,
+            "name": "120集全",
+            "status_name": status_name,
+            "percent_done": 0 if self.download_delay else 100,
+        }
         return {
             "state": True,
+            "submit_kind": "115_offline",
             "tasks": [task],
             "task_status": task,
             "raw": {"data": {"items": [{"name": "120集全"}]}},
@@ -294,8 +367,10 @@ class FakePipelineService:
         self.subscription_receive_active -= 1
         return {"receive_root_path": staging["receive_root_path"], "entries": ["追更任务"]}
 
-    def claim_subscription_transfer(self, staging, submit_result):
-        self.subscription_claim_calls.append((dict(staging), dict(submit_result)))
+    def claim_subscription_transfer(self, staging, submit_result, completed_task=None):
+        self.subscription_claim_calls.append(
+            (dict(staging), dict(submit_result), dict(completed_task or {}))
+        )
         claimed = dict(staging)
         claimed.update({"received_names": ["120集全"], "claimed_at": int(time.time())})
         self.subscription_staging = dict(claimed)
@@ -398,7 +473,12 @@ class FakePipelineService:
         finally:
             with self._lock:
                 self.download_active -= 1
-        return {"info_hash": info_hash, "status_name": "success", "percent_done": 100}
+        return {
+            "info_hash": info_hash,
+            "name": "120集全",
+            "status_name": "success",
+            "percent_done": 100,
+        }
 
     def cancel_task(self, category, info_hash):
         self.cancel_calls.append((category, info_hash))
@@ -1291,6 +1371,51 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             subscription_source_block_key("https://115.com/s/swhsc313zrk?password=second"),
         )
 
+    def test_subscription_source_block_key_normalizes_magnet_trackers(self):
+        first = "magnet:?xt=urn:btih:ABCDEF&tr=https%3A%2F%2Ftracker-one.invalid"
+        second = "magnet:?tr=https%3A%2F%2Ftracker-two.invalid&xt=urn:btih:abcdef"
+
+        self.assertEqual(subscription_source_block_key(first), subscription_source_block_key(second))
+
+    def test_subscription_search_excludes_blocked_source_and_returns_an_alternative(self):
+        service, store, _manager, application = self.build_components()
+        blocked_uri = "magnet:?xt=urn:btih:BLOCKED"
+        alternative_uri = "magnet:?xt=urn:btih:ALTERNATIVE"
+        requested_limits = []
+
+        def search(_query, _category, limit=20):
+            requested_limits.append(limit)
+            return ResultList(
+                [
+                    {"title": "已拉黑资源", "download_uri": blocked_uri, "rank": 1},
+                    {"title": "可用单集", "download_uri": alternative_uri, "rank": 2},
+                ],
+                metadata={"provider_total": 2},
+            )
+
+        service.search = search
+        store.block_subscription_source(
+            subscription_source_block_key(blocked_uri),
+            reason="offline_failed",
+            origin_import_id="failed-import",
+        )
+
+        response = application.search(
+            {
+                "owner_id": "owner-a",
+                "query": "凡人修仙传 115",
+                "category": "anime",
+                "source": "default",
+                "limit": 1,
+                "subscription_follow": True,
+            }
+        )
+
+        self.assertEqual(requested_limits, [200])
+        self.assertEqual([item["title"] for item in response["items"]], ["可用单集"])
+        self.assertEqual(response["metadata"]["blocked_count"], 1)
+        self.assertEqual(response["metadata"]["provider_total"], 2)
+
     def payload(self, application, service, existing=None, reserved=None):
         session_id, candidate_id, _ = self.search_candidate(
             application,
@@ -1440,7 +1565,57 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertIsNone(store.get_subscription_source_block(source_key))
         self.assertEqual(service.subscription_cleanup_calls, [])
 
-    def test_unknown_video_is_rejected_and_keeps_staging(self):
+    def test_failed_offline_task_cleans_staging_and_blocks_the_magnet(self):
+        service = FakePipelineService(download_delay=0.01)
+        service, store, manager, application = self.build_components(service)
+
+        def failed_status(category, info_hash):
+            service.task_status_calls.append((category, info_hash))
+            return {
+                "info_hash": info_hash,
+                "name": "凡人修仙传.115",
+                "status_name": "failed",
+                "percent_done": 0,
+            }
+
+        service.task_status = failed_status
+        payload = self.payload(application, service)
+        task, _ = manager.create_import("owner-a", "fanren-offline-failed", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "failed")
+        audit = completed["result"]["subscription_follow"]
+        self.assertEqual(audit["outcome"], "source_unavailable")
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
+        self.assertEqual(store.get_subscription_source_block(source_key)["reason"], "offline_failed")
+
+    def test_offline_status_network_failure_is_not_blocked_or_cleaned(self):
+        service = FakePipelineService(download_delay=0.01)
+        service, store, manager, application = self.build_components(service)
+
+        def failed_status(_category, _info_hash):
+            raise RuntimeError("115 offline task list failed: connection timed out")
+
+        service.task_status = failed_status
+        payload = self.payload(application, service)
+        task, _ = manager.create_import("owner-a", "fanren-offline-network", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "failed")
+        source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
+        self.assertIsNone(store.get_subscription_source_block(source_key))
+        self.assertEqual(service.subscription_cleanup_calls, [])
+
+    def test_unknown_video_is_rejected_cleaned_and_blocked(self):
         service, store, manager, application = self.build_components()
         service.subscription_entries = [{"fid": "unknown", "fn": "final-video.mkv", "kind": "video"}]
         payload = self.payload(application, service)
@@ -1453,7 +1628,29 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
 
         self.assertEqual(completed["status"], "failed")
         self.assertEqual(completed["result"]["subscription_follow"]["outcome"], "rejected")
-        self.assertEqual(service.subscription_cleanup_calls, [])
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
+        self.assertEqual(store.get_subscription_source_block(source_key)["reason"], "invalid_episode_layout")
+
+    def test_duplicate_episode_videos_are_rejected_cleaned_and_blocked(self):
+        service, store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-a", "fn": "凡人修仙传.S01E115.1080p.mkv", "kind": "video", "episode": 115},
+            {"fid": "video-b", "fn": "凡人修仙传.S01E115.2160p.mkv", "kind": "video", "episode": 115},
+        ]
+        payload = self.payload(application, service)
+        task, _ = manager.create_import("owner-a", "fanren-duplicate-episode", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "failed")
+        self.assertEqual(completed["result"]["subscription_follow"]["outcome"], "rejected")
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
+        self.assertEqual(store.get_subscription_source_block(source_key)["reason"], "invalid_episode_layout")
 
     def test_scan_mismatch_keeps_staging(self):
         service, store, manager, application = self.build_components()
@@ -1612,7 +1809,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             "raw": {"data": {"items": [{"name": "120集全"}]}},
         }
 
-        def reject_claim(_staging, _submit_result):
+        def reject_claim(_staging, _submit_result, completed_task=None):
             raise RuntimeError("subscription receive root cannot be claimed: unexpected=未知目录")
 
         service.claim_subscription_transfer = reject_claim

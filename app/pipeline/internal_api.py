@@ -13,6 +13,7 @@ from pathlib import Path
 
 from pipeline.config import category_to_openlist_path
 from pipeline.client115 import parse_115_share_url
+from pipeline.dedupe import candidate_info_hash
 from pipeline.openlist_utils import normalize_openlist_path
 from pipeline.season_subtitles import SeasonSubtitleTaskManager
 from pipeline.subtitle_asr import DEFAULT_ASR_MODEL, SubtitleAsrProcessor
@@ -1556,6 +1557,34 @@ class ImportTaskManager:
                 }
             )
 
+            def persist_blocked_source(error, block_reason=None, outcome="source_unavailable"):
+                block_reason = block_reason or subscription_source_failure_block_reason(error)
+                if not block_reason:
+                    return False
+                audit["outcome"] = outcome
+                attempts[-1].update(
+                    {
+                        "outcome": outcome,
+                        "error": str(error),
+                        "finished_at": int(time.time()),
+                    }
+                )
+                result["subscription_follow"] = audit
+                self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash or None)
+                self.service.cleanup_subscription_staging(category, staging)
+                audit["staging_cleaned_at"] = int(time.time())
+                source_key = subscription_source_block_key(
+                    (request.get("candidate") or {}).get("download_uri")
+                )
+                audit["source_block"] = self.store.block_subscription_source(
+                    source_key,
+                    reason=block_reason,
+                    origin_import_id=task["id"],
+                )
+                result["subscription_follow"] = audit
+                self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash or None)
+                return True
+
             staging = dict(audit.get("staging") or {})
             if not staging.get("openlist_path") or not staging.get("receive_root_folder_id"):
                 staging = self.service.prepare_subscription_staging(
@@ -1582,54 +1611,65 @@ class ImportTaskManager:
                         result["subscription_follow"] = audit
                         self.store.save_running(task["id"], "staging", result=result, info_hash=info_hash or None)
                     else:
-                        submit_result = dict(result.get("submit") or {})
-                        if not submit_result:
-                            self.service.validate_subscription_receive_root(staging)
-                            self.store.save_running(task["id"], "submitting", result=result)
-                            try:
+                        try:
+                            submit_result = dict(result.get("submit") or {})
+                            if not submit_result:
+                                self.service.validate_subscription_receive_root(staging)
+                                self.store.save_running(task["id"], "submitting", result=result)
                                 submit_result = self.service.submit(
                                     category,
                                     request["candidate"]["download_uri"],
                                     target_folder_id=staging["receive_root_folder_id"],
                                 )
-                            except Exception as exc:
-                                block_reason = subscription_source_failure_block_reason(exc)
-                                if block_reason:
-                                    audit["outcome"] = "source_unavailable"
-                                    attempts[-1].update(
-                                        {
-                                            "outcome": "source_unavailable",
-                                            "error": str(exc),
-                                            "finished_at": int(time.time()),
-                                        }
-                                    )
-                                    result["subscription_follow"] = audit
-                                    self.store.save_running(task["id"], "cleanup", result=result)
-                                    self.service.cleanup_subscription_staging(category, staging)
-                                    audit["staging_cleaned_at"] = int(time.time())
-                                    source_key = subscription_source_block_key(
-                                        (request.get("candidate") or {}).get("download_uri")
-                                    )
-                                    audit["source_block"] = self.store.block_subscription_source(
-                                        source_key,
-                                        reason=block_reason,
-                                        origin_import_id=task["id"],
-                                    )
-                                    result["subscription_follow"] = audit
-                                    self.store.save_running(task["id"], "cleanup", result=result)
-                                raise
-                            info_hash = first_submit_info_hash(submit_result)
+                                info_hash = first_submit_info_hash(submit_result)
+                                if not info_hash:
+                                    raise RuntimeError("pipeline submit returned no info_hash")
+                                offline_task = task_from_submit_result(submit_result, info_hash)
+                                result.update({"submit": submit_result, "task": offline_task})
+                                self.store.save_running(
+                                    task["id"],
+                                    "received_unclaimed",
+                                    result=result,
+                                    info_hash=info_hash,
+                                )
+                            elif not info_hash:
+                                info_hash = first_submit_info_hash(submit_result)
                             if not info_hash:
                                 raise RuntimeError("pipeline submit returned no info_hash")
-                            offline_task = task_from_submit_result(submit_result, info_hash)
-                            result.update({"submit": submit_result, "task": offline_task})
-                            self.store.save_running(
-                                task["id"],
-                                "received_unclaimed",
-                                result=result,
-                                info_hash=info_hash,
+                            if not offline_task:
+                                offline_task = task_from_submit_result(submit_result, info_hash)
+                            while offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
+                                status_name = offline_task.get("status_name")
+                                if status_name in OFFLINE_FAILED_STATUSES:
+                                    raise RuntimeError("115 offline task ended with status: %s" % status_name)
+                                if status_name not in OFFLINE_ACTIVE_STATUSES:
+                                    raise RuntimeError(
+                                        "115 offline task returned invalid status: %s" % (status_name or "-")
+                                    )
+                                self._raise_if_stopping()
+                                self._raise_if_cancel_requested(
+                                    task["owner_id"], task["id"], category, info_hash
+                                )
+                                self.store.save_running(
+                                    task["id"], "waiting_download", result=result, info_hash=info_hash
+                                )
+                                offline_task = self.service.task_status(category, info_hash)
+                                if not isinstance(offline_task, dict):
+                                    raise RuntimeError("pipeline task_status returned invalid response")
+                                offline_task = dict(offline_task)
+                                offline_task.setdefault("info_hash", info_hash)
+                                result["task"] = offline_task
+                                self.store.save_running(
+                                    task["id"], "waiting_download", result=result, info_hash=info_hash
+                                )
+                                if offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
+                                    self._wait_or_stop()
+                            staging = self.service.claim_subscription_transfer(
+                                staging, submit_result, completed_task=offline_task
                             )
-                        staging = self.service.claim_subscription_transfer(staging, submit_result)
+                        except Exception as exc:
+                            persist_blocked_source(exc)
+                            raise
                         audit["staging"] = staging
                         result["subscription_follow"] = audit
                         self.store.save_running(task["id"], "staging", result=result, info_hash=info_hash)
@@ -1648,25 +1688,6 @@ class ImportTaskManager:
                 result["task"] = offline_task
                 self.store.save_running(task["id"], "submitted", result=result, info_hash=info_hash)
 
-            while offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
-                status_name = offline_task.get("status_name")
-                if status_name in OFFLINE_FAILED_STATUSES:
-                    raise RuntimeError("115 offline task ended with status: %s" % status_name)
-                if status_name not in OFFLINE_ACTIVE_STATUSES:
-                    raise RuntimeError("115 offline task returned invalid status: %s" % (status_name or "-"))
-                self._raise_if_stopping()
-                self._raise_if_cancel_requested(task["owner_id"], task["id"], category, info_hash)
-                self.store.save_running(task["id"], "waiting_download", result=result, info_hash=info_hash)
-                offline_task = self.service.task_status(category, info_hash)
-                if not isinstance(offline_task, dict):
-                    raise RuntimeError("pipeline task_status returned invalid response")
-                offline_task = dict(offline_task)
-                offline_task.setdefault("info_hash", info_hash)
-                result["task"] = offline_task
-                self.store.save_running(task["id"], "waiting_download", result=result, info_hash=info_hash)
-                if offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
-                    self._wait_or_stop()
-
             self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
             staging_state = self.service.inspect_subscription_staging(category, staging, season)
             verified = {int(value) for value in staging_state.get("verified_episodes") or []}
@@ -1680,15 +1701,13 @@ class ImportTaskManager:
             selected = verified - existing - reserved
             audit["selected_episodes"] = sorted(selected)
             if audit["unknown_videos"]:
-                audit["outcome"] = "rejected"
-                result["subscription_follow"] = audit
-                self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
-                raise RuntimeError("OpenList staging contains unrecognized video names")
+                error = RuntimeError("OpenList staging contains unrecognized video names")
+                persist_blocked_source(error, block_reason="invalid_episode_layout", outcome="rejected")
+                raise error
             if audit["duplicate_episodes"]:
-                audit["outcome"] = "rejected"
-                result["subscription_follow"] = audit
-                self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
-                raise RuntimeError("OpenList staging contains multiple videos for one episode")
+                error = RuntimeError("OpenList staging contains multiple videos for one episode")
+                persist_blocked_source(error, block_reason="invalid_episode_layout", outcome="rejected")
+                raise error
             if not selected:
                 audit["outcome"] = "no_new_episodes"
                 attempts[-1].update({"outcome": "no_new_episodes", "finished_at": int(time.time())})
@@ -2114,6 +2133,9 @@ class InternalApiApplication:
             raise ApiError(400, "invalid_limit", "limit must be an integer")
         if limit < 1 or limit > 200:
             raise ApiError(400, "invalid_limit", "limit must be between 1 and 200")
+        subscription_follow = optional_bool(
+            payload.get("subscription_follow"), "subscription_follow", default=False
+        )
         try:
             capabilities = self.service.search_capabilities()
         except Exception as exc:
@@ -2121,13 +2143,14 @@ class InternalApiApplication:
         if not isinstance(capabilities, dict):
             raise ApiError(502, "capability_check_failed", "pipeline capabilities returned invalid response")
         error_details = {"capabilities": capabilities}
+        search_limit = 200 if subscription_follow else limit
         try:
             if source == "pansou":
-                result = self.service.search_pansou(query, limit=limit)
+                result = self.service.search_pansou(query, limit=search_limit)
             elif source == "bt4g":
-                result = self.service.search_bt4g(query, limit=limit)
+                result = self.service.search_bt4g(query, limit=search_limit)
             else:
-                result = self.service.search(query, category, limit=limit)
+                result = self.service.search(query, category, limit=search_limit)
         except ApiError as exc:
             exc.details.setdefault("capabilities", capabilities)
             raise
@@ -2139,11 +2162,23 @@ class InternalApiApplication:
             if not isinstance(item, dict):
                 raise ApiError(502, "search_failed", "pipeline search returned an invalid candidate", error_details)
         metadata = dict(getattr(result, "metadata", {}) or {})
+        blocked_count = 0
+        if subscription_follow:
+            available = []
+            for item in result:
+                source_key = subscription_source_block_key(item.get("download_uri"))
+                if self.store.get_subscription_source_block(source_key) is not None:
+                    blocked_count += 1
+                    continue
+                available.append(item)
+            result = available[:limit]
         metadata.update(
             {
                 "source": source,
                 "category": category,
                 "selected_count": len(result),
+                "blocked_count": blocked_count,
+                "subscription_follow": subscription_follow,
                 "capabilities": capabilities,
             }
         )
@@ -2703,6 +2738,9 @@ def subscription_source_block_key(download_uri):
     parsed = parse_115_share_url(uri)
     if parsed is not None:
         return "115-share:%s:%s" % (parsed.share_code.casefold(), str(parsed.pdir_fid or "0").strip() or "0")
+    info_hash = str(candidate_info_hash({"download_uri": uri}) or "").strip().casefold()
+    if info_hash:
+        return "info-hash:" + info_hash
     return "uri-sha256:" + hashlib.sha256(uri.encode("utf-8")).hexdigest()
 
 
@@ -2710,6 +2748,8 @@ def subscription_source_failure_block_reason(error):
     message = str(error or "").casefold()
     if any(marker in message for marker in ("链接已过期", "链接过期", "share expired", "link expired")):
         return "share_expired"
+    if "115 offline task ended with status: failed" in message:
+        return "offline_failed"
     return None
 
 

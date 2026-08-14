@@ -2051,13 +2051,13 @@ class PipelineBotService:
     def submit(self, category, download_uri, target_folder_id=None):
         if is_115_share_url(download_uri):
             return self._submit_115_share(category, download_uri, target_folder_id=target_folder_id)
-        if target_folder_id:
-            raise RuntimeError("115 temporary staging only supports 115 share resources")
         download_uri = self._resolve_download_uri(download_uri)
+        folder_id = str(target_folder_id or category_to_folder_id(category)).strip()
         result = summarize_submit(
-            self._call_115(category, lambda client: client.add_offline_urls([download_uri], category_to_folder_id(category)))
+            self._call_115(category, lambda client: client.add_offline_urls([download_uri], folder_id))
         )
         ensure_submit_result_has_task_identity(result, download_uri)
+        result["submit_kind"] = "115_offline"
         return result
 
     def _resolve_download_uri(self, download_uri):
@@ -2136,17 +2136,25 @@ class PipelineBotService:
         names = [openlist_item_name(item) for item in items]
         return {"receive_root_path": root_path, "entries": names}
 
-    def claim_subscription_transfer(self, staging, submit_result):
+    def claim_subscription_transfer(self, staging, submit_result, completed_task=None):
         client = self._build_openlist_client()
         root_path = subscription_receive_root_path(staging)
         task_path = subscription_staging_path(staging)
         received_names = subscription_received_names(submit_result)
+        if not received_names and (submit_result or {}).get("submit_kind") == "115_offline":
+            received_names = wait_openlist_offline_result_names(
+                client,
+                root_path,
+                (completed_task or {}).get("name"),
+                timeout_seconds=self.config.subscription_move_timeout_seconds,
+                poll_seconds=self.config.subscription_move_poll_seconds,
+            )
         if not received_names:
-            raise RuntimeError("115 share receive returned no top-level item names")
+            raise RuntimeError("115 transfer returned no top-level item names")
         if len(received_names) != len({name.casefold() for name in received_names}):
-            raise RuntimeError("115 share receive returned duplicate top-level item names")
+            raise RuntimeError("115 transfer returned duplicate top-level item names")
         if any(name == "追更任务" for name in received_names):
-            raise RuntimeError("115 share top-level item conflicts with reserved staging directory")
+            raise RuntimeError("115 transfer top-level item conflicts with reserved staging directory")
 
         root_items = wait_openlist_receive_root_entries(
             client,
@@ -3674,6 +3682,47 @@ def subscription_received_names(submit_result):
         if name:
             names.append(name)
     return names
+
+
+def wait_openlist_offline_result_names(
+    client,
+    root_path,
+    task_name,
+    timeout_seconds=300,
+    poll_seconds=1,
+    wait_fn=time.sleep,
+    monotonic_fn=time.monotonic,
+):
+    expected_name = str(task_name or "").strip()
+    if not expected_name:
+        raise RuntimeError("115 offline task returned no result name")
+    deadline = monotonic_fn() + max(0.0, float(timeout_seconds or 0))
+    while True:
+        try:
+            items = client.list_all(root_path, refresh=True)
+        except RuntimeError as exc:
+            if not openlist_receive_operation_is_retryable_error(exc):
+                raise
+            items = []
+        unclaimed = [item for item in items if openlist_item_name(item) != "追更任务"]
+        names = [openlist_item_name(item) for item in unclaimed]
+        if len(names) > 1:
+            raise RuntimeError(
+                "subscription receive root contains multiple offline results: %s" % ", ".join(sorted(names))
+            )
+        if len(names) == 1:
+            if names[0].casefold() != expected_name.casefold():
+                raise RuntimeError(
+                    "115 offline result name does not match task: expected=%s actual=%s"
+                    % (expected_name, names[0])
+                )
+            return names
+        if monotonic_fn() >= deadline:
+            raise RuntimeError(
+                "115 offline result did not appear in OpenList within %.1f seconds: %s"
+                % (max(0.0, float(timeout_seconds or 0)), expected_name)
+            )
+        wait_fn(max(0.01, float(poll_seconds or 0)))
 
 
 def openlist_response_is_dir(response):

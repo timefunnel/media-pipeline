@@ -4767,8 +4767,29 @@ class PipelineBotServiceTest(unittest.TestCase):
         result = service.submit("movie", "magnet:?xt=urn:btih:ABC")
 
         self.assertEqual(service.fake_115.urls, ["magnet:?xt=urn:btih:ABC"])
+        self.assertEqual(service.fake_115.folder_id, category_to_folder_id("movie"))
         self.assertEqual(result["tasks"][0]["info_hash"], "ABC")
+        self.assertEqual(result["submit_kind"], "115_offline")
         self.assertNotIn("task_status", result)
+
+    def test_submit_uses_subscription_staging_folder_for_115_offline(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class SubmitService(PipelineBotService):
+            def _call_115(self, category, callback):
+                self.fake_115 = Fake115SubmitClient({"state": True, "data": [{"info_hash": "ABC"}]})
+                return callback(self.fake_115)
+
+        service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
+
+        result = service.submit(
+            "anime",
+            "magnet:?xt=urn:btih:ABC",
+            target_folder_id="temporary-root-cid",
+        )
+
+        self.assertEqual(service.fake_115.folder_id, "temporary-root-cid")
+        self.assertEqual(result["submit_kind"], "115_offline")
 
     def test_submit_fills_task_identity_from_magnet_when_115_omits_data(self):
         from pipeline.bot import BotConfig, PipelineBotService
