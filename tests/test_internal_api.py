@@ -169,6 +169,7 @@ class FakePipelineService:
         self.upgrade_target_calls = []
         self.upgrade_duplicate_match_calls = []
         self.upgrade_remove_calls = []
+        self.submit_error = None
         self._sequence = 0
         self._lock = threading.Lock()
         self.active = 0
@@ -255,6 +256,8 @@ class FakePipelineService:
         }
 
     def submit(self, category, download_uri, target_folder_id=None):
+        if self.submit_error is not None:
+            raise self.submit_error
         with self._lock:
             self._sequence += 1
             info_hash = "HASH%03d" % self._sequence
@@ -1400,6 +1403,42 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
         self.assertIsNone(store.get_subscription_source_block(source_key))
         self.assertEqual(manager.retry_import("owner-a", completed["id"])["status"], "queued")
+
+    def test_expired_share_cleans_staging_and_blocks_the_source(self):
+        service, store, manager, application = self.build_components()
+        service.submit_error = RuntimeError("115 share receive failed: 链接已过期")
+        payload = self.payload(application, service)
+        task, _ = manager.create_import("owner-a", "fanren-expired-share", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "failed")
+        audit = completed["result"]["subscription_follow"]
+        self.assertEqual(audit["outcome"], "source_unavailable")
+        self.assertIsInstance(audit["staging_cleaned_at"], int)
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
+        block = store.get_subscription_source_block(source_key)
+        self.assertEqual(block["reason"], "share_expired")
+
+    def test_transient_share_failure_does_not_block_source(self):
+        service, store, manager, application = self.build_components()
+        service.submit_error = RuntimeError("115 share receive failed: connection timed out")
+        payload = self.payload(application, service)
+        task, _ = manager.create_import("owner-a", "fanren-transient-share", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "failed")
+        source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
+        self.assertIsNone(store.get_subscription_source_block(source_key))
+        self.assertEqual(service.subscription_cleanup_calls, [])
 
     def test_unknown_video_is_rejected_and_keeps_staging(self):
         service, store, manager, application = self.build_components()

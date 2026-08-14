@@ -1208,7 +1208,7 @@ class ImportTaskManager:
             raise ApiError(
                 409,
                 "subscription_source_blocked",
-                "订阅资源已拉黑：此前确认不含新增视频",
+                "订阅资源已拉黑：此前已确认不可用或不含新增视频",
                 details={"reason": block.get("reason"), "origin_import_id": block.get("origin_import_id")},
             )
 
@@ -1586,11 +1586,38 @@ class ImportTaskManager:
                         if not submit_result:
                             self.service.validate_subscription_receive_root(staging)
                             self.store.save_running(task["id"], "submitting", result=result)
-                            submit_result = self.service.submit(
-                                category,
-                                request["candidate"]["download_uri"],
-                                target_folder_id=staging["receive_root_folder_id"],
-                            )
+                            try:
+                                submit_result = self.service.submit(
+                                    category,
+                                    request["candidate"]["download_uri"],
+                                    target_folder_id=staging["receive_root_folder_id"],
+                                )
+                            except Exception as exc:
+                                block_reason = subscription_source_failure_block_reason(exc)
+                                if block_reason:
+                                    audit["outcome"] = "source_unavailable"
+                                    attempts[-1].update(
+                                        {
+                                            "outcome": "source_unavailable",
+                                            "error": str(exc),
+                                            "finished_at": int(time.time()),
+                                        }
+                                    )
+                                    result["subscription_follow"] = audit
+                                    self.store.save_running(task["id"], "cleanup", result=result)
+                                    self.service.cleanup_subscription_staging(category, staging)
+                                    audit["staging_cleaned_at"] = int(time.time())
+                                    source_key = subscription_source_block_key(
+                                        (request.get("candidate") or {}).get("download_uri")
+                                    )
+                                    audit["source_block"] = self.store.block_subscription_source(
+                                        source_key,
+                                        reason=block_reason,
+                                        origin_import_id=task["id"],
+                                    )
+                                    result["subscription_follow"] = audit
+                                    self.store.save_running(task["id"], "cleanup", result=result)
+                                raise
                             info_hash = first_submit_info_hash(submit_result)
                             if not info_hash:
                                 raise RuntimeError("pipeline submit returned no info_hash")
@@ -2677,6 +2704,13 @@ def subscription_source_block_key(download_uri):
     if parsed is not None:
         return "115-share:%s:%s" % (parsed.share_code.casefold(), str(parsed.pdir_fid or "0").strip() or "0")
     return "uri-sha256:" + hashlib.sha256(uri.encode("utf-8")).hexdigest()
+
+
+def subscription_source_failure_block_reason(error):
+    message = str(error or "").casefold()
+    if any(marker in message for marker in ("链接已过期", "链接过期", "share expired", "link expired")):
+        return "share_expired"
+    return None
 
 
 def normalize_subscription_follow(payload, category, target, force_duplicate, upgrade_media_id):
