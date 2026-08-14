@@ -1563,7 +1563,50 @@ class SubscriptionPromotionTest(unittest.TestCase):
         self.assertEqual(staging["receive_root_folder_id"], "temporary-root-cid")
         self.assertEqual(staging["receive_root_path"], "/115/临时")
         self.assertTrue(staging["openlist_path"].startswith("/115/临时/追更任务/凡人修仙传/"))
-        self.assertEqual(client.created, [staging["openlist_path"]])
+        self.assertEqual(len(client.created), 3)
+        self.assertEqual(client.created[-1], staging["openlist_path"])
+
+    def test_prepare_subscription_staging_creates_missing_ancestors_one_level_at_a_time(self):
+        root = "/115/temp"
+        reserved = "\u8ffd\u66f4\u4efb\u52a1"
+        service = PipelineBotService(
+            BotConfig(token="token", allowed_user_ids={1}, subscription_staging_root=root, subscription_staging_folder_id="root-cid")
+        )
+
+        class FakeOpenList:
+            def __init__(self):
+                self.directories = {root}
+                self.children = {root: []}
+                self.created = []
+
+            def list_all(self, path, refresh=False):
+                return [{"name": name, "is_dir": True} for name in self.children[path]]
+
+            def mkdir_path(self, path):
+                parent, name = path.rsplit("/", 1)
+                if parent not in self.directories:
+                    raise AssertionError("mkdir called before its parent exists: %s" % path)
+                self.directories.add(path)
+                self.children[path] = []
+                self.children[parent].append(name)
+                self.created.append(path)
+
+            def get_path(self, path):
+                if path not in self.directories:
+                    raise AssertionError("expected directory was not created: %s" % path)
+                return {"code": 200, "data": {"is_dir": True}}
+
+        client = FakeOpenList()
+        service._build_openlist_client = lambda: client
+        staging = service.prepare_subscription_staging("anime", "import-1", "show")
+
+        expected = [
+            root + "/" + reserved,
+            root + "/" + reserved + "/show",
+            root + "/" + reserved + "/show/import-1",
+        ]
+        self.assertEqual(client.created, expected)
+        self.assertEqual(staging["openlist_path"], expected[-1])
 
     def test_staging_inspection_and_cleanup_use_only_openlist_paths(self):
         service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))

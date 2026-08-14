@@ -2118,7 +2118,7 @@ class PipelineBotService:
         if not openlist_response_is_dir(root):
             raise RuntimeError("OpenList subscription staging root is not a directory")
         validate_subscription_root_entries(client.list_all(receive_root_path, refresh=True))
-        client.mkdir_path(staging_path)
+        ensure_openlist_directory_tree(client, receive_root_path, staging_path)
         task = client.get_path(staging_path)
         if not openlist_response_is_dir(task):
             raise RuntimeError("OpenList subscription staging path is not a directory")
@@ -3668,6 +3668,41 @@ def openlist_response_is_dir(response):
     data = (response or {}).get("data") or {}
     return bool(data.get("is_dir"))
 
+
+def ensure_openlist_directory_tree(client, root_path, target_path):
+    root = normalize_openlist_path(root_path)
+    target = normalize_openlist_path(target_path)
+    if not root or not target:
+        raise RuntimeError("OpenList directory paths must not be empty")
+    if target == root:
+        return root
+    prefix = root.rstrip("/") + "/"
+    if not target.startswith(prefix):
+        raise RuntimeError("OpenList target directory is outside the staging root")
+    components = [component for component in target[len(prefix) :].split("/") if component]
+    if not components:
+        raise RuntimeError("OpenList target directory path is invalid")
+
+    current = root
+    for component in components:
+        next_path = posixpath.join(current, component)
+        matches = [
+            item
+            for item in client.list_all(current, refresh=False)
+            if openlist_item_name(item) == component
+        ]
+        if len(matches) > 1:
+            raise RuntimeError("OpenList staging directory has duplicate entries: %s" % next_path)
+        if matches:
+            if not openlist_item_is_dir(matches[0]):
+                raise RuntimeError("OpenList staging path is not a directory: %s" % next_path)
+        else:
+            client.mkdir_path(next_path)
+            created = client.get_path(next_path)
+            if not openlist_response_is_dir(created):
+                raise RuntimeError("OpenList did not create a directory: %s" % next_path)
+        current = next_path
+    return current
 
 def validate_subscription_root_entries(items):
     items = list(items or [])
