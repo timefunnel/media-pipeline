@@ -21,7 +21,7 @@ for category in ("movie", "tv", "anime", "adult", "other"):
     os.environ.setdefault(prefix + "_MSG_ROOT_ID", "test-%s-root" % category)
 
 from pipeline.bot import BotConfig, PipelineBotService
-from pipeline.bot import parse_follow_episode, wait_openlist_receive_move
+from pipeline.bot import parse_follow_episode, wait_openlist_receive_move, wait_openlist_receive_root_entries
 from pipeline.config import category_to_folder_id, category_to_openlist_path
 from pipeline.internal_api import (
     ApiError,
@@ -83,6 +83,46 @@ class OpenListReceiveMoveWaitTest(unittest.TestCase):
         client = FakeOpenList()
         with self.assertRaisesRegex(RuntimeError, "permission denied"):
             wait_openlist_receive_move(client, "/115/temp", "/115/temp/staging", ["received-folder"])
+        self.assertEqual(client.calls, 1)
+
+    def test_retries_receive_root_read_timeout_until_listing_succeeds(self):
+        class FakeOpenList:
+            def __init__(self):
+                self.calls = 0
+
+            def list_all(self, path, refresh=False):
+                self.calls += 1
+                if path != "/115/temp":
+                    raise AssertionError("unexpected receive root path")
+                if not refresh:
+                    raise AssertionError("receive root listing must refresh")
+                if self.calls == 1:
+                    raise RuntimeError("OpenList request failed: The read operation timed out")
+                return [{"name": "received-folder"}]
+
+        client = FakeOpenList()
+        entries = wait_openlist_receive_root_entries(
+            client,
+            "/115/temp",
+            timeout_seconds=1,
+            poll_seconds=0,
+            wait_fn=lambda _seconds: None,
+        )
+        self.assertEqual(entries, [{"name": "received-folder"}])
+        self.assertEqual(client.calls, 2)
+
+    def test_does_not_retry_other_receive_root_listing_failures(self):
+        class FakeOpenList:
+            def __init__(self):
+                self.calls = 0
+
+            def list_all(self, _path, refresh=False):
+                self.calls += 1
+                raise RuntimeError("OpenList list failed: permission denied")
+
+        client = FakeOpenList()
+        with self.assertRaisesRegex(RuntimeError, "permission denied"):
+            wait_openlist_receive_root_entries(client, "/115/temp")
         self.assertEqual(client.calls, 1)
 
 

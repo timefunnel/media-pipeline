@@ -2148,7 +2148,12 @@ class PipelineBotService:
         if any(name == "追更任务" for name in received_names):
             raise RuntimeError("115 share top-level item conflicts with reserved staging directory")
 
-        root_items = client.list_all(root_path, refresh=True)
+        root_items = wait_openlist_receive_root_entries(
+            client,
+            root_path,
+            timeout_seconds=self.config.subscription_move_timeout_seconds,
+            poll_seconds=self.config.subscription_move_poll_seconds,
+        )
         root_counts = defaultdict(int)
         for item in root_items:
             root_counts[openlist_item_name(item).casefold()] += 1
@@ -3727,8 +3732,52 @@ def validate_subscription_root_entries(items):
 
 
 
-def openlist_receive_move_is_pending_error(exc):
-    return bool(re.search(r"\b990007\b", str(exc or "")))
+def openlist_receive_operation_is_retryable_error(exc):
+    text = str(exc or "")
+    if re.search(r"\b990007\b", text):
+        return True
+    return text.casefold().startswith("openlist request failed:") and "timed out" in text.casefold()
+
+
+def wait_openlist_receive_operation(
+    operation,
+    timeout_seconds=300,
+    poll_seconds=1,
+    wait_fn=time.sleep,
+    monotonic_fn=time.monotonic,
+):
+    timeout = max(0.0, float(timeout_seconds or 0))
+    deadline = monotonic_fn() + timeout
+    last_error = None
+    while True:
+        try:
+            return operation()
+        except RuntimeError as exc:
+            if not openlist_receive_operation_is_retryable_error(exc):
+                raise
+            last_error = exc
+        if monotonic_fn() >= deadline:
+            raise RuntimeError(
+                "OpenList share receive did not become ready within %.1f seconds: %s" % (timeout, last_error)
+            ) from last_error
+        wait_fn(max(0.01, float(poll_seconds or 0)))
+
+
+def wait_openlist_receive_root_entries(
+    client,
+    root_path,
+    timeout_seconds=300,
+    poll_seconds=1,
+    wait_fn=time.sleep,
+    monotonic_fn=time.monotonic,
+):
+    return wait_openlist_receive_operation(
+        lambda: client.list_all(root_path, refresh=True),
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+        wait_fn=wait_fn,
+        monotonic_fn=monotonic_fn,
+    )
 
 
 def wait_openlist_receive_move(
@@ -3741,22 +3790,13 @@ def wait_openlist_receive_move(
     wait_fn=time.sleep,
     monotonic_fn=time.monotonic,
 ):
-    timeout = max(0.0, float(timeout_seconds or 0))
-    deadline = monotonic_fn() + timeout
-    last_error = None
-    while True:
-        try:
-            client.move_names(src_dir, dst_dir, names)
-            return
-        except RuntimeError as exc:
-            if not openlist_receive_move_is_pending_error(exc):
-                raise
-            last_error = exc
-        if monotonic_fn() >= deadline:
-            raise RuntimeError(
-                "OpenList share receive did not become movable within %.1f seconds: %s" % (timeout, last_error)
-            ) from last_error
-        wait_fn(max(0.01, float(poll_seconds or 0)))
+    return wait_openlist_receive_operation(
+        lambda: client.move_names(src_dir, dst_dir, names),
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+        wait_fn=wait_fn,
+        monotonic_fn=monotonic_fn,
+    )
 
 def wait_openlist_names_moved(client, src_dir, dst_dir, names, timeout_seconds=300, poll_seconds=1):
     expected_by_key = {
