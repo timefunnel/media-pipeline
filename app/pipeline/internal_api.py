@@ -22,6 +22,7 @@ from pipeline.telegram_ui import task_from_submit_result
 
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_SEARCH_TTL_SECONDS = 15 * 60
+DEFAULT_OFFLINE_WAIT_SLICE_SECONDS = 5 * 60
 MAX_JSON_BODY_BYTES = 1024 * 1024
 OFFLINE_ACTIVE_STATUSES = {"submitted", "allocating", "downloading", "unknown", None, ""}
 OFFLINE_SUCCESS_STATUS = "success"
@@ -58,6 +59,10 @@ class ApiError(RuntimeError):
 
 
 class WorkerStopping(RuntimeError):
+    pass
+
+
+class OfflineWaitDeferred(RuntimeError):
     pass
 
 
@@ -445,7 +450,14 @@ class InternalApiStore:
         try:
             conn.execute("begin immediate")
             rows = conn.execute(
-                "select * from internal_api_imports where status = 'queued' order by created_at, id"
+                """
+                select * from internal_api_imports
+                where status = 'queued'
+                order by
+                    case when stage = 'waiting_download' then 1 else 0 end,
+                    case when stage = 'waiting_download' then updated_at else created_at end,
+                    id
+                """
             ).fetchall()
             row = next((item for item in rows if item["owner_id"] not in blocked_owners), None)
             if row is None:
@@ -541,6 +553,29 @@ class InternalApiStore:
                 (now, import_id),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def defer_waiting_import(self, import_id):
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """
+                update internal_api_imports
+                set status = 'queued', stage = 'waiting_download',
+                    updated_at = ?, started_at = null
+                where id = ? and status = 'running' and stage = 'waiting_download'
+                """,
+                (now, import_id),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise RuntimeError("cannot defer import that is not waiting for 115 download: %s" % import_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -1090,12 +1125,21 @@ class InternalApiStore:
 
 
 class ImportTaskManager:
-    def __init__(self, service, store, workers=3, owner_workers=2, poll_seconds=2.0):
+    def __init__(
+        self,
+        service,
+        store,
+        workers=3,
+        owner_workers=2,
+        poll_seconds=2.0,
+        offline_wait_slice_seconds=DEFAULT_OFFLINE_WAIT_SLICE_SECONDS,
+    ):
         self.service = service
         self.store = store
         self.workers = max(1, int(workers))
         self.owner_workers = max(1, int(owner_workers))
         self.poll_seconds = max(0.01, float(poll_seconds))
+        self.offline_wait_slice_seconds = max(0.01, float(offline_wait_slice_seconds))
         self._condition = threading.Condition()
         self._stop_event = threading.Event()
         self._threads = []
@@ -1304,6 +1348,11 @@ class ImportTaskManager:
             owner_id = task["owner_id"]
             try:
                 self._execute_task(task)
+            except OfflineWaitDeferred:
+                self.store.defer_waiting_import(task["id"])
+                print(
+                    "internal API import %s deferred while waiting for 115 download" % task["id"], flush=True
+                )
             except WorkerStopping:
                 self.store.requeue_running_import(task["id"])
             except ImportCanceled as exc:
@@ -1381,6 +1430,7 @@ class ImportTaskManager:
             result.update({"submit": submit_result, "task": offline_task})
             self.store.save_running(task["id"], "submitted", result=result, info_hash=info_hash)
 
+        offline_wait_deadline = time.monotonic() + self.offline_wait_slice_seconds
         while offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
             status_name = offline_task.get("status_name")
             if status_name in OFFLINE_FAILED_STATUSES:
@@ -1398,6 +1448,8 @@ class ImportTaskManager:
             result["task"] = offline_task
             self.store.save_running(task["id"], "waiting_download", result=result, info_hash=info_hash)
             if offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
+                if time.monotonic() >= offline_wait_deadline:
+                    raise OfflineWaitDeferred()
                 self._wait_or_stop()
 
         target = request["target"]
@@ -1649,6 +1701,7 @@ class ImportTaskManager:
                                 raise RuntimeError("pipeline submit returned no info_hash")
                             if not offline_task:
                                 offline_task = task_from_submit_result(submit_result, info_hash)
+                            offline_wait_deadline = time.monotonic() + self.offline_wait_slice_seconds
                             while offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
                                 status_name = offline_task.get("status_name")
                                 if status_name in OFFLINE_FAILED_STATUSES:
@@ -1674,6 +1727,8 @@ class ImportTaskManager:
                                     task["id"], "waiting_download", result=result, info_hash=info_hash
                                 )
                                 if offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
+                                    if time.monotonic() >= offline_wait_deadline:
+                                        raise OfflineWaitDeferred()
                                     self._wait_or_stop()
                             staging = self.service.claim_subscription_transfer(
                                 staging, submit_result, completed_task=offline_task
@@ -2451,6 +2506,7 @@ class InternalApiServer:
         port=8765,
         workers=3,
         owner_workers=2,
+        offline_wait_slice_seconds=DEFAULT_OFFLINE_WAIT_SLICE_SECONDS,
         search_ttl_seconds=DEFAULT_SEARCH_TTL_SECONDS,
     ):
         self.token = require_text(token, "INTERNAL_API_TOKEN", max_length=1000)
@@ -2459,7 +2515,13 @@ class InternalApiServer:
         if self.port < 1 or self.port > 65535:
             raise ValueError("INTERNAL_API_PORT must be between 1 and 65535")
         self.store = InternalApiStore(db_path, search_ttl_seconds=search_ttl_seconds)
-        self.manager = ImportTaskManager(service, self.store, workers=workers, owner_workers=owner_workers)
+        self.manager = ImportTaskManager(
+            service,
+            self.store,
+            workers=workers,
+            owner_workers=owner_workers,
+            offline_wait_slice_seconds=offline_wait_slice_seconds,
+        )
         self.subtitle_asr_manager = SubtitleAsrTaskManager(
             SubtitleAsrProcessor(getattr(service, "config", None)),
             self.store,

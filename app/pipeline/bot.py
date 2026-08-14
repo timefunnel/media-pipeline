@@ -246,6 +246,7 @@ DEFAULT_TASK_MESSAGE_EDIT_MIN_INTERVAL_SECONDS = 2
 DEFAULT_INTERNAL_API_PORT = 8765
 DEFAULT_INTERNAL_API_WORKERS = 3
 DEFAULT_INTERNAL_API_OWNER_WORKERS = 2
+DEFAULT_INTERNAL_API_OFFLINE_WAIT_SLICE_SECONDS = 5 * 60
 DEFAULT_INTERNAL_API_SEARCH_TTL_SECONDS = 15 * 60
 CATEGORY_LABELS = {"movie": "电影库", "tv": "剧集库", "anime": "动漫库", "adult": "成人库", "other": "其他库"}
 CONTENT_PROFILE_LABELS = {
@@ -500,6 +501,7 @@ class BotConfig:
     internal_api_port: int = DEFAULT_INTERNAL_API_PORT
     internal_api_workers: int = DEFAULT_INTERNAL_API_WORKERS
     internal_api_owner_workers: int = DEFAULT_INTERNAL_API_OWNER_WORKERS
+    internal_api_offline_wait_slice_seconds: float = DEFAULT_INTERNAL_API_OFFLINE_WAIT_SLICE_SECONDS
     internal_api_search_ttl_seconds: int = DEFAULT_INTERNAL_API_SEARCH_TTL_SECONDS
 
     @classmethod
@@ -718,6 +720,15 @@ class BotConfig:
             internal_api_owner_workers=max(
                 1,
                 int(env.get("INTERNAL_API_OWNER_WORKERS", str(DEFAULT_INTERNAL_API_OWNER_WORKERS))),
+            ),
+            internal_api_offline_wait_slice_seconds=max(
+                0.01,
+                float(
+                    env.get(
+                        "INTERNAL_API_OFFLINE_WAIT_SLICE_SECONDS",
+                        str(DEFAULT_INTERNAL_API_OFFLINE_WAIT_SLICE_SECONDS),
+                    )
+                ),
             ),
             internal_api_search_ttl_seconds=max(
                 1,
@@ -8629,6 +8640,7 @@ def build_bot(config=None):
             port=config.internal_api_port,
             workers=config.internal_api_workers,
             owner_workers=config.internal_api_owner_workers,
+            offline_wait_slice_seconds=config.internal_api_offline_wait_slice_seconds,
             search_ttl_seconds=config.internal_api_search_ttl_seconds,
         )
     return TelegramBot(config, telegram, store, service, internal_api=internal_api)

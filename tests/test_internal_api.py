@@ -561,7 +561,14 @@ class InternalApiTestCase(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
-    def build_components(self, service=None, workers=3, owner_workers=2, poll_seconds=0.01):
+    def build_components(
+        self,
+        service=None,
+        workers=3,
+        owner_workers=2,
+        poll_seconds=0.01,
+        offline_wait_slice_seconds=300,
+    ):
         service = service or FakePipelineService()
         store = InternalApiStore(self.db_path)
         manager = ImportTaskManager(
@@ -570,6 +577,7 @@ class InternalApiTestCase(unittest.TestCase):
             workers=workers,
             owner_workers=owner_workers,
             poll_seconds=poll_seconds,
+            offline_wait_slice_seconds=offline_wait_slice_seconds,
         )
         application = InternalApiApplication(service, store, manager)
         return service, store, manager, application
@@ -621,6 +629,7 @@ class BotApiConfigTest(InternalApiTestCase):
                 "INTERNAL_API_PORT": "9876",
                 "INTERNAL_API_WORKERS": "3",
                 "INTERNAL_API_OWNER_WORKERS": "2",
+                "INTERNAL_API_OFFLINE_WAIT_SLICE_SECONDS": "120",
                 "INTERNAL_API_SEARCH_TTL_SECONDS": "900",
             }
         )
@@ -630,6 +639,7 @@ class BotApiConfigTest(InternalApiTestCase):
         self.assertEqual(config.internal_api_port, 9876)
         self.assertEqual(config.internal_api_workers, 3)
         self.assertEqual(config.internal_api_owner_workers, 2)
+        self.assertEqual(config.internal_api_offline_wait_slice_seconds, 120)
         self.assertEqual(config.internal_api_search_ttl_seconds, 900)
 
 
@@ -2132,6 +2142,68 @@ class ImportConcurrencyTest(InternalApiTestCase):
         payload = self.import_payload(session_id, candidate_id, target=target)
         payload["owner_id"] = owner
         return manager.create_import(owner, key, payload)[0]
+
+    def test_deferred_offline_wait_is_claimed_after_newer_normal_task(self):
+        service, store, manager, application = self.build_components(workers=1, owner_workers=1)
+        first = self.create_task(manager, application, "owner-a", "first", "first", {**TARGET, "root_id": "r1"})
+        second = self.create_task(manager, application, "owner-a", "second", "second", {**TARGET, "root_id": "r2"})
+
+        claimed = store.claim_next_import(set())
+        other_id = second["id"] if claimed["id"] == first["id"] else first["id"]
+        store.save_running(claimed["id"], "waiting_download")
+        store.defer_waiting_import(claimed["id"])
+
+        next_task = store.claim_next_import(set())
+        self.assertEqual(next_task["id"], other_id)
+        deferred = store.get_import("owner-a", claimed["id"])
+        self.assertEqual((deferred["status"], deferred["stage"]), ("queued", "waiting_download"))
+
+    def test_long_offline_wait_yields_worker_to_later_task(self):
+        class WaitingFirstService(FakePipelineService):
+            def task_status(self, category, info_hash):
+                self.task_status_calls.append((category, info_hash))
+                if info_hash == "HASH001":
+                    return {
+                        "info_hash": info_hash,
+                        "name": "slow",
+                        "status_name": "downloading",
+                        "percent_done": 25,
+                    }
+                return {
+                    "info_hash": info_hash,
+                    "name": "ready",
+                    "status_name": "success",
+                    "percent_done": 100,
+                }
+
+        service = WaitingFirstService(download_delay=0.001)
+        service, store, manager, application = self.build_components(
+            service,
+            workers=1,
+            owner_workers=1,
+            poll_seconds=0.005,
+            offline_wait_slice_seconds=0.02,
+        )
+        slow = self.create_task(manager, application, "owner-a", "slow", "slow", {**TARGET, "root_id": "r1"})
+        ready = self.create_task(manager, application, "owner-a", "ready", "ready", {**TARGET, "root_id": "r2"})
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("update internal_api_imports set created_at = 1 where id = ?", (slow["id"],))
+            conn.execute("update internal_api_imports set created_at = 2 where id = ?", (ready["id"],))
+            conn.commit()
+        finally:
+            conn.close()
+
+        manager.start()
+        try:
+            deadline = time.time() + 2
+            while len(service.submit_uris) < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(service.submit_uris), 2)
+            self.assertTrue(service.submit_uris[0].endswith("SLOW"))
+            self.assertTrue(service.submit_uris[1].endswith("READY"))
+        finally:
+            manager.stop()
 
     def test_global_and_owner_worker_limits(self):
         service = FakePipelineService(sync_delay=0.08)
