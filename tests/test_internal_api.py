@@ -29,6 +29,7 @@ from pipeline.internal_api import (
     InternalApiApplication,
     InternalApiServer,
     InternalApiStore,
+    subscription_source_block_key,
     upgrade_target_scrape_queries,
 )
 
@@ -187,6 +188,7 @@ class FakePipelineService:
         self.subscription_validate_root_calls = []
         self.subscription_claim_calls = []
         self.subscription_cleanup_calls = []
+        self.subscription_cleanup_error = None
         self.subscription_verify_result = None
         self.subscription_receive_active = 0
         self.subscription_receive_max_active = 0
@@ -353,6 +355,8 @@ class FakePipelineService:
 
     def cleanup_subscription_staging(self, category, staging):
         self.subscription_cleanup_calls.append((category, dict(staging)))
+        if self.subscription_cleanup_error is not None:
+            raise self.subscription_cleanup_error
 
     def check_duplicate(self, category, query, candidate, target=None):
         self.duplicate_calls.append((category, query, dict(candidate), dict(target or {})))
@@ -1278,6 +1282,12 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(parse_follow_episode("第120集.mp4", 1), 120)
         self.assertIsNone(parse_follow_episode("凡人修仙传.1080p.mkv", 1))
 
+    def test_subscription_source_block_key_uses_115_share_code_and_subdirectory(self):
+        self.assertEqual(
+            subscription_source_block_key("https://115.com/s/swhsc313zrk?password=first"),
+            subscription_source_block_key("https://115.com/s/swhsc313zrk?password=second"),
+        )
+
     def payload(self, application, service, existing=None, reserved=None):
         session_id, candidate_id, _ = self.search_candidate(
             application,
@@ -1335,7 +1345,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(service.subscription_cleanup_calls[0][1]["openlist_path"], audit["staging"]["openlist_path"])
         self.assertEqual(service.duplicate_calls, [])
 
-    def test_no_new_episodes_is_failed_business_result_and_keeps_staging(self):
+    def test_no_new_episodes_cleans_staging_and_blocks_the_source(self):
         service, store, manager, application = self.build_components()
         service.subscription_entries = [
             {"fid": "video-%03d" % episode, "fn": "凡人修仙传.S01E%03d.mkv" % episode, "kind": "video", "episode": episode}
@@ -1350,8 +1360,46 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             manager.stop()
 
         self.assertEqual(completed["status"], "failed")
-        self.assertEqual(completed["result"]["subscription_follow"]["outcome"], "no_new_episodes")
-        self.assertEqual(service.subscription_cleanup_calls, [])
+        audit = completed["result"]["subscription_follow"]
+        self.assertEqual(audit["outcome"], "no_new_episodes")
+        self.assertIsInstance(audit["staging_cleaned_at"], int)
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        self.assertEqual(service.subscription_cleanup_calls[0][0], "anime")
+        self.assertEqual(service.subscription_cleanup_calls[0][1]["openlist_path"], audit["staging"]["openlist_path"])
+        source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
+        block = store.get_subscription_source_block(source_key)
+        self.assertEqual(block["reason"], "no_new_episodes")
+        self.assertEqual(block["origin_import_id"], completed["id"])
+        with self.assertRaises(ApiError) as retry_blocked:
+            manager.retry_import("owner-a", completed["id"])
+        self.assertEqual(retry_blocked.exception.code, "subscription_source_blocked")
+        with self.assertRaises(ApiError) as create_blocked:
+            manager.create_import("owner-a", "fanren-no-new-second", payload)
+        self.assertEqual(create_blocked.exception.code, "subscription_source_blocked")
+
+    def test_no_new_episodes_does_not_block_source_when_staging_cleanup_fails(self):
+        service, store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-%03d" % episode, "fn": "凡人修仙传.S01E%03d.mkv", "kind": "video", "episode": episode}
+            for episode in range(1, 115)
+        ]
+        service.subscription_cleanup_error = RuntimeError("OpenList cleanup failed")
+        payload = self.payload(application, service)
+        task, _ = manager.create_import("owner-a", "fanren-no-new-cleanup-fails", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "failed")
+        audit = completed["result"]["subscription_follow"]
+        self.assertEqual(audit["outcome"], "no_new_episodes")
+        self.assertNotIn("staging_cleaned_at", audit)
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
+        self.assertIsNone(store.get_subscription_source_block(source_key))
+        self.assertEqual(manager.retry_import("owner-a", completed["id"])["status"], "queued")
 
     def test_unknown_video_is_rejected_and_keeps_staging(self):
         service, store, manager, application = self.build_components()

@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import json
 import sqlite3
@@ -11,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from pipeline.config import category_to_openlist_path
+from pipeline.client115 import parse_115_share_url
 from pipeline.openlist_utils import normalize_openlist_path
 from pipeline.season_subtitles import SeasonSubtitleTaskManager
 from pipeline.subtitle_asr import DEFAULT_ASR_MODEL, SubtitleAsrProcessor
@@ -152,6 +154,16 @@ class InternalApiStore:
                 """
                 create index if not exists idx_internal_api_imports_owner
                 on internal_api_imports(owner_id, updated_at)
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists internal_api_subscription_source_blocks (
+                    source_key text primary key,
+                    reason text not null,
+                    origin_import_id text not null,
+                    created_at integer not null
+                )
                 """
             )
             conn.execute(
@@ -387,6 +399,45 @@ class InternalApiStore:
         if row is None:
             raise ApiError(404, "import_not_found", "import task not found")
         return import_row(row)
+
+    def get_subscription_source_block(self, source_key):
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "select * from internal_api_subscription_source_blocks where source_key = ?",
+                (str(source_key or "").strip(),),
+            ).fetchone()
+        finally:
+            conn.close()
+        return dict(row) if row is not None else None
+
+    def block_subscription_source(self, source_key, reason, origin_import_id):
+        source_key = str(source_key or "").strip()
+        if not source_key:
+            raise ValueError("subscription source key missing")
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute("begin immediate")
+            conn.execute(
+                """
+                insert into internal_api_subscription_source_blocks
+                    (source_key, reason, origin_import_id, created_at)
+                values (?, ?, ?, ?)
+                on conflict(source_key) do nothing
+                """,
+                (source_key, str(reason or "").strip() or "blocked", str(origin_import_id or "").strip(), now),
+            )
+            row = conn.execute(
+                "select * from internal_api_subscription_source_blocks where source_key = ?", (source_key,)
+            ).fetchone()
+            conn.commit()
+            return dict(row)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def claim_next_import(self, blocked_owners):
         conn = self._connect()
@@ -1138,12 +1189,28 @@ class ImportTaskManager:
             "keep_old_version": keep_old_version,
             "subscription_follow": subscription_follow,
         }
-        if not subscription_follow:
+        if subscription_follow:
+            self._check_subscription_source_block(request)
+        else:
             self._check_duplicate(request)
         task, created = self.store.create_import(owner_id, idempotency_key, request)
         if created:
             self.notify()
         return task, created
+
+    def _check_subscription_source_block(self, request):
+        follow = request.get("subscription_follow")
+        if not follow:
+            return
+        source_key = subscription_source_block_key((request.get("candidate") or {}).get("download_uri"))
+        block = self.store.get_subscription_source_block(source_key)
+        if block is not None:
+            raise ApiError(
+                409,
+                "subscription_source_blocked",
+                "订阅资源已拉黑：此前确认不含新增视频",
+                details={"reason": block.get("reason"), "origin_import_id": block.get("origin_import_id")},
+            )
 
     def _check_duplicate(self, request):
         upgrade_media_id = str(request.get("upgrade_media_id") or "").strip()
@@ -1211,10 +1278,11 @@ class ImportTaskManager:
     def retry_import(self, owner_id, import_id):
         owner_id = require_text(owner_id, "owner_id", 200)
         current = self.store.get_import(owner_id, import_id)
-        if current["status"] in RETRYABLE_IMPORT_STATUSES and not current["request"].get("subscription_follow") and not (
-            current.get("msg_media_id") or result_task_is_offline_success(current.get("result"))
-        ):
-            self._check_duplicate(current["request"])
+        if current["status"] in RETRYABLE_IMPORT_STATUSES:
+            if current["request"].get("subscription_follow"):
+                self._check_subscription_source_block(current["request"])
+            elif not (current.get("msg_media_id") or result_task_is_offline_success(current.get("result"))):
+                self._check_duplicate(current["request"])
         task = self.store.retry_import(owner_id, import_id)
         self.notify()
         return task
@@ -1598,7 +1666,17 @@ class ImportTaskManager:
                 audit["outcome"] = "no_new_episodes"
                 attempts[-1].update({"outcome": "no_new_episodes", "finished_at": int(time.time())})
                 result["subscription_follow"] = audit
-                self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
+                self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash)
+                self.service.cleanup_subscription_staging(category, staging)
+                audit["staging_cleaned_at"] = int(time.time())
+                source_key = subscription_source_block_key((request.get("candidate") or {}).get("download_uri"))
+                audit["source_block"] = self.store.block_subscription_source(
+                    source_key,
+                    reason="no_new_episodes",
+                    origin_import_id=task["id"],
+                )
+                result["subscription_follow"] = audit
+                self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash)
                 raise RuntimeError("OpenList staging contains no new episodes")
 
             plan = self.service.plan_subscription_promotion(staging_state, selected, season)
@@ -2589,6 +2667,16 @@ def normalize_target(payload):
     if not target["root_openlist_path"].startswith("/"):
         raise ApiError(400, "invalid_root_openlist_path", "root_openlist_path must be absolute")
     return target
+
+
+def subscription_source_block_key(download_uri):
+    uri = str(download_uri or "").strip()
+    if not uri:
+        raise ValueError("subscription source uri missing")
+    parsed = parse_115_share_url(uri)
+    if parsed is not None:
+        return "115-share:%s:%s" % (parsed.share_code.casefold(), str(parsed.pdir_fid or "0").strip() or "0")
+    return "uri-sha256:" + hashlib.sha256(uri.encode("utf-8")).hexdigest()
 
 
 def normalize_subscription_follow(payload, category, target, force_duplicate, upgrade_media_id):
