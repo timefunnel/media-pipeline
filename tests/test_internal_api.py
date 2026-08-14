@@ -21,7 +21,7 @@ for category in ("movie", "tv", "anime", "adult", "other"):
     os.environ.setdefault(prefix + "_MSG_ROOT_ID", "test-%s-root" % category)
 
 from pipeline.bot import BotConfig, PipelineBotService
-from pipeline.bot import parse_follow_episode
+from pipeline.bot import parse_follow_episode, wait_openlist_receive_move
 from pipeline.config import category_to_folder_id, category_to_openlist_path
 from pipeline.internal_api import (
     ApiError,
@@ -46,6 +46,44 @@ def target_for(category, **updates):
     target = {**TARGET, "root_openlist_path": category_to_openlist_path(category)}
     target.update(updates)
     return target
+
+
+class OpenListReceiveMoveWaitTest(unittest.TestCase):
+    def test_retries_only_the_receive_pending_error_until_move_succeeds(self):
+        class FakeOpenList:
+            def __init__(self):
+                self.calls = 0
+
+            def move_names(self, src_dir, dst_dir, names):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("OpenList move failed: code: 990007, message: receive still running")
+
+        client = FakeOpenList()
+        wait_openlist_receive_move(
+            client,
+            "/115/temp",
+            "/115/temp/staging",
+            ["received-folder"],
+            timeout_seconds=1,
+            poll_seconds=0,
+            wait_fn=lambda _seconds: None,
+        )
+        self.assertEqual(client.calls, 2)
+
+    def test_does_not_retry_other_move_failures(self):
+        class FakeOpenList:
+            def __init__(self):
+                self.calls = 0
+
+            def move_names(self, src_dir, dst_dir, names):
+                self.calls += 1
+                raise RuntimeError("OpenList move failed: permission denied")
+
+        client = FakeOpenList()
+        with self.assertRaisesRegex(RuntimeError, "permission denied"):
+            wait_openlist_receive_move(client, "/115/temp", "/115/temp/staging", ["received-folder"])
+        self.assertEqual(client.calls, 1)
 
 
 class ResultList(list):
@@ -1393,6 +1431,44 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(service.submit_uris, [])
         self.assertEqual(len(service.subscription_claim_calls), 1)
+
+    def test_retry_preserves_received_subscription_share_without_resubmitting(self):
+        service, store, manager, application = self.build_components()
+        task, _ = manager.create_import("owner-a", "fanren-retry-unclaimed", self.payload(application, service))
+        staging = {
+            "receive_root_folder_id": "temporary-root-cid",
+            "receive_root_path": "/115/temp",
+            "openlist_path": "/115/temp/staging/retry-task",
+        }
+        submit_result = {
+            "task_status": {"info_hash": "share:abc", "status_name": "success"},
+            "raw": {"data": {"items": [{"name": "received-folder"}]}},
+        }
+        result = {
+            "submit": submit_result,
+            "task": {"info_hash": "share:abc", "status_name": "success"},
+            "subscription_follow": {"staging": staging},
+        }
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                update internal_api_imports
+                set status = 'failed', stage = 'failed', result_json = ?, error = ?, info_hash = ?
+                where id = ?
+                """,
+                (json.dumps(result), "OpenList move failed: code: 990007", "share:abc", task["id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        retried = manager.retry_import("owner-a", task["id"])
+
+        self.assertEqual(retried["status"], "queued")
+        self.assertEqual(retried["info_hash"], "share:abc")
+        self.assertEqual(retried["result"]["submit"], submit_result)
+        self.assertEqual(retried["result"]["subscription_follow"]["staging"], staging)
 
     def test_received_share_with_unknown_root_item_fails_without_resubmitting(self):
         service, store, manager, application = self.build_components()

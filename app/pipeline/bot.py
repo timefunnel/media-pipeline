@@ -2167,7 +2167,14 @@ class PipelineBotService:
                 details.append("missing_or_ambiguous=" + ", ".join(ambiguous))
             raise RuntimeError("subscription receive root cannot be claimed: %s" % "; ".join(details))
 
-        client.move_names(root_path, task_path, received_names)
+        wait_openlist_receive_move(
+            client,
+            root_path,
+            task_path,
+            received_names,
+            timeout_seconds=self.config.subscription_move_timeout_seconds,
+            poll_seconds=self.config.subscription_move_poll_seconds,
+        )
         wait_openlist_names_moved(
             client,
             root_path,
@@ -3718,6 +3725,38 @@ def validate_subscription_root_entries(items):
     if reserved and not openlist_item_is_dir(reserved[0]):
         raise RuntimeError("subscription receive root reserved entry is not a directory")
 
+
+
+def openlist_receive_move_is_pending_error(exc):
+    return bool(re.search(r"\b990007\b", str(exc or "")))
+
+
+def wait_openlist_receive_move(
+    client,
+    src_dir,
+    dst_dir,
+    names,
+    timeout_seconds=300,
+    poll_seconds=1,
+    wait_fn=time.sleep,
+    monotonic_fn=time.monotonic,
+):
+    timeout = max(0.0, float(timeout_seconds or 0))
+    deadline = monotonic_fn() + timeout
+    last_error = None
+    while True:
+        try:
+            client.move_names(src_dir, dst_dir, names)
+            return
+        except RuntimeError as exc:
+            if not openlist_receive_move_is_pending_error(exc):
+                raise
+            last_error = exc
+        if monotonic_fn() >= deadline:
+            raise RuntimeError(
+                "OpenList share receive did not become movable within %.1f seconds: %s" % (timeout, last_error)
+            ) from last_error
+        wait_fn(max(0.01, float(poll_seconds or 0)))
 
 def wait_openlist_names_moved(client, src_dir, dst_dir, names, timeout_seconds=300, poll_seconds=1):
     expected_by_key = {
