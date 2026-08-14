@@ -2201,7 +2201,7 @@ class PipelineBotService:
         claimed["claimed_at"] = int(time.time())
         return claimed
 
-    def inspect_subscription_staging(self, category, staging, season):
+    def inspect_subscription_staging(self, category, staging, season, expected_episodes=None):
         client = self._build_openlist_client()
         staging_path = subscription_staging_path(staging)
         entries = list_openlist_descendants(client, staging_path)
@@ -2215,7 +2215,7 @@ class PipelineBotService:
             name = openlist_item_name(item)
             if not is_video_filename(name):
                 continue
-            episode = parse_follow_episode(name, season)
+            episode = parse_follow_episode(name, season, expected_episodes)
             if episode is None:
                 unknown.append(name)
                 continue
@@ -2241,7 +2241,7 @@ class PipelineBotService:
             if openlist_item_is_dir(item):
                 continue
             name = openlist_item_name(item)
-            episode = parse_follow_episode(name, season) if is_video_filename(name) else None
+            episode = parse_follow_episode(name, season, selected) if is_video_filename(name) else None
             if episode in selected:
                 selected_videos.append(
                     {"path": item.get("path"), "name": name, "episode": episode, "kind": "video"}
@@ -3911,7 +3911,7 @@ def is_video_filename(name):
     return posixpath.splitext(str(name or ""))[1].lower() in FOLLOW_VIDEO_EXTENSIONS
 
 
-def parse_follow_episode(name, expected_season):
+def parse_follow_episode(name, expected_season, expected_episodes=None):
     stem = posixpath.splitext(str(name or ""))[0]
     for pattern in FOLLOW_EPISODE_PATTERNS:
         match = pattern.search(stem)
@@ -3925,6 +3925,11 @@ def parse_follow_episode(name, expected_season):
     if re.fullmatch(r"0*\d{1,4}", stem.strip()):
         episode = int(stem.strip())
         return episode if episode > 0 else None
+    expected = {int(value) for value in expected_episodes or [] if int(value) > 0}
+    if len(expected) == 1:
+        episode = next(iter(expected))
+        if re.search(r"(?<!\d)%s(?!\d)" % re.escape(str(episode)), stem):
+            return episode
     return None
 
 

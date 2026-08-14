@@ -1528,6 +1528,13 @@ class ImportTaskManager:
         season = int(follow["season"])
         existing = {int(value) for value in follow.get("existing_episodes") or []}
         reserved = {int(value) for value in follow.get("reserved_episodes") or []}
+        expected_file_episodes = set()
+        if follow["title_class"] == "single":
+            expected_episode = 1
+            occupied = existing | reserved
+            while expected_episode in occupied:
+                expected_episode += 1
+            expected_file_episodes.add(expected_episode)
         info_hash = str(task.get("info_hash") or "").strip()
         offline_task = dict(result.get("task") or {})
         target_lock = self._target_lock(
@@ -1596,12 +1603,16 @@ class ImportTaskManager:
                 result["subscription_follow"] = audit
                 self.store.save_running(task["id"], "staging", result=result, info_hash=info_hash or None)
 
-            staging_state = self.service.inspect_subscription_staging(category, staging, season)
+            staging_state = self.service.inspect_subscription_staging(
+                category, staging, season, expected_file_episodes
+            )
             has_staged_files = bool(staging_state.get("entries"))
             if not staging.get("claimed_at"):
                 self._acquire_target_lock(self._subscription_receive_lock)
                 try:
-                    staging_state = self.service.inspect_subscription_staging(category, staging, season)
+                    staging_state = self.service.inspect_subscription_staging(
+                        category, staging, season, expected_file_episodes
+                    )
                     has_staged_files = bool(staging_state.get("entries"))
                     if has_staged_files:
                         self.service.validate_subscription_receive_root(staging)
@@ -1675,7 +1686,9 @@ class ImportTaskManager:
                         self.store.save_running(task["id"], "staging", result=result, info_hash=info_hash)
                 finally:
                     self._subscription_receive_lock.release()
-            staging_state = self.service.inspect_subscription_staging(category, staging, season)
+            staging_state = self.service.inspect_subscription_staging(
+                category, staging, season, expected_file_episodes
+            )
             has_staged_files = bool(staging_state.get("entries"))
             if not info_hash and has_staged_files:
                 info_hash = "subscription-staging:%s" % task["id"]
@@ -1689,7 +1702,9 @@ class ImportTaskManager:
                 self.store.save_running(task["id"], "submitted", result=result, info_hash=info_hash)
 
             self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
-            staging_state = self.service.inspect_subscription_staging(category, staging, season)
+            staging_state = self.service.inspect_subscription_staging(
+                category, staging, season, expected_file_episodes
+            )
             verified = {int(value) for value in staging_state.get("verified_episodes") or []}
             audit.update(
                 {

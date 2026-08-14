@@ -255,6 +255,7 @@ class FakePipelineService:
         self.subscription_prepare_calls = []
         self.subscription_validate_root_calls = []
         self.subscription_claim_calls = []
+        self.subscription_inspect_expected = []
         self.subscription_cleanup_calls = []
         self.subscription_cleanup_error = None
         self.subscription_verify_result = None
@@ -380,7 +381,8 @@ class FakePipelineService:
                 break
         return claimed
 
-    def inspect_subscription_staging(self, category, staging, season):
+    def inspect_subscription_staging(self, category, staging, season, expected_episodes=None):
+        self.subscription_inspect_expected.append(sorted(expected_episodes or []))
         entries = [dict(item) for item in self.subscription_entries] if staging.get("claimed_at") else []
         by_episode = {}
         unknown = []
@@ -1364,6 +1366,16 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(parse_follow_episode("凡人修仙传.S01E115.1080p.mkv", 1), 115)
         self.assertEqual(parse_follow_episode("第120集.mp4", 1), 120)
         self.assertIsNone(parse_follow_episode("凡人修仙传.1080p.mkv", 1))
+        self.assertEqual(
+            parse_follow_episode("[Hall_of_C] FanRenXiuXianZhuan_115_XHFC_39.mkv", 1, {115}),
+            115,
+        )
+        self.assertIsNone(
+            parse_follow_episode("[Hall_of_C] FanRenXiuXianZhuan_115_XHFC_39.mkv", 1, {114})
+        )
+        self.assertIsNone(
+            parse_follow_episode("[Hall_of_C] FanRenXiuXianZhuan_115_XHFC_39.mkv", 1, {39, 115})
+        )
 
     def test_subscription_source_block_key_uses_115_share_code_and_subdirectory(self):
         self.assertEqual(
@@ -1472,6 +1484,25 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(service.subscription_cleanup_calls[0][0], "anime")
         self.assertEqual(service.subscription_cleanup_calls[0][1]["openlist_path"], audit["staging"]["openlist_path"])
         self.assertEqual(service.duplicate_calls, [])
+
+    def test_single_episode_uses_frontier_as_filename_hint(self):
+        service, _store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "show_115_release.mkv", "kind": "video", "episode": 115}
+        ]
+        payload = self.payload(application, service)
+        payload["title_class"] = "single"
+        task, _ = manager.create_import("owner-a", "fanren-single", payload)
+
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(service.subscription_inspect_expected)
+        self.assertTrue(all(value == [115] for value in service.subscription_inspect_expected))
 
     def test_no_new_episodes_cleans_staging_and_blocks_the_source(self):
         service, store, manager, application = self.build_components()
