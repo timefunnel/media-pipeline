@@ -188,6 +188,7 @@ from pipeline.search import (
     search_profile_tag_labels_from_env,
     search_profile_timeout_seconds_from_env,
     search_profile_upstream_limits_from_env,
+    share115_candidate_from_text,
     search_profile_value,
     search_primary_indexer_results,
     search_sukebei_indexer_results,
@@ -8160,22 +8161,6 @@ def parse_callback_data(value):
     if action == "subpick" and payload:
         return action, int(payload)
     return None, None
-
-
-def share115_candidate_from_text(text):
-    parsed = parse_115_share_url(text)
-    if parsed is None:
-        return None
-    return {
-        "title": "115分享 %s" % parsed.share_code,
-        "download_uri": parsed.url,
-        "indexer": "115分享",
-        "seeders": None,
-        "size": None,
-        "rank": 1,
-        "source_kind": "115_share",
-        "shareCode": parsed.share_code,
-    }
 
 
 def format_p115_cookie_status_message(cookie):

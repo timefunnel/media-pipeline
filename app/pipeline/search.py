@@ -4,6 +4,7 @@ import time
 import urllib.parse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
+from pipeline.client115 import parse_115_share_url
 from pipeline.mediastation import extract_codes
 from pipeline.resource_selector import ResourceSelector
 
@@ -452,6 +453,32 @@ def search_indexer_with_timeout(prowlarr, query, limit, indexer_id, timeout=None
     return run()
 
 
+def share115_candidate_from_text(text):
+    parsed = parse_115_share_url(text)
+    if parsed is None:
+        return None
+    download_uri = parsed.url
+    if parsed.receive_code:
+        parts = urllib.parse.urlsplit(download_uri)
+        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        if not any(key.lower() in {"password", "pwd"} for key, _value in query):
+            query.append(("password", parsed.receive_code))
+            download_uri = urllib.parse.urlunsplit(
+                (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), parts.fragment)
+            )
+    return {
+        "title": "115分享 %s" % parsed.share_code,
+        "download_uri": download_uri,
+        "indexer": "115分享",
+        "seeders": None,
+        "size": None,
+        "rank": 1,
+        "source_kind": "115_share",
+        "resource_type": "115_share",
+        "shareCode": parsed.share_code,
+    }
+
+
 def magnet_candidate_from_text(text):
     uri = extract_magnet_uri(text)
     if not uri:
@@ -465,6 +492,8 @@ def magnet_candidate_from_text(text):
         "size": None,
         "rank": 1,
         "infoHash": info_hash,
+        "source_kind": "magnet",
+        "resource_type": "magnet",
     }
 
 
@@ -497,6 +526,10 @@ def magnet_info_hash(uri):
         if value.lower().startswith(prefix):
             return value[len(prefix) :].strip()
     return None
+
+
+def valid_btih_info_hash(value):
+    return re.fullmatch(r"(?:[0-9A-Fa-f]{40}|[A-Za-z2-7]{32})", str(value or "").strip()) is not None
 
 
 def parse_csv_ints(value, default):

@@ -15,6 +15,7 @@ from pipeline.config import category_to_openlist_path
 from pipeline.client115 import parse_115_share_url
 from pipeline.dedupe import candidate_info_hash
 from pipeline.openlist_utils import normalize_openlist_path
+from pipeline.search import magnet_candidate_from_text, share115_candidate_from_text, valid_btih_info_hash
 from pipeline.season_subtitles import SeasonSubtitleTaskManager
 from pipeline.subtitle_asr import DEFAULT_ASR_MODEL, SubtitleAsrProcessor
 from pipeline.telegram_ui import task_from_submit_result
@@ -2262,6 +2263,36 @@ class InternalApiApplication:
             "capabilities": capabilities,
         }
 
+    def prepare_manual_candidate(self, payload):
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_request", "request body must be a JSON object")
+        owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
+        input_text = require_text(payload.get("input"), "input", max_length=4096)
+        category = require_category(payload.get("category"))
+        candidate = share115_candidate_from_text(input_text)
+        if candidate is None:
+            candidate = magnet_candidate_from_text(input_text)
+            if candidate is not None and not valid_btih_info_hash(candidate.get("infoHash")):
+                raise ApiError(400, "invalid_magnet", "磁链缺少有效的 BTIH")
+        if candidate is None:
+            raise ApiError(400, "unsupported_manual_input", "仅支持 115 分享链接或 BTIH 磁链")
+        metadata = {
+            "source": "manual",
+            "category": category,
+            "selected_count": 1,
+            "manual_kind": candidate.get("source_kind"),
+        }
+        session_id, expires_at, items = self.store.save_search(
+            owner_id, candidate["title"], category, "manual", [candidate], metadata
+        )
+        metadata.update({"session_id": session_id, "expires_at": expires_at})
+        return {
+            "session_id": session_id,
+            "expires_at": expires_at,
+            "items": items,
+            "metadata": metadata,
+        }
+
     def search_subtitles(self, payload):
         owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
         media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
@@ -2595,6 +2626,9 @@ class InternalApiServer:
             self._authenticate(handler)
             if handler.command == "POST" and path == "/v1/search":
                 self._send_json(handler, 200, self.application.search(self._read_json(handler)))
+                return
+            if handler.command == "POST" and path == "/v1/manual-candidates":
+                self._send_json(handler, 200, self.application.prepare_manual_candidate(self._read_json(handler)))
                 return
             if handler.command == "POST" and path == "/v1/subtitles/search":
                 self._send_json(handler, 200, self.application.search_subtitles(self._read_json(handler)))

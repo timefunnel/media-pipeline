@@ -721,6 +721,57 @@ class SearchResponseTest(InternalApiTestCase):
         self.assertEqual(raised.exception.code, "search_failed")
         self.assertTrue(raised.exception.details["capabilities"]["pansou"])
 
+    def test_manual_candidate_parses_115_share_without_searching(self):
+        class NoSearchService(FakePipelineService):
+            def search(self, query, category, limit=20):
+                raise AssertionError("manual candidate must not call search")
+
+        _, _, _, application = self.build_components(NoSearchService())
+        response = application.prepare_manual_candidate(
+            {
+                "owner_id": "owner-a",
+                "input": "https://115cdn.com/s/swabc123 提取码 xy99",
+                "category": "movie",
+            }
+        )
+
+        self.assertEqual(len(response["items"]), 1)
+        candidate = response["items"][0]
+        self.assertEqual(candidate["source_kind"], "115_share")
+        self.assertEqual(candidate["resource_type"], "115_share")
+        self.assertEqual(candidate["download_uri"], "https://115cdn.com/s/swabc123?password=xy99")
+        self.assertEqual(response["metadata"]["manual_kind"], "115_share")
+
+    def test_manual_candidate_accepts_valid_btih_magnet(self):
+        _, _, _, application = self.build_components()
+        info_hash = "0123456789abcdef0123456789abcdef01234567"
+        response = application.prepare_manual_candidate(
+            {
+                "owner_id": "owner-a",
+                "input": "magnet:?xt=urn:btih:%s&dn=Sintel" % info_hash,
+                "category": "movie",
+            }
+        )
+
+        candidate = response["items"][0]
+        self.assertEqual(candidate["title"], "Sintel")
+        self.assertEqual(candidate["infoHash"], info_hash)
+        self.assertEqual(candidate["resource_type"], "magnet")
+
+    def test_manual_candidate_rejects_invalid_or_unsupported_input(self):
+        _, _, _, application = self.build_components()
+        with self.assertRaises(ApiError) as invalid_magnet:
+            application.prepare_manual_candidate(
+                {"owner_id": "owner-a", "input": "magnet:?xt=urn:btih:short", "category": "movie"}
+            )
+        self.assertEqual(invalid_magnet.exception.code, "invalid_magnet")
+
+        with self.assertRaises(ApiError) as unsupported:
+            application.prepare_manual_candidate(
+                {"owner_id": "owner-a", "input": "普通关键词", "category": "movie"}
+            )
+        self.assertEqual(unsupported.exception.code, "unsupported_manual_input")
+
 
 class PipelineTargetOverrideTest(InternalApiTestCase):
     def test_service_uses_explicit_target_for_scrape_and_maintenance(self):
@@ -813,6 +864,30 @@ class PipelineTargetOverrideTest(InternalApiTestCase):
 
 
 class ImportPersistenceTest(InternalApiTestCase):
+    def test_manual_magnet_candidate_creates_existing_import_task(self):
+        service, _store, manager, application = self.build_components()
+        info_hash = "0123456789abcdef0123456789abcdef01234567"
+        magnet = "magnet:?xt=urn:btih:%s&dn=Sintel" % info_hash
+        preview = application.prepare_manual_candidate(
+            {"owner_id": "owner-a", "input": magnet, "category": "movie"}
+        )
+        payload = self.import_payload(
+            preview["session_id"],
+            preview["items"][0]["candidate_id"],
+        )
+        payload["download_uri"] = "magnet:?xt=urn:btih:ffffffffffffffffffffffffffffffffffffffff"
+        task, created = manager.create_import("owner-a", "manual-magnet", payload)
+
+        self.assertTrue(created)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(service.submit_uris, [magnet])
+
     def test_upgrade_target_scrape_queries_prefer_exact_tmdb_id(self):
         self.assertEqual(
             upgrade_target_scrape_queries(
@@ -2324,6 +2399,28 @@ class HttpAuthenticationTest(InternalApiTestCase):
             self.assertTrue(error["duplicate"]["can_force"])
             self.assertNotIn("path", error["duplicate"])
             self.assertEqual(service.submit_uris, [])
+        finally:
+            server.stop()
+
+    def test_http_manual_candidate_endpoint_uses_bearer_and_returns_session(self):
+        service = FakePipelineService()
+        port = free_tcp_port()
+        server = InternalApiServer(service, self.db_path, token="secret", port=port, workers=1, owner_workers=1)
+        server.start()
+        try:
+            info_hash = "0123456789abcdef0123456789abcdef01234567"
+            result = http_json(
+                "http://127.0.0.1:%d/v1/manual-candidates" % port,
+                {
+                    "owner_id": "owner-a",
+                    "input": "magnet:?xt=urn:btih:%s&dn=Sintel" % info_hash,
+                    "category": "movie",
+                },
+                token="secret",
+            )
+            self.assertTrue(result["session_id"])
+            self.assertEqual(result["items"][0]["resource_type"], "magnet")
+            self.assertEqual(result["metadata"]["manual_kind"], "magnet")
         finally:
             server.stop()
 

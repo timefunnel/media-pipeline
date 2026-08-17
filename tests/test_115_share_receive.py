@@ -202,7 +202,7 @@ class Share115ReceiveTest(unittest.TestCase):
 
         self.assertEqual(candidate["source_kind"], "115_share")
         self.assertEqual(candidate["shareCode"], "swabc123")
-        self.assertEqual(candidate["download_uri"], "https://115cdn.com/s/swabc123")
+        self.assertEqual(candidate["download_uri"], "https://115cdn.com/s/swabc123?password=xy99")
 
     def test_qrcode_login_client_builds_cookie_after_confirmed_scan(self):
         transport = FakeQRTransport()
