@@ -19,6 +19,7 @@ from pipeline.client115 import (
     Client115,
     P115QRCodeLoginClient,
     Share115Client,
+    extract_115_share_items,
     is_115_share_url,
     mask_p115_cookie,
     p115_cookie_is_valid,
@@ -2059,6 +2060,29 @@ class PipelineBotService:
         if not media_id:
             raise ValueError("MediaStationGo media id missing")
         return self._build_msg_client().get_media(media_id)
+
+    def inspect_115_share(self, download_uri):
+        parsed = parse_115_share_url(download_uri)
+        if parsed is None:
+            raise ValueError("not a 115 share url")
+        snap = self._build_115_share_client().get_share_info(
+            parsed.share_code,
+            parsed.receive_code,
+            cid=parsed.pdir_fid,
+            limit=100,
+        )
+        items = extract_115_share_items(snap)
+        if not items:
+            raise RuntimeError("115 share has no receivable items")
+        data = snap.get("data") or {}
+        try:
+            total = int(data.get("count") or len(items))
+        except (TypeError, ValueError):
+            total = len(items)
+        return {
+            "items": items,
+            "total": max(total, len(items)),
+        }
 
     def submit(self, category, download_uri, target_folder_id=None):
         if is_115_share_url(download_uri):

@@ -508,15 +508,22 @@ def extract_magnet_uri(text):
 
 
 def magnet_title(uri, info_hash=None):
+    title = magnet_display_name(uri)
+    if title:
+        return title
+    if info_hash:
+        return "磁链 %s" % info_hash[:12]
+    return "磁链"
+
+
+def magnet_display_name(uri):
     params = urllib.parse.parse_qs(urllib.parse.urlsplit(uri).query)
     display_names = params.get("dn") or []
     for value in display_names:
         title = str(value or "").strip()
         if title:
             return title
-    if info_hash:
-        return "磁链 %s" % info_hash[:12]
-    return "磁链"
+    return ""
 
 
 def magnet_info_hash(uri):

@@ -15,7 +15,12 @@ from pipeline.config import category_to_openlist_path
 from pipeline.client115 import parse_115_share_url
 from pipeline.dedupe import candidate_info_hash
 from pipeline.openlist_utils import normalize_openlist_path
-from pipeline.search import magnet_candidate_from_text, share115_candidate_from_text, valid_btih_info_hash
+from pipeline.search import (
+    magnet_candidate_from_text,
+    magnet_display_name,
+    share115_candidate_from_text,
+    valid_btih_info_hash,
+)
 from pipeline.season_subtitles import SeasonSubtitleTaskManager
 from pipeline.subtitle_asr import DEFAULT_ASR_MODEL, SubtitleAsrProcessor
 from pipeline.telegram_ui import task_from_submit_result
@@ -2270,10 +2275,26 @@ class InternalApiApplication:
         input_text = require_text(payload.get("input"), "input", max_length=4096)
         category = require_category(payload.get("category"))
         candidate = share115_candidate_from_text(input_text)
-        if candidate is None:
+        if candidate is not None:
+            try:
+                inspection = self.service.inspect_115_share(candidate["download_uri"])
+            except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                raise ApiError(422, "manual_share_parse_failed", "115 分享解析失败: %s" % exc)
+            candidate = self._manual_share_candidate_from_inspection(candidate, inspection)
+        else:
             candidate = magnet_candidate_from_text(input_text)
             if candidate is not None and not valid_btih_info_hash(candidate.get("infoHash")):
                 raise ApiError(400, "invalid_magnet", "磁链缺少有效的 BTIH")
+            if candidate is not None:
+                display_name = magnet_display_name(candidate.get("download_uri"))
+                if not display_name:
+                    raise ApiError(
+                        400,
+                        "manual_magnet_name_missing",
+                        "磁链未包含 dn 资源名称，无法在创建任务前确认实际资源名称",
+                    )
+                candidate["title"] = display_name
+                candidate["summary"] = "已解析磁链声明的资源名称"
         if candidate is None:
             raise ApiError(400, "unsupported_manual_input", "仅支持 115 分享链接或 BTIH 磁链")
         metadata = {
@@ -2292,6 +2313,56 @@ class InternalApiApplication:
             "items": items,
             "metadata": metadata,
         }
+
+    def _manual_share_candidate_from_inspection(self, candidate, inspection):
+        if not isinstance(inspection, dict):
+            raise ApiError(502, "manual_share_parse_failed", "115 分享解析结果无效")
+        raw_items = inspection.get("items")
+        if not isinstance(raw_items, list):
+            raise ApiError(502, "manual_share_parse_failed", "115 分享未返回资源列表")
+        items = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                size = max(0, int(raw.get("size") or 0))
+            except (TypeError, ValueError):
+                size = 0
+            items.append({"name": name, "size": size, "is_dir": bool(raw.get("is_dir"))})
+        if not items:
+            raise ApiError(422, "manual_share_parse_failed", "115 分享没有可转存的资源")
+        try:
+            total = max(len(items), int(inspection.get("total") or len(items)))
+        except (TypeError, ValueError):
+            total = len(items)
+        names = [item["name"] for item in items]
+        if total == 1:
+            title = names[0]
+        else:
+            title = "%s 等 %d 项" % ("、".join(names[:3]), total)
+        directory_count = sum(1 for item in items if item["is_dir"])
+        file_count = len(items) - directory_count
+        if total > len(items):
+            summary = "已解析前 %d 项，共 %d 个顶层资源" % (len(items), total)
+        else:
+            summary = "已解析 %d 个顶层资源" % total
+        kinds = []
+        if directory_count:
+            kinds.append("%d 个目录" % directory_count)
+        if file_count:
+            kinds.append("%d 个文件" % file_count)
+        if kinds:
+            summary = "%s（%s）" % (summary, "，".join(kinds))
+        resolved = dict(candidate)
+        resolved["title"] = title
+        resolved["summary"] = summary
+        file_bytes = sum(item["size"] for item in items if not item["is_dir"])
+        if file_bytes:
+            resolved["size"] = file_bytes
+        return resolved
 
     def search_subtitles(self, payload):
         owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
