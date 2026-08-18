@@ -12,7 +12,7 @@ from pipeline.openlist_utils import (
     openlist_item_size,
     replace_openlist_path_prefix,
 )
-from pipeline.search import magnet_info_hash
+from pipeline.search import ed2k_info_hash, magnet_info_hash
 from pipeline.task_state import TASK_STATE
 
 
@@ -151,7 +151,8 @@ def candidate_info_hash(candidate):
         value = str((candidate or {}).get(key) or "").strip()
         if value:
             return value
-    return magnet_info_hash((candidate or {}).get("download_uri") or "")
+    uri = (candidate or {}).get("download_uri") or ""
+    return ed2k_info_hash(uri) or magnet_info_hash(uri)
 
 
 def openlist_dedupe_entries(client, category, root_path):

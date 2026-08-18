@@ -16,6 +16,7 @@ from pipeline.client115 import parse_115_share_url
 from pipeline.dedupe import candidate_info_hash
 from pipeline.openlist_utils import normalize_openlist_path
 from pipeline.search import (
+    ed2k_candidate_from_text,
     magnet_candidate_from_text,
     share115_candidate_from_text,
     valid_btih_info_hash,
@@ -1260,7 +1261,8 @@ class ImportTaskManager:
             "subscription_follow": subscription_follow,
         }
         if subscription_follow:
-            self._check_subscription_source_block(request)
+            if not subscription_follow.get("manual_replenish"):
+                self._check_subscription_source_block(request)
         else:
             self._check_duplicate(request)
         task, created = self.store.create_import(owner_id, idempotency_key, request)
@@ -1350,7 +1352,8 @@ class ImportTaskManager:
         current = self.store.get_import(owner_id, import_id)
         if current["status"] in RETRYABLE_IMPORT_STATUSES:
             if current["request"].get("subscription_follow"):
-                self._check_subscription_source_block(current["request"])
+                if not current["request"]["subscription_follow"].get("manual_replenish"):
+                    self._check_subscription_source_block(current["request"])
             elif not (current.get("msg_media_id") or result_task_is_offline_success(current.get("result"))):
                 self._check_duplicate(current["request"])
         task = self.store.retry_import(owner_id, import_id)
@@ -1695,6 +1698,7 @@ class ImportTaskManager:
             audit.update(
                 {
                     "subscription_id": follow["subscription_id"],
+                    "manual_replenish": bool(follow.get("manual_replenish")),
                     "work_key": follow["work_key"],
                     "season": season,
                     "title_class": follow["title_class"],
@@ -1721,14 +1725,15 @@ class ImportTaskManager:
                 self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash or None)
                 self.service.cleanup_subscription_staging(category, staging)
                 audit["staging_cleaned_at"] = int(time.time())
-                source_key = subscription_source_block_key(
-                    (request.get("candidate") or {}).get("download_uri")
-                )
-                audit["source_block"] = self.store.block_subscription_source(
-                    source_key,
-                    reason=block_reason,
-                    origin_import_id=task["id"],
-                )
+                if not follow.get("manual_replenish"):
+                    source_key = subscription_source_block_key(
+                        (request.get("candidate") or {}).get("download_uri")
+                    )
+                    audit["source_block"] = self.store.block_subscription_source(
+                        source_key,
+                        reason=block_reason,
+                        origin_import_id=task["id"],
+                    )
                 result["subscription_follow"] = audit
                 self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash or None)
                 return True
@@ -1874,6 +1879,16 @@ class ImportTaskManager:
                 self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash)
                 self.service.cleanup_subscription_staging(category, staging)
                 audit["staging_cleaned_at"] = int(time.time())
+                if follow.get("manual_replenish"):
+                    result["subscription_follow"] = audit
+                    self.store.finish_import(
+                        task["id"],
+                        "completed",
+                        "completed",
+                        result=result,
+                        info_hash=info_hash,
+                    )
+                    return
                 source_key = subscription_source_block_key((request.get("candidate") or {}).get("download_uri"))
                 audit["source_block"] = self.store.block_subscription_source(
                     source_key,
@@ -2364,7 +2379,11 @@ class InternalApiApplication:
             if candidate is not None and not valid_btih_info_hash(candidate.get("infoHash")):
                 raise ApiError(400, "invalid_magnet", "磁链缺少有效的 BTIH")
         if candidate is None:
-            raise ApiError(400, "unsupported_manual_input", "仅支持 115 分享链接或 BTIH 磁链")
+            candidate = ed2k_candidate_from_text(input_text)
+            if candidate is None and "ed2k://" in input_text.casefold():
+                raise ApiError(400, "invalid_ed2k", "ED2K 文件链接格式无效")
+        if candidate is None:
+            raise ApiError(400, "unsupported_manual_input", "仅支持 115 分享链接、ED2K 或 BTIH 磁链")
         candidate = dict(candidate)
         candidate["title"] = title
         candidate["summary"] = "任务名称由用户填写"
@@ -2959,7 +2978,10 @@ def subscription_source_failure_block_reason(error):
 
 def normalize_subscription_follow(payload, category, target, force_duplicate, upgrade_media_id):
     enabled = optional_bool(payload.get("subscription_follow"), "subscription_follow", default=False)
+    manual_replenish = optional_bool(payload.get("manual_replenish"), "manual_replenish", default=False)
     if not enabled:
+        if manual_replenish:
+            raise ApiError(400, "invalid_manual_replenish", "manual replenish requires subscription follow validation")
         return None
     if category not in {"tv", "anime"}:
         raise ApiError(400, "invalid_subscription_follow", "subscription follow only supports TV or anime")
@@ -2967,7 +2989,9 @@ def normalize_subscription_follow(payload, category, target, force_duplicate, up
         raise ApiError(400, "invalid_subscription_follow", "subscription follow cannot force duplicate imports")
     if upgrade_media_id:
         raise ApiError(400, "invalid_subscription_follow", "subscription follow cannot be an upgrade import")
-    subscription_id = require_text(payload.get("subscription_id"), "subscription_id", max_length=100)
+    subscription_id = "" if manual_replenish else require_text(
+        payload.get("subscription_id"), "subscription_id", max_length=100
+    )
     work_key = require_text(payload.get("work_key"), "work_key", max_length=300)
     season = require_positive_int(payload.get("season"), "season", max_value=99)
     existing = normalize_episode_numbers(payload.get("existing_episodes"), "existing_episodes")
@@ -2987,6 +3011,7 @@ def normalize_subscription_follow(payload, category, target, force_duplicate, up
         raise ApiError(400, "invalid_title_class", "invalid subscription candidate title class")
     return {
         "subscription_id": subscription_id,
+        "manual_replenish": manual_replenish,
         "work_key": work_key,
         "season": season,
         "existing_episodes": existing,

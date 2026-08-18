@@ -479,6 +479,51 @@ def share115_candidate_from_text(text):
     }
 
 
+def ed2k_candidate_from_text(text):
+    uri = extract_ed2k_uri(text)
+    if not uri:
+        return None
+    parts = uri.split("|")
+    if (
+        len(parts) < 6
+        or parts[0].lower() != "ed2k://"
+        or parts[1].lower() != "file"
+        or parts[-1] != "/"
+    ):
+        return None
+    title = urllib.parse.unquote(parts[2]).strip()
+    size_text = parts[3].strip()
+    file_hash = parts[4].strip().lower()
+    if not title or "\x00" in title or not size_text.isdigit() or int(size_text) <= 0:
+        return None
+    if re.fullmatch(r"[0-9a-f]{32}", file_hash) is None:
+        return None
+    return {
+        "title": title,
+        "download_uri": uri,
+        "indexer": "ED2K",
+        "seeders": None,
+        "size": int(size_text),
+        "rank": 1,
+        "infoHash": file_hash,
+        "ed2kHash": file_hash,
+        "source_kind": "ed2k",
+        "resource_type": "ed2k",
+    }
+
+
+def ed2k_info_hash(uri):
+    candidate = ed2k_candidate_from_text(uri)
+    return candidate.get("ed2kHash") if candidate else None
+
+
+def extract_ed2k_uri(text):
+    match = re.search(r"ed2k://\|file\|[^\s]+", str(text or ""), re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(0).rstrip(".,;，。；)")
+
+
 def magnet_candidate_from_text(text):
     uri = extract_magnet_uri(text)
     if not uri:

@@ -762,6 +762,26 @@ class SearchResponseTest(InternalApiTestCase):
         self.assertEqual(candidate["infoHash"], info_hash)
         self.assertEqual(candidate["resource_type"], "magnet")
 
+    def test_manual_candidate_accepts_valid_ed2k_file_link(self):
+        _, _, _, application = self.build_components()
+        file_hash = "0123456789abcdef0123456789abcdef"
+        uri = "ed2k://|file|Fanren.S01E115.mkv|123456789|%s|/" % file_hash
+        response = application.prepare_manual_candidate(
+            {
+                "owner_id": "owner-a",
+                "title": "Manual ED2K task",
+                "input": uri,
+                "category": "anime",
+            }
+        )
+
+        candidate = response["items"][0]
+        self.assertEqual(candidate["title"], "Manual ED2K task")
+        self.assertEqual(candidate["download_uri"], uri)
+        self.assertEqual(candidate["infoHash"], file_hash)
+        self.assertEqual(candidate["resource_type"], "ed2k")
+        self.assertEqual(candidate["size"], 123456789)
+
     def test_manual_candidate_requires_user_title(self):
         _, _, _, application = self.build_components()
         with self.assertRaises(ApiError) as raised:
@@ -778,6 +798,12 @@ class SearchResponseTest(InternalApiTestCase):
                 {"owner_id": "owner-a", "title": "Manual task", "input": "magnet:?xt=urn:btih:short", "category": "movie"}
             )
         self.assertEqual(invalid_magnet.exception.code, "invalid_magnet")
+
+        with self.assertRaises(ApiError) as invalid_ed2k:
+            application.prepare_manual_candidate(
+                {"owner_id": "owner-a", "title": "Manual task", "input": "ed2k://|file|bad.mkv|12|short|/", "category": "movie"}
+            )
+        self.assertEqual(invalid_ed2k.exception.code, "invalid_ed2k")
 
         with self.assertRaises(ApiError) as unsupported:
             application.prepare_manual_candidate(
@@ -1727,6 +1753,38 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         with self.assertRaises(ApiError) as create_blocked:
             manager.create_import("owner-a", "fanren-no-new-second", payload)
         self.assertEqual(create_blocked.exception.code, "subscription_source_blocked")
+
+    def test_manual_replenish_no_new_episodes_completes_without_blocking_source(self):
+        service, store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-%03d" % episode, "fn": "凡人修仙传.S01E%03d.mkv" % episode, "kind": "video", "episode": episode}
+            for episode in range(1, 115)
+        ]
+        payload = self.payload(application, service)
+        payload["manual_replenish"] = True
+        payload.pop("subscription_id")
+        task, _ = manager.create_import("owner-a", "fanren-manual-no-new", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertIsNone(completed["msg_media_id"])
+        audit = completed["result"]["subscription_follow"]
+        self.assertTrue(audit["manual_replenish"])
+        self.assertEqual(audit["outcome"], "no_new_episodes")
+        self.assertIsInstance(audit["staging_cleaned_at"], int)
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
+        self.assertIsNone(store.get_subscription_source_block(source_key))
+
+        next_task, created = manager.create_import(
+            "owner-a", "fanren-manual-no-new-second", payload
+        )
+        self.assertTrue(created)
+        self.assertEqual(next_task["status"], "queued")
 
     def test_no_new_episodes_does_not_block_source_when_staging_cleanup_fails(self):
         service, store, manager, application = self.build_components()
