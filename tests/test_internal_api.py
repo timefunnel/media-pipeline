@@ -261,12 +261,6 @@ class FakePipelineService:
         self.subscription_verify_result = None
         self.subscription_receive_active = 0
         self.subscription_receive_max_active = 0
-        self.manual_share_urls = []
-        self.manual_share_inspection = {
-            "items": [{"name": "凡人修仙传 第五季", "size": 0, "is_dir": True}],
-            "total": 1,
-        }
-
     def search(self, query, category, limit=20):
         return ResultList(
             [{"title": query, "download_uri": "magnet:?xt=urn:btih:%s" % query.upper(), "rank": 1}],
@@ -285,9 +279,6 @@ class FakePipelineService:
             metadata={"profile": "bt4g"},
         )
 
-    def inspect_115_share(self, download_uri):
-        self.manual_share_urls.append(download_uri)
-        return dict(self.manual_share_inspection)
 
     def subtitle_search_candidates(self, media_id, limit=20):
         return {
@@ -730,7 +721,7 @@ class SearchResponseTest(InternalApiTestCase):
         self.assertEqual(raised.exception.code, "search_failed")
         self.assertTrue(raised.exception.details["capabilities"]["pansou"])
 
-    def test_manual_candidate_parses_115_share_without_searching(self):
+    def test_manual_candidate_uses_user_title_without_resource_inspection(self):
         class NoSearchService(FakePipelineService):
             def search(self, query, category, limit=20):
                 raise AssertionError("manual candidate must not call search")
@@ -739,7 +730,8 @@ class SearchResponseTest(InternalApiTestCase):
         response = application.prepare_manual_candidate(
             {
                 "owner_id": "owner-a",
-                "input": "https://115cdn.com/s/swabc123 提取码 xy99",
+                "title": "Manual share task",
+                "input": "https://115cdn.com/s/swabc123?password=xy99",
                 "category": "movie",
             }
         )
@@ -748,73 +740,48 @@ class SearchResponseTest(InternalApiTestCase):
         candidate = response["items"][0]
         self.assertEqual(candidate["source_kind"], "115_share")
         self.assertEqual(candidate["resource_type"], "115_share")
-        self.assertEqual(candidate["title"], "凡人修仙传 第五季")
-        self.assertEqual(candidate["summary"], "已解析 1 个顶层资源（1 个目录）")
+        self.assertEqual(candidate["title"], "Manual share task")
         self.assertEqual(candidate["download_uri"], "https://115cdn.com/s/swabc123?password=xy99")
+        self.assertIsNone(candidate["size"])
         self.assertEqual(response["metadata"]["manual_kind"], "115_share")
-        self.assertEqual(service.manual_share_urls, [candidate["download_uri"]])
 
-    def test_manual_candidate_uses_all_resolved_share_roots_for_task_title(self):
-        service = FakePipelineService()
-        service.manual_share_inspection = {
-            "items": [
-                {"name": "剧集正片", "size": 0, "is_dir": True},
-                {"name": "花絮.mkv", "size": 2048, "is_dir": False},
-            ],
-            "total": 2,
-        }
-        _, _, _, application = self.build_components(service)
-
-        response = application.prepare_manual_candidate(
-            {"owner_id": "owner-a", "input": "https://115.com/s/swabc123", "category": "tv"}
-        )
-
-        candidate = response["items"][0]
-        self.assertEqual(candidate["title"], "剧集正片、花絮.mkv 等 2 项")
-        self.assertEqual(candidate["summary"], "已解析 2 个顶层资源（1 个目录，1 个文件）")
-        self.assertEqual(candidate["size"], 2048)
-
-    def test_manual_candidate_accepts_valid_btih_magnet(self):
+    def test_manual_candidate_accepts_valid_btih_magnet_without_dn(self):
         _, _, _, application = self.build_components()
         info_hash = "0123456789abcdef0123456789abcdef01234567"
         response = application.prepare_manual_candidate(
             {
                 "owner_id": "owner-a",
-                "input": "magnet:?xt=urn:btih:%s&dn=Sintel" % info_hash,
+                "title": "Manual magnet task",
+                "input": "magnet:?xt=urn:btih:%s" % info_hash,
                 "category": "movie",
             }
         )
 
         candidate = response["items"][0]
-        self.assertEqual(candidate["title"], "Sintel")
+        self.assertEqual(candidate["title"], "Manual magnet task")
         self.assertEqual(candidate["infoHash"], info_hash)
         self.assertEqual(candidate["resource_type"], "magnet")
-        self.assertEqual(candidate["summary"], "已解析磁链声明的资源名称")
 
-    def test_manual_candidate_rejects_magnet_without_resource_name(self):
+    def test_manual_candidate_requires_user_title(self):
         _, _, _, application = self.build_components()
         with self.assertRaises(ApiError) as raised:
             application.prepare_manual_candidate(
-                {
-                    "owner_id": "owner-a",
-                    "input": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
-                    "category": "movie",
-                }
+                {"owner_id": "owner-a", "input": "https://115.com/s/swabc123", "category": "movie"}
             )
         self.assertEqual(raised.exception.status, 400)
-        self.assertEqual(raised.exception.code, "manual_magnet_name_missing")
+        self.assertEqual(raised.exception.code, "missing_title")
 
     def test_manual_candidate_rejects_invalid_or_unsupported_input(self):
         _, _, _, application = self.build_components()
         with self.assertRaises(ApiError) as invalid_magnet:
             application.prepare_manual_candidate(
-                {"owner_id": "owner-a", "input": "magnet:?xt=urn:btih:short", "category": "movie"}
+                {"owner_id": "owner-a", "title": "Manual task", "input": "magnet:?xt=urn:btih:short", "category": "movie"}
             )
         self.assertEqual(invalid_magnet.exception.code, "invalid_magnet")
 
         with self.assertRaises(ApiError) as unsupported:
             application.prepare_manual_candidate(
-                {"owner_id": "owner-a", "input": "普通关键词", "category": "movie"}
+                {"owner_id": "owner-a", "title": "Manual task", "input": "ordinary text", "category": "movie"}
             )
         self.assertEqual(unsupported.exception.code, "unsupported_manual_input")
 
@@ -913,9 +880,9 @@ class ImportPersistenceTest(InternalApiTestCase):
     def test_manual_magnet_candidate_creates_existing_import_task(self):
         service, _store, manager, application = self.build_components()
         info_hash = "0123456789abcdef0123456789abcdef01234567"
-        magnet = "magnet:?xt=urn:btih:%s&dn=Sintel" % info_hash
+        magnet = "magnet:?xt=urn:btih:%s" % info_hash
         preview = application.prepare_manual_candidate(
-            {"owner_id": "owner-a", "input": magnet, "category": "movie"}
+            {"owner_id": "owner-a", "title": "Manual magnet task", "input": magnet, "category": "movie"}
         )
         payload = self.import_payload(
             preview["session_id"],
@@ -925,6 +892,8 @@ class ImportPersistenceTest(InternalApiTestCase):
         task, created = manager.create_import("owner-a", "manual-magnet", payload)
 
         self.assertTrue(created)
+        self.assertEqual(task["request"]["query"], "Manual magnet task")
+        self.assertEqual(task["request"]["candidate"]["title"], "Manual magnet task")
         manager.start()
         try:
             completed = self.wait_final(manager, "owner-a", task["id"])
@@ -934,14 +903,10 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(service.submit_uris, [magnet])
 
-    def test_manual_share_candidate_persists_resolved_title_before_task_creation(self):
+    def test_manual_share_candidate_persists_user_title_before_task_creation(self):
         service, _store, manager, application = self.build_components()
-        service.manual_share_inspection = {
-            "items": [{"name": "凡人修仙传 第五季", "size": 0, "is_dir": True}],
-            "total": 1,
-        }
         preview = application.prepare_manual_candidate(
-            {"owner_id": "owner-a", "input": "https://115.com/s/swabc123", "category": "tv"}
+            {"owner_id": "owner-a", "title": "Manual share task", "input": "https://115.com/s/swabc123", "category": "tv"}
         )
         task, created = manager.create_import(
             "owner-a",
@@ -955,9 +920,8 @@ class ImportPersistenceTest(InternalApiTestCase):
         )
 
         self.assertTrue(created)
-        self.assertEqual(task["request"]["query"], "凡人修仙传 第五季")
-        self.assertEqual(task["request"]["candidate"]["title"], "凡人修仙传 第五季")
-        self.assertEqual(service.manual_share_urls, ["https://115.com/s/swabc123"])
+        self.assertEqual(task["request"]["query"], "Manual share task")
+        self.assertEqual(task["request"]["candidate"]["title"], "Manual share task")
 
     def test_upgrade_target_scrape_queries_prefer_exact_tmdb_id(self):
         self.assertEqual(
