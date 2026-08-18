@@ -53,6 +53,18 @@ SYNC_STAGES = {
     "removing_old_version",
     "cleanup",
 }
+RETRY_RESUME_STAGES = {"syncing", "scanning", "scraping", "subtitles", "removing_old_version"}
+RETRY_STAGE_BY_FAILED_TASK_STATUS = (
+    ("openlist_adult_format_status", "syncing"),
+    ("openlist_trash_hide_status", "syncing"),
+    ("openlist_clean_status", "syncing"),
+    ("openlist_adult_extra_hide_status", "syncing"),
+    ("msg_scan_status", "scanning"),
+    ("msg_scrape_status", "scraping"),
+    ("msg_extra_cleanup_status", "syncing"),
+    ("msg_visibility_repair_status", "syncing"),
+    ("subtitle_match_status", "subtitles"),
+)
 
 
 class ApiError(RuntimeError):
@@ -470,14 +482,15 @@ class InternalApiStore:
                 conn.commit()
                 return None
             now = int(time.time())
+            stage = row["stage"] if row["stage"] in RETRY_RESUME_STAGES else "starting"
             cursor = conn.execute(
                 """
                 update internal_api_imports
-                set status = 'running', stage = 'starting', attempt_count = attempt_count + 1,
+                set status = 'running', stage = ?, attempt_count = attempt_count + 1,
                     started_at = ?, completed_at = null, updated_at = ?, error = null
                 where id = ? and status = 'queued'
                 """,
-                (now, now, row["id"]),
+                (stage, now, now, row["id"]),
             )
             if cursor.rowcount != 1:
                 conn.commit()
@@ -641,24 +654,31 @@ class InternalApiStore:
             if row["status"] not in RETRYABLE_IMPORT_STATUSES:
                 raise ApiError(409, "import_not_retryable", "import task is not retryable")
             result = json.loads(row["result_json"]) if row["result_json"] else None
+            request = json.loads(row["request_json"])
             preserve_sync = bool(row["msg_media_id"] or result_task_is_offline_success(result))
+            resume_stage = warning_retry_stage(result, request) if preserve_sync else ""
             if preserve_sync:
                 result = dict(result or {})
                 task = dict(result.get("task") or {})
                 task["msg_sync_status"] = "running"
                 task["msg_error"] = None
                 result["task"] = task
+                if resume_stage:
+                    result["retry_from_stage"] = resume_stage
+                else:
+                    result.pop("retry_from_stage", None)
             else:
                 result = None
             conn.execute(
                 """
                 update internal_api_imports
-                set status = 'queued', stage = 'queued', result_json = ?, error = null,
+                set status = 'queued', stage = ?, result_json = ?, error = null,
                     info_hash = ?, msg_media_id = ?, cancel_requested = 0,
                     updated_at = ?, started_at = null, completed_at = null
                 where id = ?
                 """,
                 (
+                    resume_stage or "queued",
                     json_dumps(result) if result is not None else None,
                     row["info_hash"] if preserve_sync else None,
                     row["msg_media_id"] if preserve_sync else None,
@@ -1419,6 +1439,7 @@ class ImportTaskManager:
         if request.get("subscription_follow"):
             return self._execute_subscription_follow_task(task)
         result = dict(task.get("result") or {})
+        resume_stage = retry_resume_stage(result)
         category = request["category"]
         title = str(request.get("upgrade_target_title") or request["title"]).strip()
         info_hash = str(task.get("info_hash") or "").strip()
@@ -1463,6 +1484,8 @@ class ImportTaskManager:
         target_lock = self._target_lock(target)
         self._acquire_target_lock(target_lock)
         try:
+            if resume_stage == "removing_old_version":
+                return self._retry_upgrade_cleanup(task, result, info_hash, target)
             while True:
                 self._raise_if_stopping()
 
@@ -1478,7 +1501,8 @@ class ImportTaskManager:
                         msg_media_id=media_id,
                     )
 
-                self.store.save_running(task["id"], "syncing", result=result, info_hash=info_hash)
+                initial_sync_stage = resume_stage if resume_stage in RETRY_RESUME_STAGES else "syncing"
+                self.store.save_running(task["id"], initial_sync_stage, result=result, info_hash=info_hash)
                 try:
                     offline_task = self.service.sync_completed_task(
                         category,
@@ -1497,6 +1521,10 @@ class ImportTaskManager:
                     warning_result = dict(current.get("result") or result)
                     warning_result["msg_media_id"] = media_id
                     warning_result["warnings"] = [str(exc)]
+                    warning_result["warning_stage"] = (
+                        current.get("stage") if current.get("stage") in RETRY_RESUME_STAGES else "syncing"
+                    )
+                    warning_result.pop("retry_from_stage", None)
                     self.store.finish_import(
                         task["id"],
                         "completed_with_warning",
@@ -1550,8 +1578,11 @@ class ImportTaskManager:
                         warning = "旧片源移入回收站失败: %s" % exc
                         if warning not in warnings:
                             warnings.append(warning)
+                        result["warning_stage"] = "removing_old_version"
                 if warnings:
                     result["warnings"] = warnings
+                    result["warning_stage"] = warning_retry_stage(result, request)
+                    result.pop("retry_from_stage", None)
                     self.store.finish_import(
                         task["id"],
                         "completed_with_warning",
@@ -1563,6 +1594,8 @@ class ImportTaskManager:
                     )
                 else:
                     result.pop("warnings", None)
+                    result.pop("warning_stage", None)
+                    result.pop("retry_from_stage", None)
                     self.store.finish_import(
                         task["id"],
                         "completed",
@@ -1574,6 +1607,57 @@ class ImportTaskManager:
                 return
         finally:
             target_lock.release()
+
+    def _retry_upgrade_cleanup(self, task, result, info_hash, target):
+        request = task["request"]
+        upgrade_media_id = str(request.get("upgrade_media_id") or "").strip()
+        media_id = str(task.get("msg_media_id") or result.get("msg_media_id") or "").strip()
+        if not upgrade_media_id or bool(request.get("keep_old_version", True)):
+            raise RuntimeError("upgrade cleanup retry is no longer applicable")
+        if not media_id:
+            raise RuntimeError("upgrade cleanup retry is missing the new MediaStationGo media id")
+        self.store.save_running(
+            task["id"],
+            "removing_old_version",
+            result=result,
+            info_hash=info_hash,
+            msg_media_id=media_id,
+        )
+        try:
+            result["upgrade_cleanup"] = self.service.remove_upgrade_target(
+                upgrade_media_id,
+                media_id,
+                target,
+                upgrade_scope=str(request.get("upgrade_scope") or "media"),
+                new_source_paths=upgrade_new_source_paths(result.get("task")),
+            )
+        except Exception as exc:
+            warning = "旧片源移入回收站失败: %s" % exc
+            result.pop("upgrade_cleanup", None)
+            result["warnings"] = [warning]
+            result["warning_stage"] = "removing_old_version"
+            result.pop("retry_from_stage", None)
+            self.store.finish_import(
+                task["id"],
+                "completed_with_warning",
+                "completed_with_warning",
+                result=result,
+                error=warning,
+                info_hash=info_hash,
+                msg_media_id=media_id,
+            )
+            return
+        result.pop("warnings", None)
+        result.pop("warning_stage", None)
+        result.pop("retry_from_stage", None)
+        self.store.finish_import(
+            task["id"],
+            "completed",
+            "completed",
+            result=result,
+            info_hash=info_hash,
+            msg_media_id=media_id,
+        )
 
     def _execute_subscription_follow_task(self, task):
         request = task["request"]
@@ -3115,6 +3199,34 @@ def first_submit_info_hash(result):
 
 def result_task_is_offline_success(result):
     return isinstance(result, dict) and (result.get("task") or {}).get("status_name") == OFFLINE_SUCCESS_STATUS
+
+
+def retry_resume_stage(result):
+    if not isinstance(result, dict):
+        return ""
+    stage = str(result.get("retry_from_stage") or "").strip()
+    return stage if stage in RETRY_RESUME_STAGES else ""
+
+
+def warning_retry_stage(result, request=None):
+    if not isinstance(result, dict):
+        return ""
+    stage = str(result.get("warning_stage") or "").strip()
+    if stage in RETRY_RESUME_STAGES:
+        return stage
+    task = result.get("task") or {}
+    if isinstance(task, dict):
+        for status_key, retry_stage in RETRY_STAGE_BY_FAILED_TASK_STATUS:
+            if task.get(status_key) == "failed":
+                return retry_stage
+    request = request or {}
+    if (
+        isinstance(request, dict)
+        and str(request.get("upgrade_media_id") or "").strip()
+        and not bool(request.get("keep_old_version", True))
+    ):
+        return "removing_old_version"
+    return ""
 
 
 def sync_stage(task):

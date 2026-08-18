@@ -1221,6 +1221,78 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertIn("旧片源移入回收站失败", completed["error"])
         self.assertTrue(completed["msg_media_id"])
 
+    def test_warning_retry_starts_at_subtitle_stage_without_resubmitting(self):
+        service, store, manager, application = self.build_components(FakePipelineService(warning=True))
+        session_id, candidate_id, _ = self.search_candidate(application)
+        task, _ = manager.create_import("owner-a", "subtitle-warning-retry", self.import_payload(session_id, candidate_id))
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed_with_warning")
+        self.assertEqual(completed["result"]["task"]["subtitle_match_status"], "failed")
+        self.assertEqual(len(service.submit_uris), 1)
+        self.assertEqual(len(service.sync_input_tasks), 1)
+
+        service.warning = False
+        retried = manager.retry_import("owner-a", task["id"])
+        self.assertEqual((retried["status"], retried["stage"]), ("queued", "subtitles"))
+
+        manager.start()
+        try:
+            resolved = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(resolved["status"], "completed")
+        self.assertEqual(len(service.submit_uris), 1)
+        self.assertEqual(len(service.sync_input_tasks), 2)
+        self.assertEqual(service.sync_input_tasks[-1]["subtitle_match_status"], "failed")
+
+    def test_upgrade_warning_retry_starts_at_cleanup_without_resyncing(self):
+        duplicate = {
+            "level": "strong",
+            "reason": "mediastation_code",
+            "source": "MediaStationGo",
+            "title": "SSIS-218",
+            "media_id": "media-upgrade-target",
+            "can_force": False,
+        }
+        service, store, manager, application = self.build_components(
+            FakePipelineService(duplicate=duplicate, upgrade_remove_error="MSG recycle unavailable")
+        )
+        session_id, candidate_id, _ = self.search_candidate(application, query="SSIS-218", category="adult")
+        payload = self.import_payload(session_id, candidate_id, category="adult", target=target_for("adult"))
+        payload["upgrade_media_id"] = "media-upgrade-target"
+        payload["keep_old_version"] = False
+        task, _ = manager.create_import("owner-a", "upgrade-warning-retry", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed_with_warning")
+        self.assertEqual(len(service.submit_uris), 1)
+        self.assertEqual(len(service.sync_input_tasks), 1)
+        self.assertEqual(len(service.upgrade_remove_calls), 1)
+
+        service.upgrade_remove_error = None
+        retried = manager.retry_import("owner-a", task["id"])
+        self.assertEqual((retried["status"], retried["stage"]), ("queued", "removing_old_version"))
+
+        manager.start()
+        try:
+            resolved = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(resolved["status"], "completed")
+        self.assertEqual(len(service.submit_uris), 1)
+        self.assertEqual(len(service.sync_input_tasks), 1)
+        self.assertEqual(len(service.upgrade_remove_calls), 2)
     def test_upgrade_rejects_duplicate_that_belongs_to_another_media(self):
         duplicate = {
             "level": "weak",
