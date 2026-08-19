@@ -2513,7 +2513,15 @@ class PipelineBotService:
             raise ValueError("升级目标作品不属于当前入库目录")
         return media
 
-    def remove_upgrade_target(self, old_media_id, new_media_id, target, upgrade_scope="media", new_source_paths=None):
+    def remove_upgrade_target(
+        self,
+        old_media_id,
+        new_media_id,
+        target,
+        upgrade_scope="media",
+        new_source_paths=None,
+        category=None,
+    ):
         old_media_id = str(old_media_id or "").strip()
         new_media_id = str(new_media_id or "").strip()
         if not old_media_id or not new_media_id:
@@ -2525,10 +2533,14 @@ class PipelineBotService:
 
         scope = str(upgrade_scope or "media").strip().lower()
         if scope == "work":
+            category = str(category or "").strip().lower()
+            if category not in ("tv", "anime"):
+                raise ValueError("整剧升级缺少有效的媒体分类")
             paths = unique_openlist_paths(new_source_paths or [])
             if not paths:
                 raise ValueError("整剧升级缺少本次扫描的新片源目录")
-            result = client.pipeline_replace_work_source(old_media_id, new_media_id, target, paths)
+            maintenance_target = self._pipeline_maintenance_target(category, target)
+            result = client.pipeline_replace_work_source(old_media_id, new_media_id, maintenance_target, paths)
             if not isinstance(result, dict) or result.get("status") not in ("success", "already_removed"):
                 raise RuntimeError("MediaStationGo整剧旧片源清理返回无效响应")
             return result

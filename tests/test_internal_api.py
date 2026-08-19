@@ -454,9 +454,17 @@ class FakePipelineService:
             raise RuntimeError(self.upgrade_duplicate_match_error)
         return self.upgrade_duplicate_match
 
-    def remove_upgrade_target(self, old_media_id, new_media_id, target, upgrade_scope="media", new_source_paths=None):
+    def remove_upgrade_target(
+        self,
+        old_media_id,
+        new_media_id,
+        target,
+        upgrade_scope="media",
+        new_source_paths=None,
+        category=None,
+    ):
         self.upgrade_remove_calls.append(
-            (old_media_id, new_media_id, dict(target or {}), upgrade_scope, list(new_source_paths or []))
+            (old_media_id, new_media_id, dict(target or {}), upgrade_scope, list(new_source_paths or []), category)
         )
         if self.upgrade_remove_error:
             raise RuntimeError(self.upgrade_remove_error)
@@ -838,6 +846,41 @@ class PipelineTargetOverrideTest(InternalApiTestCase):
             },
         )
 
+    def test_work_upgrade_cleanup_sends_explicit_category(self):
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+
+        class Client:
+            def __init__(self):
+                self.call = None
+
+            def pipeline_replace_work_source(self, *args):
+                self.call = args
+                return {"status": "success", "removed": 150, "preserved": 99}
+
+        client = Client()
+        service._build_msg_client = lambda: client
+        target = target_for("anime", provider="tmdb", media_type="anime")
+
+        result = service.remove_upgrade_target(
+            "old-episode",
+            "new-episode",
+            target,
+            upgrade_scope="work",
+            new_source_paths=["/115/动漫/吞噬星空-new"],
+            category="anime",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(
+            client.call[2],
+            {
+                "category": "anime",
+                "library_id": target["library_id"],
+                "root_id": target["root_id"],
+                "root_openlist_path": target["root_openlist_path"],
+            },
+        )
+
     def test_duplicate_check_filters_by_explicit_target_library(self):
         config = BotConfig(token="token", allowed_user_ids={1}, msg_enabled=True)
         service = PipelineBotService(config)
@@ -1179,7 +1222,7 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(
             service.upgrade_remove_calls,
-            [("media-upgrade-target", completed["msg_media_id"], target_for("adult"), "media", [])],
+            [("media-upgrade-target", completed["msg_media_id"], target_for("adult"), "media", [], "adult")],
         )
         self.assertEqual(completed["result"]["upgrade_cleanup"]["status"], "removed")
 
@@ -1363,6 +1406,7 @@ class ImportPersistenceTest(InternalApiTestCase):
                     target_for("tv"),
                     "work",
                     [category_to_openlist_path("tv").rstrip("/") + "/Imported-Show"],
+                    "tv",
                 )
             ],
         )

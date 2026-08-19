@@ -1575,6 +1575,7 @@ class ImportTaskManager:
                             target,
                             upgrade_scope=str(request.get("upgrade_scope") or "media"),
                             new_source_paths=upgrade_new_source_paths(result.get("task")),
+                            category=category,
                         )
                     except Exception as exc:
                         warning = "旧片源移入回收站失败: %s" % exc
@@ -1632,6 +1633,7 @@ class ImportTaskManager:
                 target,
                 upgrade_scope=str(request.get("upgrade_scope") or "media"),
                 new_source_paths=upgrade_new_source_paths(result.get("task")),
+                category=request.get("category"),
             )
         except Exception as exc:
             warning = "旧片源移入回收站失败: %s" % exc
