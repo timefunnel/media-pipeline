@@ -366,6 +366,7 @@ class FakeMediaStationClient:
         migration_validate_response=None,
         migration_apply_response=None,
         pipeline_ingest_response=None,
+        pipeline_ignored_media_response=None,
         subtitle_status_response=None,
     ):
         self.search_response = search_response or {"data": {"items": []}}
@@ -392,6 +393,7 @@ class FakeMediaStationClient:
         self.migration_validate_response = migration_validate_response
         self.migration_apply_response = migration_apply_response
         self.pipeline_ingest_response = pipeline_ingest_response
+        self.pipeline_ignored_media_response = list(pipeline_ignored_media_response or [])
         self.subtitle_status_response = subtitle_status_response or {
             "media_id": "",
             "has_chinese": False,
@@ -533,6 +535,16 @@ class FakeMediaStationClient:
                             "match_mode": "path" if target_paths else "query",
                             "match_path": target_paths[0] if target_paths else "",
                         },
+                        "media_items": [
+                            {
+                                "id": media.get("id"),
+                                "title": media.get("title"),
+                                "path": media.get("path"),
+                                "match_mode": "path" if target_paths else "query",
+                                "match_path": target_paths[0] if target_paths else "",
+                            }
+                        ],
+                        "ignored_media": list(self.pipeline_ignored_media_response),
                         "deleted_media_prune": prune,
                     },
                 }

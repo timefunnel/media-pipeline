@@ -4316,7 +4316,7 @@ class LlmSearchRerankClientTest(unittest.TestCase):
 
 
 class PipelineBotServiceTest(unittest.TestCase):
-    def test_finalize_import_target_promotes_single_resource_directory(self):
+    def test_finalize_import_target_keeps_single_resource_directory_inside_permanent_container(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
         class OpenList:
@@ -4370,17 +4370,11 @@ class PipelineBotServiceTest(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result["import_target_openlist_path"], "/115/电影/Movie.Release")
-        self.assertEqual(result["import_target_finalize_reason"], "promoted_resource_directory")
-        self.assertEqual(client.moves, [("/115/电影/Movie [import-123]", "/115/电影", ["Movie.Release"])])
-        self.assertEqual(client.removes, [("/115/电影", ["Movie [import-123]"])])
-        self.assertEqual(
-            client.list_all_calls,
-            [
-                ("/115/电影/Movie [import-123]", True),
-                ("/115/电影/Movie [import-123]", True),
-            ],
-        )
+        self.assertEqual(result["import_target_openlist_path"], "/115/电影/Movie [import-123]")
+        self.assertEqual(result["import_target_finalize_reason"], "permanent_task_container")
+        self.assertEqual(client.moves, [])
+        self.assertEqual(client.removes, [])
+        self.assertEqual(client.list_all_calls, [])
 
     def test_finalize_import_target_keeps_container_for_loose_files(self):
         from pipeline.bot import BotConfig, PipelineBotService
@@ -4405,7 +4399,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         )
 
         self.assertEqual(result["import_target_openlist_path"], "/115/动漫/Show [import-123]")
-        self.assertEqual(result["import_target_finalize_reason"], "container_required")
+        self.assertEqual(result["import_target_finalize_reason"], "permanent_task_container")
         self.assertEqual(client.move_calls, [])
 
     def test_finalize_import_target_keeps_container_when_resource_directory_name_is_occupied(self):
@@ -4431,7 +4425,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result["import_target_finalize_reason"], "resource_directory_name_occupied")
+        self.assertEqual(result["import_target_finalize_reason"], "permanent_task_container")
         self.assertEqual(result["import_target_openlist_path"], "/115/电影/Movie [import-123]")
         self.assertEqual(client.move_calls, [])
 
@@ -5212,7 +5206,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["msg_visibility_repair_media_count"], 5)
         self.assertEqual(task["msg_sync_status"], "success")
 
-    def test_sync_completed_task_cleans_openlist_before_mediastation_scan(self):
+    def test_sync_completed_task_applies_msg_scan_ignored_media_without_second_listing(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
         events = []
@@ -5246,6 +5240,22 @@ class PipelineBotServiceTest(unittest.TestCase):
                 }
             },
             events=events,
+            pipeline_ignored_media_response=[
+                {
+                    "openlist_path": "/115/电影/Movie/trailer.mp4",
+                    "hide_path": "/115/电影/Movie",
+                    "hide_pattern": r"^trailer\.mp4$",
+                    "reason": "small_non_episode_video",
+                    "size_bytes": 20 * 1024 * 1024,
+                },
+                {
+                    "openlist_path": "/115/电影/Movie/Extras",
+                    "hide_path": "/115/电影/Movie",
+                    "hide_pattern": "^Extras$",
+                    "reason": "known_extra_directory",
+                    "size_bytes": 10 * 1024 * 1024,
+                },
+            ],
         )
 
         with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
@@ -5280,23 +5290,23 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(
             fake_openlist.meta_hide_calls,
             [
-                ("/115/电影/Movie", [r"^trailer\.mp4$", r"^poster\.jpg$", "^Extras$"], True),
-                ("/115/电影/Movie/Extras", [r"^sample\.mp4$"], True),
+                ("/115/电影/Movie", [r"^trailer\.mp4$", "^Extras$"], True),
             ],
         )
         self.assertEqual(fake_openlist.source_delete_calls, [])
-        self.assertLess(
-            events.index(("meta_hide", "/115/电影/Movie", (r"^trailer\.mp4$", r"^poster\.jpg$", "^Extras$"), True)),
+        self.assertGreater(
+            events.index(("meta_hide", "/115/电影/Movie", (r"^trailer\.mp4$", "^Extras$"), True)),
             events.index(("scan",)),
         )
         self.assertEqual(task["openlist_clean_status"], "success")
-        self.assertEqual(task["openlist_cleaned_count"], 3)
-        self.assertEqual(task["openlist_cleaned_bytes"], 30 * 1024 * 1024 + 300 * 1024)
+        self.assertEqual(task["openlist_cleaned_count"], 2)
+        self.assertEqual(task["openlist_cleaned_bytes"], 30 * 1024 * 1024)
         self.assertEqual(task["msg_sync_status"], "success")
-        self.assertIn(("get_path", "/115/电影/Movie"), events)
+        self.assertEqual(task["msg_ingest_ignored_count"], 2)
+        self.assertEqual(fake_msg.pipeline_ingest_calls[0]["filter_small_video_max_bytes"], 100 * 1024 * 1024)
         self.assertNotIn(("list_all", "/115/电影", False), events)
 
-    def test_sync_completed_task_hides_msg_trash_before_mediastation_scan(self):
+    def test_deleted_media_hide_maintenance_runs_independently_from_ingest(self):
         from pipeline.bot import BotConfig, CandidateStore, PipelineBotService
 
         events = []
@@ -5345,6 +5355,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     openlist_pre_scan_clean_enabled=False,
                 )
             )
+            maintenance = service.sync_deleted_media_hides()
             task = service.sync_completed_task(
                 "movie",
                 "Movie",
@@ -5357,9 +5368,11 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertLess(events.index(("meta_hide", "/115/其他", ("^Old$",), True)), events.index(("scan",)))
         self.assertEqual(processed, {"trash-1", "trash-2"})
         self.assertIn(("list_deleted_media_hide_candidates", 100), fake_msg.pipeline_maintenance_calls)
-        self.assertEqual(task["openlist_trash_hide_status"], "success")
-        self.assertEqual(task["openlist_trash_hide_hidden_count"], 1)
-        self.assertEqual(task["openlist_trash_hide_skipped_count"], 1)
+        self.assertEqual(maintenance["openlist_trash_hide_status"], "success")
+        self.assertEqual(maintenance["openlist_trash_hide_hidden_count"], 1)
+        self.assertEqual(maintenance["openlist_trash_hide_skipped_count"], 1)
+        self.assertEqual(task["openlist_trash_hide_status"], "skipped")
+        self.assertEqual(task["openlist_trash_hide_reason"], "independent_maintenance")
         self.assertEqual(task["msg_sync_status"], "success")
 
     def test_repair_msg_movie_extras_writes_openlist_meta_hide(self):

@@ -2149,15 +2149,6 @@ class PipelineBotService:
         folder_name = import_target_name(title, import_id, purpose=purpose)
         target_path = posixpath.join(root_openlist_path.rstrip("/") or "/", folder_name)
         folder_id = self._ensure_category_directory(category, folder_name)
-
-        openlist_client = self._build_openlist_client()
-        wait_openlist_directory(
-            openlist_client,
-            root_openlist_path,
-            folder_name,
-            timeout_seconds=self.config.subscription_move_timeout_seconds,
-            poll_seconds=self.config.subscription_move_poll_seconds,
-        )
         return {
             "folder_id": folder_id,
             "openlist_path": target_path,
@@ -2171,97 +2162,27 @@ class PipelineBotService:
         if not target_path:
             raise ValueError("入库目标 OpenList 路径缺失")
         purpose = str(task.get("import_target_purpose") or "import").strip().lower()
-        now = int(time.time())
-        base = {
+        if purpose not in ("import", "upgrade"):
+            raise ValueError("入库目录用途无效")
+        finalize_reason = "permanent_task_container"
+        promoted_path = normalize_openlist_path(task.get("import_target_promoted_openlist_path"))
+        if promoted_path:
+            client = self._build_openlist_client()
+            if openlist_path_exists(client, promoted_path):
+                target_path = promoted_path
+                finalize_reason = "legacy_promoted_resource_recovered"
+            elif not openlist_path_exists(client, target_path):
+                raise RuntimeError("旧版入库路径恢复失败: %s" % target_path)
+        return {
             "import_target_finalize_status": "success",
             "import_target_original_openlist_path": normalize_openlist_path(
                 task.get("import_target_original_openlist_path") or target_path
             ),
             "import_target_openlist_path": target_path,
-            "import_target_finalized_at": now,
+            "import_target_finalize_reason": finalize_reason,
+            "import_target_finalized_at": int(time.time()),
             "import_target_finalize_error": None,
         }
-        if purpose == "upgrade":
-            base["import_target_finalize_reason"] = "isolated_upgrade_source"
-            return base
-
-        client = self._build_openlist_client()
-        promoted_path = normalize_openlist_path(task.get("import_target_promoted_openlist_path"))
-        try:
-            items = list(client.list_all(target_path, refresh=True))
-        except RuntimeError as exc:
-            if not promoted_path or not openlist_missing_error(exc) or not openlist_path_exists(client, promoted_path):
-                raise
-            base.update(
-                {
-                    "import_target_openlist_path": promoted_path,
-                    "import_target_promoted_openlist_path": promoted_path,
-                    "import_target_finalize_reason": "promoted_resource_directory_recovered",
-                }
-            )
-            return base
-        if not items:
-            if promoted_path and openlist_path_exists(client, promoted_path):
-                root_path = posixpath.dirname(target_path.rstrip("/")) or "/"
-                client.remove_names(root_path, [posixpath.basename(target_path.rstrip("/"))])
-                wait_openlist_path_missing(
-                    client,
-                    target_path,
-                    timeout_seconds=self.config.subscription_move_timeout_seconds,
-                    poll_seconds=self.config.subscription_move_poll_seconds,
-                )
-                base.update(
-                    {
-                        "import_target_openlist_path": promoted_path,
-                        "import_target_promoted_openlist_path": promoted_path,
-                        "import_target_finalize_reason": "promoted_resource_directory_recovered",
-                    }
-                )
-                return base
-            raise RuntimeError("OpenList入库目录为空: %s" % target_path)
-        if len(items) != 1 or not openlist_item_is_dir(items[0]):
-            base["import_target_finalize_reason"] = "container_required"
-            return base
-
-        resource_name = openlist_item_name(items[0])
-        root_path = posixpath.dirname(target_path.rstrip("/")) or "/"
-        promoted_path = posixpath.join(root_path.rstrip("/") or "/", resource_name)
-        if openlist_path_exists(client, promoted_path):
-            base["import_target_finalize_reason"] = "resource_directory_name_occupied"
-            return base
-
-        if progress_callback:
-            progress_callback(
-                {
-                    "import_target_finalize_status": "running",
-                    "import_target_original_openlist_path": base["import_target_original_openlist_path"],
-                    "import_target_promoted_openlist_path": promoted_path,
-                    "import_target_finalize_error": None,
-                }
-            )
-        client.move_names(target_path, root_path, [resource_name])
-        wait_openlist_directory_promoted(
-            client,
-            target_path,
-            promoted_path,
-            timeout_seconds=self.config.subscription_move_timeout_seconds,
-            poll_seconds=self.config.subscription_move_poll_seconds,
-        )
-        client.remove_names(root_path, [posixpath.basename(target_path.rstrip("/"))])
-        wait_openlist_path_missing(
-            client,
-            target_path,
-            timeout_seconds=self.config.subscription_move_timeout_seconds,
-            poll_seconds=self.config.subscription_move_poll_seconds,
-        )
-        base.update(
-            {
-                "import_target_openlist_path": promoted_path,
-                "import_target_promoted_openlist_path": promoted_path,
-                "import_target_finalize_reason": "promoted_resource_directory",
-            }
-        )
-        return base
 
     def _ensure_category_directory(self, category, folder_name):
         root_folder_id = str(category_to_folder_id(category) or "").strip()
@@ -3160,9 +3081,6 @@ class PipelineBotService:
         import_target_path = normalize_openlist_path(
             progress.get("import_target_openlist_path") or progress.get("upgrade_staging_openlist_path")
         )
-        import_target_purpose = str(progress.get("import_target_purpose") or "").strip().lower()
-        if not import_target_purpose and progress.get("upgrade_staging_openlist_path"):
-            import_target_purpose = "upgrade"
         openlist_client = None
         msg_client = None
 
@@ -3178,7 +3096,7 @@ class PipelineBotService:
         def get_openlist_client():
             nonlocal openlist_client
             if openlist_client is None:
-                openlist_client = self._refresh_openlist_for_msg(root_openlist_path)
+                openlist_client = self._build_openlist_client()
             return openlist_client
 
         def get_msg_client():
@@ -3188,7 +3106,13 @@ class PipelineBotService:
             return msg_client
 
         format_result = prefixed_task_fields(progress, "openlist_adult_")
-        if category == "adult" and self.config.openlist_adult_code_format_enabled:
+        if category == "adult" and import_target_path:
+            format_result = {
+                "openlist_adult_format_status": "skipped",
+                "openlist_adult_format_reason": "permanent_task_container",
+            }
+            apply_progress(format_result)
+        elif category == "adult" and self.config.openlist_adult_code_format_enabled:
             if not stage_is_complete(progress.get("openlist_adult_format_status")):
                 emit({"openlist_adult_format_status": "running", "openlist_adult_format_error": None})
                 format_result = self._format_openlist_adult_before_msg(
@@ -3219,27 +3143,17 @@ class PipelineBotService:
             )
             apply_progress(format_result)
 
-        trash_hide_result = prefixed_task_fields(progress, "openlist_trash_hide_")
-        if self.config.msg_trash_hide_sync_enabled:
-            if not stage_is_complete(progress.get("openlist_trash_hide_status")):
-                emit({"openlist_trash_hide_status": "running", "openlist_trash_hide_error": None})
-                trash_hide_result = self._sync_msg_trash_to_openlist_hide(get_msg_client(), get_openlist_client())
-                if trash_hide_result.get("openlist_trash_hide_status") != "skipped":
-                    emit(trash_hide_result)
-                else:
-                    apply_progress(trash_hide_result)
-            else:
-                apply_progress(trash_hide_result)
-        else:
-            trash_hide_result = {"openlist_trash_hide_status": "skipped", "openlist_trash_hide_reason": "disabled"}
-            apply_progress(trash_hide_result)
+        trash_hide_result = {
+            "openlist_trash_hide_status": "skipped",
+            "openlist_trash_hide_reason": "independent_maintenance",
+        }
+        apply_progress(trash_hide_result)
 
         clean_result = prefixed_task_fields(progress, "openlist_clean_")
-        if import_target_path and import_target_purpose == "upgrade":
-            get_openlist_client().list_path(import_target_path, refresh=True)
+        if import_target_path and self.config.openlist_pre_scan_clean_enabled:
             clean_result = {
-                "openlist_clean_status": "skipped",
-                "openlist_clean_reason": "isolated_upgrade_source",
+                "openlist_clean_status": "running",
+                "openlist_clean_reason": "delegated_to_msg_target_scan",
             }
             apply_progress(clean_result)
         elif self.config.openlist_pre_scan_clean_enabled:
@@ -3288,7 +3202,13 @@ class PipelineBotService:
             and self.config.openlist_pre_scan_clean_enabled
             and progress.get("msg_scan_status") != "success"
         ):
-            if not stage_is_complete(progress.get("openlist_adult_extra_hide_status")):
+            if import_target_path:
+                adult_extra_hide_result = {
+                    "openlist_adult_extra_hide_status": "skipped",
+                    "openlist_adult_extra_hide_reason": "delegated_to_msg_target_scan",
+                }
+                apply_progress(adult_extra_hide_result)
+            elif not stage_is_complete(progress.get("openlist_adult_extra_hide_status")):
                 emit({"openlist_adult_extra_hide_status": "running", "openlist_adult_extra_hide_error": None})
                 adult_extra_hide_result = self._hide_openlist_adult_extra_videos_before_msg(
                     get_openlist_client(),
@@ -3334,6 +3254,14 @@ class PipelineBotService:
             deleted_media_prune_result = prefixed_task_fields(ingest_result, "msg_deleted_media_prune_")
             target_scan_result = prefixed_task_fields(ingest_result, "msg_target_scan_")
             apply_progress(ingest_result)
+            if import_target_path and self.config.openlist_pre_scan_clean_enabled:
+                clean_result = self._apply_msg_ingest_ignored_media_hides(
+                    get_openlist_client(), ingest_result.get("msg_ingest_ignored_media")
+                )
+                if clean_result.get("openlist_clean_status") == "success":
+                    emit(clean_result)
+                else:
+                    apply_progress(clean_result)
             media_id = extract_media_id(media)
             if not media_id:
                 raise RuntimeError("MediaStationGo media id missing after scan")
@@ -3378,7 +3306,11 @@ class PipelineBotService:
         movie_cleanup_touched_openlist = int(clean_result.get("openlist_hidden_count") or 0) > 0 or int(
             clean_result.get("openlist_cleaned_count") or 0
         ) > 0
-        if category == "movie" and movie_cleanup_touched_openlist:
+        if (
+            category == "movie"
+            and movie_cleanup_touched_openlist
+            and clean_result.get("openlist_clean_reason") != "filtered_during_msg_target_scan"
+        ):
             if not stage_is_complete(progress.get("msg_extra_cleanup_status")):
                 emit({"msg_extra_cleanup_status": "running", "msg_extra_cleanup_error": None})
                 extras_result = self._repair_msg_movie_extras(
@@ -3653,6 +3585,13 @@ class PipelineBotService:
             "openlist_trash_hide_at": int(time.time()),
         }
 
+    def sync_deleted_media_hides(self):
+        if not self.config.msg_trash_hide_sync_enabled:
+            return {"openlist_trash_hide_status": "skipped", "openlist_trash_hide_reason": "disabled"}
+        if not self.config.msg_enabled:
+            return {"openlist_trash_hide_status": "skipped", "openlist_trash_hide_reason": "msg_disabled"}
+        return self._sync_msg_trash_to_openlist_hide(self._build_msg_client(), self._build_openlist_client())
+
     def _hide_openlist_adult_extra_videos_before_msg(
         self,
         client,
@@ -3733,6 +3672,16 @@ class PipelineBotService:
                 "repair_movie_extras": False,
                 "repair_episode_visibility": False,
             }
+            if (
+                authoritative_paths
+                and (
+                    progress.get("import_target_openlist_path")
+                    or progress.get("upgrade_staging_openlist_path")
+                )
+                and self.config.openlist_pre_scan_clean_enabled
+            ):
+                request["filter_small_video_max_bytes"] = int(self.config.openlist_pre_scan_clean_max_bytes)
+                request["filter_adult_extras"] = category == "adult"
             job = client.pipeline_start_ingest(request)
 
         deadline = time.monotonic() + max(0, int(self.config.msg_sync_poll_seconds))
@@ -3783,6 +3732,20 @@ class PipelineBotService:
             "msg_ingest_status": "completed",
             "msg_ingest_error": None,
         }
+        media_items = result.get("media_items")
+        if isinstance(media_items, list):
+            media_ids = [str(item.get("id") or "").strip() for item in media_items if isinstance(item, dict)]
+            media_ids = [value for value in media_ids if value]
+            updates["msg_ingest_media_ids"] = media_ids
+            updates["msg_ingest_media_count"] = len(media_ids)
+        ignored_media = result.get("ignored_media")
+        if isinstance(ignored_media, list):
+            updates["msg_ingest_ignored_media"] = [dict(item) for item in ignored_media if isinstance(item, dict)]
+            updates["msg_ingest_ignored_count"] = len(updates["msg_ingest_ignored_media"])
+        cloud_subtitle_status = str(result.get("cloud_subtitle_status") or "").strip()
+        if cloud_subtitle_status:
+            updates["msg_cloud_subtitle_status"] = cloud_subtitle_status
+            updates["msg_cloud_subtitle_error"] = str(result.get("cloud_subtitle_error") or "").strip() or None
         scan_result = result.get("scan")
         if isinstance(scan_result, dict):
             updates.update(
@@ -3826,13 +3789,48 @@ class PipelineBotService:
             )
         return updates
 
-    def _refresh_openlist_for_msg(self, root_openlist_path):
-        path = normalize_openlist_path(root_openlist_path)
-        if not path:
-            raise ValueError("OpenList root path missing")
-        client = OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
-        client.list_path(path, refresh=True)
-        return client
+    def _apply_msg_ingest_ignored_media_hides(self, client, ignored_media):
+        groups = defaultdict(list)
+        ignored = []
+        for item in ignored_media or []:
+            if not isinstance(item, dict):
+                continue
+            hide_path = normalize_openlist_path(item.get("hide_path"))
+            pattern = str(item.get("hide_pattern") or "").strip()
+            openlist_path = normalize_openlist_path(item.get("openlist_path"))
+            if not hide_path or not pattern or not openlist_path:
+                return {
+                    "openlist_clean_status": "failed",
+                    "openlist_clean_error": "MediaStationGo ignored media item is incomplete",
+                    "openlist_cleaned_count": 0,
+                    "openlist_cleaned_bytes": 0,
+                    "openlist_hidden_count": 0,
+                    "openlist_cleaned_at": int(time.time()),
+                }
+            if pattern not in groups[hide_path]:
+                groups[hide_path].append(pattern)
+            ignored.append(item)
+        try:
+            for hide_path, patterns in sorted(groups.items()):
+                client.upsert_meta_hide(hide_path, patterns, h_sub=True)
+        except RuntimeError as exc:
+            return {
+                "openlist_clean_status": "failed",
+                "openlist_clean_error": str(exc),
+                "openlist_cleaned_count": len(ignored),
+                "openlist_cleaned_bytes": sum(int(item.get("size_bytes") or 0) for item in ignored),
+                "openlist_hidden_count": 0,
+                "openlist_cleaned_at": int(time.time()),
+            }
+        return {
+            "openlist_clean_status": "success",
+            "openlist_clean_reason": "filtered_during_msg_target_scan",
+            "openlist_cleaned_count": len(ignored),
+            "openlist_cleaned_bytes": sum(int(item.get("size_bytes") or 0) for item in ignored),
+            "openlist_hidden_count": sum(len(patterns) for patterns in groups.values()),
+            "openlist_cleaned_at": int(time.time()),
+            "openlist_clean_error": None,
+        }
 
     def _clean_openlist_before_msg(
         self,
@@ -3886,6 +3884,7 @@ class PipelineBotService:
                 task=task,
                 allow_existing_target=is_upgrade,
                 target_path=target_openlist_path,
+                preserve_target_path=bool(target_openlist_path),
             )
         except (RuntimeError, ValueError) as exc:
             return {
@@ -3981,60 +3980,6 @@ def wait_openlist_directory(
                 raise
         if monotonic_fn() >= deadline:
             raise RuntimeError("OpenList未在 %.1f 秒内识别入库目录: %s" % (timeout, name))
-        wait_fn(max(0.01, float(poll_seconds or 0)))
-
-
-def wait_openlist_directory_promoted(
-    client,
-    source_path,
-    promoted_path,
-    timeout_seconds=300,
-    poll_seconds=1,
-    wait_fn=time.sleep,
-    monotonic_fn=time.monotonic,
-):
-    timeout = max(0.0, float(timeout_seconds or 0))
-    deadline = monotonic_fn() + timeout
-    resource_name = posixpath.basename(promoted_path.rstrip("/"))
-    while True:
-        source_names = {
-            openlist_item_name(item).casefold()
-            for item in client.list_all(source_path, refresh=True)
-        }
-        promoted_visible = False
-        try:
-            client.list_path(promoted_path, refresh=True)
-            promoted_visible = True
-        except RuntimeError as exc:
-            if not openlist_missing_error(exc) and not openlist_receive_operation_is_retryable_error(exc):
-                raise
-        if resource_name.casefold() not in source_names and promoted_visible:
-            return
-        if monotonic_fn() >= deadline:
-            raise RuntimeError("OpenList目录提升校验失败: %s" % promoted_path)
-        wait_fn(max(0.01, float(poll_seconds or 0)))
-
-
-def wait_openlist_path_missing(
-    client,
-    path,
-    timeout_seconds=300,
-    poll_seconds=1,
-    wait_fn=time.sleep,
-    monotonic_fn=time.monotonic,
-):
-    timeout = max(0.0, float(timeout_seconds or 0))
-    deadline = monotonic_fn() + timeout
-    while True:
-        try:
-            client.list_path(path, refresh=True)
-        except RuntimeError as exc:
-            if openlist_missing_error(exc):
-                return
-            if not openlist_receive_operation_is_retryable_error(exc):
-                raise
-        if monotonic_fn() >= deadline:
-            raise RuntimeError("OpenList入库容器删除校验失败: %s" % path)
         wait_fn(max(0.01, float(poll_seconds or 0)))
 
 
@@ -6739,6 +6684,7 @@ class TelegramBot:
         interval = max(1, int(self.config.sync_recovery_interval_seconds))
         loop_interval = min(interval, ACTIVE_115_FAST_POLL_INTERVAL_SECONDS)
         last_msg_recovery_at = 0
+        last_trash_hide_sync_at = 0
         while True:
             try:
                 now = int(time.time())
@@ -6746,6 +6692,12 @@ class TelegramBot:
                 if now - last_msg_recovery_at >= interval:
                     self.recover_running_msg_sync_tasks_once()
                     last_msg_recovery_at = now
+                if now - last_trash_hide_sync_at >= interval:
+                    try:
+                        self.service.sync_deleted_media_hides()
+                    except Exception as exc:
+                        print("deleted media hide maintenance failed: %s" % exc, flush=True)
+                    last_trash_hide_sync_at = now
             except sqlite3.Error as exc:
                 print("sync recovery sqlite access failed: %s" % exc, flush=True)
             time.sleep(loop_interval)
@@ -6961,6 +6913,12 @@ STALE_MSG_MEDIA_RESET_KEYS = (
     "msg_ingest_scan_added",
     "msg_ingest_scan_updated",
     "msg_ingest_scan_removed",
+    "msg_ingest_media_ids",
+    "msg_ingest_media_count",
+    "msg_ingest_ignored_media",
+    "msg_ingest_ignored_count",
+    "msg_cloud_subtitle_status",
+    "msg_cloud_subtitle_error",
     "msg_scan_status",
     "msg_scrape_status",
     "msg_scrape_mode",
@@ -8056,6 +8014,7 @@ def format_openlist_adult_code(
     task=None,
     allow_existing_target=False,
     target_path=None,
+    preserve_target_path=False,
 ):
     target = find_openlist_task_target(client, category_path, queries, task=task, target_path=target_path)
     if target is None:
@@ -8080,7 +8039,7 @@ def format_openlist_adult_code(
     new_path = old_path
     renamed_target = False
     target_name_occupied = False
-    if new_name != old_name:
+    if new_name != old_name and not preserve_target_path:
         new_path = posixpath.join(str(target_dir).rstrip("/") or "/", new_name)
         target_name_occupied = new_path.casefold() != old_path.casefold() and openlist_path_exists(client, new_path)
         if not (allow_existing_target and target_name_occupied):
@@ -8920,6 +8879,7 @@ def format_task_diagnostics_message(record):
         ("msg_error", "MSG错误"),
         ("msg_extra_cleanup_error", "特典隐藏错误"),
         ("msg_visibility_repair_error", "可见性修复错误"),
+        ("msg_cloud_subtitle_error", "云字幕缓存错误"),
     ):
         if task.get(key):
             lines.append("%s：%s" % (label, task.get(key)))

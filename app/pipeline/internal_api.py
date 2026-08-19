@@ -1497,18 +1497,20 @@ class ImportTaskManager:
             self._raise_if_stopping()
             self._raise_if_cancel_requested(task["owner_id"], task["id"], category, info_hash)
             self.store.save_running(task["id"], "waiting_download", result=result, info_hash=info_hash)
+            previous_poll_attempt = offline_task_poll_attempt(offline_task)
             offline_task = self.service.task_status(category, info_hash)
             if not isinstance(offline_task, dict):
                 raise RuntimeError("pipeline task_status returned invalid response")
             offline_task = dict(offline_task)
             offline_task.setdefault("info_hash", info_hash)
+            mark_offline_task_polled(offline_task, previous_poll_attempt)
             apply_import_target(offline_task, import_target)
             result["task"] = offline_task
             self.store.save_running(task["id"], "waiting_download", result=result, info_hash=info_hash)
             if offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
                 if time.monotonic() >= offline_wait_deadline:
                     raise OfflineWaitDeferred()
-                self._wait_or_stop()
+                self._wait_or_stop(offline_task_poll_delay(offline_task, self.poll_seconds))
 
         target = request["target"]
         self._raise_if_cancel_requested(task["owner_id"], task["id"], category, info_hash)
@@ -1842,11 +1844,13 @@ class ImportTaskManager:
                                 self.store.save_running(
                                     task["id"], "waiting_download", result=result, info_hash=info_hash
                                 )
+                                previous_poll_attempt = offline_task_poll_attempt(offline_task)
                                 offline_task = self.service.task_status(category, info_hash)
                                 if not isinstance(offline_task, dict):
                                     raise RuntimeError("pipeline task_status returned invalid response")
                                 offline_task = dict(offline_task)
                                 offline_task.setdefault("info_hash", info_hash)
+                                mark_offline_task_polled(offline_task, previous_poll_attempt)
                                 result["task"] = offline_task
                                 self.store.save_running(
                                     task["id"], "waiting_download", result=result, info_hash=info_hash
@@ -1854,7 +1858,7 @@ class ImportTaskManager:
                                 if offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
                                     if time.monotonic() >= offline_wait_deadline:
                                         raise OfflineWaitDeferred()
-                                    self._wait_or_stop()
+                                    self._wait_or_stop(offline_task_poll_delay(offline_task, self.poll_seconds))
                             staging = self.service.claim_subscription_transfer(
                                 staging, submit_result, completed_task=offline_task
                             )
@@ -2019,8 +2023,9 @@ class ImportTaskManager:
             self.service.cancel_task(category, info_hash)
         raise ImportCanceled("import task canceled")
 
-    def _wait_or_stop(self):
-        if self._stop_event.wait(self.poll_seconds):
+    def _wait_or_stop(self, delay_seconds=None):
+        delay = self.poll_seconds if delay_seconds is None else max(0.01, float(delay_seconds))
+        if self._stop_event.wait(delay):
             raise WorkerStopping("internal API worker stopping")
 
     def _raise_if_stopping(self):
@@ -3213,6 +3218,26 @@ def first_submit_info_hash(result):
 
 def result_task_is_offline_success(result):
     return isinstance(result, dict) and (result.get("task") or {}).get("status_name") == OFFLINE_SUCCESS_STATUS
+
+
+def offline_task_poll_attempt(task):
+    try:
+        return max(0, int((task or {}).get("pipeline_poll_attempt") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def mark_offline_task_polled(task, previous_attempt=0):
+    task["pipeline_poll_attempt"] = max(0, int(previous_attempt or 0)) + 1
+    task["pipeline_last_polled_at"] = int(time.time())
+    return task
+
+
+def offline_task_poll_delay(task, initial_seconds, max_seconds=60.0):
+    initial = max(0.01, float(initial_seconds or 0.01))
+    attempt = offline_task_poll_attempt(task)
+    multiplier = 2 ** min(max(0, attempt - 1), 8)
+    return min(max(initial, float(max_seconds)), initial * multiplier)
 
 
 def retry_resume_stage(result):
