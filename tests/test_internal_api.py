@@ -2579,6 +2579,7 @@ class HttpAuthenticationTest(InternalApiTestCase):
                 {
                     "owner_id": "owner-a",
                     "input": "magnet:?xt=urn:btih:%s&dn=Sintel" % info_hash,
+                    "title": "Sintel",
                     "category": "movie",
                 },
                 token="secret",
