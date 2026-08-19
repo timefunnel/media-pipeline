@@ -2140,6 +2140,51 @@ class PipelineBotService:
             "openlist_path": staging_path,
         }
 
+    def prepare_work_upgrade_staging(self, category, import_id, title):
+        if category not in ("tv", "anime"):
+            raise ValueError("整剧升级暂存目录仅支持剧集和动漫")
+        root_folder_id = str(category_to_folder_id(category) or "").strip()
+        root_openlist_path = normalize_openlist_path(category_to_openlist_path(category))
+        folder_name = work_upgrade_staging_name(title, import_id)
+        staging_path = posixpath.join(root_openlist_path.rstrip("/") or "/", folder_name)
+        client = self._build_115_client(category)
+
+        matches = [
+            item
+            for item in client.list_all_files(root_folder_id)
+            if p115_open_item_name(item) == folder_name
+        ]
+        if len(matches) > 1:
+            raise RuntimeError("115整剧升级目录存在重名项: %s" % folder_name)
+        if matches:
+            if not p115_open_item_is_dir(matches[0]):
+                raise RuntimeError("115整剧升级目录名已被文件占用: %s" % folder_name)
+            folder_id = p115_open_item_id(matches[0])
+        else:
+            response = client.create_folder(folder_name, root_folder_id)
+            folder_id = p115_open_item_id((response or {}).get("data") or {})
+        if not folder_id:
+            raise RuntimeError("115整剧升级目录缺少文件夹 ID")
+
+        info = client.get_folder_info(folder_id)
+        data = (info or {}).get("data") or {}
+        if (info or {}).get("state") is not True or p115_open_item_name(data) != folder_name:
+            raise RuntimeError("115整剧升级目录校验失败: %s" % folder_name)
+
+        openlist_client = self._build_openlist_client()
+        wait_openlist_directory(
+            openlist_client,
+            root_openlist_path,
+            folder_name,
+            timeout_seconds=self.config.subscription_move_timeout_seconds,
+            poll_seconds=self.config.subscription_move_poll_seconds,
+        )
+        return {
+            "folder_id": folder_id,
+            "openlist_path": staging_path,
+            "folder_name": folder_name,
+        }
+
     def validate_subscription_receive_root(self, staging):
         client = self._build_openlist_client()
         root_path = subscription_receive_root_path(staging)
@@ -2961,6 +3006,7 @@ class PipelineBotService:
         progress = dict(task or {})
         msg_target = self._msg_target(category, target)
         root_openlist_path = msg_target["root_openlist_path"]
+        upgrade_staging_path = normalize_openlist_path(progress.get("upgrade_staging_openlist_path"))
         openlist_client = None
         msg_client = None
 
@@ -3027,7 +3073,14 @@ class PipelineBotService:
             apply_progress(trash_hide_result)
 
         clean_result = prefixed_task_fields(progress, "openlist_clean_")
-        if self.config.openlist_pre_scan_clean_enabled:
+        if upgrade_staging_path:
+            get_openlist_client().list_path(upgrade_staging_path, refresh=True)
+            clean_result = {
+                "openlist_clean_status": "skipped",
+                "openlist_clean_reason": "work_upgrade_staging",
+            }
+            apply_progress(clean_result)
+        elif self.config.openlist_pre_scan_clean_enabled:
             if not stage_is_complete(progress.get("openlist_clean_status")):
                 emit({"openlist_clean_status": "running", "openlist_clean_error": None})
                 clean_result = self._clean_openlist_before_msg(
@@ -3662,6 +3715,7 @@ def msg_target_openlist_paths(category, task):
     task = task or {}
     paths = []
     for key in (
+        "upgrade_staging_openlist_path",
         "openlist_adult_format_new_path",
         "openlist_adult_format_path",
         "openlist_clean_target",
@@ -3682,6 +3736,57 @@ def safe_115_folder_name(value, fallback):
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", str(value or "").strip())
     value = re.sub(r"\s+", " ", value).strip(" .-")
     return (value or fallback)[:120]
+
+
+def work_upgrade_staging_name(title, import_id):
+    token = re.sub(r"[^0-9A-Za-z]+", "", str(import_id or ""))[:12]
+    if not token:
+        raise ValueError("整剧升级任务 ID 无效")
+    suffix = " [upgrade-%s]" % token
+    base = safe_115_folder_name(title, "work")
+    return base[: 120 - len(suffix)].rstrip(" .-") + suffix
+
+
+def p115_open_item_name(item):
+    item = item or {}
+    return str(item.get("fn") or item.get("file_name") or item.get("name") or "").strip()
+
+
+def p115_open_item_id(item):
+    item = item or {}
+    return str(item.get("fid") or item.get("file_id") or item.get("cid") or "").strip()
+
+
+def p115_open_item_is_dir(item):
+    item = item or {}
+    if "fc" in item:
+        return str(item.get("fc")) == "0"
+    return bool(item.get("is_dir", True))
+
+
+def wait_openlist_directory(
+    client,
+    parent_path,
+    name,
+    timeout_seconds=300,
+    poll_seconds=1,
+    wait_fn=time.sleep,
+    monotonic_fn=time.monotonic,
+):
+    timeout = max(0.0, float(timeout_seconds or 0))
+    deadline = monotonic_fn() + timeout
+    while True:
+        items = client.list_all(parent_path, refresh=True)
+        matches = [item for item in items if openlist_item_name(item) == name]
+        if len(matches) > 1:
+            raise RuntimeError("OpenList整剧升级目录存在重名项: %s" % name)
+        if matches:
+            if not openlist_item_is_dir(matches[0]):
+                raise RuntimeError("OpenList整剧升级目录名已被文件占用: %s" % name)
+            return matches[0]
+        if monotonic_fn() >= deadline:
+            raise RuntimeError("OpenList未在 %.1f 秒内识别整剧升级目录: %s" % (timeout, name))
+        wait_fn(max(0.01, float(poll_seconds or 0)))
 
 
 def subscription_staging_path(staging):
@@ -3961,6 +4066,7 @@ def msg_authoritative_openlist_paths(task):
     task = task or {}
     paths = []
     for key in (
+        "upgrade_staging_openlist_path",
         "openlist_adult_format_new_path",
         "openlist_adult_format_path",
         "openlist_clean_target",
