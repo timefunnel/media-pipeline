@@ -2708,7 +2708,14 @@ class PipelineBotService:
                 if progress_callback:
                     progress_callback(dict(out))
                 return out
-        if task_msg_synced(out):
+        post_enhancement_execution = bool(out.get("post_enhancement_execution"))
+        if not post_enhancement_execution and (
+            task_msg_synced(out)
+            or (
+                out.get("msg_sync_status") == "success"
+                and str(out.get("post_enhancement_status") or "").strip().lower() in {"pending", "running"}
+            )
+        ):
             return out
         if not self.config.msg_enabled and target is None:
             return out
@@ -3151,11 +3158,14 @@ class PipelineBotService:
 
         clean_result = prefixed_task_fields(progress, "openlist_clean_")
         if import_target_path and self.config.openlist_pre_scan_clean_enabled:
-            clean_result = {
-                "openlist_clean_status": "running",
-                "openlist_clean_reason": "delegated_to_msg_target_scan",
-            }
-            apply_progress(clean_result)
+            if stage_is_complete(progress.get("openlist_clean_status")):
+                apply_progress(clean_result)
+            else:
+                clean_result = {
+                    "openlist_clean_status": "running",
+                    "openlist_clean_reason": "delegated_to_msg_target_scan",
+                }
+                apply_progress(clean_result)
         elif self.config.openlist_pre_scan_clean_enabled:
             if not stage_is_complete(progress.get("openlist_clean_status")):
                 emit({"openlist_clean_status": "running", "openlist_clean_error": None})
@@ -3275,6 +3285,38 @@ class PipelineBotService:
                     "msg_match_path": media.get("_pipeline_match_path"),
                 }
             )
+
+        if progress.get("defer_enhancements") and not progress.get("post_enhancement_execution"):
+            return {
+                "msg_sync_status": "success",
+                "msg_scan_status": "success",
+                "msg_scrape_status": "skipped",
+                "msg_scrape_reason": "post_ingest_deferred",
+                "msg_library_id": (root or {}).get("library_id") or progress.get("msg_library_id"),
+                "msg_root_id": (root or {}).get("root_id") or progress.get("msg_root_id"),
+                "msg_media_id": media_id,
+                "msg_media_title": media_title,
+                "msg_match_mode": progress.get("msg_match_mode"),
+                "msg_match_path": progress.get("msg_match_path"),
+                "msg_extra_cleanup_status": "skipped",
+                "msg_extra_cleanup_reason": "post_ingest_deferred",
+                "msg_visibility_repair_status": "skipped",
+                "msg_visibility_repair_reason": "post_ingest_deferred",
+                "subtitle_match_status": "skipped",
+                "subtitle_match_reason": "post_ingest_deferred",
+                "post_enhancement_status": "pending",
+                "post_enhancement_stage": "scrape",
+                "post_enhancement_error": None,
+                "msg_error": None,
+                "msg_synced_at": int(time.time()),
+                **clean_result,
+                **format_result,
+                **trash_hide_result,
+                **adult_extra_hide_result,
+                **ingest_result,
+                **deleted_media_prune_result,
+                **target_scan_result,
+            }
 
         if not stage_is_complete(progress.get("msg_scrape_status")):
             if not root.get("scrape_enabled", True):
@@ -8880,6 +8922,7 @@ def format_task_diagnostics_message(record):
         ("msg_extra_cleanup_error", "特典隐藏错误"),
         ("msg_visibility_repair_error", "可见性修复错误"),
         ("msg_cloud_subtitle_error", "云字幕缓存错误"),
+        ("post_enhancement_error", "入库增强错误"),
     ):
         if task.get(key):
             lines.append("%s：%s" % (label, task.get(key)))

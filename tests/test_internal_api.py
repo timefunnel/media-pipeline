@@ -238,6 +238,8 @@ class FakePipelineService:
         upgrade_remove_error=None,
         upgrade_duplicate_match=False,
         upgrade_duplicate_match_error=None,
+        defer_enhancements=False,
+        post_enhancement_error="",
     ):
         self.warning = warning
         self.missing_media_id = missing_media_id
@@ -249,6 +251,8 @@ class FakePipelineService:
         self.upgrade_remove_error = upgrade_remove_error
         self.upgrade_duplicate_match = upgrade_duplicate_match
         self.upgrade_duplicate_match_error = upgrade_duplicate_match_error
+        self.defer_enhancements = bool(defer_enhancements)
+        self.post_enhancement_error = post_enhancement_error
         self.submit_uris = []
         self.task_status_calls = []
         self.sync_targets = []
@@ -256,6 +260,7 @@ class FakePipelineService:
         self.sync_scrape_queries = []
         self.sync_upgrade_media_ids = []
         self.sync_input_tasks = []
+        self.post_enhancement_calls = []
         self.cancel_calls = []
         self.duplicate_calls = []
         self.upgrade_target_calls = []
@@ -586,6 +591,40 @@ class FakePipelineService:
                 }
             ),
         }
+        if self.defer_enhancements and task.get("defer_enhancements") and not task.get("post_enhancement_execution"):
+            result.update(
+                {
+                    "msg_scrape_status": "skipped",
+                    "msg_scrape_reason": "post_ingest_deferred",
+                    "subtitle_match_status": "skipped",
+                    "subtitle_match_reason": "post_ingest_deferred",
+                    "post_enhancement_status": "pending",
+                    "post_enhancement_stage": "scrape",
+                }
+            )
+        elif self.defer_enhancements and task.get("post_enhancement_execution"):
+            self.post_enhancement_calls.append(dict(task))
+            if self.post_enhancement_error:
+                result.update(
+                    {
+                        "msg_sync_status": "failed",
+                        "msg_scan_status": "success",
+                        "msg_scrape_status": "failed",
+                        "msg_scrape_error": self.post_enhancement_error,
+                        "post_enhancement_status": "failed",
+                        "post_enhancement_stage": "scrape",
+                        "post_enhancement_error": self.post_enhancement_error,
+                    }
+                )
+            else:
+                result.update(
+                    {
+                        "msg_scrape_status": "success",
+                        "subtitle_match_status": "success",
+                        "post_enhancement_status": "success",
+                        "post_enhancement_stage": "completed",
+                    }
+                )
         if self.sync_error:
             result["msg_sync_status"] = "failed"
             result["msg_scan_status"] = "failed"
@@ -1240,6 +1279,67 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(len(service.submit_uris), 1)
         self.assertEqual(service.duplicate_calls[-1][3], TARGET)
+
+    def test_post_ingest_enhancement_runs_after_core_import_and_reuses_download(self):
+        service, store, manager, application = self.build_components(
+            FakePipelineService(defer_enhancements=True)
+        )
+        session_id, candidate_id, _ = self.search_candidate(application)
+        task, _ = manager.create_import("owner-a", "deferred-enhancement", self.import_payload(session_id, candidate_id))
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                completed = manager.get_import("owner-a", task["id"])
+                task_result = (completed.get("result") or {}).get("task") or {}
+                if task_result.get("post_enhancement_status") == "success":
+                    break
+                time.sleep(0.01)
+        finally:
+            manager.stop()
+
+        task_result = (completed.get("result") or {}).get("task") or {}
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(task_result.get("post_enhancement_status"), "success")
+        self.assertEqual(len(service.submit_uris), 1)
+        self.assertEqual(len(service.sync_input_tasks), 2)
+        self.assertTrue(service.sync_input_tasks[0].get("defer_enhancements"))
+        self.assertTrue(service.sync_input_tasks[1].get("post_enhancement_execution"))
+        self.assertEqual(len(service.post_enhancement_calls), 1)
+
+    def test_failed_post_ingest_enhancement_is_retryable_without_resubmit(self):
+        service, store, manager, application = self.build_components(
+            FakePipelineService(defer_enhancements=True, post_enhancement_error="scrape unavailable")
+        )
+        session_id, candidate_id, _ = self.search_candidate(application)
+        task, _ = manager.create_import("owner-a", "deferred-enhancement-fail", self.import_payload(session_id, candidate_id))
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                completed = manager.get_import("owner-a", task["id"])
+                task_result = (completed.get("result") or {}).get("task") or {}
+                if task_result.get("post_enhancement_status") == "failed":
+                    break
+                time.sleep(0.01)
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed_with_warning")
+        self.assertEqual((completed["result"] or {}).get("task", {}).get("post_enhancement_status"), "failed")
+        service.post_enhancement_error = ""
+        retried = manager.retry_import("owner-a", task["id"])
+        self.assertEqual((retried["status"], retried["stage"]), ("queued", "post_enhancement"))
+        manager.start()
+        try:
+            resolved = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+        self.assertEqual(resolved["status"], "completed")
+        self.assertEqual(len(service.submit_uris), 1)
+        self.assertEqual(len(service.post_enhancement_calls), 2)
 
     def test_strong_duplicate_cannot_be_forced_and_never_submits(self):
         duplicate = {

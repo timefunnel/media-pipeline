@@ -53,7 +53,7 @@ SYNC_STAGES = {
     "removing_old_version",
     "cleanup",
 }
-RETRY_RESUME_STAGES = {"syncing", "scanning", "scraping", "subtitles", "removing_old_version"}
+RETRY_RESUME_STAGES = {"syncing", "scanning", "scraping", "subtitles", "post_enhancement", "removing_old_version"}
 RETRY_STAGE_BY_FAILED_TASK_STATUS = (
     ("openlist_adult_format_status", "syncing"),
     ("openlist_trash_hide_status", "syncing"),
@@ -64,6 +64,7 @@ RETRY_STAGE_BY_FAILED_TASK_STATUS = (
     ("msg_extra_cleanup_status", "syncing"),
     ("msg_visibility_repair_status", "syncing"),
     ("subtitle_match_status", "subtitles"),
+    ("post_enhancement_status", "post_enhancement"),
 )
 
 
@@ -423,6 +424,94 @@ class InternalApiStore:
         if row is None:
             raise ApiError(404, "import_not_found", "import task not found")
         return import_row(row)
+
+    def list_pending_post_enhancements(self):
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                select * from internal_api_imports
+                where status in ('completed', 'completed_with_warning')
+                  and result_json like '%post_enhancement_status%'
+                order by updated_at asc, id asc
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+        pending = []
+        for row in rows:
+            task = import_row(row)
+            post_status = str(((task.get("result") or {}).get("task") or {}).get("post_enhancement_status") or "").strip().lower()
+            if post_status in {"pending", "running"}:
+                pending.append(task)
+        return pending
+
+    def update_completed_result(self, import_id, result):
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """
+                update internal_api_imports
+                set result_json = ?, updated_at = ?
+                where id = ? and status in ('completed', 'completed_with_warning')
+                """,
+                (json_dumps(result), now, import_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        if cursor.rowcount != 1:
+            raise RuntimeError("completed import enhancement target not found: %s" % import_id)
+
+    def finish_post_enhancement_warning(self, import_id, result, error):
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """
+                update internal_api_imports
+                set status = 'completed_with_warning', stage = 'completed_with_warning',
+                    result_json = ?, error = ?, updated_at = ?, completed_at = ?
+                where id = ? and status in ('completed', 'completed_with_warning')
+                """,
+                (json_dumps(result), str(error or "post-ingest enhancement failed"), now, now, import_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        if cursor.rowcount != 1:
+            raise RuntimeError("post-ingest enhancement warning target not found: %s" % import_id)
+
+    def finish_post_enhancement_success(self, import_id, result):
+        now = int(time.time())
+        task = dict((result or {}).get("task") or {})
+        warnings = [str(value).strip() for value in (result or {}).get("warnings") or [] if str(value).strip()]
+        warnings.extend(str(value).strip() for value in task.get("warnings") or [] if str(value).strip())
+        if warnings:
+            status = "completed_with_warning"
+            stage = "completed_with_warning"
+            error = "; ".join(warnings)
+        else:
+            status = "completed"
+            stage = "completed"
+            error = None
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """
+                update internal_api_imports
+                set status = ?, stage = ?, result_json = ?, error = ?,
+                    updated_at = ?, completed_at = ?
+                where id = ? and status in ('completed', 'completed_with_warning')
+                """,
+                (status, stage, json_dumps(result), error, now, now, import_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        if cursor.rowcount != 1:
+            raise RuntimeError("post-ingest enhancement success target not found: %s" % import_id)
 
     def get_subscription_source_block(self, source_key):
         conn = self._connect()
@@ -1173,6 +1262,9 @@ class ImportTaskManager:
         self._target_locks = {}
         self._target_locks_guard = threading.Lock()
         self._subscription_receive_lock = threading.Lock()
+        self._post_enhancement_active = set()
+        self._post_enhancement_threads = set()
+        self._post_enhancement_guard = threading.Lock()
 
     def start(self):
         with self._condition:
@@ -1186,6 +1278,8 @@ class ImportTaskManager:
             ]
             for thread in self._threads:
                 thread.start()
+        for task in self.store.list_pending_post_enhancements():
+            self._schedule_post_enhancement(task)
 
     def stop(self):
         self._stop_event.set()
@@ -1194,6 +1288,115 @@ class ImportTaskManager:
         for thread in list(self._threads):
             thread.join(timeout=5)
         self._threads = []
+        with self._post_enhancement_guard:
+            enhancement_threads = list(self._post_enhancement_threads)
+        for thread in enhancement_threads:
+            thread.join(timeout=5)
+
+    def _schedule_post_enhancement(self, task):
+        task_id = str((task or {}).get("id") or "").strip()
+        if not task_id:
+            return False
+        with self._post_enhancement_guard:
+            if task_id in self._post_enhancement_active:
+                return False
+            self._post_enhancement_active.add(task_id)
+            thread = threading.Thread(
+                target=self._run_post_enhancement,
+                args=(dict(task),),
+                name="internal-api-post-enhancement-%s" % task_id[:8],
+                daemon=True,
+            )
+            self._post_enhancement_threads.add(thread)
+            thread.start()
+        return True
+
+    def _run_post_enhancement(self, task):
+        task_id = str(task.get("id") or "").strip()
+        try:
+            current = self.store.get_import(task["owner_id"], task_id)
+            request = dict(current.get("request") or {})
+            result = dict(current.get("result") or {})
+            offline_task = dict(result.get("task") or {})
+            post_status = str(offline_task.get("post_enhancement_status") or "").strip().lower()
+            if post_status not in {"pending", "running"}:
+                return
+            offline_task.update(
+                {
+                    "post_enhancement_status": "running",
+                    "post_enhancement_execution": True,
+                    "defer_enhancements": False,
+                }
+            )
+            result["task"] = offline_task
+            self.store.update_completed_result(task_id, result)
+
+            def save_progress(progress):
+                current_result = dict(result)
+                current_task = dict(offline_task)
+                current_task.update(dict(progress or {}))
+                current_task["post_enhancement_status"] = "running"
+                current_task["post_enhancement_execution"] = True
+                current_result["task"] = current_task
+                self.store.update_completed_result(task_id, current_result)
+
+            enhanced = self.service.sync_completed_task(
+                request["category"],
+                str(request.get("upgrade_target_title") or request["title"]).strip(),
+                offline_task,
+                progress_callback=save_progress,
+                target=request.get("target"),
+                preferred_scrape_queries=request.get("upgrade_target_scrape_queries"),
+                upgrade_media_id=request.get("upgrade_media_id"),
+            )
+            if not isinstance(enhanced, dict):
+                raise RuntimeError("post-ingest enhancement returned invalid task")
+            if enhanced.get("msg_sync_status") != "success":
+                raise RuntimeError(str(enhanced.get("msg_error") or "post-ingest enhancement failed"))
+            enhanced["post_enhancement_status"] = "success"
+            enhanced["post_enhancement_stage"] = "completed"
+            enhanced["post_enhancement_error"] = None
+            post_warning = result.pop("post_enhancement_warning", None)
+            if post_warning:
+                remaining_warnings = [
+                    value for value in result.get("warnings") or [] if str(value).strip() != str(post_warning).strip()
+                ]
+                if remaining_warnings:
+                    result["warnings"] = remaining_warnings
+                else:
+                    result.pop("warnings", None)
+            if enhanced.get("warning_stage") == "post_enhancement":
+                enhanced.pop("warning_stage", None)
+                enhanced.pop("warnings", None)
+            enhanced.pop("post_enhancement_execution", None)
+            enhanced.pop("defer_enhancements", None)
+            result["task"] = enhanced
+            self.store.finish_post_enhancement_success(task_id, result)
+        except Exception as exc:
+            try:
+                current = self.store.get_import(task["owner_id"], task_id)
+                result = dict(current.get("result") or {})
+                offline_task = dict(result.get("task") or {})
+                offline_task["post_enhancement_status"] = "failed"
+                offline_task["post_enhancement_error"] = str(exc)
+                offline_task["post_enhancement_stage"] = str(offline_task.get("post_enhancement_stage") or "enhance")
+                offline_task["warning_stage"] = "post_enhancement"
+                offline_task.pop("post_enhancement_execution", None)
+                result["task"] = offline_task
+                result["post_enhancement_warning"] = str(exc)
+                warning_items = [str(value).strip() for value in result.get("warnings") or [] if str(value).strip()]
+                if str(exc) not in warning_items:
+                    warning_items.append(str(exc))
+                result["warnings"] = warning_items
+                self.store.finish_post_enhancement_warning(task_id, result, "; ".join(warning_items))
+            except Exception as persist_exc:
+                print("internal API post-enhancement persistence failed: %s" % persist_exc, flush=True)
+            print("internal API post-enhancement %s failed: %s" % (task_id, exc), flush=True)
+        finally:
+            current_thread = threading.current_thread()
+            with self._post_enhancement_guard:
+                self._post_enhancement_active.discard(task_id)
+                self._post_enhancement_threads.discard(current_thread)
 
     def notify(self):
         with self._condition:
@@ -1515,7 +1718,9 @@ class ImportTaskManager:
         target = request["target"]
         self._raise_if_cancel_requested(task["owner_id"], task["id"], category, info_hash)
         target_lock = self._target_lock(target)
-        self._acquire_target_lock(target_lock)
+        hold_target_lock = resume_stage != "post_enhancement"
+        if hold_target_lock:
+            self._acquire_target_lock(target_lock)
         try:
             if resume_stage == "removing_old_version":
                 return self._retry_upgrade_cleanup(task, result, info_hash, target)
@@ -1537,6 +1742,9 @@ class ImportTaskManager:
                 initial_sync_stage = resume_stage if resume_stage in RETRY_RESUME_STAGES else "syncing"
                 self.store.save_running(task["id"], initial_sync_stage, result=result, info_hash=info_hash)
                 try:
+                    offline_task["defer_enhancements"] = resume_stage != "post_enhancement"
+                    if resume_stage == "post_enhancement":
+                        offline_task["post_enhancement_execution"] = True
                     offline_task = self.service.sync_completed_task(
                         category,
                         title,
@@ -1590,6 +1798,20 @@ class ImportTaskManager:
                     raise RuntimeError("MediaStationGo sync completed without msg_media_id")
                 warnings = sync_warnings(offline_task)
                 result["msg_media_id"] = media_id
+                if resume_stage == "post_enhancement":
+                    if offline_task.get("msg_sync_status") == "success":
+                        offline_task["post_enhancement_status"] = "success"
+                        offline_task["post_enhancement_stage"] = "completed"
+                    else:
+                        offline_task["post_enhancement_status"] = "failed"
+                        offline_task["post_enhancement_stage"] = str(offline_task.get("post_enhancement_stage") or "enhance")
+                        offline_task["warning_stage"] = "post_enhancement"
+                    offline_task.pop("post_enhancement_execution", None)
+                    offline_task.pop("defer_enhancements", None)
+                    result["task"] = offline_task
+                post_enhancement_pending = (
+                    str(offline_task.get("post_enhancement_status") or "").strip().lower() == "pending"
+                )
                 upgrade_media_id = str(request.get("upgrade_media_id") or "").strip()
                 if upgrade_media_id and not bool(request.get("keep_old_version", True)):
                     self.store.save_running(
@@ -1638,9 +1860,13 @@ class ImportTaskManager:
                         info_hash=info_hash,
                         msg_media_id=media_id,
                     )
+                if post_enhancement_pending:
+                    current = self.store.get_import(task["owner_id"], task["id"])
+                    self._schedule_post_enhancement(current)
                 return
         finally:
-            target_lock.release()
+            if hold_target_lock:
+                target_lock.release()
 
     def _retry_upgrade_cleanup(self, task, result, info_hash, target):
         request = task["request"]
