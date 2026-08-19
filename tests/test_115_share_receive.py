@@ -189,9 +189,13 @@ class Share115ReceiveTest(unittest.TestCase):
         fake = FakeShareClient()
         service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}, p115_cookie="UID=u"))
         with patch.object(service, "_build_115_share_client", return_value=fake):
-            result = service.submit("adult", "https://115.com/s/swabc123?password=xy99")
+            result = service.submit(
+                "adult",
+                "https://115.com/s/swabc123?password=xy99",
+                target_folder_id="task-folder",
+            )
 
-        self.assertEqual(fake.calls, [("https://115.com/s/swabc123?password=xy99", category_to_folder_id("adult"))])
+        self.assertEqual(fake.calls, [("https://115.com/s/swabc123?password=xy99", "task-folder")])
         self.assertEqual(result["submit_kind"], "115_share_receive")
         self.assertEqual(result["task_status"]["status_name"], "success")
         self.assertEqual(result["task_status"]["source_kind"], "115_share")

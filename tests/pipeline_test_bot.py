@@ -4316,6 +4316,125 @@ class LlmSearchRerankClientTest(unittest.TestCase):
 
 
 class PipelineBotServiceTest(unittest.TestCase):
+    def test_finalize_import_target_promotes_single_resource_directory(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class OpenList:
+            def __init__(self):
+                self.tree = {
+                    "/115/电影": [{"name": "Movie [import-123]", "is_dir": True}],
+                    "/115/电影/Movie [import-123]": [{"name": "Movie.Release", "is_dir": True}],
+                }
+                self.moves = []
+                self.removes = []
+                self.list_all_calls = []
+
+            def list_all(self, path, refresh=False):
+                self.list_all_calls.append((path, refresh))
+                return list(self.tree.get(path, []))
+
+            def move_names(self, src_dir, dst_dir, names):
+                self.moves.append((src_dir, dst_dir, list(names)))
+                item = self.tree[src_dir].pop(0)
+                self.tree.setdefault(dst_dir, []).append(item)
+
+            def remove_names(self, src_dir, names):
+                self.removes.append((src_dir, list(names)))
+                wanted = {str(name).casefold() for name in names}
+                self.tree[src_dir] = [item for item in self.tree[src_dir] if item["name"].casefold() not in wanted]
+                for name in names:
+                    self.tree.pop(src_dir.rstrip("/") + "/" + str(name), None)
+
+            def list_path(self, path, refresh=False):
+                if path not in self.tree:
+                    parent, name = path.rsplit("/", 1)
+                    if not any(item["name"] == name for item in self.tree.get(parent, [])):
+                        raise RuntimeError("OpenList list failed: object not found")
+                return {"code": 200, "data": {"content": self.tree.get(path, [])}}
+
+            def get_path(self, path):
+                parent, name = path.rsplit("/", 1)
+                if path not in self.tree and not any(item["name"] == name for item in self.tree.get(parent, [])):
+                    raise RuntimeError("OpenList get failed: object not found")
+                return {"code": 200, "data": {"name": name, "is_dir": True}}
+
+        client = OpenList()
+        service = PipelineBotService(BotConfig("token", {1}, "/tmp/state.db", subscription_move_poll_seconds=0))
+        service._build_openlist_client = lambda: client
+
+        result = service.finalize_import_target(
+            "movie",
+            {
+                "import_target_openlist_path": "/115/电影/Movie [import-123]",
+                "import_target_purpose": "import",
+            },
+        )
+
+        self.assertEqual(result["import_target_openlist_path"], "/115/电影/Movie.Release")
+        self.assertEqual(result["import_target_finalize_reason"], "promoted_resource_directory")
+        self.assertEqual(client.moves, [("/115/电影/Movie [import-123]", "/115/电影", ["Movie.Release"])])
+        self.assertEqual(client.removes, [("/115/电影", ["Movie [import-123]"])])
+        self.assertEqual(
+            client.list_all_calls,
+            [
+                ("/115/电影/Movie [import-123]", True),
+                ("/115/电影/Movie [import-123]", True),
+            ],
+        )
+
+    def test_finalize_import_target_keeps_container_for_loose_files(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        client = CleaningOpenList(
+            {
+                "/115/动漫/Show [import-123]": [
+                    {"name": "E01.mkv", "is_dir": False},
+                    {"name": "E02.mkv", "is_dir": False},
+                ]
+            }
+        )
+        service = PipelineBotService(BotConfig("token", {1}, "/tmp/state.db"))
+        service._build_openlist_client = lambda: client
+
+        result = service.finalize_import_target(
+            "anime",
+            {
+                "import_target_openlist_path": "/115/动漫/Show [import-123]",
+                "import_target_purpose": "import",
+            },
+        )
+
+        self.assertEqual(result["import_target_openlist_path"], "/115/动漫/Show [import-123]")
+        self.assertEqual(result["import_target_finalize_reason"], "container_required")
+        self.assertEqual(client.move_calls, [])
+
+    def test_finalize_import_target_keeps_container_when_resource_directory_name_is_occupied(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        client = CleaningOpenList(
+            {
+                "/115/电影": [
+                    {"name": "Movie [import-123]", "is_dir": True},
+                    {"name": "Movie.Release", "is_dir": True},
+                ],
+                "/115/电影/Movie [import-123]": [{"name": "Movie.Release", "is_dir": True}],
+            }
+        )
+        service = PipelineBotService(BotConfig("token", {1}, "/tmp/state.db"))
+        service._build_openlist_client = lambda: client
+
+        result = service.finalize_import_target(
+            "movie",
+            {
+                "import_target_openlist_path": "/115/电影/Movie [import-123]",
+                "import_target_purpose": "import",
+            },
+        )
+
+        self.assertEqual(result["import_target_finalize_reason"], "resource_directory_name_occupied")
+        self.assertEqual(result["import_target_openlist_path"], "/115/电影/Movie [import-123]")
+        self.assertEqual(client.move_calls, [])
+
     def test_auto_subtitle_match_skips_when_msg_reports_existing_chinese_subtitle(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
@@ -4742,7 +4861,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     prowlarr_config="/prowlarr-config/config.xml",
                 )
             )
-            service.submit("movie", "prowlarr-download://9?link=ABC%2BDEF")
+            service.submit("movie", "prowlarr-download://9?link=ABC%2BDEF", target_folder_id="task-folder")
 
         self.assertEqual(service.fake_115.urls, ["magnet:?xt=urn:btih:ABC"])
         self.assertEqual(
@@ -4764,10 +4883,10 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
 
-        result = service.submit("movie", "magnet:?xt=urn:btih:ABC")
+        result = service.submit("movie", "magnet:?xt=urn:btih:ABC", target_folder_id="task-folder")
 
         self.assertEqual(service.fake_115.urls, ["magnet:?xt=urn:btih:ABC"])
-        self.assertEqual(service.fake_115.folder_id, category_to_folder_id("movie"))
+        self.assertEqual(service.fake_115.folder_id, "task-folder")
         self.assertEqual(result["tasks"][0]["info_hash"], "ABC")
         self.assertEqual(result["submit_kind"], "115_offline")
         self.assertNotIn("task_status", result)
@@ -4801,7 +4920,11 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
 
-        result = service.submit("adult", "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233")
+        result = service.submit(
+            "adult",
+            "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+            target_folder_id="task-folder",
+        )
 
         self.assertEqual(result["tasks"], [
             {
@@ -4824,7 +4947,11 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
 
-        result = service.submit("adult", "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233")
+        result = service.submit(
+            "adult",
+            "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+            target_folder_id="task-folder",
+        )
 
         self.assertEqual(result["tasks"], [])
         self.assertEqual(result["state"], False)
@@ -4839,7 +4966,11 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
 
-        result = service.submit("adult", "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233")
+        result = service.submit(
+            "adult",
+            "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+            target_folder_id="task-folder",
+        )
 
         self.assertEqual(result["tasks"][0]["info_hash"], "D00D7132F75BEB644A19E6A1CC011AA3523CF233")
         self.assertEqual(result["tasks"][0]["message"], "任务已存在")
@@ -5136,7 +5267,14 @@ class PipelineBotServiceTest(unittest.TestCase):
             task = service.sync_completed_task(
                 "movie",
                 "Movie",
-                {"info_hash": "ABC", "status_name": "success", "name": "Movie"},
+                {
+                    "info_hash": "ABC",
+                    "status_name": "success",
+                    "name": "Movie",
+                    "import_target_openlist_path": "/115/电影/Movie",
+                    "import_target_original_openlist_path": "/115/电影/Movie",
+                    "import_target_purpose": "import",
+                },
             )
 
         self.assertEqual(
@@ -5155,6 +5293,8 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(task["openlist_cleaned_count"], 3)
         self.assertEqual(task["openlist_cleaned_bytes"], 30 * 1024 * 1024 + 300 * 1024)
         self.assertEqual(task["msg_sync_status"], "success")
+        self.assertIn(("get_path", "/115/电影/Movie"), events)
+        self.assertNotIn(("list_all", "/115/电影", False), events)
 
     def test_sync_completed_task_hides_msg_trash_before_mediastation_scan(self):
         from pipeline.bot import BotConfig, CandidateStore, PipelineBotService
@@ -7451,6 +7591,63 @@ class PipelineBotServiceTest(unittest.TestCase):
         )
         self.assertEqual(result["target_openlist_path"], "/115/动漫/成龙历险记")
         self.assertTrue(result["openlist_moved"])
+
+    def test_migrate_top_level_file_creates_work_directory_before_move(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        migration_result = {
+            "source_openlist_path": "/115/其他/Sintel.mkv",
+            "target_openlist_path": "/115/电影/Sintel/Sintel.mkv",
+            "target_category": "movie",
+            "media_count": 1,
+            "series_count": 0,
+        }
+        fake_msg = FakeMediaStationClient(
+            migration_validate_response=dict(migration_result),
+            migration_apply_response=dict(migration_result),
+        )
+        fake_openlist = CleaningOpenList(
+            {
+                "/115/其他": [{"name": "Sintel.mkv", "is_dir": False, "size": 1024}],
+                "/115/电影": [],
+            }
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+            "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
+        ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    subscription_move_poll_seconds=0,
+                )
+            )
+            with patch.object(service, "_ensure_category_directory", return_value="sintel-folder-id") as ensure:
+                result = service.migrate_media_candidate(
+                    {
+                        "title": "Sintel",
+                        "category": "other",
+                        "library_id": "test-other-library",
+                        "library_root_id": "test-other-root",
+                        "source_openlist_path": "/115/其他/Sintel.mkv",
+                        "source_kind": "file",
+                        "media_count": 1,
+                    },
+                    "movie",
+                )
+
+        ensure.assert_called_once_with("movie", "Sintel")
+        self.assertEqual(fake_openlist.move_calls, [("/115/其他", "/115/电影/Sintel", ["Sintel.mkv"])])
+        self.assertEqual(result["target_openlist_path"], "/115/电影/Sintel/Sintel.mkv")
+        self.assertTrue(result["openlist_moved"])
+        self.assertEqual(
+            [call[3] for call in fake_msg.pipeline_maintenance_calls if call[0] in ("validate_migration", "apply_migration")],
+            ["/115/电影/Sintel/Sintel.mkv", "/115/电影/Sintel/Sintel.mkv"],
+        )
 
     def test_search_migration_candidates_restores_category_from_configured_library_id(self):
         from pipeline.bot import BotConfig, PipelineBotService

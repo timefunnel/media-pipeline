@@ -97,11 +97,11 @@ class OpenListReceiveMoveWaitTest(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def list_all(self, path, refresh=False):
+            def list_path(self, path, refresh=False):
                 self.calls += 1
                 if self.calls == 1:
-                    return []
-                return [{"name": "Show [upgrade-task]", "is_dir": True}]
+                    raise RuntimeError("OpenList list failed: object not found")
+                return {"code": 200, "data": {"content": []}}
 
         client = FakeOpenList()
         result = wait_openlist_directory(
@@ -262,6 +262,7 @@ class FakePipelineService:
         self.upgrade_duplicate_match_calls = []
         self.upgrade_remove_calls = []
         self.upgrade_prepare_calls = []
+        self.import_prepare_calls = []
         self.submit_error = None
         self.submit_target_folder_ids = []
         self._sequence = 0
@@ -374,12 +375,16 @@ class FakePipelineService:
             "raw": {"data": {"items": [{"name": "120集全"}]}},
         }
 
-    def prepare_work_upgrade_staging(self, category, import_id, title):
-        self.upgrade_prepare_calls.append((category, import_id, title))
+    def prepare_import_target(self, category, import_id, title, purpose="import"):
+        self.import_prepare_calls.append((category, import_id, title, purpose))
+        if purpose == "upgrade":
+            self.upgrade_prepare_calls.append((category, import_id, title))
+        prefix = "Upgrade" if purpose == "upgrade" else "Import"
         return {
-            "folder_id": "upgrade-folder-" + import_id,
-            "openlist_path": category_to_openlist_path(category).rstrip("/") + "/Upgrade-" + import_id,
-            "folder_name": "Upgrade-" + import_id,
+            "folder_id": purpose + "-folder-" + import_id,
+            "openlist_path": category_to_openlist_path(category).rstrip("/") + "/" + prefix + "-" + import_id,
+            "folder_name": prefix + "-" + import_id,
+            "purpose": purpose,
         }
 
     def prepare_subscription_staging(self, category, import_id, work_key):
@@ -590,7 +595,7 @@ class FakePipelineService:
             result["msg_media_title"] = "MSG " + title
             if category in ("tv", "anime"):
                 result["msg_target_scan_status"] = "success"
-                result["msg_target_scan_path"] = task.get("upgrade_staging_openlist_path") or (
+                result["msg_target_scan_path"] = task.get("import_target_openlist_path") or (
                     target["root_openlist_path"].rstrip("/") + "/Imported-Show"
                 )
         if self.warning:
@@ -919,7 +924,7 @@ class PipelineTargetOverrideTest(InternalApiTestCase):
             },
         )
 
-    def test_work_upgrade_staging_creates_and_verifies_dedicated_folder(self):
+    def test_import_target_creates_and_verifies_dedicated_folder(self):
         service = PipelineBotService(
             BotConfig(
                 token="token",
@@ -932,8 +937,10 @@ class PipelineTargetOverrideTest(InternalApiTestCase):
         class Client115:
             def __init__(self):
                 self.created = []
+                self.list_calls = []
 
             def list_all_files(self, folder_id):
+                self.list_calls.append(folder_id)
                 return []
 
             def create_folder(self, name, parent_id):
@@ -944,19 +951,20 @@ class PipelineTargetOverrideTest(InternalApiTestCase):
                 return {"state": True, "data": {"file_id": folder_id, "file_name": self.created[0][0]}}
 
         class OpenList:
-            def list_all(self, path, refresh=False):
-                return [{"name": client.created[0][0], "is_dir": True}]
+            def list_path(self, path, refresh=False):
+                return {"code": 200, "data": {"content": []}}
 
         client = Client115()
         service._build_115_client = lambda _category: client
         service._build_openlist_client = lambda: OpenList()
 
-        staging = service.prepare_work_upgrade_staging("anime", "abcdef1234567890", "吞噬星空")
+        staging = service.prepare_import_target("anime", "abcdef1234567890", "吞噬星空", purpose="upgrade")
 
         self.assertEqual(staging["folder_id"], "upgrade-folder")
         self.assertEqual(staging["folder_name"], "吞噬星空 [upgrade-abcdef123456]")
         self.assertEqual(staging["openlist_path"], "/115/动漫/吞噬星空 [upgrade-abcdef123456]")
         self.assertEqual(client.created[0][1], category_to_folder_id("anime"))
+        self.assertEqual(client.list_calls, [])
 
     def test_duplicate_check_filters_by_explicit_target_library(self):
         config = BotConfig(token="token", allowed_user_ids={1}, msg_enabled=True)
@@ -1004,7 +1012,7 @@ class PipelineTargetOverrideTest(InternalApiTestCase):
         with self.assertRaisesRegex(ValueError, "不属于当前入库目录"):
             service.validate_upgrade_target("media-existing", {**TARGET, "root_id": "other-root"})
 
-    def test_submit_uses_configured_category_folder_id(self):
+    def test_submit_requires_explicit_target_folder_id(self):
         service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
 
         class Client:
@@ -1017,9 +1025,11 @@ class PipelineTargetOverrideTest(InternalApiTestCase):
 
         client = Client()
         service._call_115 = lambda category, callback: callback(client)
-        service.submit("movie", "magnet:?xt=urn:btih:ABC")
+        with self.assertRaisesRegex(ValueError, "目标目录 ID 缺失"):
+            service.submit("movie", "magnet:?xt=urn:btih:ABC")
+        service.submit("movie", "magnet:?xt=urn:btih:ABC", target_folder_id="task-folder")
 
-        self.assertEqual(client.folder_id, category_to_folder_id("movie"))
+        self.assertEqual(client.folder_id, "task-folder")
 
 
 class ImportPersistenceTest(InternalApiTestCase):
@@ -1101,6 +1111,12 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertEqual(completed["msg_media_title"], "MSG sintel")
         self.assertEqual(service.submit_uris, [search["items"][0]["download_uri"]])
         self.assertNotEqual(service.submit_uris[0], payload["download_uri"])
+        self.assertEqual(service.import_prepare_calls, [("movie", task["id"], "sintel", "import")])
+        self.assertEqual(service.submit_target_folder_ids, ["import-folder-" + task["id"]])
+        self.assertEqual(
+            completed["result"]["task"]["import_target_openlist_path"],
+            category_to_openlist_path("movie").rstrip("/") + "/Import-" + task["id"],
+        )
         self.assertEqual(service.sync_targets, [TARGET])
         self.assertEqual(completed["request"]["target"], TARGET)
         self.assertEqual(
@@ -1480,7 +1496,7 @@ class ImportPersistenceTest(InternalApiTestCase):
             [("tv", task["id"], "Upgrade Target")],
         )
         self.assertEqual(service.submit_target_folder_ids, ["upgrade-folder-" + task["id"]])
-        self.assertEqual(service.sync_input_tasks[-1]["upgrade_staging_openlist_path"], staging_path)
+        self.assertEqual(service.sync_input_tasks[-1]["import_target_openlist_path"], staging_path)
         self.assertEqual(
             service.upgrade_remove_calls,
             [
@@ -1494,6 +1510,48 @@ class ImportPersistenceTest(InternalApiTestCase):
                 )
             ],
         )
+
+    def test_tv_upgrade_recovery_preserves_legacy_staging_purpose(self):
+        service, store, manager, application = self.build_components()
+        session_id, candidate_id, _ = self.search_candidate(
+            application,
+            query="My Royal Enemy",
+            category="tv",
+        )
+        payload = self.import_payload(session_id, candidate_id, category="tv", target=target_for("tv"))
+        payload["upgrade_media_id"] = "episode-7"
+        task, _ = manager.create_import("owner-a", "tv-legacy-staging", payload)
+        staging_path = category_to_openlist_path("tv").rstrip("/") + "/Legacy-" + task["id"]
+        legacy_result = {
+            "upgrade_staging": {
+                "folder_id": "legacy-upgrade-folder",
+                "openlist_path": staging_path,
+                "folder_name": "Legacy-" + task["id"],
+            }
+        }
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "update internal_api_imports set result_json = ? where id = ?",
+                (json.dumps(legacy_result), task["id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(service.import_prepare_calls, [])
+        self.assertEqual(service.submit_target_folder_ids, ["legacy-upgrade-folder"])
+        self.assertEqual(service.sync_input_tasks[-1]["import_target_openlist_path"], staging_path)
+        self.assertEqual(service.sync_input_tasks[-1]["import_target_purpose"], "upgrade")
+        self.assertEqual(completed["result"]["import_target"]["purpose"], "upgrade")
+        self.assertNotIn("upgrade_staging", completed["result"])
 
     def test_tv_upgrade_rejects_single_media_scope(self):
         service, store, manager, application = self.build_components()
@@ -2574,7 +2632,7 @@ class ImportConcurrencyTest(InternalApiTestCase):
             manager.stop()
 
     def test_global_and_owner_worker_limits(self):
-        service = FakePipelineService(sync_delay=0.08)
+        service = FakePipelineService(sync_delay=0.2)
         service, store, manager, application = self.build_components(service, workers=3, owner_workers=2)
         tasks = [
             ("owner-a", self.create_task(manager, application, "owner-a", "a1", "a1", {**TARGET, "root_id": "r1"})),

@@ -1446,33 +1446,44 @@ class ImportTaskManager:
         title = str(request.get("upgrade_target_title") or request["title"]).strip()
         info_hash = str(task.get("info_hash") or "").strip()
         offline_task = dict(result.get("task") or {})
+        import_target = dict(result.get("import_target") or result.get("upgrade_staging") or {})
+        if import_target:
+            if not str(import_target.get("purpose") or "").strip():
+                import_target["purpose"] = (
+                    "upgrade"
+                    if result.get("upgrade_staging") or str(request.get("upgrade_media_id") or "").strip()
+                    else "import"
+                )
+            result["import_target"] = dict(import_target)
+            result.pop("upgrade_staging", None)
 
         self._raise_if_stopping()
         self._raise_if_cancel_requested(task["owner_id"], task["id"], category, info_hash)
         if not info_hash:
-            upgrade_staging = dict(result.get("upgrade_staging") or {})
-            if work_upgrade_requires_staging(request):
-                if not upgrade_staging:
-                    self.store.save_running(task["id"], "preparing_upgrade", result=result)
-                    upgrade_staging = self.service.prepare_work_upgrade_staging(
-                        category,
-                        task["id"],
-                        title,
-                    )
-                    validate_work_upgrade_staging(upgrade_staging)
-                    result["upgrade_staging"] = dict(upgrade_staging)
-                    self.store.save_running(task["id"], "preparing_upgrade", result=result)
+            if not import_target:
+                purpose = "upgrade" if str(request.get("upgrade_media_id") or "").strip() else "import"
+                self.store.save_running(task["id"], "preparing_target", result=result)
+                import_target = self.service.prepare_import_target(
+                    category,
+                    task["id"],
+                    title,
+                    purpose=purpose,
+                )
+                validate_import_target(import_target)
+                result["import_target"] = dict(import_target)
+                result.pop("upgrade_staging", None)
+                self.store.save_running(task["id"], "preparing_target", result=result)
             self.store.save_running(task["id"], "submitting", result=result)
             submit_result = self.service.submit(
                 category,
                 request["candidate"]["download_uri"],
-                target_folder_id=upgrade_staging.get("folder_id"),
+                target_folder_id=import_target.get("folder_id"),
             )
             info_hash = first_submit_info_hash(submit_result)
             if not info_hash:
                 raise RuntimeError("pipeline submit returned no info_hash")
             offline_task = task_from_submit_result(submit_result, info_hash)
-            apply_work_upgrade_staging(offline_task, upgrade_staging)
+            apply_import_target(offline_task, import_target)
             result.update({"submit": submit_result, "task": offline_task})
             self.store.save_running(task["id"], "submitted", result=result, info_hash=info_hash)
 
@@ -1491,7 +1502,7 @@ class ImportTaskManager:
                 raise RuntimeError("pipeline task_status returned invalid response")
             offline_task = dict(offline_task)
             offline_task.setdefault("info_hash", info_hash)
-            apply_work_upgrade_staging(offline_task, result.get("upgrade_staging"))
+            apply_import_target(offline_task, import_target)
             result["task"] = offline_task
             self.store.save_running(task["id"], "waiting_download", result=result, info_hash=info_hash)
             if offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
@@ -3114,29 +3125,23 @@ def normalize_upgrade_scope(category, upgrade_media_id, value):
     return "media"
 
 
-def work_upgrade_requires_staging(request):
-    request = request or {}
-    return (
-        request.get("category") in ("tv", "anime")
-        and str(request.get("upgrade_media_id") or "").strip() != ""
-        and str(request.get("upgrade_scope") or "").strip().lower() == "work"
-    )
-
-
-def validate_work_upgrade_staging(staging):
-    staging = staging or {}
-    if not str(staging.get("folder_id") or "").strip():
-        raise RuntimeError("整剧升级暂存目录缺少115文件夹 ID")
-    path = normalize_openlist_path(staging.get("openlist_path"))
+def validate_import_target(target):
+    target = target or {}
+    if not str(target.get("folder_id") or "").strip():
+        raise RuntimeError("入库目标目录缺少115文件夹 ID")
+    path = normalize_openlist_path(target.get("openlist_path"))
     if not path:
-        raise RuntimeError("整剧升级暂存目录缺少 OpenList 路径")
+        raise RuntimeError("入库目标目录缺少 OpenList 路径")
     return path
 
 
-def apply_work_upgrade_staging(offline_task, staging):
-    if not isinstance(offline_task, dict) or not staging:
+def apply_import_target(offline_task, target):
+    if not isinstance(offline_task, dict) or not target:
         return offline_task
-    offline_task["upgrade_staging_openlist_path"] = validate_work_upgrade_staging(staging)
+    path = validate_import_target(target)
+    offline_task["import_target_openlist_path"] = path
+    offline_task["import_target_original_openlist_path"] = path
+    offline_task["import_target_purpose"] = str(target.get("purpose") or "import").strip().lower()
     return offline_task
 
 
@@ -3340,6 +3345,7 @@ def import_status_message(status, stage, error):
     return {
         "queued": "等待执行",
         "starting": "开始执行",
+        "preparing_target": "正在准备入库目录",
         "submitting": "正在提交 115 任务",
         "preparing_upgrade": "正在准备整剧升级目录",
         "submitted": "115 任务已提交",

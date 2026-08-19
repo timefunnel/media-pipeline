@@ -178,18 +178,26 @@ class MediaStationClient:
             data={"query": str(query or "").strip(), "limit": max(1, int(limit))},
         )
 
-    def pipeline_validate_migration(self, source, target):
+    def pipeline_validate_migration(self, source, target, target_openlist_path=None):
         return self._pipeline_request(
             "POST",
             "/pipeline/migrations/validate",
-            data={"source": dict(source or {}), "target": dict(target or {})},
+            data={
+                "source": dict(source or {}),
+                "target": dict(target or {}),
+                "target_openlist_path": str(target_openlist_path or "").strip(),
+            },
         )
 
-    def pipeline_apply_migration(self, source, target):
+    def pipeline_apply_migration(self, source, target, target_openlist_path=None):
         return self._pipeline_request(
             "POST",
             "/pipeline/migrations/apply",
-            data={"source": dict(source or {}), "target": dict(target or {})},
+            data={
+                "source": dict(source or {}),
+                "target": dict(target or {}),
+                "target_openlist_path": str(target_openlist_path or "").strip(),
+            },
         )
 
     def pipeline_start_ingest(self, request):

@@ -1,4 +1,5 @@
 import posixpath
+import re
 
 from pipeline.config import category_to_openlist_path
 
@@ -21,11 +22,29 @@ def build_migration_target(candidate, target_category):
     source_name = posixpath.basename(str((candidate or {}).get("source_openlist_path") or "").rstrip("/"))
     if not source_name:
         raise ValueError("source path name missing")
+    source_kind = str((candidate or {}).get("source_kind") or "").strip()
+    if source_kind == "file":
+        folder_name = migration_file_folder_name((candidate or {}).get("title"), source_name)
+        target_parent_path = posixpath.join(target_root_path, folder_name)
+        target_path = posixpath.join(target_parent_path, source_name)
+    else:
+        folder_name = None
+        target_parent_path = target_root_path
+        target_path = posixpath.join(target_root_path, source_name)
     return {
         "target_category": target_category,
         "target_root_openlist_path": target_root_path,
-        "target_openlist_path": posixpath.join(target_root_path, source_name),
+        "target_parent_openlist_path": target_parent_path,
+        "target_folder_name": folder_name,
+        "target_openlist_path": target_path,
     }
+
+
+def migration_file_folder_name(title, source_name):
+    value = str(title or posixpath.splitext(source_name)[0] or "work").strip()
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", value)
+    value = re.sub(r"\s+", " ", value).strip(" .-")
+    return (value or "work")[:120]
 
 
 def format_size(value):

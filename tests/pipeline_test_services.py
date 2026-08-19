@@ -924,6 +924,23 @@ class CategoryConfigTest(unittest.TestCase):
         self.assertEqual(target["target_root_openlist_path"], "/115/动漫")
         self.assertEqual(target["target_openlist_path"], "/115/动漫/成龙历险记")
 
+    def test_build_migration_target_wraps_top_level_file_in_work_directory(self):
+        from pipeline.migration import build_migration_target
+
+        target = build_migration_target(
+            {
+                "title": "Sintel",
+                "category": "other",
+                "source_openlist_path": "/115/其他/Sintel.mkv",
+                "source_kind": "file",
+            },
+            "movie",
+        )
+
+        self.assertEqual(target["target_parent_openlist_path"], "/115/电影/Sintel")
+        self.assertEqual(target["target_folder_name"], "Sintel")
+        self.assertEqual(target["target_openlist_path"], "/115/电影/Sintel/Sintel.mkv")
+
     def test_routes_movie_tv_anime_adult_and_other_to_separate_115_folders(self):
         from pipeline.config import category_maps, load_category_config
 
@@ -1390,6 +1407,7 @@ class MediaStationClientTest(unittest.TestCase):
         self.assertEqual(transport.calls[7]["url"], "http://127.0.0.1:18080/api/pipeline/deleted-media/hide-candidates")
         self.assertEqual(transport.calls[8]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/search")
         self.assertEqual(transport.calls[9]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/validate")
+        self.assertEqual(transport.calls[9]["data"]["target_openlist_path"], "")
         self.assertEqual(transport.calls[10]["url"], "http://127.0.0.1:18080/api/pipeline/migrations/apply")
         self.assertEqual(transport.calls[11]["url"], "http://127.0.0.1:18080/api/pipeline/ingest")
         self.assertEqual(transport.calls[12]["url"], "http://127.0.0.1:18080/api/pipeline/ingest/ingest-1")

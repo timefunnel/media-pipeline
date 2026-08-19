@@ -2061,10 +2061,12 @@ class PipelineBotService:
 
 
     def submit(self, category, download_uri, target_folder_id=None):
+        folder_id = str(target_folder_id or "").strip()
+        if not folder_id:
+            raise ValueError("115入库目标目录 ID 缺失")
         if is_115_share_url(download_uri):
-            return self._submit_115_share(category, download_uri, target_folder_id=target_folder_id)
+            return self._submit_115_share(category, download_uri, target_folder_id=folder_id)
         download_uri = self._resolve_download_uri(download_uri)
-        folder_id = str(target_folder_id or category_to_folder_id(category)).strip()
         result = summarize_submit(
             self._call_115(category, lambda client: client.add_offline_urls([download_uri], folder_id))
         )
@@ -2079,7 +2081,9 @@ class PipelineBotService:
         return ProwlarrClient(self.config.prowlarr_url, api_key).resolve_download_uri(download_uri)
 
     def _submit_115_share(self, category, download_uri, target_folder_id=None):
-        folder_id = str(target_folder_id or category_to_folder_id(category)).strip()
+        folder_id = str(target_folder_id or "").strip()
+        if not folder_id:
+            raise ValueError("115分享入库目标目录 ID 缺失")
         client = self._build_115_share_client()
         response = client.receive_share_url(download_uri, folder_id)
         data = response.get("data") or {}
@@ -2140,36 +2144,11 @@ class PipelineBotService:
             "openlist_path": staging_path,
         }
 
-    def prepare_work_upgrade_staging(self, category, import_id, title):
-        if category not in ("tv", "anime"):
-            raise ValueError("整剧升级暂存目录仅支持剧集和动漫")
-        root_folder_id = str(category_to_folder_id(category) or "").strip()
+    def prepare_import_target(self, category, import_id, title, purpose="import"):
         root_openlist_path = normalize_openlist_path(category_to_openlist_path(category))
-        folder_name = work_upgrade_staging_name(title, import_id)
-        staging_path = posixpath.join(root_openlist_path.rstrip("/") or "/", folder_name)
-        client = self._build_115_client(category)
-
-        matches = [
-            item
-            for item in client.list_all_files(root_folder_id)
-            if p115_open_item_name(item) == folder_name
-        ]
-        if len(matches) > 1:
-            raise RuntimeError("115整剧升级目录存在重名项: %s" % folder_name)
-        if matches:
-            if not p115_open_item_is_dir(matches[0]):
-                raise RuntimeError("115整剧升级目录名已被文件占用: %s" % folder_name)
-            folder_id = p115_open_item_id(matches[0])
-        else:
-            response = client.create_folder(folder_name, root_folder_id)
-            folder_id = p115_open_item_id((response or {}).get("data") or {})
-        if not folder_id:
-            raise RuntimeError("115整剧升级目录缺少文件夹 ID")
-
-        info = client.get_folder_info(folder_id)
-        data = (info or {}).get("data") or {}
-        if (info or {}).get("state") is not True or p115_open_item_name(data) != folder_name:
-            raise RuntimeError("115整剧升级目录校验失败: %s" % folder_name)
+        folder_name = import_target_name(title, import_id, purpose=purpose)
+        target_path = posixpath.join(root_openlist_path.rstrip("/") or "/", folder_name)
+        folder_id = self._ensure_category_directory(category, folder_name)
 
         openlist_client = self._build_openlist_client()
         wait_openlist_directory(
@@ -2181,9 +2160,144 @@ class PipelineBotService:
         )
         return {
             "folder_id": folder_id,
-            "openlist_path": staging_path,
+            "openlist_path": target_path,
             "folder_name": folder_name,
+            "purpose": str(purpose or "import").strip().lower(),
         }
+
+    def finalize_import_target(self, category, task, progress_callback=None):
+        task = dict(task or {})
+        target_path = normalize_openlist_path(task.get("import_target_openlist_path"))
+        if not target_path:
+            raise ValueError("入库目标 OpenList 路径缺失")
+        purpose = str(task.get("import_target_purpose") or "import").strip().lower()
+        now = int(time.time())
+        base = {
+            "import_target_finalize_status": "success",
+            "import_target_original_openlist_path": normalize_openlist_path(
+                task.get("import_target_original_openlist_path") or target_path
+            ),
+            "import_target_openlist_path": target_path,
+            "import_target_finalized_at": now,
+            "import_target_finalize_error": None,
+        }
+        if purpose == "upgrade":
+            base["import_target_finalize_reason"] = "isolated_upgrade_source"
+            return base
+
+        client = self._build_openlist_client()
+        promoted_path = normalize_openlist_path(task.get("import_target_promoted_openlist_path"))
+        try:
+            items = list(client.list_all(target_path, refresh=True))
+        except RuntimeError as exc:
+            if not promoted_path or not openlist_missing_error(exc) or not openlist_path_exists(client, promoted_path):
+                raise
+            base.update(
+                {
+                    "import_target_openlist_path": promoted_path,
+                    "import_target_promoted_openlist_path": promoted_path,
+                    "import_target_finalize_reason": "promoted_resource_directory_recovered",
+                }
+            )
+            return base
+        if not items:
+            if promoted_path and openlist_path_exists(client, promoted_path):
+                root_path = posixpath.dirname(target_path.rstrip("/")) or "/"
+                client.remove_names(root_path, [posixpath.basename(target_path.rstrip("/"))])
+                wait_openlist_path_missing(
+                    client,
+                    target_path,
+                    timeout_seconds=self.config.subscription_move_timeout_seconds,
+                    poll_seconds=self.config.subscription_move_poll_seconds,
+                )
+                base.update(
+                    {
+                        "import_target_openlist_path": promoted_path,
+                        "import_target_promoted_openlist_path": promoted_path,
+                        "import_target_finalize_reason": "promoted_resource_directory_recovered",
+                    }
+                )
+                return base
+            raise RuntimeError("OpenList入库目录为空: %s" % target_path)
+        if len(items) != 1 or not openlist_item_is_dir(items[0]):
+            base["import_target_finalize_reason"] = "container_required"
+            return base
+
+        resource_name = openlist_item_name(items[0])
+        root_path = posixpath.dirname(target_path.rstrip("/")) or "/"
+        promoted_path = posixpath.join(root_path.rstrip("/") or "/", resource_name)
+        if openlist_path_exists(client, promoted_path):
+            base["import_target_finalize_reason"] = "resource_directory_name_occupied"
+            return base
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "import_target_finalize_status": "running",
+                    "import_target_original_openlist_path": base["import_target_original_openlist_path"],
+                    "import_target_promoted_openlist_path": promoted_path,
+                    "import_target_finalize_error": None,
+                }
+            )
+        client.move_names(target_path, root_path, [resource_name])
+        wait_openlist_directory_promoted(
+            client,
+            target_path,
+            promoted_path,
+            timeout_seconds=self.config.subscription_move_timeout_seconds,
+            poll_seconds=self.config.subscription_move_poll_seconds,
+        )
+        client.remove_names(root_path, [posixpath.basename(target_path.rstrip("/"))])
+        wait_openlist_path_missing(
+            client,
+            target_path,
+            timeout_seconds=self.config.subscription_move_timeout_seconds,
+            poll_seconds=self.config.subscription_move_poll_seconds,
+        )
+        base.update(
+            {
+                "import_target_openlist_path": promoted_path,
+                "import_target_promoted_openlist_path": promoted_path,
+                "import_target_finalize_reason": "promoted_resource_directory",
+            }
+        )
+        return base
+
+    def _ensure_category_directory(self, category, folder_name):
+        root_folder_id = str(category_to_folder_id(category) or "").strip()
+        if not root_folder_id:
+            raise RuntimeError("115分类根目录 ID 缺失: %s" % category)
+        client = self._build_115_client(category)
+        folder_id = ""
+        create_error = None
+        try:
+            response = client.create_folder(folder_name, root_folder_id)
+            folder_id = p115_open_item_id((response or {}).get("data") or {})
+        except RuntimeError as exc:
+            create_error = exc
+
+        if not folder_id:
+            matches = [
+                item
+                for item in client.list_all_files(root_folder_id)
+                if p115_open_item_name(item) == folder_name
+            ]
+            if len(matches) > 1:
+                raise RuntimeError("115入库目录存在重名项: %s" % folder_name)
+            if matches:
+                if not p115_open_item_is_dir(matches[0]):
+                    raise RuntimeError("115入库目录名已被文件占用: %s" % folder_name)
+                folder_id = p115_open_item_id(matches[0])
+            elif create_error is not None:
+                raise create_error
+            else:
+                raise RuntimeError("115入库目录缺少文件夹 ID")
+
+        info = client.get_folder_info(folder_id)
+        data = (info or {}).get("data") or {}
+        if (info or {}).get("state") is not True or p115_open_item_name(data) != folder_name:
+            raise RuntimeError("115入库目录校验失败: %s" % folder_name)
+        return folder_id
 
     def validate_subscription_receive_root(self, staging):
         client = self._build_openlist_client()
@@ -2440,7 +2554,11 @@ class PipelineBotService:
             "source_kind": candidate.get("source_kind"),
         }
         msg_target = self._pipeline_maintenance_target(target_category)
-        validation = msg_client.pipeline_validate_migration(source, msg_target)
+        validation = msg_client.pipeline_validate_migration(
+            source,
+            msg_target,
+            target_openlist_path=target["target_openlist_path"],
+        )
         if (
             not isinstance(validation, dict)
             or validation.get("source_openlist_path") != candidate.get("source_openlist_path")
@@ -2452,17 +2570,33 @@ class PipelineBotService:
         source_path = candidate["source_openlist_path"]
         if not openlist_child_exists(openlist_client, source_path):
             raise RuntimeError("OpenList source not found: %s" % source_path)
-        if openlist_child_exists(openlist_client, target["target_openlist_path"]):
+        if target.get("target_folder_name"):
+            if openlist_child_exists(openlist_client, target["target_parent_openlist_path"]):
+                raise RuntimeError("OpenList target already exists: %s" % target["target_parent_openlist_path"])
+        elif openlist_child_exists(openlist_client, target["target_openlist_path"]):
             raise RuntimeError("OpenList target already exists: %s" % target["target_openlist_path"])
 
         source_dir = posixpath.dirname(source_path.rstrip("/")) or "/"
         source_name = posixpath.basename(source_path.rstrip("/"))
-        target_root = target["target_root_openlist_path"]
-        openlist_client.move_names(source_dir, target_root, [source_name])
+        target_dir = target["target_parent_openlist_path"]
+        if target.get("target_folder_name"):
+            self._ensure_category_directory(target_category, target["target_folder_name"])
+            wait_openlist_directory(
+                openlist_client,
+                target["target_root_openlist_path"],
+                target["target_folder_name"],
+                timeout_seconds=self.config.subscription_move_timeout_seconds,
+                poll_seconds=self.config.subscription_move_poll_seconds,
+            )
+        openlist_client.move_names(source_dir, target_dir, [source_name])
         openlist_client.list_path(source_dir, refresh=True)
-        openlist_client.list_path(target_root, refresh=True)
+        openlist_client.list_path(target_dir, refresh=True)
 
-        result = msg_client.pipeline_apply_migration(source, msg_target)
+        result = msg_client.pipeline_apply_migration(
+            source,
+            msg_target,
+            target_openlist_path=target["target_openlist_path"],
+        )
         if (
             not isinstance(result, dict)
             or result.get("source_openlist_path") != candidate.get("source_openlist_path")
@@ -2631,15 +2765,32 @@ class PipelineBotService:
         out = dict(task or {})
         if not TASK_STATE.is_offline_success(out):
             return out
-        if task_msg_synced(out):
-            return out
-        if not self.config.msg_enabled and target is None:
-            return out
 
         def capture_progress(progress):
             out.update(progress)
             if progress_callback:
                 progress_callback(dict(progress))
+
+        if out.get("import_target_openlist_path") and out.get("import_target_finalize_status") != "success":
+            try:
+                capture_progress(self.finalize_import_target(category, out, progress_callback=capture_progress))
+            except (RuntimeError, ValueError) as exc:
+                out.update(
+                    {
+                        "import_target_finalize_status": "failed",
+                        "import_target_finalize_error": str(exc),
+                        "import_target_finalized_at": int(time.time()),
+                        "msg_sync_status": "failed",
+                        "msg_error": str(exc),
+                    }
+                )
+                if progress_callback:
+                    progress_callback(dict(out))
+                return out
+        if task_msg_synced(out):
+            return out
+        if not self.config.msg_enabled and target is None:
+            return out
 
         try:
             result = self._sync_mediastation(
@@ -3006,7 +3157,12 @@ class PipelineBotService:
         progress = dict(task or {})
         msg_target = self._msg_target(category, target)
         root_openlist_path = msg_target["root_openlist_path"]
-        upgrade_staging_path = normalize_openlist_path(progress.get("upgrade_staging_openlist_path"))
+        import_target_path = normalize_openlist_path(
+            progress.get("import_target_openlist_path") or progress.get("upgrade_staging_openlist_path")
+        )
+        import_target_purpose = str(progress.get("import_target_purpose") or "").strip().lower()
+        if not import_target_purpose and progress.get("upgrade_staging_openlist_path"):
+            import_target_purpose = "upgrade"
         openlist_client = None
         msg_client = None
 
@@ -3042,7 +3198,13 @@ class PipelineBotService:
                     progress,
                     root_openlist_path,
                     is_upgrade=bool(str(upgrade_media_id or "").strip()),
+                    target_openlist_path=import_target_path,
                 )
+                format_old_path = normalize_openlist_path(format_result.get("openlist_adult_format_old_path"))
+                format_new_path = normalize_openlist_path(format_result.get("openlist_adult_format_new_path"))
+                if import_target_path and format_old_path == import_target_path and format_new_path:
+                    format_result["import_target_openlist_path"] = format_new_path
+                    import_target_path = format_new_path
                 if format_result.get("openlist_adult_format_status") != "skipped":
                     emit(format_result)
                 else:
@@ -3073,18 +3235,23 @@ class PipelineBotService:
             apply_progress(trash_hide_result)
 
         clean_result = prefixed_task_fields(progress, "openlist_clean_")
-        if upgrade_staging_path:
-            get_openlist_client().list_path(upgrade_staging_path, refresh=True)
+        if import_target_path and import_target_purpose == "upgrade":
+            get_openlist_client().list_path(import_target_path, refresh=True)
             clean_result = {
                 "openlist_clean_status": "skipped",
-                "openlist_clean_reason": "work_upgrade_staging",
+                "openlist_clean_reason": "isolated_upgrade_source",
             }
             apply_progress(clean_result)
         elif self.config.openlist_pre_scan_clean_enabled:
             if not stage_is_complete(progress.get("openlist_clean_status")):
                 emit({"openlist_clean_status": "running", "openlist_clean_error": None})
                 clean_result = self._clean_openlist_before_msg(
-                    get_openlist_client(), category, title, progress, root_openlist_path
+                    get_openlist_client(),
+                    category,
+                    title,
+                    progress,
+                    root_openlist_path,
+                    target_openlist_path=import_target_path,
                 )
                 if clean_result.get("openlist_clean_status") != "skipped":
                     emit(clean_result)
@@ -3124,7 +3291,12 @@ class PipelineBotService:
             if not stage_is_complete(progress.get("openlist_adult_extra_hide_status")):
                 emit({"openlist_adult_extra_hide_status": "running", "openlist_adult_extra_hide_error": None})
                 adult_extra_hide_result = self._hide_openlist_adult_extra_videos_before_msg(
-                    get_openlist_client(), category, queries, progress, root_openlist_path
+                    get_openlist_client(),
+                    category,
+                    queries,
+                    progress,
+                    root_openlist_path,
+                    target_openlist_path=import_target_path,
                 )
                 if adult_extra_hide_result.get("openlist_adult_extra_hide_status") != "skipped":
                     emit(adult_extra_hide_result)
@@ -3481,13 +3653,22 @@ class PipelineBotService:
             "openlist_trash_hide_at": int(time.time()),
         }
 
-    def _hide_openlist_adult_extra_videos_before_msg(self, client, category, queries, task, root_openlist_path=None):
+    def _hide_openlist_adult_extra_videos_before_msg(
+        self,
+        client,
+        category,
+        queries,
+        task,
+        root_openlist_path=None,
+        target_openlist_path=None,
+    ):
         result = hide_openlist_adult_extra_videos(
             client,
             root_openlist_path or category_to_openlist_path(category),
             queries,
             task=task,
             pre_scan_max_bytes=self.config.openlist_pre_scan_clean_max_bytes,
+            target_path=target_openlist_path,
         )
         if not isinstance(result, dict):
             raise RuntimeError("OpenList adult extra video hide returned invalid response")
@@ -3653,7 +3834,15 @@ class PipelineBotService:
         client.list_path(path, refresh=True)
         return client
 
-    def _clean_openlist_before_msg(self, client, category, title, task, root_openlist_path=None):
+    def _clean_openlist_before_msg(
+        self,
+        client,
+        category,
+        title,
+        task,
+        root_openlist_path=None,
+        target_openlist_path=None,
+    ):
         if not self.config.openlist_pre_scan_clean_enabled:
             return {"openlist_clean_status": "skipped", "openlist_clean_reason": "disabled"}
         try:
@@ -3664,6 +3853,7 @@ class PipelineBotService:
                 task=task,
                 max_bytes=self.config.openlist_pre_scan_clean_max_bytes,
                 hide_extra_scan_items=category == "movie",
+                target_path=target_openlist_path,
             )
         except (RuntimeError, ValueError) as exc:
             return {
@@ -3682,6 +3872,7 @@ class PipelineBotService:
         task,
         root_openlist_path=None,
         is_upgrade=False,
+        target_openlist_path=None,
     ):
         if category != "adult":
             return {}
@@ -3694,6 +3885,7 @@ class PipelineBotService:
                 media_search_queries(title, task),
                 task=task,
                 allow_existing_target=is_upgrade,
+                target_path=target_openlist_path,
             )
         except (RuntimeError, ValueError) as exc:
             return {
@@ -3715,6 +3907,7 @@ def msg_target_openlist_paths(category, task):
     task = task or {}
     paths = []
     for key in (
+        "import_target_openlist_path",
         "upgrade_staging_openlist_path",
         "openlist_adult_format_new_path",
         "openlist_adult_format_path",
@@ -3738,11 +3931,14 @@ def safe_115_folder_name(value, fallback):
     return (value or fallback)[:120]
 
 
-def work_upgrade_staging_name(title, import_id):
+def import_target_name(title, import_id, purpose="import"):
     token = re.sub(r"[^0-9A-Za-z]+", "", str(import_id or ""))[:12]
     if not token:
-        raise ValueError("整剧升级任务 ID 无效")
-    suffix = " [upgrade-%s]" % token
+        raise ValueError("入库任务 ID 无效")
+    purpose = str(purpose or "import").strip().lower()
+    if purpose not in ("import", "upgrade"):
+        raise ValueError("入库目录用途无效")
+    suffix = " [%s-%s]" % (purpose, token)
     base = safe_115_folder_name(title, "work")
     return base[: 120 - len(suffix)].rstrip(" .-") + suffix
 
@@ -3775,17 +3971,70 @@ def wait_openlist_directory(
 ):
     timeout = max(0.0, float(timeout_seconds or 0))
     deadline = monotonic_fn() + timeout
+    target_path = normalize_openlist_path(posixpath.join(parent_path, name))
     while True:
-        items = client.list_all(parent_path, refresh=True)
-        matches = [item for item in items if openlist_item_name(item) == name]
-        if len(matches) > 1:
-            raise RuntimeError("OpenList整剧升级目录存在重名项: %s" % name)
-        if matches:
-            if not openlist_item_is_dir(matches[0]):
-                raise RuntimeError("OpenList整剧升级目录名已被文件占用: %s" % name)
-            return matches[0]
+        try:
+            client.list_path(target_path, refresh=True)
+            return {"name": name, "path": target_path, "is_dir": True}
+        except RuntimeError as exc:
+            if not openlist_missing_error(exc) and not openlist_receive_operation_is_retryable_error(exc):
+                raise
         if monotonic_fn() >= deadline:
-            raise RuntimeError("OpenList未在 %.1f 秒内识别整剧升级目录: %s" % (timeout, name))
+            raise RuntimeError("OpenList未在 %.1f 秒内识别入库目录: %s" % (timeout, name))
+        wait_fn(max(0.01, float(poll_seconds or 0)))
+
+
+def wait_openlist_directory_promoted(
+    client,
+    source_path,
+    promoted_path,
+    timeout_seconds=300,
+    poll_seconds=1,
+    wait_fn=time.sleep,
+    monotonic_fn=time.monotonic,
+):
+    timeout = max(0.0, float(timeout_seconds or 0))
+    deadline = monotonic_fn() + timeout
+    resource_name = posixpath.basename(promoted_path.rstrip("/"))
+    while True:
+        source_names = {
+            openlist_item_name(item).casefold()
+            for item in client.list_all(source_path, refresh=True)
+        }
+        promoted_visible = False
+        try:
+            client.list_path(promoted_path, refresh=True)
+            promoted_visible = True
+        except RuntimeError as exc:
+            if not openlist_missing_error(exc) and not openlist_receive_operation_is_retryable_error(exc):
+                raise
+        if resource_name.casefold() not in source_names and promoted_visible:
+            return
+        if monotonic_fn() >= deadline:
+            raise RuntimeError("OpenList目录提升校验失败: %s" % promoted_path)
+        wait_fn(max(0.01, float(poll_seconds or 0)))
+
+
+def wait_openlist_path_missing(
+    client,
+    path,
+    timeout_seconds=300,
+    poll_seconds=1,
+    wait_fn=time.sleep,
+    monotonic_fn=time.monotonic,
+):
+    timeout = max(0.0, float(timeout_seconds or 0))
+    deadline = monotonic_fn() + timeout
+    while True:
+        try:
+            client.list_path(path, refresh=True)
+        except RuntimeError as exc:
+            if openlist_missing_error(exc):
+                return
+            if not openlist_receive_operation_is_retryable_error(exc):
+                raise
+        if monotonic_fn() >= deadline:
+            raise RuntimeError("OpenList入库容器删除校验失败: %s" % path)
         wait_fn(max(0.01, float(poll_seconds or 0)))
 
 
@@ -4066,6 +4315,7 @@ def msg_authoritative_openlist_paths(task):
     task = task or {}
     paths = []
     for key in (
+        "import_target_openlist_path",
         "upgrade_staging_openlist_path",
         "openlist_adult_format_new_path",
         "openlist_adult_format_path",
@@ -5048,7 +5298,17 @@ class TelegramBot:
             if not submission.get("claimed"):
                 return
             try:
-                result = self.service.submit(category, candidate["download_uri"])
+                import_target = self.service.prepare_import_target(
+                    category,
+                    candidate_id,
+                    candidate.get("title") or record.get("query") or "work",
+                )
+                result = self.service.submit(
+                    category,
+                    candidate["download_uri"],
+                    target_folder_id=import_target.get("folder_id"),
+                )
+                apply_import_target_to_submit_result(result, import_target)
             except Exception as exc:
                 self.store.finish_candidate_submission(candidate_id, "failed", error=str(exc))
                 raise
@@ -5179,6 +5439,7 @@ class TelegramBot:
             self._update_callback_message(chat_id, message_id, "取消失败：%s" % exc, fallback_chat_id=record["chat_id"])
             return
         task = result.get("task") or record["task"]
+        task = self._task_with_known_status_message_id(record, task, message_id=message_id)
         self.store.save_task(user_id, record["chat_id"], record["category"], record["title"], task)
         self.telegram.answer_callback_query(callback_id, "已取消任务" if result.get("cancelled") else "任务不可取消")
         self._update_callback_message(
@@ -6177,6 +6438,7 @@ class TelegramBot:
         return task
 
     def _send_status_message_before_sync(self, chat_id, record, task):
+        task = self._task_with_known_status_message_id(record, task)
         task = self._task_with_syncing_status(task)
         if not task_sync_is_running(task):
             return task
@@ -6196,9 +6458,25 @@ class TelegramBot:
         return out
 
     def _task_with_known_status_message_id(self, record, task, message_id=None):
+        original = task
+        out = dict(task or {})
+        persisted_task = (record or {}).get("task") or {}
+        for key in (
+            "import_target_openlist_path",
+            "import_target_original_openlist_path",
+            "import_target_purpose",
+            "import_target_finalize_status",
+            "import_target_finalize_reason",
+            "import_target_promoted_openlist_path",
+            "import_target_finalized_at",
+            "import_target_finalize_error",
+            "upgrade_staging_openlist_path",
+        ):
+            if key not in out and key in persisted_task:
+                out[key] = persisted_task[key]
         status_message_id = normalize_telegram_message_id(message_id)
         if not status_message_id:
-            status_message_id = task_telegram_status_message_id(task)
+            status_message_id = task_telegram_status_message_id(out)
         if not status_message_id:
             status_message_id = task_telegram_status_message_id((record or {}).get("task"))
         if not status_message_id:
@@ -6211,8 +6489,7 @@ class TelegramBot:
                 if current_record is not None:
                     status_message_id = task_telegram_status_message_id(current_record.get("task"))
         if not status_message_id:
-            return task
-        out = dict(task or {})
+            return out if out != (original or {}) else original
         out["telegram_status_message_id"] = status_message_id
         return out
 
@@ -6425,6 +6702,7 @@ class TelegramBot:
                 return 0
             task = dict(result.get("task") or record["task"] or {})
             task.setdefault("info_hash", record["info_hash"])
+            task = self._task_with_known_status_message_id(record, task)
             if result.get("cancelled"):
                 mark_task_auto_cancelled(task, now)
             if TASK_STATE.is_offline_success(task):
@@ -7729,8 +8007,9 @@ def clean_openlist_task_media(
     task=None,
     max_bytes=DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES,
     hide_extra_scan_items=False,
+    target_path=None,
 ):
-    target = find_openlist_task_target(client, category_path, queries, task=task)
+    target = find_openlist_task_target(client, category_path, queries, task=task, target_path=target_path)
     if target is None:
         raise RuntimeError("OpenList target not found for cleanup")
 
@@ -7770,8 +8049,15 @@ def clean_openlist_task_media(
     }
 
 
-def format_openlist_adult_code(client, category_path, queries, task=None, allow_existing_target=False):
-    target = find_openlist_task_target(client, category_path, queries, task=task)
+def format_openlist_adult_code(
+    client,
+    category_path,
+    queries,
+    task=None,
+    allow_existing_target=False,
+    target_path=None,
+):
+    target = find_openlist_task_target(client, category_path, queries, task=task, target_path=target_path)
     if target is None:
         return {
             "openlist_adult_format_status": "skipped",
@@ -7796,11 +8082,7 @@ def format_openlist_adult_code(client, category_path, queries, task=None, allow_
     target_name_occupied = False
     if new_name != old_name:
         new_path = posixpath.join(str(target_dir).rstrip("/") or "/", new_name)
-        target_name_occupied = any(
-            openlist_item_name(item).casefold() == new_name.casefold()
-            and openlist_item_path(target_dir, item) != old_path
-            for item in client.list_all(target_dir, refresh=False)
-        )
+        target_name_occupied = new_path.casefold() != old_path.casefold() and openlist_path_exists(client, new_path)
         if not (allow_existing_target and target_name_occupied):
             client.rename_path(old_path, new_name)
             renamed_target = True
@@ -7849,8 +8131,9 @@ def hide_openlist_adult_extra_videos(
     queries,
     task=None,
     pre_scan_max_bytes=DEFAULT_OPENLIST_PRE_SCAN_CLEAN_MAX_BYTES,
+    target_path=None,
 ):
-    target = find_openlist_task_target(client, category_path, queries, task=task)
+    target = find_openlist_task_target(client, category_path, queries, task=task, target_path=target_path)
     if target is None:
         return {
             "openlist_adult_extra_hide_status": "skipped",
@@ -7977,7 +8260,21 @@ def adult_code_name_suffix(name, code):
     return suffix.strip(" ._-")
 
 
-def find_openlist_task_target(client, category_path, queries, task=None):
+def find_openlist_task_target(client, category_path, queries, task=None, target_path=None):
+    exact_path = normalize_openlist_path(target_path)
+    if exact_path:
+        target_dir = posixpath.dirname(exact_path.rstrip("/")) or "/"
+        target_name = posixpath.basename(exact_path.rstrip("/"))
+        try:
+            response = client.get_path(exact_path)
+        except RuntimeError as exc:
+            if openlist_missing_error(exc):
+                return None
+            raise
+        item = dict((response or {}).get("data") or {})
+        item.setdefault("name", target_name)
+        return target_dir, item
+
     items = client.list_all(category_path, refresh=False)
     scored = []
     for item in items:
@@ -8175,6 +8472,19 @@ def openlist_child_exists(client, path):
         if item.get("name") == source_name:
             return True
     return False
+
+
+def openlist_path_exists(client, path):
+    normalized = normalize_openlist_path(path)
+    if not normalized:
+        raise ValueError("OpenList path must not be empty")
+    try:
+        client.get_path(normalized)
+    except RuntimeError as exc:
+        if openlist_missing_error(exc):
+            return False
+        raise
+    return True
 
 
 def openlist_child_exists_for_hide(client, path):
@@ -8543,6 +8853,23 @@ def first_submit_task_info_hash(result):
         if value:
             return value
     return None
+
+
+def apply_import_target_to_submit_result(result, target):
+    if not isinstance(result, dict):
+        raise RuntimeError("pipeline submit returned invalid response")
+    target = dict(target or {})
+    path = normalize_openlist_path(target.get("openlist_path"))
+    if not path:
+        raise RuntimeError("入库目标目录缺少 OpenList 路径")
+    purpose = str(target.get("purpose") or "import").strip().lower()
+    for task in list(result.get("tasks") or []) + [result.get("task_status")]:
+        if not isinstance(task, dict):
+            continue
+        task["import_target_openlist_path"] = path
+        task["import_target_original_openlist_path"] = path
+        task["import_target_purpose"] = purpose
+    return result
 
 
 def access_token_invalid_response(response):

@@ -312,7 +312,19 @@ class CleaningOpenList:
 
     def get_path(self, path):
         self.events.append(("get_path", path))
-        return {"code": 200, "message": "success", "data": {"sign": "sign-%s" % str(path).rsplit("/", 1)[-1]}}
+        normalized = str(path).rstrip("/") or "/"
+        parent, _, name = normalized.rpartition("/")
+        parent = parent or "/"
+        item = next(
+            (dict(row) for row in self.tree.get(parent, []) if str(row.get("name") or "") == name),
+            None,
+        )
+        if item is None and normalized in self.tree:
+            item = {"name": name, "is_dir": True}
+        if item is None:
+            raise RuntimeError("OpenList get failed: object not found")
+        item["sign"] = "sign-%s" % name
+        return {"code": 200, "message": "success", "data": item}
 
 
 class RetryTokenStore:
@@ -451,16 +463,20 @@ class FakeMediaStationClient:
         self.pipeline_maintenance_calls.append(("search_migration_candidates", query, int(limit)))
         return self.migration_search_response
 
-    def pipeline_validate_migration(self, source, target):
-        self.pipeline_maintenance_calls.append(("validate_migration", dict(source or {}), dict(target or {})))
+    def pipeline_validate_migration(self, source, target, target_openlist_path=None):
+        self.pipeline_maintenance_calls.append(
+            ("validate_migration", dict(source or {}), dict(target or {}), target_openlist_path)
+        )
         if self.events is not None:
             self.events.append(("msg_validate_migration", source.get("source_openlist_path"), target.get("category")))
         if self.migration_validate_response is None:
             raise AssertionError("migration_validate_response missing")
         return self.migration_validate_response
 
-    def pipeline_apply_migration(self, source, target):
-        self.pipeline_maintenance_calls.append(("apply_migration", dict(source or {}), dict(target or {})))
+    def pipeline_apply_migration(self, source, target, target_openlist_path=None):
+        self.pipeline_maintenance_calls.append(
+            ("apply_migration", dict(source or {}), dict(target or {}), target_openlist_path)
+        )
         if self.events is not None:
             self.events.append(("msg_apply_migration", source.get("source_openlist_path"), target.get("category")))
         if self.migration_apply_response is None:
@@ -699,6 +715,7 @@ class FakeBotService:
         self.bt4g_search_calls = []
         self.rerank_calls = []
         self.submit_calls = []
+        self.submit_target_folder_ids = []
         self.status_calls = []
         self.statuses_calls = []
         self.cancel_calls = []
@@ -816,8 +833,24 @@ class FakeBotService:
             item["llm_reason"] = "正文更匹配"
         return ranked
 
-    def submit(self, category, download_uri):
+    def prepare_import_target(self, category, import_id, title, purpose="import"):
+        return {
+            "folder_id": "task-folder-%s" % import_id,
+            "openlist_path": "/115/%s/Import-%s" % (category, import_id),
+            "folder_name": "Import-%s" % import_id,
+            "purpose": purpose,
+        }
+
+    def finalize_import_target(self, category, task):
+        return {
+            "import_target_finalize_status": "success",
+            "import_target_openlist_path": task.get("import_target_openlist_path"),
+            "import_target_finalize_reason": "test",
+        }
+
+    def submit(self, category, download_uri, target_folder_id=None):
         self.submit_calls.append((category, download_uri))
+        self.submit_target_folder_ids.append(target_folder_id)
         return self.submit_response
 
     def task_status(self, category, info_hash):
