@@ -1931,8 +1931,8 @@ class ImportTaskManager:
         season = int(follow["season"])
         existing = {int(value) for value in follow.get("existing_episodes") or []}
         reserved = {int(value) for value in follow.get("reserved_episodes") or []}
-        expected_file_episodes = set()
-        if follow["title_class"] == "single":
+        expected_file_episodes = {int(value) for value in follow.get("expected_episodes") or []}
+        if follow["title_class"] == "single" and not expected_file_episodes:
             expected_episode = 1
             occupied = existing | reserved
             while expected_episode in occupied:
@@ -1963,6 +1963,7 @@ class ImportTaskManager:
                     "title_class": follow["title_class"],
                     "baseline_episodes": sorted(existing),
                     "reserved_episodes": sorted(reserved),
+                    "expected_episodes": sorted(expected_file_episodes),
                     "target_openlist_path": target_path,
                     "attempts": attempts,
                 }
@@ -3278,6 +3279,7 @@ def normalize_subscription_follow(payload, category, target, force_duplicate, up
     season = require_positive_int(payload.get("season"), "season", max_value=99)
     existing = normalize_episode_numbers(payload.get("existing_episodes"), "existing_episodes")
     reserved = normalize_episode_numbers(payload.get("reserved_episodes"), "reserved_episodes")
+    expected = normalize_episode_numbers(payload.get("expected_episodes"), "expected_episodes")
     target_path = normalize_openlist_path(
         require_text(payload.get("target_openlist_path"), "target_openlist_path", max_length=2000)
     )
@@ -3291,6 +3293,8 @@ def normalize_subscription_follow(payload, category, target, force_duplicate, up
     title_class = str(payload.get("title_class") or "unknown").strip().lower()
     if title_class not in {"single", "range", "cumulative_pack", "season_pack", "unknown"}:
         raise ApiError(400, "invalid_title_class", "invalid subscription candidate title class")
+    if expected and not manual_replenish:
+        raise ApiError(400, "invalid_expected_episodes", "expected_episodes only supports manual replenish")
     return {
         "subscription_id": subscription_id,
         "manual_replenish": manual_replenish,
@@ -3298,6 +3302,7 @@ def normalize_subscription_follow(payload, category, target, force_duplicate, up
         "season": season,
         "existing_episodes": existing,
         "reserved_episodes": reserved,
+        "expected_episodes": expected,
         "target_openlist_path": target_path,
         "title_class": title_class,
     }

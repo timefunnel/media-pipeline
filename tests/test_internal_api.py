@@ -1944,12 +1944,38 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             parse_follow_episode("[Hall_of_C] FanRenXiuXianZhuan_115_XHFC_39.mkv", 1, {115}),
             115,
         )
+        self.assertEqual(parse_follow_episode("吞噬星空132.mp4", 1, {132}), 132)
+        self.assertIsNone(parse_follow_episode("吞噬星空2132.mp4", 1, {132}))
         self.assertIsNone(
             parse_follow_episode("[Hall_of_C] FanRenXiuXianZhuan_115_XHFC_39.mkv", 1, {114})
         )
         self.assertIsNone(
             parse_follow_episode("[Hall_of_C] FanRenXiuXianZhuan_115_XHFC_39.mkv", 1, {39, 115})
         )
+
+    def test_manual_replenishment_preserves_controlled_expected_episode(self):
+        from pipeline.internal_api import ApiError, normalize_subscription_follow
+
+        target = target_for("anime")
+        payload = {
+            "subscription_follow": True,
+            "manual_replenish": True,
+            "work_key": "series:4790edb7",
+            "season": 1,
+            "existing_episodes": [1, 2, 4],
+            "reserved_episodes": [],
+            "expected_episodes": [3],
+            "target_openlist_path": "/115/动漫/吞噬星空/Season 1",
+            "title_class": "unknown",
+        }
+        follow = normalize_subscription_follow(payload, "anime", target, False, "")
+        self.assertEqual(follow["expected_episodes"], [3])
+
+        payload["manual_replenish"] = False
+        payload["subscription_id"] = "subscription-test"
+        with self.assertRaises(ApiError) as raised:
+            normalize_subscription_follow(payload, "anime", target, False, "")
+        self.assertEqual(raised.exception.code, "invalid_expected_episodes")
 
     def test_subscription_source_block_key_uses_115_share_code_and_subdirectory(self):
         self.assertEqual(
