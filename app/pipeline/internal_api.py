@@ -441,8 +441,8 @@ class InternalApiStore:
         pending = []
         for row in rows:
             task = import_row(row)
-            post_status = str(((task.get("result") or {}).get("task") or {}).get("post_enhancement_status") or "").strip().lower()
-            if post_status in {"pending", "running"}:
+            task_result = (task.get("result") or {}).get("task") or {}
+            if post_enhancement_needs_run(task_result):
                 pending.append(task)
         return pending
 
@@ -1318,9 +1318,9 @@ class ImportTaskManager:
             request = dict(current.get("request") or {})
             result = dict(current.get("result") or {})
             offline_task = dict(result.get("task") or {})
-            post_status = str(offline_task.get("post_enhancement_status") or "").strip().lower()
-            if post_status not in {"pending", "running"}:
+            if not post_enhancement_needs_run(offline_task):
                 return
+            restore_deferred_post_enhancement_stages(offline_task)
             offline_task.update(
                 {
                     "post_enhancement_status": "running",
@@ -3510,7 +3510,7 @@ def sync_warnings(task):
     warnings = []
     if task.get("msg_sync_status") != "success":
         warnings.append("MSG sync status: %s" % (task.get("msg_sync_status") or "missing"))
-    if task.get("msg_scrape_status") not in {"success", "skipped"}:
+    if task.get("msg_scrape_status") not in {"success", "skipped"} and not post_enhancement_needs_run(task):
         warnings.append("MSG scrape status: %s" % (task.get("msg_scrape_status") or "missing"))
     for key, value in sorted(task.items()):
         if key.endswith("_status") and value == "failed":
@@ -3526,6 +3526,34 @@ def sync_warnings(task):
         if warning not in warnings:
             warnings.append(warning)
     return warnings
+
+
+POST_ENHANCEMENT_DEFERRED_STAGES = (
+    ("msg_scrape_status", "msg_scrape_reason"),
+    ("msg_extra_cleanup_status", "msg_extra_cleanup_reason"),
+    ("msg_visibility_repair_status", "msg_visibility_repair_reason"),
+    ("subtitle_match_status", "subtitle_match_reason"),
+)
+
+
+def post_enhancement_has_deferred_stage(task):
+    task = task or {}
+    return any(task.get(reason_key) == "post_ingest_deferred" for _status_key, reason_key in POST_ENHANCEMENT_DEFERRED_STAGES)
+
+
+def post_enhancement_needs_run(task):
+    task = task or {}
+    status = str(task.get("post_enhancement_status") or "").strip().lower()
+    return status in {"pending", "running"} or (status == "success" and post_enhancement_has_deferred_stage(task))
+
+
+def restore_deferred_post_enhancement_stages(task):
+    task = task or {}
+    for status_key, reason_key in POST_ENHANCEMENT_DEFERRED_STAGES:
+        if task.get(reason_key) == "post_ingest_deferred":
+            task[status_key] = "deferred"
+            task.pop(reason_key, None)
+    return task
 
 
 def import_row(row):

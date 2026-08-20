@@ -260,6 +260,7 @@ class FakePipelineService:
         self.sync_scrape_queries = []
         self.sync_upgrade_media_ids = []
         self.sync_input_tasks = []
+        self.sync_results = []
         self.post_enhancement_calls = []
         self.cancel_calls = []
         self.duplicate_calls = []
@@ -594,9 +595,9 @@ class FakePipelineService:
         if self.defer_enhancements and task.get("defer_enhancements") and not task.get("post_enhancement_execution"):
             result.update(
                 {
-                    "msg_scrape_status": "skipped",
+                    "msg_scrape_status": "deferred",
                     "msg_scrape_reason": "post_ingest_deferred",
-                    "subtitle_match_status": "skipped",
+                    "subtitle_match_status": "deferred",
                     "subtitle_match_reason": "post_ingest_deferred",
                     "post_enhancement_status": "pending",
                     "post_enhancement_stage": "scrape",
@@ -640,6 +641,7 @@ class FakePipelineService:
         if self.warning:
             result["subtitle_match_status"] = "failed"
             result["subtitle_match_error"] = "subtitle provider failed"
+        self.sync_results.append(dict(result))
         return result
 
 
@@ -1306,7 +1308,40 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertEqual(len(service.sync_input_tasks), 2)
         self.assertTrue(service.sync_input_tasks[0].get("defer_enhancements"))
         self.assertTrue(service.sync_input_tasks[1].get("post_enhancement_execution"))
+        self.assertEqual(service.sync_results[0]["msg_scrape_status"], "deferred")
+        self.assertEqual(service.sync_results[1]["msg_scrape_status"], "success")
         self.assertEqual(len(service.post_enhancement_calls), 1)
+
+    def test_historical_post_enhancement_false_success_is_queued_for_repair(self):
+        from pipeline.internal_api import post_enhancement_needs_run, restore_deferred_post_enhancement_stages
+
+        service, store, manager, _application = self.build_components()
+        task, _ = store.create_import(
+            "owner-a", "historical-false-success", {"category": "movie", "title": "Historical False Success"}
+        )
+        historical = {
+            "info_hash": "historical-hash",
+            "status_name": "success",
+            "msg_sync_status": "success",
+            "msg_scrape_status": "skipped",
+            "msg_scrape_reason": "post_ingest_deferred",
+            "post_enhancement_status": "success",
+        }
+        store.finish_import(task["id"], "completed", "completed", result={"task": historical})
+
+        pending = store.list_pending_post_enhancements()
+        self.assertEqual([item["id"] for item in pending], [task["id"]])
+        self.assertTrue(post_enhancement_needs_run(historical))
+        restore_deferred_post_enhancement_stages(historical)
+        self.assertEqual(historical["msg_scrape_status"], "deferred")
+        self.assertNotIn("msg_scrape_reason", historical)
+
+        manager._run_post_enhancement(task)
+        repaired = (store.get_import("owner-a", task["id"])["result"] or {}).get("task") or {}
+        self.assertEqual(repaired.get("post_enhancement_status"), "success")
+        self.assertEqual(repaired.get("msg_scrape_status"), "success")
+        self.assertNotIn("msg_scrape_reason", repaired)
+        self.assertEqual(service.submit_uris, [])
 
     def test_failed_post_ingest_enhancement_is_retryable_without_resubmit(self):
         service, store, manager, application = self.build_components(

@@ -73,7 +73,10 @@ class TaskStateMachine:
 
     def msg_synced(self, task):
         task = task or {}
-        return task.get("msg_sync_status") == STATUS_SUCCESS and self.stage_is_complete(task.get("msg_scrape_status"))
+        post_enhancement = str(task.get("post_enhancement_status") or "").strip().lower()
+        return task.get("msg_sync_status") == STATUS_SUCCESS and (
+            self.stage_is_complete(task.get("msg_scrape_status")) or post_enhancement in {"pending", "running"}
+        )
 
     def sync_is_running(self, task):
         task = task or {}

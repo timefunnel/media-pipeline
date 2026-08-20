@@ -627,6 +627,18 @@ class CandidateStoreTest(unittest.TestCase):
 
 class TaskStateMachineTest(unittest.TestCase):
 
+    def test_task_state_machine_treats_deferred_scrape_as_synced_only_while_post_enhancement_runs(self):
+        from pipeline.task_state import TASK_STATE
+
+        deferred = {
+            "msg_sync_status": "success",
+            "msg_scrape_status": "deferred",
+            "post_enhancement_status": "pending",
+        }
+        self.assertTrue(TASK_STATE.msg_synced(deferred))
+        deferred["post_enhancement_status"] = "success"
+        self.assertFalse(TASK_STATE.msg_synced(deferred))
+
     def test_task_state_machine_treats_skipped_scrape_as_synced(self):
         from pipeline.task_state import TASK_STATE
         from pipeline.telegram_ui import format_task_status_message
