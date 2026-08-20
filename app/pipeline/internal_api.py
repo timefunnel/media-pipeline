@@ -1998,7 +1998,7 @@ class ImportTaskManager:
                 return True
 
             staging = dict(audit.get("staging") or {})
-            if not staging.get("openlist_path") or not staging.get("receive_root_folder_id"):
+            if not staging.get("openlist_path") or not subscription_receive_target_folder_id(staging):
                 staging = self.service.prepare_subscription_staging(
                     category,
                     task["id"],
@@ -2008,17 +2008,26 @@ class ImportTaskManager:
                 result["subscription_follow"] = audit
                 self.store.save_running(task["id"], "staging", result=result, info_hash=info_hash or None)
 
-            staging_state = self.service.inspect_subscription_staging(
-                category, staging, season, expected_file_episodes
-            )
-            has_staged_files = bool(staging_state.get("entries"))
+            direct_receive = subscription_receives_directly_to_staging(staging)
+            if direct_receive and not staging.get("claimed_at"):
+                has_staged_files = False
+            else:
+                staging_state = self.service.inspect_subscription_staging(
+                    category, staging, season, expected_file_episodes
+                )
+                has_staged_files = bool(staging_state.get("entries"))
             if not staging.get("claimed_at"):
-                self._acquire_target_lock(self._subscription_receive_lock)
+                receive_lock = None if direct_receive else self._subscription_receive_lock
+                if receive_lock is not None:
+                    self._acquire_target_lock(receive_lock)
                 try:
-                    staging_state = self.service.inspect_subscription_staging(
-                        category, staging, season, expected_file_episodes
-                    )
-                    has_staged_files = bool(staging_state.get("entries"))
+                    if direct_receive:
+                        has_staged_files = False
+                    else:
+                        staging_state = self.service.inspect_subscription_staging(
+                            category, staging, season, expected_file_episodes
+                        )
+                        has_staged_files = bool(staging_state.get("entries"))
                     if has_staged_files:
                         self.service.validate_subscription_receive_root(staging)
                         staging["recovered_at"] = int(time.time())
@@ -2035,7 +2044,7 @@ class ImportTaskManager:
                                 submit_result = self.service.submit(
                                     category,
                                     request["candidate"]["download_uri"],
-                                    target_folder_id=staging["receive_root_folder_id"],
+                                    target_folder_id=subscription_receive_target_folder_id(staging),
                                 )
                                 info_hash = first_submit_info_hash(submit_result)
                                 if not info_hash:
@@ -2095,7 +2104,8 @@ class ImportTaskManager:
                         result["subscription_follow"] = audit
                         self.store.save_running(task["id"], "staging", result=result, info_hash=info_hash)
                 finally:
-                    self._subscription_receive_lock.release()
+                    if receive_lock is not None:
+                        receive_lock.release()
             staging_state = self.service.inspect_subscription_staging(
                 category, staging, season, expected_file_episodes
             )
@@ -3227,6 +3237,16 @@ def subscription_source_block_key(download_uri):
     if info_hash:
         return "info-hash:" + info_hash
     return "uri-sha256:" + hashlib.sha256(uri.encode("utf-8")).hexdigest()
+
+
+def subscription_receives_directly_to_staging(staging):
+    return str((staging or {}).get("receive_mode") or "").strip().lower() == "direct_task_directory"
+
+
+def subscription_receive_target_folder_id(staging):
+    staging = staging or {}
+    key = "receive_folder_id" if subscription_receives_directly_to_staging(staging) else "receive_root_folder_id"
+    return str(staging.get(key) or "").strip()
 
 
 def subscription_source_failure_block_reason(error):

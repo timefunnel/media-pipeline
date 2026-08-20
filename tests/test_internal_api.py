@@ -25,6 +25,7 @@ from pipeline.bot import (
     parse_follow_episode,
     wait_openlist_directory,
     wait_openlist_offline_result_names,
+    wait_openlist_receive_entry_count,
     wait_openlist_receive_move,
     wait_openlist_receive_root_entries,
 )
@@ -155,6 +156,40 @@ class OpenListReceiveMoveWaitTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "permission denied"):
             wait_openlist_receive_root_entries(client, "/115/temp")
         self.assertEqual(client.calls, 1)
+
+    def test_waits_for_direct_receive_entry_count_without_matching_names(self):
+        class FakeOpenList:
+            def __init__(self):
+                self.calls = 0
+
+            def list_all(self, path, refresh=False):
+                self.calls += 1
+                self.assert_request = (path, refresh)
+                if self.calls == 1:
+                    return [{"name": "01.mkv"}]
+                return [{"name": "01.mkv"}, {"name": "02.mkv"}]
+
+        client = FakeOpenList()
+        entries = wait_openlist_receive_entry_count(
+            client,
+            "/115/临时/追更任务/series/task",
+            2,
+            timeout_seconds=1,
+            poll_seconds=0,
+            wait_fn=lambda _seconds: None,
+        )
+
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(client.assert_request, ("/115/临时/追更任务/series/task", True))
+
+    def test_direct_receive_entry_count_rejects_unexpected_extra_items(self):
+        class FakeOpenList:
+            def list_all(self, _path, refresh=False):
+                return [{"name": "01.mkv"}, {"name": "02.mkv"}]
+
+        with self.assertRaisesRegex(RuntimeError, "exceeds 115 result: expected=1 actual=2"):
+            wait_openlist_receive_entry_count(FakeOpenList(), "/115/temp/task", 1, timeout_seconds=0)
 
     def test_offline_result_wait_matches_the_completed_task_name(self):
         class FakeOpenList:
@@ -2024,6 +2059,31 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(service.subscription_cleanup_calls[0][1]["openlist_path"], audit["staging"]["openlist_path"])
         self.assertEqual(service.duplicate_calls, [])
 
+    def test_direct_subscription_receive_submits_to_the_task_directory(self):
+        service, _store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115}
+        ]
+        original_prepare = service.prepare_subscription_staging
+
+        def prepare_direct(category, import_id, work_key):
+            staging = original_prepare(category, import_id, work_key)
+            staging.update({"receive_mode": "direct_task_directory", "receive_folder_id": "task-folder-cid"})
+            return staging
+
+        service.prepare_subscription_staging = prepare_direct
+        task, _ = manager.create_import("owner-a", "fanren-direct-receive", self.payload(application, service))
+
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(service.submit_target_folder_ids, ["task-folder-cid"])
+        self.assertEqual(completed["result"]["subscription_follow"]["staging"]["receive_mode"], "direct_task_directory")
+
     def test_single_episode_uses_frontier_as_filename_hint(self):
         service, _store, manager, application = self.build_components()
         service.subscription_entries = [
@@ -2486,6 +2546,49 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
 
         self.assertEqual(service.subscription_receive_max_active, 1)
 
+    def test_different_direct_subscription_works_do_not_serialize_receive(self):
+        service, _store, manager, application = self.build_components(workers=2, owner_workers=2)
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115}
+        ]
+        original_prepare = service.prepare_subscription_staging
+
+        def prepare_direct(category, import_id, work_key):
+            staging = original_prepare(category, import_id, work_key)
+            staging.update({"receive_mode": "direct_task_directory", "receive_folder_id": "task-" + import_id})
+            return staging
+
+        service.prepare_subscription_staging = prepare_direct
+        first_payload = self.payload(application, service)
+        session_id, candidate_id, _ = self.search_candidate(
+            application,
+            owner_id="owner-b",
+            query="另一部动画 更新至120集",
+            category="anime",
+        )
+        second_payload = self.import_payload(
+            session_id,
+            candidate_id,
+            category="anime",
+            target=target_for("anime"),
+        )
+        second_payload.update(first_payload)
+        second_payload["search_session_id"] = session_id
+        second_payload["candidate_id"] = candidate_id
+        second_payload["work_key"] = "另一部动画"
+        second_payload["subscription_id"] = "subscription-other"
+        first, _ = manager.create_import("owner-a", "fanren-direct-1", first_payload)
+        second, _ = manager.create_import("owner-b", "fanren-direct-2", second_payload)
+
+        manager.start()
+        try:
+            self.wait_final(manager, "owner-a", first["id"], timeout=5)
+            self.wait_final(manager, "owner-b", second["id"], timeout=5)
+        finally:
+            manager.stop()
+
+        self.assertGreaterEqual(service.subscription_receive_max_active, 2)
+
 
 class SubscriptionPromotionTest(unittest.TestCase):
     def test_partial_openlist_move_is_detected_by_target_verification(self):
@@ -2538,77 +2641,127 @@ class SubscriptionPromotionTest(unittest.TestCase):
             [(staging_path, target_path, ["凡人修仙传.S01E115.mkv", "凡人修仙传.S01E115.zh-CN.srt"])],
         )
 
-    def test_prepare_subscription_staging_uses_openlist_path_and_configured_receive_root_id(self):
+    def test_prepare_subscription_staging_uses_a_dedicated_115_receive_directory(self):
         service = PipelineBotService(
             BotConfig(token="token", allowed_user_ids={1}, subscription_staging_folder_id="temporary-root-cid")
         )
 
-        class FakeOpenList:
+        class FakeClient115:
             def __init__(self):
                 self.created = []
+                self.names = {}
 
-            def mkdir_path(self, path):
-                self.created.append(path)
+            def create_folder(self, name, parent_id):
+                folder_id = "cid-%d" % (len(self.created) + 1)
+                self.created.append((name, parent_id, folder_id))
+                self.names[folder_id] = name
+                return {"state": True, "data": {"file_id": folder_id}}
 
-            def get_path(self, path):
-                return {"code": 200, "data": {"name": path.rsplit("/", 1)[-1], "is_dir": True}}
+            def get_folder_info(self, folder_id):
+                return {"state": True, "data": {"file_id": folder_id, "file_name": self.names[folder_id]}}
 
-            def list_all(self, path, refresh=False):
-                return []
-
-        client = FakeOpenList()
-        service._build_openlist_client = lambda: client
-        service._build_115_client = lambda _category: (_ for _ in ()).throw(AssertionError("115 Open API must not be used"))
+        client = FakeClient115()
+        service._build_115_client = lambda _category: client
+        service._build_openlist_client = lambda: (_ for _ in ()).throw(AssertionError("OpenList mkdir must not be used"))
 
         staging = service.prepare_subscription_staging("anime", "import-1", "凡人修仙传")
 
+        self.assertEqual(staging["receive_mode"], "direct_task_directory")
         self.assertEqual(staging["receive_root_folder_id"], "temporary-root-cid")
+        self.assertEqual(staging["receive_folder_id"], "cid-3")
         self.assertEqual(staging["receive_root_path"], "/115/临时")
         self.assertTrue(staging["openlist_path"].startswith("/115/临时/追更任务/凡人修仙传/"))
-        self.assertEqual(len(client.created), 3)
-        self.assertEqual(client.created[-1], staging["openlist_path"])
+        self.assertEqual(
+            client.created,
+            [
+                ("追更任务", "temporary-root-cid", "cid-1"),
+                ("凡人修仙传", "cid-1", "cid-2"),
+                ("import-1", "cid-2", "cid-3"),
+            ],
+        )
 
-    def test_prepare_subscription_staging_creates_missing_ancestors_one_level_at_a_time(self):
+    def test_direct_subscription_receive_waits_for_count_without_moving_top_level_names(self):
+        service = PipelineBotService(
+            BotConfig(
+                token="token",
+                allowed_user_ids={1},
+                subscription_move_timeout_seconds=1,
+                subscription_move_poll_seconds=0,
+            )
+        )
+        staging = {
+            "receive_mode": "direct_task_directory",
+            "receive_root_path": "/115/临时",
+            "receive_folder_id": "task-cid",
+            "openlist_path": "/115/临时/追更任务/show/import-1",
+        }
+
+        class FakeOpenList:
+            def __init__(self):
+                self.list_calls = 0
+                self.moves = []
+
+            def list_all(self, path, refresh=False):
+                self.list_calls += 1
+                self.last_list = (path, refresh)
+                if self.list_calls == 1:
+                    return [{"name": "01.mkv"}]
+                return [{"name": "01.mkv"}, {"name": "02.mkv"}]
+
+            def move_names(self, src_dir, dst_dir, names):
+                self.moves.append((src_dir, dst_dir, names))
+
+        client = FakeOpenList()
+        service._build_openlist_client = lambda: client
+        claimed = service.claim_subscription_transfer(
+            staging,
+            {
+                "submit_kind": "115_share_receive",
+                "raw": {"data": {"items": [{"name": "original-a"}, {"name": "original-b"}]}},
+            },
+        )
+
+        self.assertEqual(claimed["received_item_count"], 2)
+        self.assertIsInstance(claimed["claimed_at"], int)
+        self.assertEqual(client.last_list, (staging["openlist_path"], True))
+        self.assertEqual(client.moves, [])
+
+    def test_prepare_subscription_staging_reuses_verified_existing_115_ancestors(self):
         root = "/115/temp"
-        reserved = "\u8ffd\u66f4\u4efb\u52a1"
         service = PipelineBotService(
             BotConfig(token="token", allowed_user_ids={1}, subscription_staging_root=root, subscription_staging_folder_id="root-cid")
         )
 
-        class FakeOpenList:
+        class FakeClient115:
             def __init__(self):
-                self.directories = {root}
-                self.children = {root: []}
                 self.created = []
+                self.listed = []
 
-            def list_all(self, path, refresh=False):
-                return [{"name": name, "is_dir": True} for name in self.children[path]]
+            def create_folder(self, name, parent_id):
+                self.created.append((name, parent_id))
+                raise RuntimeError("folder already exists")
 
-            def mkdir_path(self, path):
-                parent, name = path.rsplit("/", 1)
-                if parent not in self.directories:
-                    raise AssertionError("mkdir called before its parent exists: %s" % path)
-                self.directories.add(path)
-                self.children[path] = []
-                self.children[parent].append(name)
-                self.created.append(path)
+            def list_all_files(self, folder_id):
+                self.listed.append(folder_id)
+                entries = {
+                    "root-cid": [{"cid": "reserved-cid", "fn": "追更任务", "fc": "0"}],
+                    "reserved-cid": [{"cid": "show-cid", "fn": "show", "fc": "0"}],
+                    "show-cid": [{"cid": "task-cid", "fn": "import-1", "fc": "0"}],
+                }
+                return entries[folder_id]
 
-            def get_path(self, path):
-                if path not in self.directories:
-                    raise AssertionError("expected directory was not created: %s" % path)
-                return {"code": 200, "data": {"is_dir": True}}
+            def get_folder_info(self, folder_id):
+                names = {"reserved-cid": "追更任务", "show-cid": "show", "task-cid": "import-1"}
+                return {"state": True, "data": {"file_id": folder_id, "file_name": names[folder_id]}}
 
-        client = FakeOpenList()
-        service._build_openlist_client = lambda: client
+        client = FakeClient115()
+        service._build_115_client = lambda _category: client
         staging = service.prepare_subscription_staging("anime", "import-1", "show")
 
-        expected = [
-            root + "/" + reserved,
-            root + "/" + reserved + "/show",
-            root + "/" + reserved + "/show/import-1",
-        ]
-        self.assertEqual(client.created, expected)
-        self.assertEqual(staging["openlist_path"], expected[-1])
+        self.assertEqual(staging["receive_folder_id"], "task-cid")
+        self.assertEqual(client.created, [("追更任务", "root-cid"), ("show", "reserved-cid"), ("import-1", "show-cid")])
+        self.assertEqual(client.listed, ["root-cid", "reserved-cid", "show-cid"])
+        self.assertEqual(staging["openlist_path"], root + "/追更任务/show/import-1")
 
     def test_staging_inspection_and_cleanup_use_only_openlist_paths(self):
         service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
@@ -2640,30 +2793,29 @@ class SubscriptionPromotionTest(unittest.TestCase):
         self.assertEqual(client.last_list, (staging["openlist_path"], True))
         self.assertEqual(client.removed, [("/115/临时/追更任务/凡人修仙传", ["import-1"])])
 
-    def test_subscription_follow_path_does_not_build_115_open_api_client(self):
+    def test_subscription_staging_does_not_create_directories_through_openlist(self):
         service = PipelineBotService(
             BotConfig(token="token", allowed_user_ids={1}, subscription_staging_folder_id="temporary-root-cid")
         )
 
-        class FakeOpenList:
-            def get_path(self, path):
-                return {"code": 200, "data": {"is_dir": True}}
+        class FakeClient115:
+            def __init__(self):
+                self.created = []
 
-            def list_all(self, path, refresh=False):
-                return []
+            def create_folder(self, name, parent_id):
+                folder_id = "cid-%d" % (len(self.created) + 1)
+                self.created.append((name, parent_id, folder_id))
+                return {"state": True, "data": {"file_id": folder_id}}
 
-            def mkdir_path(self, path):
-                return {"code": 200}
+            def get_folder_info(self, folder_id):
+                return {"state": True, "data": {"file_id": folder_id, "file_name": self.created[int(folder_id.split("-")[-1]) - 1][0]}}
 
-        service._build_openlist_client = lambda: FakeOpenList()
-        service._build_115_client = lambda _category: (_ for _ in ()).throw(
-            AssertionError("115 Open API must not be used")
-        )
+        service._build_115_client = lambda _category: FakeClient115()
+        service._build_openlist_client = lambda: (_ for _ in ()).throw(AssertionError("OpenList mkdir must not be used"))
 
         staging = service.prepare_subscription_staging("anime", "import-1", "凡人修仙传")
-        inspected = service.inspect_subscription_staging("anime", {**staging, "claimed_at": 1}, 1)
 
-        self.assertEqual(inspected["entries"], [])
+        self.assertEqual(staging["receive_mode"], "direct_task_directory")
 
 
 class ImportWorkerRecoveryTest(InternalApiTestCase):

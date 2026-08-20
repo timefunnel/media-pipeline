@@ -2129,18 +2129,16 @@ class PipelineBotService:
                 task_name,
             )
         )
-        client = self._build_openlist_client()
-        root = client.get_path(receive_root_path)
-        if not openlist_response_is_dir(root):
-            raise RuntimeError("OpenList subscription staging root is not a directory")
-        validate_subscription_root_entries(client.list_all(receive_root_path, refresh=True))
-        ensure_openlist_directory_tree(client, receive_root_path, staging_path)
-        task = client.get_path(staging_path)
-        if not openlist_response_is_dir(task):
-            raise RuntimeError("OpenList subscription staging path is not a directory")
+        receive_folder_id = self._ensure_115_directory_tree(
+            category,
+            receive_root_folder_id,
+            ["追更任务", safe_115_folder_name(work_key, "subscription"), task_name],
+        )
         return {
+            "receive_mode": "direct_task_directory",
             "receive_root_folder_id": receive_root_folder_id,
             "receive_root_path": receive_root_path,
+            "receive_folder_id": receive_folder_id,
             "openlist_path": staging_path,
         }
 
@@ -2189,6 +2187,24 @@ class PipelineBotService:
         if not root_folder_id:
             raise RuntimeError("115分类根目录 ID 缺失: %s" % category)
         client = self._build_115_client(category)
+        return self._ensure_115_directory(client, root_folder_id, folder_name)
+
+    def _ensure_115_directory_tree(self, category, root_folder_id, names):
+        client = self._build_115_client(category)
+        folder_id = str(root_folder_id or "").strip()
+        if not folder_id:
+            raise RuntimeError("115入库根目录 ID 缺失")
+        for name in names:
+            folder_id = self._ensure_115_directory(client, folder_id, name)
+        return folder_id
+
+    def _ensure_115_directory(self, client, root_folder_id, folder_name):
+        root_folder_id = str(root_folder_id or "").strip()
+        folder_name = str(folder_name or "").strip()
+        if not root_folder_id:
+            raise RuntimeError("115入库根目录 ID 缺失")
+        if not folder_name:
+            raise RuntimeError("115入库目录名缺失")
         folder_id = ""
         create_error = None
         try:
@@ -2221,6 +2237,12 @@ class PipelineBotService:
         return folder_id
 
     def validate_subscription_receive_root(self, staging):
+        if subscription_receives_directly_to_staging(staging):
+            return {
+                "receive_root_path": subscription_staging_path(staging),
+                "entries": [],
+                "receive_mode": "direct_task_directory",
+            }
         client = self._build_openlist_client()
         root_path = subscription_receive_root_path(staging)
         items = client.list_all(root_path, refresh=True)
@@ -2232,6 +2254,31 @@ class PipelineBotService:
         client = self._build_openlist_client()
         root_path = subscription_receive_root_path(staging)
         task_path = subscription_staging_path(staging)
+        if subscription_receives_directly_to_staging(staging):
+            expected_count = subscription_received_item_count(submit_result)
+            if expected_count <= 0 and (submit_result or {}).get("submit_kind") == "115_offline":
+                expected_count = len(
+                    wait_openlist_offline_result_names(
+                        client,
+                        task_path,
+                        (completed_task or {}).get("name"),
+                        timeout_seconds=self.config.subscription_move_timeout_seconds,
+                        poll_seconds=self.config.subscription_move_poll_seconds,
+                    )
+                )
+            if expected_count <= 0:
+                raise RuntimeError("115 transfer returned no top-level item count")
+            wait_openlist_receive_entry_count(
+                client,
+                task_path,
+                expected_count,
+                timeout_seconds=self.config.subscription_move_timeout_seconds,
+                poll_seconds=self.config.subscription_move_poll_seconds,
+            )
+            claimed = dict(staging or {})
+            claimed["received_item_count"] = expected_count
+            claimed["claimed_at"] = int(time.time())
+            return claimed
         received_names = subscription_received_names(submit_result)
         if not received_names and (submit_result or {}).get("submit_kind") == "115_offline":
             received_names = wait_openlist_offline_result_names(
@@ -4032,6 +4079,10 @@ def subscription_staging_path(staging):
     return path
 
 
+def subscription_receives_directly_to_staging(staging):
+    return str((staging or {}).get("receive_mode") or "").strip().lower() == "direct_task_directory"
+
+
 def subscription_receive_root_path(staging):
     path = normalize_openlist_path((staging or {}).get("receive_root_path"))
     if not path:
@@ -4047,6 +4098,12 @@ def subscription_received_names(submit_result):
         if name:
             names.append(name)
     return names
+
+
+def subscription_received_item_count(submit_result):
+    data = ((submit_result or {}).get("raw") or {}).get("data") or {}
+    items = data.get("items") or []
+    return len(items) if isinstance(items, list) else 0
 
 
 def wait_openlist_offline_result_names(
@@ -4089,46 +4146,6 @@ def wait_openlist_offline_result_names(
             )
         wait_fn(max(0.01, float(poll_seconds or 0)))
 
-
-def openlist_response_is_dir(response):
-    data = (response or {}).get("data") or {}
-    return bool(data.get("is_dir"))
-
-
-def ensure_openlist_directory_tree(client, root_path, target_path):
-    root = normalize_openlist_path(root_path)
-    target = normalize_openlist_path(target_path)
-    if not root or not target:
-        raise RuntimeError("OpenList directory paths must not be empty")
-    if target == root:
-        return root
-    prefix = root.rstrip("/") + "/"
-    if not target.startswith(prefix):
-        raise RuntimeError("OpenList target directory is outside the staging root")
-    components = [component for component in target[len(prefix) :].split("/") if component]
-    if not components:
-        raise RuntimeError("OpenList target directory path is invalid")
-
-    current = root
-    for component in components:
-        next_path = posixpath.join(current, component)
-        matches = [
-            item
-            for item in client.list_all(current, refresh=False)
-            if openlist_item_name(item) == component
-        ]
-        if len(matches) > 1:
-            raise RuntimeError("OpenList staging directory has duplicate entries: %s" % next_path)
-        if matches:
-            if not openlist_item_is_dir(matches[0]):
-                raise RuntimeError("OpenList staging path is not a directory: %s" % next_path)
-        else:
-            client.mkdir_path(next_path)
-            created = client.get_path(next_path)
-            if not openlist_response_is_dir(created):
-                raise RuntimeError("OpenList did not create a directory: %s" % next_path)
-        current = next_path
-    return current
 
 def validate_subscription_root_entries(items):
     items = list(items or [])
@@ -4192,6 +4209,45 @@ def wait_openlist_receive_root_entries(
         wait_fn=wait_fn,
         monotonic_fn=monotonic_fn,
     )
+
+
+def wait_openlist_receive_entry_count(
+    client,
+    path,
+    expected_count,
+    timeout_seconds=300,
+    poll_seconds=1,
+    wait_fn=time.sleep,
+    monotonic_fn=time.monotonic,
+):
+    expected_count = int(expected_count or 0)
+    if expected_count <= 0:
+        raise RuntimeError("OpenList receive expected entry count must be positive")
+    timeout = max(0.0, float(timeout_seconds or 0))
+    deadline = monotonic_fn() + timeout
+    observed_count = 0
+    while True:
+        try:
+            entries = client.list_all(path, refresh=True)
+        except RuntimeError as exc:
+            if not openlist_missing_error(exc) and not openlist_receive_operation_is_retryable_error(exc):
+                raise
+            entries = None
+        if entries is not None:
+            observed_count = len(entries)
+            if observed_count == expected_count:
+                return entries
+            if observed_count > expected_count:
+                raise RuntimeError(
+                    "OpenList direct receive entry count exceeds 115 result: expected=%d actual=%d"
+                    % (expected_count, observed_count)
+                )
+        if monotonic_fn() >= deadline:
+            raise RuntimeError(
+                "OpenList direct receive entries did not become visible within %.1f seconds: expected=%d actual=%d"
+                % (timeout, expected_count, observed_count)
+            )
+        wait_fn(max(0.01, float(poll_seconds or 0)))
 
 
 def wait_openlist_receive_move(
