@@ -744,9 +744,25 @@ class InternalApiStore:
                 raise ApiError(409, "import_not_retryable", "import task is not retryable")
             result = json.loads(row["result_json"]) if row["result_json"] else None
             request = json.loads(row["request_json"])
-            preserve_sync = bool(row["msg_media_id"] or result_task_is_offline_success(result))
+            retry_resubmit = subscription_retry_resubmit(result, request, row["msg_media_id"])
+            preserve_sync = bool(
+                not retry_resubmit
+                and (row["msg_media_id"] or result_task_is_offline_success(result))
+            )
             resume_stage = warning_retry_stage(result, request) if preserve_sync else ""
-            if preserve_sync:
+            if retry_resubmit:
+                result = {
+                    "subscription_retry": {
+                        "previous_info_hash": str(row["info_hash"] or "").strip(),
+                        "previous_submit_kind": str(
+                            ((result or {}).get("submit") or {}).get("submit_kind") or ""
+                        ).strip(),
+                        "previous_outcome": str(
+                            ((result or {}).get("subscription_follow") or {}).get("outcome") or ""
+                        ).strip(),
+                    }
+                }
+            elif preserve_sync:
                 result = dict(result or {})
                 task = dict(result.get("task") or {})
                 task["msg_sync_status"] = "running"
@@ -2040,6 +2056,26 @@ class ImportTaskManager:
                         try:
                             submit_result = dict(result.get("submit") or {})
                             if not submit_result:
+                                retry = dict(result.get("subscription_retry") or {})
+                                previous_info_hash = str(
+                                    retry.get("previous_info_hash") or ""
+                                ).strip()
+                                if (
+                                    previous_info_hash
+                                    and retry.get("previous_submit_kind") == "115_offline"
+                                    and not retry.get("offline_task_reset_at")
+                                ):
+                                    self.store.save_running(
+                                        task["id"], "resetting_download", result=result
+                                    )
+                                    retry["offline_task_reset"] = self.service.reset_task_for_resubmit(
+                                        category, previous_info_hash
+                                    )
+                                    retry["offline_task_reset_at"] = int(time.time())
+                                    result["subscription_retry"] = retry
+                                    self.store.save_running(
+                                        task["id"], "resetting_download", result=result
+                                    )
                                 self.service.validate_subscription_receive_root(staging)
                                 self.store.save_running(task["id"], "submitting", result=result)
                                 submit_result = self.service.submit(
@@ -2136,10 +2172,12 @@ class ImportTaskManager:
             )
             selected = verified - existing - reserved
             audit["selected_episodes"] = sorted(selected)
-            if audit["unknown_videos"]:
+            if audit["unknown_videos"] and not selected:
                 error = RuntimeError("OpenList staging contains unrecognized video names")
                 persist_blocked_source(error, block_reason="invalid_episode_layout", outcome="rejected")
                 raise error
+            if audit["unknown_videos"]:
+                audit["ignored_unknown_videos"] = list(audit["unknown_videos"])
             if audit["duplicate_episodes"]:
                 error = RuntimeError("OpenList staging contains multiple videos for one episode")
                 persist_blocked_source(error, block_reason="invalid_episode_layout", outcome="rejected")
@@ -3469,6 +3507,15 @@ def first_submit_info_hash(result):
 
 def result_task_is_offline_success(result):
     return isinstance(result, dict) and (result.get("task") or {}).get("status_name") == OFFLINE_SUCCESS_STATUS
+
+
+def subscription_retry_resubmit(result, request, msg_media_id=None):
+    if msg_media_id or not isinstance(result, dict) or not isinstance(request, dict):
+        return False
+    if not request.get("subscription_follow") or not result_task_is_offline_success(result):
+        return False
+    audit = result.get("subscription_follow") or {}
+    return bool(audit.get("staging_cleaned_at"))
 
 
 def offline_task_poll_attempt(task):

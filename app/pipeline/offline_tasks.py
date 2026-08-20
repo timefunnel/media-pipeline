@@ -114,3 +114,20 @@ def cancel_task_if_active(client, info_hash, max_pages=10):
         "response": response,
         "reason": "",
     }
+
+
+def reset_task_for_resubmit(client, info_hash, max_pages=10):
+    try:
+        task = find_task_by_info_hash(client, info_hash, max_pages=max_pages)
+    except RuntimeError as exc:
+        if str(exc).startswith("offline task not found:"):
+            return {"deleted": False, "task": None, "response": None, "reason": "task_not_found"}
+        raise
+
+    response = client.delete_offline_task(info_hash, delete_files=False)
+    if response.get("state") is not True:
+        raise RuntimeError(
+            "115 offline task reset failed: %s"
+            % (response.get("message") or response.get("msg") or response.get("code"))
+        )
+    return {"deleted": True, "task": task, "response": response, "reason": ""}

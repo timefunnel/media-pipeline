@@ -2087,6 +2087,30 @@ class OfflineTaskTest(unittest.TestCase):
         self.assertEqual(result["task"]["status_name"], "success")
         self.assertEqual(client.deleted, [])
 
+    def test_reset_task_for_resubmit_deletes_finished_task_without_files(self):
+        client = Fake115CancelClient(
+            {"state": True, "data": {"page_count": 1, "tasks": [{"info_hash": "ABC", "status": 2, "percentDone": 100}]}},
+            {"state": True, "data": []},
+        )
+
+        result = reset_task_for_resubmit(client, "ABC")
+
+        self.assertTrue(result["deleted"])
+        self.assertEqual(result["task"]["status_name"], "success")
+        self.assertEqual(client.deleted, [("ABC", False)])
+
+    def test_reset_task_for_resubmit_is_idempotent_when_task_is_missing(self):
+        client = Fake115CancelClient(
+            {"state": True, "data": {"page_count": 1, "tasks": []}},
+            {"state": True, "data": []},
+        )
+
+        result = reset_task_for_resubmit(client, "ABC")
+
+        self.assertFalse(result["deleted"])
+        self.assertEqual(result["reason"], "task_not_found")
+        self.assertEqual(client.deleted, [])
+
 class SearchProfileTest(unittest.TestCase):
     def test_profile_search_uses_externalized_categories(self):
         from pipeline.bot import SEARCH_PROFILE_GENERAL, search_profile_indexer_results

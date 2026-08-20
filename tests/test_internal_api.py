@@ -330,6 +330,7 @@ class FakePipelineService:
         self.subscription_verify_result = None
         self.subscription_receive_active = 0
         self.subscription_receive_max_active = 0
+        self.reset_resubmit_calls = []
     def search(self, query, category, limit=20):
         return ResultList(
             [{"title": query, "download_uri": "magnet:?xt=urn:btih:%s" % query.upper(), "rank": 1}],
@@ -575,6 +576,10 @@ class FakePipelineService:
     def cancel_task(self, category, info_hash):
         self.cancel_calls.append((category, info_hash))
         return {"info_hash": info_hash, "status_name": "cancelled"}
+
+    def reset_task_for_resubmit(self, category, info_hash):
+        self.reset_resubmit_calls.append((category, info_hash))
+        return {"deleted": True, "task": {"info_hash": info_hash}, "response": {"state": True}}
 
     def sync_completed_task(
         self,
@@ -2319,6 +2324,60 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(len(service.subscription_cleanup_calls), 1)
         source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
         self.assertEqual(store.get_subscription_source_block(source_key)["reason"], "invalid_episode_layout")
+
+    def test_unknown_video_is_ignored_when_known_missing_episode_is_selected(self):
+        service, store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115},
+            {"fid": "advertisement", "fn": "更多高清剧集请访问发布站.mkv", "kind": "video"},
+        ]
+        payload = self.payload(application, service)
+        payload["manual_replenish"] = True
+        payload.pop("subscription_id")
+        task, _ = manager.create_import("owner-a", "fanren-known-with-advertisement", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        audit = completed["result"]["subscription_follow"]
+        self.assertEqual(audit["selected_episodes"], [115])
+        self.assertEqual(audit["moved_episodes"], [115])
+        self.assertEqual(audit["unknown_videos"], ["更多高清剧集请访问发布站.mkv"])
+        self.assertEqual(audit["ignored_unknown_videos"], ["更多高清剧集请访问发布站.mkv"])
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
+        self.assertIsNone(store.get_subscription_source_block(source_key))
+
+    def test_retry_reuses_import_record_and_resubmits_after_staging_cleanup(self):
+        service, _store, manager, application = self.build_components()
+        service.subscription_entries = [{"fid": "unknown", "fn": "final-video.mkv", "kind": "video"}]
+        payload = self.payload(application, service)
+        payload["manual_replenish"] = True
+        payload.pop("subscription_id")
+        task, _ = manager.create_import("owner-a", "fanren-retry-cleaned-staging", payload)
+        manager.start()
+        try:
+            failed = self.wait_final(manager, "owner-a", task["id"])
+            service.subscription_stagings.pop(task["id"], None)
+            service.subscription_staging = None
+            service.subscription_entries = [
+                {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115}
+            ]
+            retried = manager.retry_import("owner-a", failed["id"])
+            completed = self.wait_final(manager, "owner-a", failed["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(retried["id"], failed["id"])
+        self.assertEqual(completed["id"], failed["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(service.reset_resubmit_calls, [("anime", "HASH001")])
+        self.assertEqual(len(service.submit_uris), 2)
+        self.assertEqual(service.submit_uris[0], service.submit_uris[1])
+        self.assertEqual(completed["info_hash"], "HASH002")
 
     def test_duplicate_episode_videos_are_rejected_cleaned_and_blocked(self):
         service, store, manager, application = self.build_components()

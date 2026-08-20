@@ -137,7 +137,12 @@ from pipeline.mediastation import (
     media_belongs_to_library,
     media_haystack,
 )
-from pipeline.offline_tasks import cancel_task_if_active, find_task_by_info_hash, find_tasks_by_info_hashes
+from pipeline.offline_tasks import (
+    cancel_task_if_active,
+    find_task_by_info_hash,
+    find_tasks_by_info_hashes,
+    reset_task_for_resubmit,
+)
 from pipeline.openlist import DEFAULT_OPENLIST_URL, OpenListClient, OpenListPasswordTokenProvider, OpenListTokenProvider
 from pipeline.openlist_tokens import load_access_token_from_api
 from pipeline.prowlarr import (
@@ -2516,6 +2521,12 @@ class PipelineBotService:
 
     def cancel_task(self, category, info_hash):
         return self._call_115(category, lambda client: cancel_task_if_active(client, info_hash, max_pages=10))
+
+    def reset_task_for_resubmit(self, category, info_hash):
+        return self._call_115(
+            category,
+            lambda client: reset_task_for_resubmit(client, info_hash, max_pages=10),
+        )
 
     def migrate_media_candidate(self, candidate, target_category):
         target = build_migration_target(candidate, target_category)
