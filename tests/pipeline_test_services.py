@@ -2111,6 +2111,17 @@ class OfflineTaskTest(unittest.TestCase):
         self.assertEqual(result["reason"], "task_not_found")
         self.assertEqual(client.deleted, [])
 
+    def test_reset_task_for_resubmit_rejects_active_task(self):
+        client = Fake115CancelClient(
+            {"state": True, "data": {"page_count": 1, "tasks": [{"info_hash": "ABC", "status": 1}]}},
+            {"state": True, "data": []},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "still active"):
+            reset_task_for_resubmit(client, "ABC")
+
+        self.assertEqual(client.deleted, [])
+
 class SearchProfileTest(unittest.TestCase):
     def test_profile_search_uses_externalized_categories(self):
         from pipeline.bot import SEARCH_PROFILE_GENERAL, search_profile_indexer_results

@@ -253,6 +253,32 @@ class OpenListReceiveMoveWaitTest(unittest.TestCase):
                 FakeOpenList(), "/115/临时", "凡人修仙传", timeout_seconds=0
             )
 
+    def test_offline_result_wait_honors_stop_check_before_listing(self):
+        class FakeOpenList:
+            def list_all(self, _path, refresh=False):
+                raise AssertionError("listing should not run after cancellation")
+
+        with self.assertRaisesRegex(RuntimeError, "canceled"):
+            wait_openlist_offline_result_names(
+                FakeOpenList(),
+                "/115/临时",
+                "凡人修仙传",
+                stop_check=lambda: (_ for _ in ()).throw(RuntimeError("canceled")),
+            )
+
+    def test_direct_receive_count_honors_stop_check_before_listing(self):
+        class FakeOpenList:
+            def list_all(self, _path, refresh=False):
+                raise AssertionError("listing should not run after cancellation")
+
+        with self.assertRaisesRegex(RuntimeError, "canceled"):
+            wait_openlist_receive_entry_count(
+                FakeOpenList(),
+                "/115/临时/追更任务/series/task",
+                1,
+                stop_check=lambda: (_ for _ in ()).throw(RuntimeError("canceled")),
+            )
+
 
 class ResultList(list):
     def __init__(self, items, metadata=None):
@@ -451,7 +477,11 @@ class FakePipelineService:
         self.subscription_receive_active -= 1
         return {"receive_root_path": staging["receive_root_path"], "entries": ["追更任务"]}
 
-    def claim_subscription_transfer(self, staging, submit_result, completed_task=None):
+    def claim_subscription_transfer(
+        self, staging, submit_result, completed_task=None, stop_check=None
+    ):
+        if stop_check is not None:
+            stop_check()
         self.subscription_claim_calls.append(
             (dict(staging), dict(submit_result), dict(completed_task or {}))
         )
@@ -1957,6 +1987,84 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertIsNone(
             parse_follow_episode("[Hall_of_C] FanRenXiuXianZhuan_115_XHFC_39.mkv", 1, {39, 115})
         )
+        self.assertIsNone(parse_follow_episode("吞噬星空.S05E139.mkv", 1))
+        self.assertEqual(parse_follow_episode("吞噬星空.S05E139.mkv", 1, {139}), 139)
+
+    def test_manual_replenishment_infers_expected_episode_from_chinese_marker(self):
+        from pipeline.internal_api import manual_replenishment_expected_episodes
+
+        single = manual_replenishment_expected_episodes(
+            {
+                "title": "吞噬星空 第5季[第139集]",
+                "download_uri": "magnet:?xt=urn:btih:ABC&dn=吞噬星空%20第139集",
+            },
+            existing=[138, 140],
+        )
+        episode_range = manual_replenishment_expected_episodes(
+            {"title": "吞噬星空[第124-133集]"},
+            existing=[124, 125, 126, 127, 128, 129, 130, 131, 133],
+        )
+
+        self.assertEqual(single, [139])
+        self.assertEqual(episode_range, [132])
+
+    def test_unclaimed_direct_staging_retry_requires_resubmit(self):
+        from pipeline.internal_api import subscription_retry_resubmit
+
+        result = {
+            "task": {"status_name": "success"},
+            "subscription_follow": {
+                "staging": {"receive_mode": "direct_task_directory"}
+            },
+        }
+        request = {"subscription_follow": {"manual_replenish": True}}
+
+        self.assertTrue(subscription_retry_resubmit(result, request))
+
+    def test_manual_replenishment_uses_inferred_episode_as_filename_hint(self):
+        service, _store, manager, application = self.build_components()
+        session_id, candidate_id, _ = self.search_candidate(
+            application,
+            query="吞噬星空 第5季[第139集]",
+            category="anime",
+        )
+        payload = self.import_payload(
+            session_id,
+            candidate_id,
+            category="anime",
+            target=target_for("anime"),
+        )
+        payload.update(
+            {
+                "subscription_follow": True,
+                "manual_replenish": True,
+                "work_key": "series:4790edb7",
+                "season": 1,
+                "existing_episodes": [138, 140],
+                "reserved_episodes": [],
+                "target_openlist_path": "/115/动漫/吞噬星空/Season 1",
+                "title_class": "unknown",
+            }
+        )
+        service.subscription_entries = [
+            {
+                "fid": "video-139",
+                "fn": "吞噬星空.Swallowed.Star.S05E139.mkv",
+                "kind": "video",
+                "episode": 139,
+            }
+        ]
+        task, _ = manager.create_import("owner-a", "swallowed-star-139", payload)
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(service.subscription_inspect_expected)
+        self.assertTrue(all(value == [139] for value in service.subscription_inspect_expected))
+        self.assertEqual(completed["result"]["subscription_follow"]["selected_episodes"], [139])
 
     def test_manual_replenishment_preserves_controlled_expected_episode(self):
         from pipeline.internal_api import ApiError, normalize_subscription_follow
@@ -2556,7 +2664,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             "raw": {"data": {"items": [{"name": "120集全"}]}},
         }
 
-        def reject_claim(_staging, _submit_result, completed_task=None):
+        def reject_claim(_staging, _submit_result, completed_task=None, stop_check=None):
             raise RuntimeError("subscription receive root cannot be claimed: unexpected=未知目录")
 
         service.claim_subscription_transfer = reject_claim

@@ -4962,13 +4962,27 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(result["tasks"], [])
         self.assertEqual(result["state"], False)
 
-    def test_submit_fills_task_identity_for_existing_115_task_response(self):
+    def test_submit_resets_existing_finished_115_task_and_resubmits_to_target(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
         class SubmitService(PipelineBotService):
+            def __init__(self, config):
+                super().__init__(config)
+                self.responses = [
+                    {"state": False, "code": 10008, "message": "任务已存在"},
+                    {"state": True, "data": [{"info_hash": "D00D7132F75BEB644A19E6A1CC011AA3523CF233"}]},
+                ]
+                self.fake_115s = []
+                self.reset_calls = []
+
             def _call_115(self, category, callback):
-                self.fake_115 = Fake115SubmitClient({"state": False, "code": 10008, "message": "任务已存在"})
-                return callback(self.fake_115)
+                client = Fake115SubmitClient(self.responses.pop(0))
+                self.fake_115s.append(client)
+                return callback(client)
+
+            def reset_task_for_resubmit(self, category, info_hash):
+                self.reset_calls.append((category, info_hash))
+                return {"deleted": True}
 
         service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
 
@@ -4979,7 +4993,8 @@ class PipelineBotServiceTest(unittest.TestCase):
         )
 
         self.assertEqual(result["tasks"][0]["info_hash"], "D00D7132F75BEB644A19E6A1CC011AA3523CF233")
-        self.assertEqual(result["tasks"][0]["message"], "任务已存在")
+        self.assertEqual(service.reset_calls, [("adult", "D00D7132F75BEB644A19E6A1CC011AA3523CF233")])
+        self.assertEqual([client.folder_id for client in service.fake_115s], ["task-folder", "task-folder"])
 
     def test_task_status_refreshes_openlist_and_retries_when_115_token_is_invalid(self):
         from pipeline.bot import BotConfig, PipelineBotService

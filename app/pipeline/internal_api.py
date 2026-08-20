@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -1948,6 +1949,12 @@ class ImportTaskManager:
         existing = {int(value) for value in follow.get("existing_episodes") or []}
         reserved = {int(value) for value in follow.get("reserved_episodes") or []}
         expected_file_episodes = {int(value) for value in follow.get("expected_episodes") or []}
+        if follow.get("manual_replenish") and not expected_file_episodes:
+            expected_file_episodes.update(
+                manual_replenishment_expected_episodes(
+                    request.get("candidate"), existing=existing, reserved=reserved
+                )
+            )
         if follow["title_class"] == "single" and not expected_file_episodes:
             expected_episode = 1
             occupied = existing | reserved
@@ -2131,8 +2138,18 @@ class ImportTaskManager:
                                     if time.monotonic() >= offline_wait_deadline:
                                         raise OfflineWaitDeferred()
                                     self._wait_or_stop(offline_task_poll_delay(offline_task, self.poll_seconds))
+
+                            def check_receive_wait():
+                                self._raise_if_stopping()
+                                self._raise_if_cancel_requested(
+                                    task["owner_id"], task["id"], category, info_hash
+                                )
+
                             staging = self.service.claim_subscription_transfer(
-                                staging, submit_result, completed_task=offline_task
+                                staging,
+                                submit_result,
+                                completed_task=offline_task,
+                                stop_check=check_receive_wait,
                             )
                         except Exception as exc:
                             persist_blocked_source(exc)
@@ -3515,7 +3532,34 @@ def subscription_retry_resubmit(result, request, msg_media_id=None):
     if not request.get("subscription_follow") or not result_task_is_offline_success(result):
         return False
     audit = result.get("subscription_follow") or {}
-    return bool(audit.get("staging_cleaned_at"))
+    if audit.get("staging_cleaned_at"):
+        return True
+    staging = audit.get("staging") or {}
+    return bool(
+        str(staging.get("receive_mode") or "").strip().lower() == "direct_task_directory"
+        and not staging.get("claimed_at")
+    )
+
+
+def manual_replenishment_expected_episodes(candidate, existing=None, reserved=None):
+    candidate = candidate or {}
+    values = [str(candidate.get(key) or "") for key in ("title", "name", "download_uri")]
+    text = urllib.parse.unquote(" ".join(values))
+    episodes = set()
+    for match in re.finditer(r"第\s*0*(\d{1,4})\s*[-~—–至到]\s*0*(\d{1,4})\s*集", text):
+        start = int(match.group(1))
+        end = int(match.group(2))
+        if start <= 0 or end < start or end - start > 500:
+            continue
+        episodes.update(range(start, end + 1))
+    for match in re.finditer(r"第\s*0*(\d{1,4})\s*集", text):
+        episode = int(match.group(1))
+        if episode > 0:
+            episodes.add(episode)
+    occupied = {int(value) for value in existing or []} | {
+        int(value) for value in reserved or []
+    }
+    return sorted(episodes - occupied)
 
 
 def offline_task_poll_attempt(task):

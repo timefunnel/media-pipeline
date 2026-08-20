@@ -2073,9 +2073,20 @@ class PipelineBotService:
         if is_115_share_url(download_uri):
             return self._submit_115_share(category, download_uri, target_folder_id=folder_id)
         download_uri = self._resolve_download_uri(download_uri)
-        result = summarize_submit(
-            self._call_115(category, lambda client: client.add_offline_urls([download_uri], folder_id))
+        response = self._call_115(
+            category, lambda client: client.add_offline_urls([download_uri], folder_id)
         )
+        if submit_response_task_exists(response):
+            info_hash = candidate_info_hash({"download_uri": download_uri})
+            if not info_hash:
+                raise RuntimeError("115 existing offline task response has no info_hash")
+            self.reset_task_for_resubmit(category, info_hash)
+            response = self._call_115(
+                category, lambda client: client.add_offline_urls([download_uri], folder_id)
+            )
+            if submit_response_task_exists(response):
+                raise RuntimeError("115 offline task still exists after reset")
+        result = summarize_submit(response)
         ensure_submit_result_has_task_identity(result, download_uri)
         result["submit_kind"] = "115_offline"
         return result
@@ -2261,7 +2272,9 @@ class PipelineBotService:
         names = [openlist_item_name(item) for item in items]
         return {"receive_root_path": root_path, "entries": names}
 
-    def claim_subscription_transfer(self, staging, submit_result, completed_task=None):
+    def claim_subscription_transfer(
+        self, staging, submit_result, completed_task=None, stop_check=None
+    ):
         client = self._build_openlist_client()
         root_path = subscription_receive_root_path(staging)
         task_path = subscription_staging_path(staging)
@@ -2275,6 +2288,7 @@ class PipelineBotService:
                         (completed_task or {}).get("name"),
                         timeout_seconds=self.config.subscription_move_timeout_seconds,
                         poll_seconds=self.config.subscription_move_poll_seconds,
+                        stop_check=stop_check,
                     )
                 )
             if expected_count <= 0:
@@ -2285,6 +2299,7 @@ class PipelineBotService:
                 expected_count,
                 timeout_seconds=self.config.subscription_move_timeout_seconds,
                 poll_seconds=self.config.subscription_move_poll_seconds,
+                stop_check=stop_check,
             )
             claimed = dict(staging or {})
             claimed["received_item_count"] = expected_count
@@ -2298,6 +2313,7 @@ class PipelineBotService:
                 (completed_task or {}).get("name"),
                 timeout_seconds=self.config.subscription_move_timeout_seconds,
                 poll_seconds=self.config.subscription_move_poll_seconds,
+                stop_check=stop_check,
             )
         if not received_names:
             raise RuntimeError("115 transfer returned no top-level item names")
@@ -4131,12 +4147,15 @@ def wait_openlist_offline_result_names(
     poll_seconds=1,
     wait_fn=time.sleep,
     monotonic_fn=time.monotonic,
+    stop_check=None,
 ):
     expected_name = str(task_name or "").strip()
     if not expected_name:
         raise RuntimeError("115 offline task returned no result name")
     deadline = monotonic_fn() + max(0.0, float(timeout_seconds or 0))
     while True:
+        if stop_check is not None:
+            stop_check()
         try:
             items = client.list_all(root_path, refresh=True)
         except RuntimeError as exc:
@@ -4236,6 +4255,7 @@ def wait_openlist_receive_entry_count(
     poll_seconds=1,
     wait_fn=time.sleep,
     monotonic_fn=time.monotonic,
+    stop_check=None,
 ):
     expected_count = int(expected_count or 0)
     if expected_count <= 0:
@@ -4244,6 +4264,8 @@ def wait_openlist_receive_entry_count(
     deadline = monotonic_fn() + timeout
     observed_count = 0
     while True:
+        if stop_check is not None:
+            stop_check()
         try:
             entries = client.list_all(path, refresh=True)
         except RuntimeError as exc:
@@ -4351,19 +4373,21 @@ def is_video_filename(name):
 
 def parse_follow_episode(name, expected_season, expected_episodes=None):
     stem = posixpath.splitext(str(name or ""))[0]
+    expected = {int(value) for value in expected_episodes or [] if int(value) > 0}
     for pattern in FOLLOW_EPISODE_PATTERNS:
         match = pattern.search(stem)
         if not match:
             continue
         season = int(match.groupdict().get("season") or expected_season or 1)
         episode = int(match.group("episode"))
-        if season != int(expected_season or 1) or episode <= 0:
+        if episode <= 0:
+            return None
+        if season != int(expected_season or 1) and episode not in expected:
             return None
         return episode
     if re.fullmatch(r"0*\d{1,4}", stem.strip()):
         episode = int(stem.strip())
         return episode if episode > 0 else None
-    expected = {int(value) for value in expected_episodes or [] if int(value) > 0}
     if len(expected) == 1:
         episode = next(iter(expected))
         if re.search(r"(?<!\d)%s(?!\d)" % re.escape(str(episode)), stem):
@@ -8919,6 +8943,13 @@ def submit_response_should_track(result):
         return True
     text = " ".join(str((result or {}).get(key) or "") for key in ("code", "message"))
     return "已存在" in text or "已添加" in text
+
+
+def submit_response_task_exists(result):
+    if not isinstance(result, dict):
+        return False
+    text = " ".join(str(result.get(key) or "") for key in ("code", "message", "msg"))
+    return str(result.get("code") or "") == "10008" or "任务已存在" in text
 
 
 def first_submit_task_info_hash(result):

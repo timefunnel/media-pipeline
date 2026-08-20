@@ -124,6 +124,11 @@ def reset_task_for_resubmit(client, info_hash, max_pages=10):
             return {"deleted": False, "task": None, "response": None, "reason": "task_not_found"}
         raise
 
+    if task.get("status_name") in ACTIVE_STATUS_NAMES:
+        raise RuntimeError(
+            "115 offline task is still active and cannot be reset: %s" % task.get("status_name")
+        )
+
     response = client.delete_offline_task(info_hash, delete_files=False)
     if response.get("state") is not True:
         raise RuntimeError(
