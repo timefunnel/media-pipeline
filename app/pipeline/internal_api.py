@@ -1,7 +1,6 @@
 import hashlib
 import hmac
 import json
-import re
 import sqlite3
 import threading
 import time
@@ -1948,19 +1947,14 @@ class ImportTaskManager:
         season = int(follow["season"])
         existing = {int(value) for value in follow.get("existing_episodes") or []}
         reserved = {int(value) for value in follow.get("reserved_episodes") or []}
-        expected_file_episodes = {int(value) for value in follow.get("expected_episodes") or []}
-        if follow.get("manual_replenish") and not expected_file_episodes:
-            expected_file_episodes.update(
-                manual_replenishment_expected_episodes(
-                    request.get("candidate"), existing=existing, reserved=reserved
-                )
+        file_episode_hints = set()
+        if follow.get("manual_replenish") and existing:
+            upper_bound = max(existing)
+            file_episode_hints.update(
+                episode
+                for episode in range(1, upper_bound + 1)
+                if episode not in existing and episode not in reserved
             )
-        if follow["title_class"] == "single" and not expected_file_episodes:
-            expected_episode = 1
-            occupied = existing | reserved
-            while expected_episode in occupied:
-                expected_episode += 1
-            expected_file_episodes.add(expected_episode)
         info_hash = str(task.get("info_hash") or "").strip()
         offline_task = dict(result.get("task") or {})
         target_lock = self._target_lock(
@@ -1986,7 +1980,6 @@ class ImportTaskManager:
                     "title_class": follow["title_class"],
                     "baseline_episodes": sorted(existing),
                     "reserved_episodes": sorted(reserved),
-                    "expected_episodes": sorted(expected_file_episodes),
                     "target_openlist_path": target_path,
                     "attempts": attempts,
                 }
@@ -2036,14 +2029,14 @@ class ImportTaskManager:
             if direct_receive and not staging.get("claimed_at"):
                 if result.get("submit"):
                     staging_state = self.service.inspect_subscription_staging(
-                        category, staging, season, expected_file_episodes
+                        category, staging, season, file_episode_hints
                     )
                     has_staged_files = bool(staging_state.get("entries"))
                 else:
                     has_staged_files = False
             else:
                 staging_state = self.service.inspect_subscription_staging(
-                    category, staging, season, expected_file_episodes
+                    category, staging, season, file_episode_hints
                 )
                 has_staged_files = bool(staging_state.get("entries"))
             if not staging.get("claimed_at"):
@@ -2054,14 +2047,14 @@ class ImportTaskManager:
                     if direct_receive:
                         if result.get("submit"):
                             staging_state = self.service.inspect_subscription_staging(
-                                category, staging, season, expected_file_episodes
+                                category, staging, season, file_episode_hints
                             )
                             has_staged_files = bool(staging_state.get("entries"))
                         else:
                             has_staged_files = False
                     else:
                         staging_state = self.service.inspect_subscription_staging(
-                            category, staging, season, expected_file_episodes
+                            category, staging, season, file_episode_hints
                         )
                         has_staged_files = bool(staging_state.get("entries"))
                     if has_staged_files:
@@ -2172,6 +2165,29 @@ class ImportTaskManager:
                                         raise OfflineWaitDeferred()
                                     self._wait_or_stop(offline_task_poll_delay(offline_task, self.poll_seconds))
 
+                            manifest = dict(audit.get("resource_manifest") or {})
+                            if str(manifest.get("info_hash") or "") != info_hash:
+                                manifest = self.service.inspect_subscription_submit_result(
+                                    category,
+                                    submit_result,
+                                    offline_task,
+                                    season,
+                                    episode_hints=file_episode_hints,
+                                )
+                                manifest["info_hash"] = info_hash
+                                audit["resource_manifest"] = manifest
+                                result["subscription_follow"] = audit
+                            offline_task["received_item_count"] = int(
+                                manifest.get("top_level_item_count") or 0
+                            )
+                            result["task"] = offline_task
+                            self.store.save_running(
+                                task["id"],
+                                "verifying_source",
+                                result=result,
+                                info_hash=info_hash,
+                            )
+
                             def check_receive_wait():
                                 self._raise_if_stopping()
                                 self._raise_if_cancel_requested(
@@ -2194,7 +2210,7 @@ class ImportTaskManager:
                     if receive_lock is not None:
                         receive_lock.release()
             staging_state = self.service.inspect_subscription_staging(
-                category, staging, season, expected_file_episodes
+                category, staging, season, file_episode_hints
             )
             has_staged_files = bool(staging_state.get("entries"))
             if not info_hash and has_staged_files:
@@ -2210,9 +2226,18 @@ class ImportTaskManager:
 
             self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
             staging_state = self.service.inspect_subscription_staging(
-                category, staging, season, expected_file_episodes
+                category, staging, season, file_episode_hints
             )
             verified = {int(value) for value in staging_state.get("verified_episodes") or []}
+            source_manifest = audit.get("resource_manifest") or {}
+            source_verified = {
+                int(value)
+                for value in source_manifest.get("verified_episodes") or []
+            }
+            if source_manifest and source_verified != verified:
+                raise RuntimeError(
+                    "OpenList staging episode manifest does not match the 115 resource manifest"
+                )
             audit.update(
                 {
                     "verified_episodes": sorted(verified),
@@ -2220,7 +2245,10 @@ class ImportTaskManager:
                     "duplicate_episodes": dict(staging_state.get("duplicate_episodes") or {}),
                 }
             )
-            selected = verified - existing - reserved
+            if follow.get("manual_replenish"):
+                selected = verified & file_episode_hints
+            else:
+                selected = verified - existing - reserved
             audit["selected_episodes"] = sorted(selected)
             if audit["unknown_videos"] and not selected:
                 error = RuntimeError("OpenList staging contains unrecognized video names")
@@ -2736,7 +2764,12 @@ class InternalApiApplication:
         category = require_category(payload.get("category"))
         candidate = share115_candidate_from_text(input_text)
         if candidate is None:
-            candidate = magnet_candidate_from_text(input_text)
+            magnet_input = input_text
+            if input_text.strip().casefold().startswith("magnet:?"):
+                if any(token in input_text for token in ("\r", "\n", "\t")):
+                    raise ApiError(400, "invalid_magnet", "磁链必须为单行完整链接")
+                magnet_input = input_text.strip().replace(" ", "%20")
+            candidate = magnet_candidate_from_text(magnet_input)
             if candidate is not None and not valid_btih_info_hash(candidate.get("infoHash")):
                 raise ApiError(400, "invalid_magnet", "磁链缺少有效的 BTIH")
         if candidate is None:
@@ -3367,7 +3400,12 @@ def normalize_subscription_follow(payload, category, target, force_duplicate, up
     season = require_positive_int(payload.get("season"), "season", max_value=99)
     existing = normalize_episode_numbers(payload.get("existing_episodes"), "existing_episodes")
     reserved = normalize_episode_numbers(payload.get("reserved_episodes"), "reserved_episodes")
-    expected = normalize_episode_numbers(payload.get("expected_episodes"), "expected_episodes")
+    if normalize_episode_numbers(payload.get("expected_episodes"), "expected_episodes"):
+        raise ApiError(
+            400,
+            "invalid_expected_episodes",
+            "expected_episodes is not used; replenish decisions come from staged files and the missing baseline",
+        )
     target_path = normalize_openlist_path(
         require_text(payload.get("target_openlist_path"), "target_openlist_path", max_length=2000)
     )
@@ -3381,8 +3419,6 @@ def normalize_subscription_follow(payload, category, target, force_duplicate, up
     title_class = str(payload.get("title_class") or "unknown").strip().lower()
     if title_class not in {"single", "range", "cumulative_pack", "season_pack", "unknown"}:
         raise ApiError(400, "invalid_title_class", "invalid subscription candidate title class")
-    if expected and not manual_replenish:
-        raise ApiError(400, "invalid_expected_episodes", "expected_episodes only supports manual replenish")
     return {
         "subscription_id": subscription_id,
         "manual_replenish": manual_replenish,
@@ -3390,7 +3426,6 @@ def normalize_subscription_follow(payload, category, target, force_duplicate, up
         "season": season,
         "existing_episodes": existing,
         "reserved_episodes": reserved,
-        "expected_episodes": expected,
         "target_openlist_path": target_path,
         "title_class": title_class,
     }
@@ -3572,27 +3607,6 @@ def subscription_retry_resubmit(result, request, msg_media_id=None):
         str(staging.get("receive_mode") or "").strip().lower() == "direct_task_directory"
         and not staging.get("claimed_at")
     )
-
-
-def manual_replenishment_expected_episodes(candidate, existing=None, reserved=None):
-    candidate = candidate or {}
-    values = [str(candidate.get(key) or "") for key in ("title", "name", "download_uri")]
-    text = urllib.parse.unquote(" ".join(values))
-    episodes = set()
-    for match in re.finditer(r"第\s*0*(\d{1,4})\s*[-~—–至到]\s*0*(\d{1,4})\s*集", text):
-        start = int(match.group(1))
-        end = int(match.group(2))
-        if start <= 0 or end < start or end - start > 500:
-            continue
-        episodes.update(range(start, end + 1))
-    for match in re.finditer(r"第\s*0*(\d{1,4})\s*集", text):
-        episode = int(match.group(1))
-        if episode > 0:
-            episodes.add(episode)
-    occupied = {int(value) for value in existing or []} | {
-        int(value) for value in reserved or []
-    }
-    return sorted(episodes - occupied)
 
 
 def offline_task_poll_attempt(task):

@@ -150,10 +150,15 @@ class Client115:
         return response
 
     def list_all_files(self, folder_id, page_size=1000):
+        return self.list_all_files_with_request_count(folder_id, page_size=page_size)[0]
+
+    def list_all_files_with_request_count(self, folder_id, page_size=1000):
         offset = 0
         out = []
+        request_count = 0
         while True:
             response = self.list_files(folder_id, limit=page_size, offset=offset)
+            request_count += 1
             raw_data = response.get("data") or []
             data = raw_data
             if isinstance(raw_data, dict):
@@ -163,7 +168,7 @@ class Client115:
             out.extend(data)
             count = int(response.get("count") or (raw_data.get("count") if isinstance(raw_data, dict) else 0) or len(out))
             if not data or len(out) >= count:
-                return out
+                return out, request_count
             offset += len(data)
 
     def move_files(self, file_ids, target_folder_id):
@@ -243,8 +248,12 @@ class Share115Client:
             raise ValueError("folder_id must not be empty")
 
         cookie_jar = self._create_share_session(share_code, receive_code)
-        snap = self._snap(cookie_jar, share_code, receive_code, cid=cid, limit=100)
-        items = extract_115_share_items(snap)
+        items, manifest_items, manifest_request_count = self._inspect_share_tree(
+            cookie_jar,
+            share_code,
+            receive_code,
+            cid=cid,
+        )
         if not items:
             raise RuntimeError("115 share has no receivable items")
 
@@ -282,6 +291,8 @@ class Share115Client:
                 "cid": folder_id,
                 "source_cid": cid,
                 "items": items,
+                "manifest_items": manifest_items,
+                "manifest_request_count": manifest_request_count,
                 "file_ids": file_ids,
                 "save_as_top_fids": data.get("save_as_top_fids") or data.get("file_id") or [],
                 "raw": data,
@@ -307,11 +318,57 @@ class Share115Client:
             pass
         return cookie_jar
 
-    def _snap(self, cookie_jar, share_code, receive_code="", cid="0", limit=50):
+    def _inspect_share_tree(
+        self,
+        cookie_jar,
+        share_code,
+        receive_code="",
+        cid="0",
+        page_size=1000,
+        max_entries=20000,
+    ):
+        request_count = 0
+
+        def list_items(folder_id):
+            nonlocal request_count
+            offset = 0
+            out = []
+            while True:
+                request_count += 1
+                response = self._snap(
+                    cookie_jar,
+                    share_code,
+                    receive_code,
+                    cid=folder_id,
+                    limit=page_size,
+                    offset=offset,
+                )
+                page = extract_115_share_items(response)
+                out.extend(page)
+                if len(out) > int(max_entries):
+                    raise RuntimeError("115 share entry limit exceeded")
+                data = response.get("data") or {}
+                total = int(data.get("count") or data.get("total") or 0)
+                if not page or len(page) < int(page_size) or (total and len(out) >= total):
+                    return out
+                offset += len(page)
+
+        top_items = list_items(cid)
+        manifest = list(top_items)
+        stack = [item["file_id"] for item in top_items if item.get("is_dir")]
+        while stack:
+            children = list_items(stack.pop())
+            manifest.extend(children)
+            if len(manifest) > int(max_entries):
+                raise RuntimeError("115 share entry limit exceeded")
+            stack.extend(item["file_id"] for item in children if item.get("is_dir"))
+        return top_items, manifest, request_count
+
+    def _snap(self, cookie_jar, share_code, receive_code="", cid="0", limit=50, offset=0):
         query = urllib.parse.urlencode(
             {
                 "share_code": share_code,
-                "offset": 0,
+                "offset": max(0, int(offset)),
                 "limit": int(limit),
                 "asc": 0,
                 "cid": "" if str(cid or "0") == "0" else str(cid),

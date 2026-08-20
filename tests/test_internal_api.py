@@ -350,7 +350,7 @@ class FakePipelineService:
         self.subscription_prepare_calls = []
         self.subscription_validate_root_calls = []
         self.subscription_claim_calls = []
-        self.subscription_inspect_expected = []
+        self.subscription_inspect_hints = []
         self.subscription_cleanup_calls = []
         self.subscription_cleanup_error = None
         self.subscription_verify_result = None
@@ -494,8 +494,8 @@ class FakePipelineService:
                 break
         return claimed
 
-    def inspect_subscription_staging(self, category, staging, season, expected_episodes=None):
-        self.subscription_inspect_expected.append(sorted(expected_episodes or []))
+    def inspect_subscription_staging(self, category, staging, season, episode_hints=None):
+        self.subscription_inspect_hints.append(sorted(episode_hints or []))
         entries = [dict(item) for item in self.subscription_entries] if staging.get("claimed_at") else []
         by_episode = {}
         unknown = []
@@ -513,6 +513,39 @@ class FakePipelineService:
             "verified_episodes": sorted(by_episode),
             "unknown_videos": unknown,
             "duplicate_episodes": {str(key): value for key, value in by_episode.items() if len(value) > 1},
+        }
+
+    def inspect_subscription_submit_result(
+        self,
+        category,
+        submit_result,
+        completed_task,
+        season,
+        episode_hints=None,
+    ):
+        by_episode = {}
+        unknown = []
+        for item in self.subscription_entries:
+            if item.get("kind") != "video":
+                continue
+            episode = item.get("episode")
+            if not episode:
+                unknown.append(item.get("fn"))
+                continue
+            by_episode.setdefault(int(episode), []).append(item.get("fn"))
+        return {
+            "source_kind": (submit_result or {}).get("submit_kind") or "115_offline",
+            "inspection_timing": "before_transfer"
+            if (submit_result or {}).get("submit_kind") == "115_share_receive"
+            else "after_download",
+            "top_level_item_count": 1,
+            "request_count": 1,
+            "entry_count": len(self.subscription_entries),
+            "verified_episodes": sorted(by_episode),
+            "unknown_videos": sorted(unknown),
+            "duplicate_episodes": {
+                str(key): value for key, value in by_episode.items() if len(value) > 1
+            },
         }
 
     def plan_subscription_promotion(self, staging, selected_episodes, season):
@@ -541,10 +574,10 @@ class FakePipelineService:
     def refresh_subscription_target(self, target_openlist_path):
         return {"path": target_openlist_path}
 
-    def verify_subscription_msg_episodes(self, category, target_openlist_path, season, expected_episodes):
+    def verify_subscription_msg_episodes(self, category, target_openlist_path, season, selected_episodes):
         if self.subscription_verify_result is not None:
             return dict(self.subscription_verify_result)
-        return {"verified_episodes": sorted(expected_episodes), "missing_episodes": [], "duplicate_episodes": {}}
+        return {"verified_episodes": sorted(selected_episodes), "missing_episodes": [], "duplicate_episodes": {}}
 
     def cleanup_subscription_staging(self, category, staging):
         self.subscription_cleanup_calls.append((category, dict(staging)))
@@ -923,6 +956,27 @@ class SearchResponseTest(InternalApiTestCase):
         self.assertEqual(candidate["title"], "Manual magnet task")
         self.assertEqual(candidate["infoHash"], info_hash)
         self.assertEqual(candidate["resource_type"], "magnet")
+
+    def test_manual_candidate_preserves_magnet_display_name_with_spaces(self):
+        _, _, _, application = self.build_components()
+        info_hash = "cba9085cfbe940ae873dfdf20ab635c064fd274f"
+        response = application.prepare_manual_candidate(
+            {
+                "owner_id": "owner-a",
+                "title": "吞噬星空",
+                "input": (
+                    "magnet:?xt=urn:btih:%s&dn=【高清剧集网发布 www.BPHDTV.com】"
+                    "吞噬星空 第5季[第139集]"
+                )
+                % info_hash,
+                "category": "anime",
+            }
+        )
+
+        candidate = response["items"][0]
+        self.assertEqual(candidate["infoHash"], info_hash)
+        self.assertNotIn(" ", candidate["download_uri"])
+        self.assertIn("第139集", urllib.parse.unquote(candidate["download_uri"]))
 
     def test_manual_candidate_accepts_valid_ed2k_file_link(self):
         _, _, _, application = self.build_components()
@@ -1988,25 +2042,12 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             parse_follow_episode("[Hall_of_C] FanRenXiuXianZhuan_115_XHFC_39.mkv", 1, {39, 115})
         )
         self.assertIsNone(parse_follow_episode("吞噬星空.S05E139.mkv", 1))
-        self.assertEqual(parse_follow_episode("吞噬星空.S05E139.mkv", 1, {139}), 139)
-
-    def test_manual_replenishment_infers_expected_episode_from_chinese_marker(self):
-        from pipeline.internal_api import manual_replenishment_expected_episodes
-
-        single = manual_replenishment_expected_episodes(
-            {
-                "title": "吞噬星空 第5季[第139集]",
-                "download_uri": "magnet:?xt=urn:btih:ABC&dn=吞噬星空%20第139集",
-            },
-            existing=[138, 140],
+        self.assertEqual(
+            parse_follow_episode(
+                "吞噬星空.S05E139.mkv", 1, allow_season_mismatch=True
+            ),
+            139,
         )
-        episode_range = manual_replenishment_expected_episodes(
-            {"title": "吞噬星空[第124-133集]"},
-            existing=[124, 125, 126, 127, 128, 129, 130, 131, 133],
-        )
-
-        self.assertEqual(single, [139])
-        self.assertEqual(episode_range, [132])
 
     def test_unclaimed_direct_staging_retry_requires_resubmit(self):
         from pipeline.internal_api import subscription_retry_resubmit
@@ -2021,11 +2062,11 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
 
         self.assertTrue(subscription_retry_resubmit(result, request))
 
-    def test_manual_replenishment_uses_inferred_episode_as_filename_hint(self):
+    def test_manual_replenishment_uses_known_missing_episodes_as_filename_hints(self):
         service, _store, manager, application = self.build_components()
         session_id, candidate_id, _ = self.search_candidate(
             application,
-            query="吞噬星空 第5季[第139集]",
+            query="吞噬星空",
             category="anime",
         )
         payload = self.import_payload(
@@ -2062,11 +2103,11 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             manager.stop()
 
         self.assertEqual(completed["status"], "completed")
-        self.assertTrue(service.subscription_inspect_expected)
-        self.assertTrue(all(value == [139] for value in service.subscription_inspect_expected))
+        self.assertTrue(service.subscription_inspect_hints)
+        self.assertTrue(all(139 in value for value in service.subscription_inspect_hints))
         self.assertEqual(completed["result"]["subscription_follow"]["selected_episodes"], [139])
 
-    def test_manual_replenishment_preserves_controlled_expected_episode(self):
+    def test_subscription_follow_rejects_expected_episode_input(self):
         from pipeline.internal_api import ApiError, normalize_subscription_follow
 
         target = target_for("anime")
@@ -2081,11 +2122,6 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             "target_openlist_path": "/115/动漫/吞噬星空/Season 1",
             "title_class": "unknown",
         }
-        follow = normalize_subscription_follow(payload, "anime", target, False, "")
-        self.assertEqual(follow["expected_episodes"], [3])
-
-        payload["manual_replenish"] = False
-        payload["subscription_id"] = "subscription-test"
         with self.assertRaises(ApiError) as raised:
             normalize_subscription_follow(payload, "anime", target, False, "")
         self.assertEqual(raised.exception.code, "invalid_expected_episodes")
@@ -2223,10 +2259,10 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(service.submit_target_folder_ids, ["task-folder-cid"])
         self.assertEqual(completed["result"]["subscription_follow"]["staging"]["receive_mode"], "direct_task_directory")
 
-    def test_single_episode_uses_frontier_as_filename_hint(self):
+    def test_single_episode_without_actual_episode_marker_is_rejected(self):
         service, _store, manager, application = self.build_components()
         service.subscription_entries = [
-            {"fid": "video-115", "fn": "show_115_release.mkv", "kind": "video", "episode": 115}
+            {"fid": "video-115", "fn": "show_115_release.mkv", "kind": "video"}
         ]
         payload = self.payload(application, service)
         payload["title_class"] = "single"
@@ -2238,9 +2274,10 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         finally:
             manager.stop()
 
-        self.assertEqual(completed["status"], "completed")
-        self.assertTrue(service.subscription_inspect_expected)
-        self.assertTrue(all(value == [115] for value in service.subscription_inspect_expected))
+        self.assertEqual(completed["status"], "failed")
+        self.assertTrue(service.subscription_inspect_hints)
+        self.assertTrue(all(value == [] for value in service.subscription_inspect_hints))
+        self.assertIn("unrecognized video names", completed["error"])
 
     def test_no_new_episodes_cleans_staging_and_blocks_the_source(self):
         service, store, manager, application = self.build_components()
@@ -2439,7 +2476,11 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115},
             {"fid": "advertisement", "fn": "更多高清剧集请访问发布站.mkv", "kind": "video"},
         ]
-        payload = self.payload(application, service)
+        payload = self.payload(
+            application,
+            service,
+            existing=list(range(1, 115)) + [116],
+        )
         payload["manual_replenish"] = True
         payload.pop("subscription_id")
         task, _ = manager.create_import("owner-a", "fanren-known-with-advertisement", payload)
@@ -2462,7 +2503,11 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
     def test_retry_reuses_import_record_and_resubmits_after_staging_cleanup(self):
         service, _store, manager, application = self.build_components()
         service.subscription_entries = [{"fid": "unknown", "fn": "final-video.mkv", "kind": "video"}]
-        payload = self.payload(application, service)
+        payload = self.payload(
+            application,
+            service,
+            existing=list(range(1, 115)) + [116],
+        )
         payload["manual_replenish"] = True
         payload.pop("subscription_id")
         task, _ = manager.create_import("owner-a", "fanren-retry-cleaned-staging", payload)
@@ -2638,7 +2683,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         original_inspect = service.inspect_subscription_staging
         inspect_calls = []
 
-        def inspect_after_redelivery(category, current_staging, season, expected_episodes=None):
+        def inspect_after_redelivery(category, current_staging, season, episode_hints=None):
             inspect_calls.append(dict(current_staging))
             if len(inspect_calls) <= 2:
                 return {
@@ -2648,7 +2693,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
                     "unknown_videos": [],
                     "duplicate_episodes": {},
                 }
-            return original_inspect(category, current_staging, season, expected_episodes)
+            return original_inspect(category, current_staging, season, episode_hints)
 
         service.inspect_subscription_staging = inspect_after_redelivery
         conn = sqlite3.connect(self.db_path)

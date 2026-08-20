@@ -2280,6 +2280,8 @@ class PipelineBotService:
         task_path = subscription_staging_path(staging)
         if subscription_receives_directly_to_staging(staging):
             expected_count = subscription_received_item_count(submit_result)
+            if expected_count <= 0:
+                expected_count = int((completed_task or {}).get("received_item_count") or 0)
             if expected_count <= 0 and (submit_result or {}).get("submit_kind") == "115_offline":
                 expected_count = len(
                     wait_openlist_offline_result_names(
@@ -2367,7 +2369,7 @@ class PipelineBotService:
         claimed["claimed_at"] = int(time.time())
         return claimed
 
-    def inspect_subscription_staging(self, category, staging, season, expected_episodes=None):
+    def inspect_subscription_staging(self, category, staging, season, episode_hints=None):
         client = self._build_openlist_client()
         staging_path = subscription_staging_path(staging)
         entries = list_openlist_descendants(client, staging_path)
@@ -2381,7 +2383,12 @@ class PipelineBotService:
             name = openlist_item_name(item)
             if not is_video_filename(name):
                 continue
-            episode = parse_follow_episode(name, season, expected_episodes)
+            episode = parse_follow_episode(
+                name,
+                season,
+                episode_hints,
+                allow_season_mismatch=category == "anime",
+            )
             if episode is None:
                 unknown.append(name)
                 continue
@@ -2398,21 +2405,73 @@ class PipelineBotService:
             "duplicate_episodes": duplicates,
         }
 
+    def inspect_subscription_offline_result(self, category, task, season, episode_hints=None):
+        return self._call_115(
+            category,
+            lambda client: inspect_115_offline_result(
+                client,
+                task,
+                season,
+                episode_hints=episode_hints,
+                allow_season_mismatch=category == "anime",
+            ),
+        )
+
+    def inspect_subscription_submit_result(
+        self,
+        category,
+        submit_result,
+        completed_task,
+        season,
+        episode_hints=None,
+    ):
+        if (submit_result or {}).get("submit_kind") == "115_share_receive":
+            data = ((submit_result or {}).get("raw") or {}).get("data") or {}
+            manifest = classify_115_resource_entries(
+                data.get("manifest_items") or data.get("items") or [],
+                season,
+                episode_hints=episode_hints,
+                allow_season_mismatch=category == "anime",
+            )
+            manifest.update(
+                {
+                    "source_kind": "115_share",
+                    "inspection_timing": "before_transfer",
+                    "top_level_item_count": len(data.get("items") or []),
+                    "request_count": int(data.get("manifest_request_count") or 0),
+                }
+            )
+            return manifest
+        manifest = self.inspect_subscription_offline_result(
+            category,
+            completed_task,
+            season,
+            episode_hints=episode_hints,
+        )
+        manifest.update(
+            {
+                "source_kind": "115_offline",
+                "inspection_timing": "after_download",
+            }
+        )
+        return manifest
+
     def plan_subscription_promotion(self, staging, selected_episodes, season):
         selected = {int(value) for value in selected_episodes or []}
         entries = list((staging or {}).get("entries") or [])
-        selected_videos = []
+        selected_videos = [
+            {
+                "path": item.get("path"),
+                "name": item.get("name"),
+                "episode": int(item.get("episode") or 0),
+                "kind": "video",
+            }
+            for item in (staging or {}).get("videos") or []
+            if int(item.get("episode") or 0) in selected
+        ]
         video_stems = []
-        for item in entries:
-            if openlist_item_is_dir(item):
-                continue
-            name = openlist_item_name(item)
-            episode = parse_follow_episode(name, season, selected) if is_video_filename(name) else None
-            if episode in selected:
-                selected_videos.append(
-                    {"path": item.get("path"), "name": name, "episode": episode, "kind": "video"}
-                )
-                video_stems.append(posixpath.splitext(name)[0].casefold())
+        for item in selected_videos:
+            video_stems.append(posixpath.splitext(str(item.get("name") or ""))[0].casefold())
         files = list(selected_videos)
         for item in entries:
             if openlist_item_is_dir(item):
@@ -2488,10 +2547,10 @@ class PipelineBotService:
         client.list_path(path, refresh=True)
         return {"path": path, "refreshed_at": int(time.time())}
 
-    def verify_subscription_msg_episodes(self, category, target_openlist_path, season, expected_episodes):
+    def verify_subscription_msg_episodes(self, category, target_openlist_path, season, selected_episodes):
         root = category_to_msg_library_root(category)
         client = self._build_msg_client()
-        expected = {int(value) for value in expected_episodes or []}
+        expected = {int(value) for value in selected_episodes or []}
         target = normalize_openlist_path(target_openlist_path)
         matched = defaultdict(list)
         page = 1
@@ -4371,9 +4430,11 @@ def is_video_filename(name):
     return posixpath.splitext(str(name or ""))[1].lower() in FOLLOW_VIDEO_EXTENSIONS
 
 
-def parse_follow_episode(name, expected_season, expected_episodes=None):
+def parse_follow_episode(
+    name, expected_season, episode_hints=None, allow_season_mismatch=False
+):
     stem = posixpath.splitext(str(name or ""))[0]
-    expected = {int(value) for value in expected_episodes or [] if int(value) > 0}
+    hints = {int(value) for value in episode_hints or [] if int(value) > 0}
     for pattern in FOLLOW_EPISODE_PATTERNS:
         match = pattern.search(stem)
         if not match:
@@ -4382,17 +4443,137 @@ def parse_follow_episode(name, expected_season, expected_episodes=None):
         episode = int(match.group("episode"))
         if episode <= 0:
             return None
-        if season != int(expected_season or 1) and episode not in expected:
+        if season != int(expected_season or 1) and not allow_season_mismatch:
             return None
         return episode
     if re.fullmatch(r"0*\d{1,4}", stem.strip()):
         episode = int(stem.strip())
-        return episode if episode > 0 else None
-    if len(expected) == 1:
-        episode = next(iter(expected))
-        if re.search(r"(?<!\d)%s(?!\d)" % re.escape(str(episode)), stem):
-            return episode
+        return episode if episode > 0 and episode in hints else None
+    matched_hints = [
+        episode
+        for episode in hints
+        if re.search(r"(?<!\d)%s(?!\d)" % re.escape(str(episode)), stem)
+    ]
+    if len(matched_hints) == 1:
+        return matched_hints[0]
     return None
+
+
+def inspect_115_offline_result(
+    client,
+    task,
+    season,
+    episode_hints=None,
+    allow_season_mismatch=False,
+    max_entries=20000,
+):
+    task = dict(task or {})
+    file_id = str(task.get("file_id") or "").strip()
+    if not file_id:
+        raise RuntimeError("115 completed offline task returned no file_id")
+    request_count = [0]
+    try:
+        entries = list_115_descendants(
+            client,
+            file_id,
+            request_count=request_count,
+            max_entries=max_entries,
+        )
+    except RuntimeError as directory_error:
+        parent_id = str(task.get("wp_path_id") or "").strip()
+        if not parent_id:
+            raise directory_error
+        parent_items, parent_requests = client.list_all_files_with_request_count(
+            parent_id, page_size=7000
+        )
+        request_count[0] += parent_requests
+        matches = [
+            item
+            for item in parent_items
+            if p115_open_item_id(item) == file_id
+        ]
+        if len(matches) != 1 or p115_open_item_is_dir(matches[0]):
+            raise directory_error
+        entries = [dict(matches[0])]
+
+    manifest = classify_115_resource_entries(
+        entries,
+        season,
+        episode_hints=episode_hints,
+        allow_season_mismatch=allow_season_mismatch,
+    )
+    manifest.update({
+        "root_file_id": file_id,
+        "top_level_item_count": 1,
+        "request_count": request_count[0],
+    })
+    return manifest
+
+
+def classify_115_resource_entries(
+    entries,
+    season,
+    episode_hints=None,
+    allow_season_mismatch=False,
+):
+    videos = []
+    unknown = []
+    by_episode = defaultdict(list)
+    for item in entries or []:
+        if bool((item or {}).get("is_dir")) or p115_open_item_is_dir(item):
+            continue
+        name = p115_open_item_name(item)
+        if not is_video_filename(name):
+            continue
+        episode = parse_follow_episode(
+            name,
+            season,
+            episode_hints,
+            allow_season_mismatch=allow_season_mismatch,
+        )
+        if episode is None:
+            unknown.append(name)
+            continue
+        videos.append(
+            {
+                "file_id": p115_open_item_id(item),
+                "name": name,
+                "episode": episode,
+            }
+        )
+        by_episode[episode].append(name)
+    return {
+        "entry_count": len(entries or []),
+        "videos": videos,
+        "verified_episodes": sorted(by_episode),
+        "unknown_videos": sorted(unknown),
+        "duplicate_episodes": {
+            str(episode): names for episode, names in by_episode.items() if len(names) > 1
+        },
+    }
+
+
+def list_115_descendants(client, folder_id, request_count=None, max_entries=20000):
+    out = []
+    stack = [str(folder_id or "").strip()]
+    while stack:
+        current = stack.pop()
+        if not current:
+            raise RuntimeError("115 resource directory id missing")
+        items, requests = client.list_all_files_with_request_count(current, page_size=7000)
+        if request_count is not None:
+            request_count[0] += requests
+        for item in items:
+            row = dict(item or {})
+            out.append(row)
+            if len(out) > int(max_entries):
+                raise RuntimeError("115 resource entry limit exceeded")
+            if p115_open_item_is_dir(row):
+                child_id = p115_open_item_id(row)
+                if not child_id:
+                    raise RuntimeError("115 nested resource directory missing file_id")
+                stack.append(child_id)
+    return out
 
 
 def msg_authoritative_openlist_paths(task):

@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from http.cookiejar import CookieJar
 from pathlib import Path
 from unittest.mock import patch
@@ -23,7 +24,14 @@ for _category, _prefix in {
     }.items():
         os.environ[_prefix + "_" + _suffix] = _value
 
-from pipeline.bot import BotConfig, CandidateStore, PipelineBotService, TelegramBot, share115_candidate_from_text
+from pipeline.bot import (
+    BotConfig,
+    CandidateStore,
+    PipelineBotService,
+    TelegramBot,
+    inspect_115_offline_result,
+    share115_candidate_from_text,
+)
 from pipeline.client115 import P115QRCodeLoginClient, Share115Client, p115_cookie_is_valid, parse_115_share_url
 from pipeline.config import category_to_folder_id
 
@@ -48,6 +56,17 @@ class FakeShareTransport:
         if parse_json is False:
             return "<html></html>"
         if "share/snap" in url:
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            cid = (query.get("cid") or [""])[0]
+            if cid == "folder-1":
+                return {
+                    "state": True,
+                    "data": {
+                        "list": [
+                            {"fid": "file-2", "cid": "folder-1", "n": "ABF-002.mp4", "s": 456},
+                        ]
+                    },
+                }
             return {
                 "state": True,
                 "data": {
@@ -138,6 +157,35 @@ class FakeQRCodeLoginClient:
 
 
 class Share115ReceiveTest(unittest.TestCase):
+    def test_completed_offline_folder_needs_one_list_request_for_flat_resource(self):
+        class Fake115:
+            def __init__(self):
+                self.calls = []
+
+            def list_all_files_with_request_count(self, folder_id, page_size=1000):
+                self.calls.append((folder_id, page_size))
+                return (
+                    [
+                        {"fid": "video-139", "fn": "吞噬星空.S05E139.mkv", "fc": "1"},
+                        {"fid": "advert", "fn": "更多资源请访问发布站.mkv", "fc": "1"},
+                    ],
+                    1,
+                )
+
+        client = Fake115()
+        result = inspect_115_offline_result(
+            client,
+            {"file_id": "result-folder", "wp_path_id": "task-folder"},
+            1,
+            episode_hints={139},
+            allow_season_mismatch=True,
+        )
+
+        self.assertEqual(client.calls, [("result-folder", 7000)])
+        self.assertEqual(result["request_count"], 1)
+        self.assertEqual(result["verified_episodes"], [139])
+        self.assertEqual(result["unknown_videos"], ["更多资源请访问发布站.mkv"])
+
     def test_parse_115_share_url_reads_code_password_and_subdir(self):
         parsed = parse_115_share_url(
             "https://115.com/s/swabc123?password=xy99#/list/share/987654321"
@@ -167,6 +215,11 @@ class Share115ReceiveTest(unittest.TestCase):
         )
         self.assertIn("UID=u", receive_call["headers"]["Cookie"])
         self.assertEqual(result["data"]["save_as_top_fids"], ["saved-1"])
+        self.assertEqual(
+            [item["name"] for item in result["data"]["manifest_items"]],
+            ["ABF-001.mp4", "ABF-001", "ABF-002.mp4"],
+        )
+        self.assertEqual(result["data"]["manifest_request_count"], 2)
 
     def test_pipeline_submit_115_share_uses_share_client_not_offline_open_api(self):
         class FakeShareClient:
