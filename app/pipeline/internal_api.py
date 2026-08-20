@@ -2034,7 +2034,13 @@ class ImportTaskManager:
 
             direct_receive = subscription_receives_directly_to_staging(staging)
             if direct_receive and not staging.get("claimed_at"):
-                has_staged_files = False
+                if result.get("submit"):
+                    staging_state = self.service.inspect_subscription_staging(
+                        category, staging, season, expected_file_episodes
+                    )
+                    has_staged_files = bool(staging_state.get("entries"))
+                else:
+                    has_staged_files = False
             else:
                 staging_state = self.service.inspect_subscription_staging(
                     category, staging, season, expected_file_episodes
@@ -2046,7 +2052,13 @@ class ImportTaskManager:
                     self._acquire_target_lock(receive_lock)
                 try:
                     if direct_receive:
-                        has_staged_files = False
+                        if result.get("submit"):
+                            staging_state = self.service.inspect_subscription_staging(
+                                category, staging, season, expected_file_episodes
+                            )
+                            has_staged_files = bool(staging_state.get("entries"))
+                        else:
+                            has_staged_files = False
                     else:
                         staging_state = self.service.inspect_subscription_staging(
                             category, staging, season, expected_file_episodes
@@ -2062,6 +2074,27 @@ class ImportTaskManager:
                     else:
                         try:
                             submit_result = dict(result.get("submit") or {})
+                            if (
+                                submit_result
+                                and direct_receive
+                                and result_task_is_offline_success(result)
+                            ):
+                                retry = dict(result.get("subscription_retry") or {})
+                                retry.update(
+                                    {
+                                        "previous_info_hash": str(info_hash or "").strip(),
+                                        "previous_submit_kind": str(
+                                            submit_result.get("submit_kind") or ""
+                                        ).strip(),
+                                        "previous_outcome": str(audit.get("outcome") or "").strip(),
+                                    }
+                                )
+                                result.pop("submit", None)
+                                result.pop("task", None)
+                                result["subscription_retry"] = retry
+                                submit_result = {}
+                                offline_task = {}
+                                info_hash = ""
                             if not submit_result:
                                 retry = dict(result.get("subscription_retry") or {})
                                 previous_info_hash = str(

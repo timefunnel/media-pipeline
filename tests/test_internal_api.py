@@ -2611,6 +2611,72 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(service.submit_uris, [])
         self.assertEqual(len(service.subscription_claim_calls), 1)
 
+    def test_restart_resubmits_completed_offline_task_when_direct_staging_is_empty(self):
+        service, _store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115}
+        ]
+        payload = self.payload(application, service)
+        task, _ = manager.create_import("owner-a", "fanren-empty-direct-recovery", payload)
+        staging = {
+            "receive_mode": "direct_task_directory",
+            "receive_root_folder_id": "temporary-root-cid",
+            "receive_root_path": "/115/临时",
+            "receive_folder_id": "task-folder-cid",
+            "openlist_path": "/115/临时/追更任务/凡人修仙传/%s" % task["id"],
+        }
+        submit_result = {
+            "submit_kind": "115_offline",
+            "tasks": [{"info_hash": "OLDHASH", "status_name": "success"}],
+            "task_status": {"info_hash": "OLDHASH", "status_name": "success"},
+        }
+        result = {
+            "submit": submit_result,
+            "task": {"info_hash": "OLDHASH", "status_name": "success"},
+            "subscription_follow": {"staging": staging},
+        }
+        original_inspect = service.inspect_subscription_staging
+        inspect_calls = []
+
+        def inspect_after_redelivery(category, current_staging, season, expected_episodes=None):
+            inspect_calls.append(dict(current_staging))
+            if len(inspect_calls) <= 2:
+                return {
+                    "entries": [],
+                    "videos": [],
+                    "verified_episodes": [],
+                    "unknown_videos": [],
+                    "duplicate_episodes": {},
+                }
+            return original_inspect(category, current_staging, season, expected_episodes)
+
+        service.inspect_subscription_staging = inspect_after_redelivery
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                update internal_api_imports
+                set status = 'running', stage = 'received_unclaimed', result_json = ?, info_hash = ?
+                where id = ?
+                """,
+                (json.dumps(result), "OLDHASH", task["id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(service.reset_resubmit_calls, [("anime", "OLDHASH")])
+        self.assertEqual(len(service.submit_uris), 1)
+        self.assertEqual(service.submit_target_folder_ids, ["task-folder-cid"])
+        self.assertGreaterEqual(len(inspect_calls), 3)
+
     def test_retry_preserves_received_subscription_share_without_resubmitting(self):
         service, store, manager, application = self.build_components()
         task, _ = manager.create_import("owner-a", "fanren-retry-unclaimed", self.payload(application, service))
