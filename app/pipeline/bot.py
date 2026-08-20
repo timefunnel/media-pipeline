@@ -19,6 +19,7 @@ from pipeline.client115 import (
     Client115,
     P115QRCodeLoginClient,
     Share115Client,
+    ensure_115_open_success,
     is_115_share_url,
     mask_p115_cookie,
     p115_cookie_is_valid,
@@ -2186,17 +2187,21 @@ class PipelineBotService:
         root_folder_id = str(category_to_folder_id(category) or "").strip()
         if not root_folder_id:
             raise RuntimeError("115分类根目录 ID 缺失: %s" % category)
-        client = self._build_115_client(category)
-        return self._ensure_115_directory(client, root_folder_id, folder_name)
+        return self._call_115(
+            category,
+            lambda client: self._ensure_115_directory(client, root_folder_id, folder_name),
+        )
 
     def _ensure_115_directory_tree(self, category, root_folder_id, names):
-        client = self._build_115_client(category)
-        folder_id = str(root_folder_id or "").strip()
-        if not folder_id:
-            raise RuntimeError("115入库根目录 ID 缺失")
-        for name in names:
-            folder_id = self._ensure_115_directory(client, folder_id, name)
-        return folder_id
+        def ensure_tree(client):
+            folder_id = str(root_folder_id or "").strip()
+            if not folder_id:
+                raise RuntimeError("115入库根目录 ID 缺失")
+            for name in names:
+                folder_id = self._ensure_115_directory(client, folder_id, name)
+            return folder_id
+
+        return self._call_115(category, ensure_tree)
 
     def _ensure_115_directory(self, client, root_folder_id, folder_name):
         root_folder_id = str(root_folder_id or "").strip()
@@ -2231,8 +2236,9 @@ class PipelineBotService:
                 raise RuntimeError("115入库目录缺少文件夹 ID")
 
         info = client.get_folder_info(folder_id)
+        ensure_115_open_success(info, "verify folder")
         data = (info or {}).get("data") or {}
-        if (info or {}).get("state") is not True or p115_open_item_name(data) != folder_name:
+        if p115_open_item_name(data) != folder_name:
             raise RuntimeError("115入库目录校验失败: %s" % folder_name)
         return folder_id
 

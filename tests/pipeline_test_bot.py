@@ -5002,6 +5002,61 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertIn(("openlist", "/115/电影", True), events)
         self.assertEqual(token_store.tokens, ["expired-token", "fresh-token"])
 
+    def test_prepare_subscription_staging_refreshes_openlist_when_115_token_is_invalid(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        events = []
+        token_store = RetryTokenStore()
+
+        class Directory115Client:
+            def __init__(self, token):
+                self.token = token
+
+            def create_folder(self, name, parent_id):
+                events.append(("create_folder", self.token, parent_id, name))
+                if self.token == "expired-token":
+                    raise RuntimeError("115 create folder failed: access_token 无效")
+                folder_id = "%s/%s" % (parent_id, name)
+                return {"state": True, "code": 0, "data": {"cid": folder_id, "fn": name}}
+
+            def list_all_files(self, parent_id):
+                events.append(("list_folder", self.token, parent_id))
+                if self.token == "expired-token":
+                    raise RuntimeError("115 list folder failed: access_token 无效")
+                return []
+
+            def get_folder_info(self, folder_id):
+                events.append(("get_folder", self.token, folder_id))
+                if self.token == "expired-token":
+                    return {"state": False, "code": 40140125, "message": "access_token 无效"}
+                return {
+                    "state": True,
+                    "code": 0,
+                    "data": {"cid": folder_id, "fn": folder_id.rsplit("/", 1)[-1]},
+                }
+
+        with patch("pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()), patch(
+            "pipeline.bot.OpenListClient", side_effect=lambda url, token: RetryOpenList(events)
+        ), patch(
+            "pipeline.bot.load_access_token_from_api", side_effect=lambda *args, **kwargs: token_store.load_access_token()
+        ), patch("pipeline.bot.Client115", side_effect=Directory115Client):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    subscription_staging_root="/115/临时",
+                    subscription_staging_folder_id="staging-root",
+                )
+            )
+            staging = service.prepare_subscription_staging("anime", "import-1", "series:test")
+
+        self.assertEqual(staging["receive_mode"], "direct_task_directory")
+        self.assertEqual(staging["receive_folder_id"], "staging-root/追更任务/series-test/import-1")
+        self.assertIn(("openlist", "/115/动漫", False), events)
+        self.assertIn(("openlist", "/115/动漫", True), events)
+        self.assertEqual(token_store.tokens, ["expired-token", "fresh-token"])
+
     def test_sync_completed_task_scans_root_finds_media_and_scrapes_one_item(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
