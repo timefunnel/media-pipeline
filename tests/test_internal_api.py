@@ -352,6 +352,7 @@ class FakePipelineService:
         self.subscription_claim_calls = []
         self.subscription_inspect_hints = []
         self.subscription_cleanup_calls = []
+        self.subscription_settle_calls = []
         self.subscription_cleanup_error = None
         self.subscription_verify_result = None
         self.subscription_receive_active = 0
@@ -583,6 +584,31 @@ class FakePipelineService:
         self.subscription_cleanup_calls.append((category, dict(staging)))
         if self.subscription_cleanup_error is not None:
             raise self.subscription_cleanup_error
+
+    def settle_subscription_staging(self, category, staging, terminal_status, promoted=False):
+        self.subscription_settle_calls.append(
+            (category, dict(staging), terminal_status, bool(promoted))
+        )
+        if terminal_status == "failed" and not promoted and self.subscription_entries:
+            return {
+                "status": "retained",
+                "reason": "retryable_content_before_promotion",
+                "path": staging["openlist_path"],
+                "entry_count": len(self.subscription_entries),
+            }
+        self.cleanup_subscription_staging(category, staging)
+        return {
+            "status": "cleaned",
+            "reason": "task_canceled"
+            if terminal_status == "canceled"
+            else (
+                "promoted_files_no_longer_need_staging"
+                if promoted
+                else "empty_failed_staging"
+            ),
+            "path": staging["openlist_path"],
+            "cleaned_at": int(time.time()),
+        }
 
     def check_duplicate(self, category, query, candidate, target=None):
         self.duplicate_calls.append((category, query, dict(candidate), dict(target or {})))
@@ -2259,6 +2285,55 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(service.submit_target_folder_ids, ["task-folder-cid"])
         self.assertEqual(completed["result"]["subscription_follow"]["staging"]["receive_mode"], "direct_task_directory")
 
+    def test_running_subscription_cancel_cleans_staging(self):
+        service, store, manager, application = self.build_components()
+        task, _ = manager.create_import(
+            "owner-a",
+            "fanren-running-cancel",
+            self.payload(application, service),
+        )
+        staging = service.prepare_subscription_staging("anime", task["id"], "凡人修仙传")
+        recovered_result = {
+            "task": {
+                "info_hash": "CANCEL-SUBSCRIPTION-HASH",
+                "status_name": "downloading",
+                "percent_done": 20,
+            },
+            "subscription_follow": {"staging": staging},
+        }
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                update internal_api_imports
+                set status = 'running', stage = 'waiting_download', result_json = ?,
+                    info_hash = ?, cancel_requested = 1
+                where id = ?
+                """,
+                (
+                    json.dumps(recovered_result),
+                    "CANCEL-SUBSCRIPTION-HASH",
+                    task["id"],
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.assertEqual(store.recover_running_imports(), 1)
+        manager.start()
+        try:
+            canceled = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(canceled["status"], "canceled")
+        self.assertEqual(service.cancel_calls, [("anime", "CANCEL-SUBSCRIPTION-HASH")])
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        cleanup = canceled["result"]["subscription_follow"]["staging_cleanup"]
+        self.assertEqual(cleanup["status"], "cleaned")
+        self.assertEqual(cleanup["reason"], "task_canceled")
+
     def test_single_episode_without_actual_episode_marker_is_rejected(self):
         service, _store, manager, application = self.build_components()
         service.subscription_entries = [
@@ -2387,7 +2462,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         block = store.get_subscription_source_block(source_key)
         self.assertEqual(block["reason"], "share_expired")
 
-    def test_transient_share_failure_does_not_block_source(self):
+    def test_transient_share_failure_cleans_empty_staging_without_blocking_source(self):
         service, store, manager, application = self.build_components()
         service.submit_error = RuntimeError("115 share receive failed: connection timed out")
         payload = self.payload(application, service)
@@ -2401,7 +2476,32 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(completed["status"], "failed")
         source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
         self.assertIsNone(store.get_subscription_source_block(source_key))
-        self.assertEqual(service.subscription_cleanup_calls, [])
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        cleanup = completed["result"]["subscription_follow"]["staging_cleanup"]
+        self.assertEqual(cleanup["status"], "cleaned")
+        self.assertEqual(cleanup["reason"], "empty_failed_staging")
+
+    def test_terminal_cleanup_failure_is_recorded_without_replacing_import_error(self):
+        service, _store, manager, application = self.build_components()
+        service.submit_error = RuntimeError("115 share receive failed: connection timed out")
+        service.subscription_cleanup_error = RuntimeError("OpenList cleanup failed: permission denied")
+        task, _ = manager.create_import(
+            "owner-a",
+            "fanren-terminal-cleanup-failure",
+            self.payload(application, service),
+        )
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "failed")
+        self.assertEqual(completed["error"], "115 share receive failed: connection timed out")
+        cleanup = completed["result"]["subscription_follow"]["staging_cleanup"]
+        self.assertEqual(cleanup["status"], "failed")
+        self.assertEqual(cleanup["reason"], "terminal_failed_cleanup")
+        self.assertEqual(cleanup["error"], "OpenList cleanup failed: permission denied")
 
     def test_failed_offline_task_cleans_staging_and_blocks_the_magnet(self):
         service = FakePipelineService(download_delay=0.01)
@@ -2432,7 +2532,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
         self.assertEqual(store.get_subscription_source_block(source_key)["reason"], "offline_failed")
 
-    def test_offline_status_network_failure_is_not_blocked_or_cleaned(self):
+    def test_offline_status_network_failure_cleans_empty_staging_without_blocking(self):
         service = FakePipelineService(download_delay=0.01)
         service, store, manager, application = self.build_components(service)
 
@@ -2451,7 +2551,38 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(completed["status"], "failed")
         source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
         self.assertIsNone(store.get_subscription_source_block(source_key))
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        cleanup = completed["result"]["subscription_follow"]["staging_cleanup"]
+        self.assertEqual(cleanup["status"], "cleaned")
+        self.assertEqual(cleanup["reason"], "empty_failed_staging")
+
+    def test_transient_failure_retains_nonempty_staging_before_promotion(self):
+        service, _store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115}
+        ]
+
+        def fail_inspection(_category, _staging, _season, _episode_hints=None):
+            raise RuntimeError("OpenList staging list failed: connection timed out")
+
+        service.inspect_subscription_staging = fail_inspection
+        task, _ = manager.create_import(
+            "owner-a",
+            "fanren-retain-before-promotion",
+            self.payload(application, service),
+        )
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "failed")
         self.assertEqual(service.subscription_cleanup_calls, [])
+        cleanup = completed["result"]["subscription_follow"]["staging_cleanup"]
+        self.assertEqual(cleanup["status"], "retained")
+        self.assertEqual(cleanup["reason"], "retryable_content_before_promotion")
+        self.assertEqual(cleanup["entry_count"], 1)
 
     def test_unknown_video_is_rejected_cleaned_and_blocked(self):
         service, store, manager, application = self.build_components()
@@ -2552,7 +2683,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
         self.assertEqual(store.get_subscription_source_block(source_key)["reason"], "invalid_episode_layout")
 
-    def test_scan_mismatch_keeps_staging(self):
+    def test_scan_mismatch_cleans_promoted_staging_and_retries_from_scan(self):
         service, store, manager, application = self.build_components()
         service.subscription_entries = [
             {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115}
@@ -2567,6 +2698,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         manager.start()
         try:
             failed = self.wait_final(manager, "owner-a", task["id"])
+            failed_cleanup = failed["result"]["subscription_follow"]["staging_cleanup"]
             service.subscription_verify_result = None
             retried = manager.retry_import("owner-a", failed["id"])
             completed = self.wait_final(manager, "owner-a", failed["id"])
@@ -2574,6 +2706,8 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             manager.stop()
 
         self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed_cleanup["status"], "cleaned")
+        self.assertEqual(failed_cleanup["reason"], "promoted_files_no_longer_need_staging")
         self.assertEqual(retried["id"], failed["id"])
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(len(service.submit_uris), 1)
@@ -3085,10 +3219,22 @@ class SubscriptionPromotionTest(unittest.TestCase):
         class FakeOpenList:
             def __init__(self):
                 self.removed = []
+                self.listed = []
 
             def list_all(self, path, refresh=False):
+                self.listed.append((path, refresh))
                 self.last_list = (path, refresh)
                 return [{"name": "凡人修仙传.S01E115.mkv", "is_dir": False}]
+
+            def list_path(self, path, refresh=False, page=1, per_page=1):
+                self.listed.append((path, refresh))
+                return {
+                    "code": 200,
+                    "data": {
+                        "content": [{"name": "existing-task", "is_dir": True}],
+                        "total": 1,
+                    },
+                }
 
             def remove_names(self, parent, names):
                 self.removed.append((parent, list(names)))
@@ -3098,11 +3244,154 @@ class SubscriptionPromotionTest(unittest.TestCase):
         service._build_115_client = lambda _category: (_ for _ in ()).throw(AssertionError("115 Open API must not be used"))
 
         inspected = service.inspect_subscription_staging("anime", staging, 1)
-        service.cleanup_subscription_staging("anime", staging)
+        cleanup = service.cleanup_subscription_staging("anime", staging)
 
         self.assertEqual(inspected["verified_episodes"], [115])
-        self.assertEqual(client.last_list, (staging["openlist_path"], True))
+        self.assertEqual(
+            client.listed,
+            [
+                (staging["openlist_path"], True),
+                ("/115/临时/追更任务/凡人修仙传", True),
+            ],
+        )
         self.assertEqual(client.removed, [("/115/临时/追更任务/凡人修仙传", ["import-1"])])
+        self.assertFalse(cleanup["parent_pruned"])
+
+    def test_staging_cleanup_prunes_empty_work_parent(self):
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        staging = {
+            "openlist_path": "/115/临时/追更任务/series-4790edb7/import-1",
+        }
+
+        class FakeOpenList:
+            def __init__(self):
+                self.removed = []
+                self.listed = []
+
+            def remove_names(self, parent, names):
+                self.removed.append((parent, list(names)))
+
+            def list_path(self, path, refresh=False, page=1, per_page=1):
+                self.listed.append((path, refresh, page, per_page))
+                return {"code": 200, "data": {"content": [], "total": 0}}
+
+        client = FakeOpenList()
+        service._build_openlist_client = lambda: client
+
+        cleanup = service.cleanup_subscription_staging("anime", staging)
+
+        self.assertEqual(
+            client.removed,
+            [
+                ("/115/临时/追更任务/series-4790edb7", ["import-1"]),
+                ("/115/临时/追更任务", ["series-4790edb7"]),
+            ],
+        )
+        self.assertEqual(
+            client.listed,
+            [("/115/临时/追更任务/series-4790edb7", True, 1, 1)],
+        )
+        self.assertTrue(cleanup["parent_pruned"])
+
+    def test_staging_cleanup_is_idempotent_when_task_and_parent_are_absent(self):
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        staging = {
+            "openlist_path": "/115/临时/追更任务/series-4790edb7/import-1",
+        }
+
+        class MissingOpenList:
+            def remove_names(self, _parent, _names):
+                raise RuntimeError("OpenList remove failed: object not found")
+
+            def list_path(self, _path, refresh=False, page=1, per_page=1):
+                raise RuntimeError("OpenList list failed: object not found")
+
+        service._build_openlist_client = lambda: MissingOpenList()
+
+        cleanup = service.cleanup_subscription_staging("anime", staging)
+
+        self.assertTrue(cleanup["task_already_absent"])
+        self.assertTrue(cleanup["parent_already_absent"])
+        self.assertFalse(cleanup["parent_pruned"])
+
+    def test_parent_prune_failure_does_not_undo_task_cleanup(self):
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        staging = {
+            "openlist_path": "/115/临时/追更任务/series-4790edb7/import-1",
+        }
+
+        class ParentListFailureOpenList:
+            def __init__(self):
+                self.removed = []
+
+            def remove_names(self, parent, names):
+                self.removed.append((parent, list(names)))
+
+            def list_path(self, _path, refresh=False, page=1, per_page=1):
+                raise RuntimeError("OpenList list failed: connection timed out")
+
+        client = ParentListFailureOpenList()
+        service._build_openlist_client = lambda: client
+
+        cleanup = service.cleanup_subscription_staging("anime", staging)
+
+        self.assertEqual(
+            client.removed,
+            [("/115/临时/追更任务/series-4790edb7", ["import-1"])],
+        )
+        self.assertEqual(
+            cleanup["parent_prune_error"],
+            "OpenList list failed: connection timed out",
+        )
+        self.assertFalse(cleanup["parent_pruned"])
+
+    def test_failed_staging_with_content_is_retained_before_promotion(self):
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        staging = {
+            "openlist_path": "/115/临时/追更任务/series-4790edb7/import-1",
+        }
+
+        class NonEmptyOpenList:
+            def __init__(self):
+                self.removed = []
+
+            def list_path(self, path, refresh=False, page=1, per_page=1):
+                self.last_list = (path, refresh)
+                return {
+                    "code": 200,
+                    "data": {
+                        "content": [{"name": "吞噬星空.S05E139.mkv", "is_dir": False}],
+                        "total": 1,
+                    },
+                }
+
+            def remove_names(self, parent, names):
+                self.removed.append((parent, list(names)))
+
+        client = NonEmptyOpenList()
+        service._build_openlist_client = lambda: client
+
+        settlement = service.settle_subscription_staging(
+            "anime",
+            staging,
+            "failed",
+            promoted=False,
+        )
+
+        self.assertEqual(settlement["status"], "retained")
+        self.assertEqual(settlement["reason"], "retryable_content_before_promotion")
+        self.assertEqual(settlement["entry_count"], 1)
+        self.assertEqual(client.removed, [])
+
+    def test_staging_cleanup_rejects_paths_outside_task_root(self):
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        service._build_openlist_client = lambda: object()
+
+        with self.assertRaisesRegex(RuntimeError, "outside the task root"):
+            service.cleanup_subscription_staging(
+                "anime",
+                {"openlist_path": "/115/临时/other/import-1"},
+            )
 
     def test_subscription_staging_does_not_create_directories_through_openlist(self):
         service = PipelineBotService(
