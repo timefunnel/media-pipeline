@@ -1985,6 +1985,31 @@ class ImportTaskManager:
                 }
             )
 
+            resumed_episodes = {int(value) for value in audit.get("moved_episodes") or []}
+            if resumed_episodes:
+                staging = dict(audit.get("staging") or {})
+                if not staging.get("openlist_path"):
+                    raise RuntimeError("promoted subscription retry is missing staging state")
+                offline_task = reset_subscription_sync_for_retry(offline_task)
+                result["task"] = offline_task
+                self._complete_subscription_promotion(
+                    task,
+                    request,
+                    result,
+                    audit,
+                    attempts,
+                    category,
+                    title,
+                    target_path,
+                    season,
+                    info_hash,
+                    offline_task,
+                    staging,
+                    resumed_episodes,
+                    require_scan_added=False,
+                )
+                return
+
             def persist_blocked_source(error, block_reason=None, outcome="source_unavailable"):
                 block_reason = block_reason or subscription_source_failure_block_reason(error)
                 if not block_reason:
@@ -2304,69 +2329,126 @@ class ImportTaskManager:
             result["subscription_follow"] = audit
             self.service.refresh_subscription_target(target_path)
 
-            sync_input = dict(offline_task)
-            sync_input["subscription_target_openlist_path"] = target_path
-
-            def save_progress(progress):
-                current = dict(result)
-                current["task"] = dict(progress or {})
-                current["subscription_follow"] = audit
-                media_id = str((progress or {}).get("msg_media_id") or "").strip()
-                self.store.save_running(
-                    task["id"],
-                    sync_stage(progress),
-                    result=current,
-                    info_hash=info_hash,
-                    msg_media_id=media_id,
-                )
-
-            self.store.save_running(task["id"], "scanning", result=result, info_hash=info_hash)
-            synced = self.service.sync_completed_task(
+            self._complete_subscription_promotion(
+                task,
+                request,
+                result,
+                audit,
+                attempts,
                 category,
                 title,
-                sync_input,
-                progress_callback=save_progress,
-                target=request["target"],
+                target_path,
+                season,
+                info_hash,
+                offline_task,
+                staging,
+                selected,
+                require_scan_added=True,
             )
-            if not isinstance(synced, dict):
-                raise RuntimeError("pipeline sync_completed_task returned invalid response")
-            synced = dict(synced)
-            result["task"] = synced
-            media_id = str(synced.get("msg_media_id") or "").strip()
-            scan_added = int(synced.get("msg_ingest_scan_added") or 0)
-            audit["scan_added"] = scan_added
-            if scan_added != len(selected):
-                audit["outcome"] = "failed"
-                result["subscription_follow"] = audit
-                self.store.save_running(task["id"], "verifying_scan", result=result, info_hash=info_hash, msg_media_id=media_id)
-                raise RuntimeError(
-                    "MediaStationGo scan added %d episodes, expected %d" % (scan_added, len(selected))
-                )
-            verified_msg = self.service.verify_subscription_msg_episodes(category, target_path, season, selected)
-            audit["msg_verification"] = verified_msg
-            if verified_msg.get("missing_episodes") or verified_msg.get("duplicate_episodes"):
-                audit["outcome"] = "failed"
-                result["subscription_follow"] = audit
-                self.store.save_running(task["id"], "verifying_scan", result=result, info_hash=info_hash, msg_media_id=media_id)
-                raise RuntimeError("MediaStationGo episode verification did not match the promotion plan")
+        finally:
+            target_lock.release()
 
-            self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash, msg_media_id=media_id)
-            self.service.cleanup_subscription_staging(category, staging)
-            audit["staging_cleaned_at"] = int(time.time())
-            audit["outcome"] = "imported"
-            attempts[-1].update({"outcome": "imported", "finished_at": int(time.time())})
-            result["subscription_follow"] = audit
-            result["msg_media_id"] = media_id
-            self.store.finish_import(
+    def _complete_subscription_promotion(
+        self,
+        task,
+        request,
+        result,
+        audit,
+        attempts,
+        category,
+        title,
+        target_path,
+        season,
+        info_hash,
+        offline_task,
+        staging,
+        selected,
+        require_scan_added,
+    ):
+        sync_input = dict(offline_task)
+        sync_input["subscription_target_openlist_path"] = target_path
+        if category == "anime":
+            sync_input["subscription_target_season"] = season
+
+        def save_progress(progress):
+            current = dict(result)
+            current["task"] = dict(progress or {})
+            current["subscription_follow"] = audit
+            media_id = str((progress or {}).get("msg_media_id") or "").strip()
+            self.store.save_running(
                 task["id"],
-                "completed",
-                "completed",
+                sync_stage(progress),
+                result=current,
+                info_hash=info_hash,
+                msg_media_id=media_id,
+            )
+
+        self.store.save_running(task["id"], "scanning", result=result, info_hash=info_hash)
+        synced = self.service.sync_completed_task(
+            category,
+            title,
+            sync_input,
+            progress_callback=save_progress,
+            target=request["target"],
+        )
+        if not isinstance(synced, dict):
+            raise RuntimeError("pipeline sync_completed_task returned invalid response")
+        synced = dict(synced)
+        result["task"] = synced
+        media_id = str(synced.get("msg_media_id") or "").strip()
+        scan_added = int(synced.get("msg_ingest_scan_added") or 0)
+        audit["scan_added"] = scan_added
+        if require_scan_added and scan_added != len(selected):
+            audit["outcome"] = "failed"
+            result["subscription_follow"] = audit
+            self.store.save_running(
+                task["id"],
+                "verifying_scan",
                 result=result,
                 info_hash=info_hash,
                 msg_media_id=media_id,
             )
-        finally:
-            target_lock.release()
+            raise RuntimeError(
+                "MediaStationGo scan added %d episodes, expected %d"
+                % (scan_added, len(selected))
+            )
+        verified_msg = self.service.verify_subscription_msg_episodes(
+            category, target_path, season, selected
+        )
+        audit["msg_verification"] = verified_msg
+        if verified_msg.get("missing_episodes") or verified_msg.get("duplicate_episodes"):
+            audit["outcome"] = "failed"
+            result["subscription_follow"] = audit
+            self.store.save_running(
+                task["id"],
+                "verifying_scan",
+                result=result,
+                info_hash=info_hash,
+                msg_media_id=media_id,
+            )
+            raise RuntimeError("MediaStationGo episode verification did not match the promotion plan")
+
+        self.store.save_running(
+            task["id"],
+            "cleanup",
+            result=result,
+            info_hash=info_hash,
+            msg_media_id=media_id,
+        )
+        self.service.cleanup_subscription_staging(category, staging)
+        audit["staging_cleaned_at"] = int(time.time())
+        audit["outcome"] = "imported"
+        attempts[-1].update({"outcome": "imported", "finished_at": int(time.time())})
+        result["subscription_follow"] = audit
+        result["msg_media_id"] = media_id
+        self.store.finish_import(
+            task["id"],
+            "completed",
+            "completed",
+            result=result,
+            info_hash=info_hash,
+            msg_media_id=media_id,
+        )
 
     def _raise_if_cancel_requested(self, owner_id, import_id, category, info_hash):
         current = self.store.get_import(owner_id, import_id)
@@ -3607,6 +3689,24 @@ def subscription_retry_resubmit(result, request, msg_media_id=None):
         str(staging.get("receive_mode") or "").strip().lower() == "direct_task_directory"
         and not staging.get("claimed_at")
     )
+
+
+def reset_subscription_sync_for_retry(task):
+    out = dict(task or {})
+    for key in (
+        "msg_scan_status",
+        "msg_ingest_status",
+        "msg_ingest_job_id",
+        "msg_ingest_idempotency_key",
+        "msg_ingest_error",
+        "msg_target_scan_status",
+        "msg_target_scan_error",
+        "msg_error",
+        "msg_synced_at",
+    ):
+        out.pop(key, None)
+    out["msg_sync_status"] = "running"
+    return out
 
 
 def offline_task_poll_attempt(task):

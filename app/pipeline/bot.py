@@ -3853,6 +3853,9 @@ class PipelineBotService:
                 "repair_movie_extras": False,
                 "repair_episode_visibility": False,
             }
+            subscription_target_season = int(progress.get("subscription_target_season") or 0)
+            if category == "anime" and subscription_target_season > 0:
+                request["force_season_number"] = subscription_target_season
             if (
                 authoritative_paths
                 and (

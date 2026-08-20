@@ -2566,12 +2566,19 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         task, _ = manager.create_import("owner-a", "fanren-scan-mismatch", payload)
         manager.start()
         try:
-            completed = self.wait_final(manager, "owner-a", task["id"])
+            failed = self.wait_final(manager, "owner-a", task["id"])
+            service.subscription_verify_result = None
+            retried = manager.retry_import("owner-a", failed["id"])
+            completed = self.wait_final(manager, "owner-a", failed["id"])
         finally:
             manager.stop()
 
-        self.assertEqual(completed["status"], "failed")
-        self.assertEqual(service.subscription_cleanup_calls, [])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(retried["id"], failed["id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(len(service.submit_uris), 1)
+        self.assertEqual(service.sync_input_tasks[-1]["subscription_target_season"], 1)
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
 
     def test_restart_reuses_existing_staging_without_resubmitting_share(self):
         service, store, manager, application = self.build_components()

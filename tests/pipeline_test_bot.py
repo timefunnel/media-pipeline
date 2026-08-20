@@ -4996,6 +4996,50 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(service.reset_calls, [("adult", "D00D7132F75BEB644A19E6A1CC011AA3523CF233")])
         self.assertEqual([client.folder_id for client in service.fake_115s], ["task-folder", "task-folder"])
 
+    def test_anime_subscription_ingest_forces_target_season(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        target_path = "/115/动漫/吞噬星空/Season 1"
+        fake_msg = FakeMediaStationClient(
+            list_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-139",
+                            "library_id": "test-anime-library",
+                            "title": "吞噬星空",
+                            "path": "cloud://openlist" + target_path + "/吞噬星空.S05E139.mkv",
+                        }
+                    ]
+                }
+            }
+        )
+        service = PipelineBotService(
+            BotConfig(
+                "token",
+                {700656624},
+                "/tmp/state.db",
+                msg_admin_user="admin",
+                msg_admin_password="secret",
+                msg_enabled=True,
+                msg_sync_poll_seconds=0,
+            )
+        )
+        progress = {"subscription_target_season": 1}
+
+        service._run_msg_pipeline_ingest(
+            fake_msg,
+            "anime",
+            "吞噬星空",
+            progress,
+            [],
+            [target_path],
+            True,
+            progress.update,
+        )
+
+        self.assertEqual(fake_msg.pipeline_ingest_calls[0]["force_season_number"], 1)
+
     def test_task_status_refreshes_openlist_and_retries_when_115_token_is_invalid(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
