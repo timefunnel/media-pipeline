@@ -2597,7 +2597,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(cleanup["reason"], "retryable_content_before_promotion")
         self.assertEqual(cleanup["entry_count"], 1)
 
-    def test_unknown_video_is_rejected_cleaned_and_blocked(self):
+    def test_unknown_video_is_rejected_cleaned_without_source_block(self):
         service, store, manager, application = self.build_components()
         service.subscription_entries = [{"fid": "unknown", "fn": "final-video.mkv", "kind": "video"}]
         payload = self.payload(application, service)
@@ -2612,7 +2612,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(completed["result"]["subscription_follow"]["outcome"], "rejected")
         self.assertEqual(len(service.subscription_cleanup_calls), 1)
         source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
-        self.assertEqual(store.get_subscription_source_block(source_key)["reason"], "invalid_episode_layout")
+        self.assertIsNone(store.get_subscription_source_block(source_key))
 
     def test_unknown_video_is_ignored_when_known_missing_episode_is_selected(self):
         service, store, manager, application = self.build_components()
@@ -2676,7 +2676,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(service.submit_uris[0], service.submit_uris[1])
         self.assertEqual(completed["info_hash"], "HASH002")
 
-    def test_duplicate_episode_videos_are_rejected_cleaned_and_blocked(self):
+    def test_duplicate_episode_videos_are_rejected_cleaned_without_source_block(self):
         service, store, manager, application = self.build_components()
         service.subscription_entries = [
             {"fid": "video-a", "fn": "凡人修仙传.S01E115.1080p.mkv", "kind": "video", "episode": 115},
@@ -2694,7 +2694,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(completed["result"]["subscription_follow"]["outcome"], "rejected")
         self.assertEqual(len(service.subscription_cleanup_calls), 1)
         source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
-        self.assertEqual(store.get_subscription_source_block(source_key)["reason"], "invalid_episode_layout")
+        self.assertIsNone(store.get_subscription_source_block(source_key))
 
     def test_scan_mismatch_cleans_promoted_staging_and_retries_from_scan(self):
         service, store, manager, application = self.build_components()

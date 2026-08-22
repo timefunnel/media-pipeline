@@ -2073,7 +2073,9 @@ class ImportTaskManager:
                 )
                 return
 
-            def persist_blocked_source(error, block_reason=None, outcome="source_unavailable"):
+            def persist_blocked_source(
+                error, block_reason=None, outcome="source_unavailable", block_source=True
+            ):
                 block_reason = block_reason or subscription_source_failure_block_reason(error)
                 if not block_reason:
                     return False
@@ -2092,7 +2094,7 @@ class ImportTaskManager:
                     lambda: self.service.cleanup_subscription_staging(category, staging),
                 )
                 record_subscription_staging_cleanup(audit, cleanup, outcome)
-                if not follow.get("manual_replenish"):
+                if block_source and not follow.get("manual_replenish"):
                     source_key = subscription_source_block_key(
                         (request.get("candidate") or {}).get("download_uri")
                     )
@@ -2350,13 +2352,23 @@ class ImportTaskManager:
             audit["selected_episodes"] = sorted(selected)
             if audit["unknown_videos"] and not selected:
                 error = RuntimeError("OpenList staging contains unrecognized video names")
-                persist_blocked_source(error, block_reason="invalid_episode_layout", outcome="rejected")
+                persist_blocked_source(
+                    error,
+                    block_reason="invalid_episode_layout",
+                    outcome="rejected",
+                    block_source=False,
+                )
                 raise error
             if audit["unknown_videos"]:
                 audit["ignored_unknown_videos"] = list(audit["unknown_videos"])
             if audit["duplicate_episodes"]:
                 error = RuntimeError("OpenList staging contains multiple videos for one episode")
-                persist_blocked_source(error, block_reason="invalid_episode_layout", outcome="rejected")
+                persist_blocked_source(
+                    error,
+                    block_reason="invalid_episode_layout",
+                    outcome="rejected",
+                    block_source=False,
+                )
                 raise error
             if not selected:
                 audit["outcome"] = "no_new_episodes"
