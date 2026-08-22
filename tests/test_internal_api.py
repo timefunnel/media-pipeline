@@ -2061,6 +2061,19 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         )
         self.assertEqual(parse_follow_episode("吞噬星空132.mp4", 1, {132}), 132)
         self.assertIsNone(parse_follow_episode("吞噬星空2132.mp4", 1, {132}))
+        self.assertEqual(
+            parse_follow_episode(
+                "Tunshi Xingkong - 148 Final (2160p HQ) [AX-Corrected-v2].mkv", 1
+            ),
+            148,
+        )
+        self.assertEqual(
+            parse_follow_episode(
+                "Tunshi Xingkong - 148 Original (2160p) [AX-Corrected-v2].mkv", 1
+            ),
+            148,
+        )
+        self.assertIsNone(parse_follow_episode("Tunshi Xingkong - 2020 Final.mkv", 1))
         self.assertIsNone(
             parse_follow_episode("[Hall_of_C] FanRenXiuXianZhuan_115_XHFC_39.mkv", 1, {114})
         )
