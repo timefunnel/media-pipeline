@@ -4426,6 +4426,7 @@ FOLLOW_EPISODE_PATTERNS = (
     re.compile(r"(?i)S(?P<season>\d{1,2})E(?P<episode>\d{1,4})"),
     re.compile(r"(?i)(?:^|[^A-Za-z])EP?[ ._-]?(?P<episode>\d{1,4})(?:[^0-9]|$)"),
     re.compile(r"第\s*(?P<episode>\d{1,4})\s*[集话話]"),
+    re.compile(r"(?i)(?:^|[\s._-])[-–—]\s*(?P<episode>\d{1,3})(?=\s*[\[(])"),
     re.compile(r"(?i)(?:^|[\s._-])[-–—]\s*(?P<episode>\d{1,3})\s+(?:final|original)(?:\b|[^A-Za-z])"),
 )
 
