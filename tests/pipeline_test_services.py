@@ -2123,6 +2123,12 @@ class OfflineTaskTest(unittest.TestCase):
         self.assertEqual(client.deleted, [])
 
 class SearchProfileTest(unittest.TestCase):
+    def test_anime_category_uses_anime_profile_without_title_hint(self):
+        from pipeline.search import SEARCH_PROFILE_ANIME, search_profile_for_query
+
+        for query in ("Swallowed Star 148", "吞噬星空"):
+            self.assertEqual(search_profile_for_query("anime", query), SEARCH_PROFILE_ANIME)
+
     def test_profile_search_uses_externalized_categories(self):
         from pipeline.bot import SEARCH_PROFILE_GENERAL, search_profile_indexer_results
 
