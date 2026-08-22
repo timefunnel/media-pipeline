@@ -2369,43 +2369,28 @@ class PipelineBotService:
         claimed["claimed_at"] = int(time.time())
         return claimed
 
-    def inspect_subscription_staging(self, category, staging, season, episode_hints=None):
+    def inspect_subscription_staging(
+        self, category, staging, season, episode_hints=None, expected_episodes=None
+    ):
         client = self._build_openlist_client()
         staging_path = subscription_staging_path(staging)
         entries = list_openlist_descendants(client, staging_path)
-        videos = []
-        unknown = []
-        duplicates = {}
-        by_episode = {}
-        for item in entries:
-            if openlist_item_is_dir(item):
-                continue
-            name = openlist_item_name(item)
-            if not is_video_filename(name):
-                continue
-            episode = parse_follow_episode(
-                name,
-                season,
-                episode_hints,
-                allow_season_mismatch=category == "anime",
-            )
-            if episode is None:
-                unknown.append(name)
-                continue
-            videos.append({"path": item.get("path"), "name": name, "episode": episode})
-            by_episode.setdefault(episode, []).append(name)
-        for episode, names in by_episode.items():
-            if len(names) > 1:
-                duplicates[str(episode)] = names
-        return {
-            "entries": entries,
-            "videos": videos,
-            "verified_episodes": sorted(by_episode),
-            "unknown_videos": sorted(unknown),
-            "duplicate_episodes": duplicates,
-        }
+        classified = classify_subscription_follow_videos(
+            entries,
+            season,
+            episode_hints=episode_hints,
+            expected_episodes=expected_episodes,
+            allow_season_mismatch=category == "anime",
+            item_is_dir=openlist_item_is_dir,
+            item_name=openlist_item_name,
+            item_size=openlist_item_size,
+            video_fields=lambda item, name: {"path": item.get("path"), "name": name},
+        )
+        return {"entries": entries, **classified}
 
-    def inspect_subscription_offline_result(self, category, task, season, episode_hints=None):
+    def inspect_subscription_offline_result(
+        self, category, task, season, episode_hints=None, expected_episodes=None
+    ):
         return self._call_115(
             category,
             lambda client: inspect_115_offline_result(
@@ -2413,6 +2398,7 @@ class PipelineBotService:
                 task,
                 season,
                 episode_hints=episode_hints,
+                expected_episodes=expected_episodes,
                 allow_season_mismatch=category == "anime",
             ),
         )
@@ -2424,6 +2410,7 @@ class PipelineBotService:
         completed_task,
         season,
         episode_hints=None,
+        expected_episodes=None,
     ):
         if (submit_result or {}).get("submit_kind") == "115_share_receive":
             data = ((submit_result or {}).get("raw") or {}).get("data") or {}
@@ -2431,6 +2418,7 @@ class PipelineBotService:
                 data.get("manifest_items") or data.get("items") or [],
                 season,
                 episode_hints=episode_hints,
+                expected_episodes=expected_episodes,
                 allow_season_mismatch=category == "anime",
             )
             manifest.update(
@@ -2447,6 +2435,7 @@ class PipelineBotService:
             completed_task,
             season,
             episode_hints=episode_hints,
+            expected_episodes=expected_episodes,
         )
         manifest.update(
             {
@@ -4560,6 +4549,7 @@ def inspect_115_offline_result(
     task,
     season,
     episode_hints=None,
+    expected_episodes=None,
     allow_season_mismatch=False,
     max_entries=20000,
 ):
@@ -4596,6 +4586,7 @@ def inspect_115_offline_result(
         entries,
         season,
         episode_hints=episode_hints,
+        expected_episodes=expected_episodes,
         allow_season_mismatch=allow_season_mismatch,
     )
     manifest.update({
@@ -4610,39 +4601,100 @@ def classify_115_resource_entries(
     entries,
     season,
     episode_hints=None,
+    expected_episodes=None,
     allow_season_mismatch=False,
 ):
+    classified = classify_subscription_follow_videos(
+        entries,
+        season,
+        episode_hints=episode_hints,
+        expected_episodes=expected_episodes,
+        allow_season_mismatch=allow_season_mismatch,
+        item_is_dir=p115_open_item_is_dir,
+        item_name=p115_open_item_name,
+        item_size=subscription_follow_item_size,
+        video_fields=lambda item, name: {"file_id": p115_open_item_id(item), "name": name},
+    )
+    return {"entry_count": len(entries or []), **classified}
+
+
+def subscription_follow_item_size(item):
+    if not isinstance(item, dict):
+        return 0
+    for key in ("size", "size_bytes", "sizeBytes", "s"):
+        try:
+            value = int(item.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0
+
+
+def classify_subscription_follow_videos(
+    entries,
+    season,
+    episode_hints=None,
+    expected_episodes=None,
+    allow_season_mismatch=False,
+    item_is_dir=None,
+    item_name=None,
+    item_size=None,
+    video_fields=None,
+):
+    item_is_dir = item_is_dir or (lambda _item: False)
+    item_name = item_name or (lambda _item: "")
+    item_size = item_size or (lambda _item: 0)
+    video_fields = video_fields or (lambda _item, name: {"name": name})
+    raw_videos = []
+    for item in entries or []:
+        if item_is_dir(item):
+            continue
+        name = item_name(item)
+        if is_video_filename(name):
+            raw_videos.append({"item": item, "name": name, "size": int(item_size(item) or 0)})
+
+    expected = sorted({int(value) for value in expected_episodes or [] if int(value) > 0})
     videos = []
     unknown = []
+    ambiguous = []
+    supplemental = []
+    if expected:
+        if len(expected) != 1:
+            ambiguous = [item["name"] for item in raw_videos]
+        elif len(raw_videos) == 1:
+            item = raw_videos[0]
+            videos.append({**video_fields(item["item"], item["name"]), "episode": expected[0]})
+        elif len(raw_videos) > 1:
+            ordered = sorted(raw_videos, key=lambda item: item["size"], reverse=True)
+            primary, second = ordered[0], ordered[1]
+            if primary["size"] > 0 and second["size"] > 0 and primary["size"] >= second["size"] * 5:
+                videos.append({**video_fields(primary["item"], primary["name"]), "episode": expected[0]})
+                supplemental = [item["name"] for item in ordered[1:]]
+            else:
+                ambiguous = [item["name"] for item in raw_videos]
+    else:
+        for item in raw_videos:
+            episode = parse_follow_episode(
+                item["name"],
+                season,
+                episode_hints,
+                allow_season_mismatch=allow_season_mismatch,
+            )
+            if episode is None:
+                unknown.append(item["name"])
+                continue
+            videos.append({**video_fields(item["item"], item["name"]), "episode": episode})
+
     by_episode = defaultdict(list)
-    for item in entries or []:
-        if bool((item or {}).get("is_dir")) or p115_open_item_is_dir(item):
-            continue
-        name = p115_open_item_name(item)
-        if not is_video_filename(name):
-            continue
-        episode = parse_follow_episode(
-            name,
-            season,
-            episode_hints,
-            allow_season_mismatch=allow_season_mismatch,
-        )
-        if episode is None:
-            unknown.append(name)
-            continue
-        videos.append(
-            {
-                "file_id": p115_open_item_id(item),
-                "name": name,
-                "episode": episode,
-            }
-        )
-        by_episode[episode].append(name)
+    for video in videos:
+        by_episode[int(video["episode"])].append(video["name"])
     return {
-        "entry_count": len(entries or []),
         "videos": videos,
         "verified_episodes": sorted(by_episode),
         "unknown_videos": sorted(unknown),
+        "ambiguous_videos": sorted(ambiguous),
+        "supplemental_videos": sorted(supplemental),
         "duplicate_episodes": {
             str(episode): names for episode, names in by_episode.items() if len(names) > 1
         },
