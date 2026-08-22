@@ -24,6 +24,7 @@ from pipeline.search import (
 from pipeline.season_subtitles import SeasonSubtitleTaskManager
 from pipeline.subtitle_asr import DEFAULT_ASR_MODEL, SubtitleAsrProcessor
 from pipeline.telegram_ui import task_from_submit_result
+from pipeline.task_state import ACTIVE_115_TIMEOUT_SECONDS
 
 
 DEFAULT_API_HOST = "127.0.0.1"
@@ -1495,7 +1496,7 @@ class ImportTaskManager:
             return
         source_key = subscription_source_block_key((request.get("candidate") or {}).get("download_uri"))
         block = self.store.get_subscription_source_block(source_key)
-        if block is not None:
+        if subscription_source_block_is_effective(block):
             raise ApiError(
                 409,
                 "subscription_source_blocked",
@@ -2158,6 +2159,13 @@ class ImportTaskManager:
                                 raise RuntimeError("pipeline submit returned no info_hash")
                             if not offline_task:
                                 offline_task = task_from_submit_result(submit_result, info_hash)
+                            if audit.get("offline_info_hash") != info_hash:
+                                audit["offline_info_hash"] = info_hash
+                                audit["offline_started_at"] = int(time.time())
+                                result["subscription_follow"] = audit
+                                self.store.save_running(
+                                    task["id"], "waiting_download", result=result, info_hash=info_hash
+                                )
                             offline_wait_deadline = time.monotonic() + self.offline_wait_slice_seconds
                             while offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
                                 status_name = offline_task.get("status_name")
@@ -2171,6 +2179,25 @@ class ImportTaskManager:
                                 self._raise_if_cancel_requested(
                                     task["owner_id"], task["id"], category, info_hash
                                 )
+                                if subscription_offline_wait_timed_out(audit):
+                                    cancel_result = self.service.cancel_task(category, info_hash)
+                                    offline_task = dict(cancel_result.get("task") or offline_task)
+                                    offline_task.setdefault("info_hash", info_hash)
+                                    result["task"] = offline_task
+                                    self.store.save_running(
+                                        task["id"], "waiting_download", result=result, info_hash=info_hash
+                                    )
+                                    if offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
+                                        error = RuntimeError(
+                                            "115 offline task exceeded %s seconds without success" % ACTIVE_115_TIMEOUT_SECONDS
+                                        )
+                                        persist_blocked_source(
+                                            error,
+                                            block_reason="offline_failed",
+                                            outcome="source_unavailable",
+                                        )
+                                        raise error
+                                    continue
                                 self.store.save_running(
                                     task["id"], "waiting_download", result=result, info_hash=info_hash
                                 )
@@ -2302,12 +2329,6 @@ class ImportTaskManager:
                         info_hash=info_hash,
                     )
                     return
-                source_key = subscription_source_block_key((request.get("candidate") or {}).get("download_uri"))
-                audit["source_block"] = self.store.block_subscription_source(
-                    source_key,
-                    reason="no_new_episodes",
-                    origin_import_id=task["id"],
-                )
                 result["subscription_follow"] = audit
                 self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash)
                 raise RuntimeError("OpenList staging contains no new episodes")
@@ -2812,7 +2833,9 @@ class InternalApiApplication:
             available = []
             for item in result:
                 source_key = subscription_source_block_key(item.get("download_uri"))
-                if self.store.get_subscription_source_block(source_key) is not None:
+                if subscription_source_block_is_effective(
+                    self.store.get_subscription_source_block(source_key)
+                ):
                     blocked_count += 1
                     continue
                 available.append(item)
@@ -3460,6 +3483,20 @@ def subscription_source_failure_block_reason(error):
     if "115 offline task ended with status: failed" in message:
         return "offline_failed"
     return None
+
+
+def subscription_source_block_is_effective(block):
+    if not isinstance(block, dict):
+        return False
+    return str(block.get("reason") or "").strip() in {"share_expired", "offline_failed"}
+
+
+def subscription_offline_wait_timed_out(audit, now=None):
+    started_at = int((audit or {}).get("offline_started_at") or 0)
+    if started_at <= 0:
+        return False
+    now = int(time.time() if now is None else now)
+    return now - started_at >= ACTIVE_115_TIMEOUT_SECONDS
 
 
 def normalize_subscription_follow(payload, category, target, force_duplicate, upgrade_media_id):
