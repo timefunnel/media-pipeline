@@ -22,6 +22,7 @@ for category in ("movie", "tv", "anime", "adult", "other"):
 
 from pipeline.bot import BotConfig, PipelineBotService
 from pipeline.bot import (
+    classify_115_resource_entries,
     parse_follow_episode,
     wait_openlist_directory,
     wait_openlist_offline_result_names,
@@ -2146,6 +2147,55 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         with self.assertRaises(ApiError) as raised:
             normalize_subscription_follow(payload, "anime", target, False, "")
         self.assertEqual(raised.exception.code, "invalid_expected_episodes")
+
+    def test_automatic_subscription_uses_server_target_without_filename_parsing(self):
+        from pipeline.internal_api import normalize_subscription_follow
+
+        target = target_for("anime")
+        payload = {
+            "subscription_follow": True,
+            "subscription_id": "subscription-swallowed-star",
+            "work_key": "series:4790edb7",
+            "season": 1,
+            "existing_episodes": list(range(1, 150)),
+            "reserved_episodes": [],
+            "expected_episodes": [150],
+            "target_openlist_path": "/115/动漫/吞噬星空/Season 1",
+            "title_class": "single",
+        }
+        follow = normalize_subscription_follow(payload, "anime", target, False, "")
+        self.assertEqual(follow["expected_episodes"], [150])
+
+        classified = classify_115_resource_entries(
+            [{"fid": "opaque", "fc": "1", "fn": "release-v2.mkv", "s": 2_000_000_000}],
+            1,
+            expected_episodes=follow["expected_episodes"],
+        )
+        self.assertEqual(classified["verified_episodes"], [150])
+        self.assertEqual(classified["videos"][0]["episode"], 150)
+
+    def test_automatic_subscription_accepts_a_clearly_larger_primary_video(self):
+        classified = classify_115_resource_entries(
+            [
+                {"fid": "main", "fc": "1", "fn": "main.mkv", "s": 2_000_000_000},
+                {"fid": "sample", "fc": "1", "fn": "sample.mkv", "s": 100_000_000},
+            ],
+            1,
+            expected_episodes=[150],
+        )
+        self.assertEqual(classified["verified_episodes"], [150])
+        self.assertEqual(classified["videos"][0]["file_id"], "main")
+        self.assertEqual(classified["supplemental_videos"], ["sample.mkv"])
+
+        ambiguous = classify_115_resource_entries(
+            [
+                {"fid": "first", "fc": "1", "fn": "first.mkv", "s": 2_000_000_000},
+                {"fid": "second", "fc": "1", "fn": "second.mkv", "s": 1_900_000_000},
+            ],
+            1,
+            expected_episodes=[150],
+        )
+        self.assertEqual(ambiguous["ambiguous_videos"], ["first.mkv", "second.mkv"])
 
     def test_subscription_source_block_key_uses_115_share_code_and_subdirectory(self):
         self.assertEqual(
