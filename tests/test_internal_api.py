@@ -2177,6 +2177,14 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
 
         self.assertEqual(subscription_source_block_key(first), subscription_source_block_key(second))
 
+    def test_subscription_offline_wait_uses_the_shared_115_auto_cancel_timeout(self):
+        from pipeline.internal_api import subscription_offline_wait_timed_out
+        from pipeline.task_state import ACTIVE_115_TIMEOUT_SECONDS
+
+        audit = {"offline_started_at": 100}
+        self.assertFalse(subscription_offline_wait_timed_out(audit, now=99 + ACTIVE_115_TIMEOUT_SECONDS))
+        self.assertTrue(subscription_offline_wait_timed_out(audit, now=100 + ACTIVE_115_TIMEOUT_SECONDS))
+
     def test_subscription_search_excludes_blocked_source_and_returns_an_alternative(self):
         service, store, _manager, application = self.build_components()
         blocked_uri = "magnet:?xt=urn:btih:BLOCKED"
@@ -2215,6 +2223,45 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual([item["title"] for item in response["items"]], ["可用单集"])
         self.assertEqual(response["metadata"]["blocked_count"], 1)
         self.assertEqual(response["metadata"]["provider_total"], 2)
+
+    def test_subscription_search_ignores_legacy_non_source_failure_blocks(self):
+        service, store, _manager, application = self.build_components()
+        layout_uri = "magnet:?xt=urn:btih:LAYOUT"
+        no_new_uri = "magnet:?xt=urn:btih:NONEW"
+
+        service.search = lambda _query, _category, limit=20: ResultList(
+            [
+                {"title": "布局已修复资源", "download_uri": layout_uri, "rank": 1},
+                {"title": "无新增记录资源", "download_uri": no_new_uri, "rank": 2},
+            ]
+        )
+        store.block_subscription_source(
+            subscription_source_block_key(layout_uri),
+            reason="invalid_episode_layout",
+            origin_import_id="old-layout",
+        )
+        store.block_subscription_source(
+            subscription_source_block_key(no_new_uri),
+            reason="no_new_episodes",
+            origin_import_id="old-no-new",
+        )
+
+        response = application.search(
+            {
+                "owner_id": "owner-a",
+                "query": "吞噬星空 148",
+                "category": "anime",
+                "source": "default",
+                "limit": 20,
+                "subscription_follow": True,
+            }
+        )
+
+        self.assertEqual(
+            [item["title"] for item in response["items"]],
+            ["布局已修复资源", "无新增记录资源"],
+        )
+        self.assertEqual(response["metadata"]["blocked_count"], 0)
 
     def payload(self, application, service, existing=None, reserved=None):
         session_id, candidate_id, _ = self.search_candidate(
@@ -2367,7 +2414,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertTrue(all(value == [] for value in service.subscription_inspect_hints))
         self.assertIn("unrecognized video names", completed["error"])
 
-    def test_no_new_episodes_cleans_staging_and_blocks_the_source(self):
+    def test_no_new_episodes_cleans_staging_without_blocking_source(self):
         service, store, manager, application = self.build_components()
         service.subscription_entries = [
             {"fid": "video-%03d" % episode, "fn": "凡人修仙传.S01E%03d.mkv" % episode, "kind": "video", "episode": episode}
@@ -2389,15 +2436,8 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(service.subscription_cleanup_calls[0][0], "anime")
         self.assertEqual(service.subscription_cleanup_calls[0][1]["openlist_path"], audit["staging"]["openlist_path"])
         source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
-        block = store.get_subscription_source_block(source_key)
-        self.assertEqual(block["reason"], "no_new_episodes")
-        self.assertEqual(block["origin_import_id"], completed["id"])
-        with self.assertRaises(ApiError) as retry_blocked:
-            manager.retry_import("owner-a", completed["id"])
-        self.assertEqual(retry_blocked.exception.code, "subscription_source_blocked")
-        with self.assertRaises(ApiError) as create_blocked:
-            manager.create_import("owner-a", "fanren-no-new-second", payload)
-        self.assertEqual(create_blocked.exception.code, "subscription_source_blocked")
+        self.assertIsNone(store.get_subscription_source_block(source_key))
+        self.assertEqual(manager.retry_import("owner-a", completed["id"])["status"], "queued")
 
     def test_manual_replenish_no_new_episodes_completes_without_blocking_source(self):
         service, store, manager, application = self.build_components()
