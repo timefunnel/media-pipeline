@@ -44,7 +44,7 @@ SEARCH_PROFILE_TAG_LABELS = {
 def search_profile_for_query(category, query):
     if category == "adult" or is_strong_adult_code_query(query):
         return SEARCH_PROFILE_ADULT
-    if should_search_anime(category, query):
+    if category == "anime" or should_search_anime(category, query):
         return SEARCH_PROFILE_ANIME
     return SEARCH_PROFILE_GENERAL
 
