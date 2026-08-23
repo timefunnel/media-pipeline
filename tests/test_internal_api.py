@@ -2455,6 +2455,49 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(service.subscription_cleanup_calls[0][1]["openlist_path"], audit["staging"]["openlist_path"])
         self.assertEqual(service.duplicate_calls, [])
 
+    def test_subscription_promotion_retries_once_after_scan_visibility_race(self):
+        service, _store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115}
+        ]
+        original_sync = service.sync_completed_task
+        sync_calls = []
+
+        def sync_with_stale_first_scan(*args, **kwargs):
+            sync_calls.append(True)
+            synced = original_sync(*args, **kwargs)
+            synced["msg_ingest_scan_added"] = 0 if len(sync_calls) == 1 else 1
+            return synced
+
+        service.sync_completed_task = sync_with_stale_first_scan
+        verify_calls = []
+
+        def verify_after_visibility_delay(*args, **kwargs):
+            verify_calls.append(True)
+            if len(verify_calls) == 1:
+                return {"verified_episodes": [], "missing_episodes": [115], "duplicate_episodes": {}}
+            return {"verified_episodes": [115], "missing_episodes": [], "duplicate_episodes": {}}
+
+        service.verify_subscription_msg_episodes = verify_after_visibility_delay
+        manager._wait_or_stop = lambda _delay=None: None
+        task, _ = manager.create_import(
+            "owner-a", "fanren-scan-visibility-race", self.payload(application, service)
+        )
+
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        audit = completed["result"]["subscription_follow"]
+        self.assertEqual(audit["scan_visibility_retry_count"], 1)
+        self.assertEqual(audit["scan_added"], 1)
+        self.assertEqual(len(sync_calls), 2)
+        self.assertEqual(len(verify_calls), 2)
+        self.assertEqual(len(service.submit_uris), 1)
+
     def test_direct_subscription_receive_submits_to_the_task_directory(self):
         service, _store, manager, application = self.build_components()
         service.subscription_entries = [

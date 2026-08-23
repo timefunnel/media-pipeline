@@ -30,6 +30,8 @@ from pipeline.task_state import ACTIVE_115_TIMEOUT_SECONDS
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_SEARCH_TTL_SECONDS = 15 * 60
 DEFAULT_OFFLINE_WAIT_SLICE_SECONDS = 5 * 60
+SUBSCRIPTION_SCAN_VISIBILITY_RETRY_DELAY_SECONDS = 2.0
+SUBSCRIPTION_SCAN_VISIBILITY_RETRY_LIMIT = 1
 MAX_JSON_BODY_BYTES = 1024 * 1024
 OFFLINE_ACTIVE_STATUSES = {"submitted", "allocating", "downloading", "unknown", None, ""}
 OFFLINE_SUCCESS_STATUS = "success"
@@ -2531,39 +2533,53 @@ class ImportTaskManager:
             )
 
         self.store.save_running(task["id"], "scanning", result=result, info_hash=info_hash)
-        synced = self.service.sync_completed_task(
-            category,
-            title,
-            sync_input,
-            progress_callback=save_progress,
-            target=request["target"],
-        )
-        if not isinstance(synced, dict):
-            raise RuntimeError("pipeline sync_completed_task returned invalid response")
-        synced = dict(synced)
-        result["task"] = synced
-        media_id = str(synced.get("msg_media_id") or "").strip()
-        scan_added = int(synced.get("msg_ingest_scan_added") or 0)
+        def sync_once(current_task):
+            synced_result = self.service.sync_completed_task(
+                category,
+                title,
+                current_task,
+                progress_callback=save_progress,
+                target=request["target"],
+            )
+            if not isinstance(synced_result, dict):
+                raise RuntimeError("pipeline sync_completed_task returned invalid response")
+            synced_result = dict(synced_result)
+            result["task"] = synced_result
+            return (
+                synced_result,
+                str(synced_result.get("msg_media_id") or "").strip(),
+                int(synced_result.get("msg_ingest_scan_added") or 0),
+            )
+
+        synced, media_id, scan_added = sync_once(sync_input)
         audit["scan_added"] = scan_added
-        if require_scan_added and scan_added != len(selected):
-            audit["outcome"] = "failed"
-            result["subscription_follow"] = audit
-            self.store.save_running(
-                task["id"],
-                "verifying_scan",
-                result=result,
-                info_hash=info_hash,
-                msg_media_id=media_id,
-            )
-            raise RuntimeError(
-                "MediaStationGo scan added %d episodes, expected %d"
-                % (scan_added, len(selected))
-            )
         verified_msg = self.service.verify_subscription_msg_episodes(
             category, target_path, season, selected
         )
         audit["msg_verification"] = verified_msg
-        if verified_msg.get("missing_episodes") or verified_msg.get("duplicate_episodes"):
+        missing_episodes = list(verified_msg.get("missing_episodes") or [])
+        duplicate_episodes = dict(verified_msg.get("duplicate_episodes") or {})
+        scan_mismatch = require_scan_added and scan_added != len(selected)
+        if (missing_episodes or scan_mismatch) and not duplicate_episodes:
+            for retry_number in range(1, SUBSCRIPTION_SCAN_VISIBILITY_RETRY_LIMIT + 1):
+                self._wait_or_stop(SUBSCRIPTION_SCAN_VISIBILITY_RETRY_DELAY_SECONDS)
+                retry_input = reset_subscription_sync_for_retry(synced)
+                retry_input["subscription_target_openlist_path"] = target_path
+                if category == "anime":
+                    retry_input["subscription_target_season"] = season
+                synced, media_id, scan_added = sync_once(retry_input)
+                audit["scan_visibility_retry_count"] = retry_number
+                audit["scan_added"] = scan_added
+                verified_msg = self.service.verify_subscription_msg_episodes(
+                    category, target_path, season, selected
+                )
+                audit["msg_verification"] = verified_msg
+                missing_episodes = list(verified_msg.get("missing_episodes") or [])
+                duplicate_episodes = dict(verified_msg.get("duplicate_episodes") or {})
+                scan_mismatch = require_scan_added and scan_added != len(selected)
+                if not missing_episodes and not duplicate_episodes and not scan_mismatch:
+                    break
+        if duplicate_episodes or missing_episodes or scan_mismatch:
             audit["outcome"] = "failed"
             result["subscription_follow"] = audit
             self.store.save_running(
@@ -2573,8 +2589,12 @@ class ImportTaskManager:
                 info_hash=info_hash,
                 msg_media_id=media_id,
             )
-            raise RuntimeError("MediaStationGo episode verification did not match the promotion plan")
-
+            if duplicate_episodes or missing_episodes:
+                raise RuntimeError("MediaStationGo episode verification did not match the promotion plan")
+            raise RuntimeError(
+                "MediaStationGo scan added %d episodes, expected %d"
+                % (scan_added, len(selected))
+            )
         self.store.save_running(
             task["id"],
             "cleanup",
