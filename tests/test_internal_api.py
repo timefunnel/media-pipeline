@@ -2195,6 +2195,20 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
 
         self.assertTrue(subscription_retry_resubmit(result, request))
 
+    def test_cleaned_subscription_staging_retry_resubmits_even_with_msg_media_id(self):
+        from pipeline.internal_api import subscription_retry_resubmit
+
+        result = {
+            "task": {"status_name": "success"},
+            "subscription_follow": {
+                "staging": {"receive_mode": "direct_task_directory"},
+                "staging_cleaned_at": 123,
+            },
+        }
+        request = {"subscription_follow": {"manual_replenish": False}}
+
+        self.assertTrue(subscription_retry_resubmit(result, request, msg_media_id="media-176"))
+
     def test_manual_replenishment_uses_known_missing_episodes_as_filename_hints(self):
         service, _store, manager, application = self.build_components()
         session_id, candidate_id, _ = self.search_candidate(

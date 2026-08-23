@@ -3941,13 +3941,22 @@ def subscription_direct_receive_scan_ready(result):
 
 
 def subscription_retry_resubmit(result, request, msg_media_id=None):
-    if msg_media_id or not isinstance(result, dict) or not isinstance(request, dict):
+    if not isinstance(result, dict) or not isinstance(request, dict):
         return False
     if not request.get("subscription_follow") or not result_task_is_offline_success(result):
         return False
     audit = result.get("subscription_follow") or {}
     if audit.get("staging_cleaned_at"):
+        promotion = audit.get("promotion") or {}
+        if audit.get("moved_episodes") or promotion.get("moved_episodes"):
+            return False
         return True
+    # A subscription follow may already have a MediaStationGo media id from a
+    # failed verification pass.  That association must not keep a retry on the
+    # old 115 task after its staging directory has been cleaned; the cleanup
+    # marker above is authoritative for resubmission.
+    if msg_media_id:
+        return False
     staging = audit.get("staging") or {}
     return bool(
         str(staging.get("receive_mode") or "").strip().lower() == "direct_task_directory"
