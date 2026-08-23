@@ -23,11 +23,10 @@ require pull requests. Before any history migration, first push an
 `archive/...` tag for every legacy tip. A `forced-update` or shallow fetch is a
 release blocker until the ancestry and semantic differences are audited.
 
-## Current Hosting Limitation
+## Branch Protection
 
-As of 2026-08-23, GitHub reports that this private repository's rulesets and
-classic branch protections are not enforced on its current account plan. Do
-not represent pull requests or branch rules as an effective server-side gate
-until the repository is moved to a GitHub Team or Enterprise organization plan
-with enforced branch protection. The provenance script and annotated release
-tags remain mandatory local release gates in the meantime.
+As of 2026-08-23, this public repository has an active GitHub ruleset named
+`Protect codex/local-dev`. It targets only `codex/local-dev`, requires pull
+requests, and blocks branch deletion and force pushes. The provenance script
+and annotated release tags remain mandatory release gates alongside that
+server-side protection.
