@@ -1605,11 +1605,16 @@ class ImportTaskManager:
                 self.store.requeue_running_import(task["id"])
             except ImportCanceled as exc:
                 current = self.store.get_import(owner_id, task["id"])
+                canceled_result = self._settle_subscription_terminal_staging(
+                    current,
+                    dict(current.get("result") or {}),
+                    "canceled",
+                )
                 self.store.finish_import(
                     task["id"],
                     "canceled",
                     "canceled",
-                    result=current.get("result"),
+                    result=canceled_result,
                     error=str(exc),
                     info_hash=current.get("info_hash"),
                     msg_media_id=current.get("msg_media_id"),
@@ -1632,6 +1637,11 @@ class ImportTaskManager:
                         }
                         follow_audit["attempts"] = attempts
                     failed_result["subscription_follow"] = follow_audit
+                failed_result = self._settle_subscription_terminal_staging(
+                    current,
+                    failed_result,
+                    "failed",
+                )
                 self.store.finish_import(
                     task["id"],
                     "failed",
@@ -1647,6 +1657,59 @@ class ImportTaskManager:
                     if self._active_by_owner[owner_id] <= 0:
                         self._active_by_owner.pop(owner_id, None)
                     self._condition.notify_all()
+
+    def _settle_subscription_terminal_staging(self, task, result, terminal_status):
+        request = dict((task or {}).get("request") or {})
+        if not request.get("subscription_follow"):
+            return result
+        result = dict(result or {})
+        audit = dict(result.get("subscription_follow") or {})
+        staging = dict(audit.get("staging") or {})
+        if not staging.get("openlist_path") or audit.get("staging_cleaned_at"):
+            return result
+        promoted = bool(audit.get("moved_episodes"))
+        try:
+            settlement = self._with_subscription_staging_lock(
+                request["subscription_follow"]["work_key"],
+                lambda: self.service.settle_subscription_staging(
+                    request["category"],
+                    staging,
+                    terminal_status,
+                    promoted=promoted,
+                ),
+            )
+        except Exception as cleanup_exc:
+            settlement = {
+                "status": "failed",
+                "reason": "terminal_%s_cleanup" % terminal_status,
+                "path": staging.get("openlist_path"),
+                "error": str(cleanup_exc),
+            }
+            print(
+                "internal API import %s staging cleanup failed: %s"
+                % (task.get("id"), cleanup_exc),
+                flush=True,
+            )
+        audit["staging_cleanup"] = dict(settlement or {})
+        if audit["staging_cleanup"].get("status") == "cleaned":
+            audit["staging_cleaned_at"] = int(
+                audit["staging_cleanup"].get("cleaned_at") or time.time()
+            )
+        result["subscription_follow"] = audit
+        return result
+
+    def _with_subscription_staging_lock(self, work_key, callback):
+        lock = self._target_lock(
+            {
+                "library_id": "subscription-staging",
+                "root_id": str(work_key or "").strip(),
+            }
+        )
+        self._acquire_target_lock(lock)
+        try:
+            return callback()
+        finally:
+            lock.release()
 
     def _claim_task(self):
         with self._condition:
@@ -2023,7 +2086,9 @@ class ImportTaskManager:
                 )
                 return
 
-            def persist_blocked_source(error, block_reason=None, outcome="source_unavailable"):
+            def persist_blocked_source(
+                error, block_reason=None, outcome="source_unavailable", block_source=True
+            ):
                 block_reason = block_reason or subscription_source_failure_block_reason(error)
                 if not block_reason:
                     return False
@@ -2037,9 +2102,12 @@ class ImportTaskManager:
                 )
                 result["subscription_follow"] = audit
                 self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash or None)
-                self.service.cleanup_subscription_staging(category, staging)
-                audit["staging_cleaned_at"] = int(time.time())
-                if not follow.get("manual_replenish"):
+                cleanup = self._with_subscription_staging_lock(
+                    follow["work_key"],
+                    lambda: self.service.cleanup_subscription_staging(category, staging),
+                )
+                record_subscription_staging_cleanup(audit, cleanup, outcome)
+                if block_source and not follow.get("manual_replenish"):
                     source_key = subscription_source_block_key(
                         (request.get("candidate") or {}).get("download_uri")
                     )
@@ -2053,13 +2121,20 @@ class ImportTaskManager:
                 return True
 
             staging = dict(audit.get("staging") or {})
+            if audit.get("staging_cleaned_at"):
+                staging = {}
             if not staging.get("openlist_path") or not subscription_receive_target_folder_id(staging):
-                staging = self.service.prepare_subscription_staging(
-                    category,
-                    task["id"],
+                staging = self._with_subscription_staging_lock(
                     follow["work_key"],
+                    lambda: self.service.prepare_subscription_staging(
+                        category,
+                        task["id"],
+                        follow["work_key"],
+                    ),
                 )
                 audit["staging"] = staging
+                audit.pop("staging_cleaned_at", None)
+                audit.pop("staging_cleanup", None)
                 result["subscription_follow"] = audit
                 self.store.save_running(task["id"], "staging", result=result, info_hash=info_hash or None)
 
@@ -2315,21 +2390,34 @@ class ImportTaskManager:
                 raise error
             if audit["unknown_videos"] and not selected:
                 error = RuntimeError("OpenList staging contains unrecognized video names")
-                persist_blocked_source(error, block_reason="invalid_episode_layout", outcome="rejected")
+                persist_blocked_source(
+                    error,
+                    block_reason="invalid_episode_layout",
+                    outcome="rejected",
+                    block_source=False,
+                )
                 raise error
             if audit["unknown_videos"]:
                 audit["ignored_unknown_videos"] = list(audit["unknown_videos"])
             if audit["duplicate_episodes"]:
                 error = RuntimeError("OpenList staging contains multiple videos for one episode")
-                persist_blocked_source(error, block_reason="invalid_episode_layout", outcome="rejected")
+                persist_blocked_source(
+                    error,
+                    block_reason="invalid_episode_layout",
+                    outcome="rejected",
+                    block_source=False,
+                )
                 raise error
             if not selected:
                 audit["outcome"] = "no_new_episodes"
                 attempts[-1].update({"outcome": "no_new_episodes", "finished_at": int(time.time())})
                 result["subscription_follow"] = audit
                 self.store.save_running(task["id"], "cleanup", result=result, info_hash=info_hash)
-                self.service.cleanup_subscription_staging(category, staging)
-                audit["staging_cleaned_at"] = int(time.time())
+                cleanup = self._with_subscription_staging_lock(
+                    follow["work_key"],
+                    lambda: self.service.cleanup_subscription_staging(category, staging),
+                )
+                record_subscription_staging_cleanup(audit, cleanup, "no_new_episodes")
                 if follow.get("manual_replenish"):
                     result["subscription_follow"] = audit
                     self.store.finish_import(
@@ -2467,8 +2555,12 @@ class ImportTaskManager:
             info_hash=info_hash,
             msg_media_id=media_id,
         )
-        self.service.cleanup_subscription_staging(category, staging)
-        audit["staging_cleaned_at"] = int(time.time())
+        if not audit.get("staging_cleaned_at"):
+            cleanup = self._with_subscription_staging_lock(
+                request["subscription_follow"]["work_key"],
+                lambda: self.service.cleanup_subscription_staging(category, staging),
+            )
+            record_subscription_staging_cleanup(audit, cleanup, "import_completed")
         audit["outcome"] = "imported"
         attempts[-1].update({"outcome": "imported", "finished_at": int(time.time())})
         result["subscription_follow"] = audit
@@ -3753,6 +3845,18 @@ def reset_subscription_sync_for_retry(task):
         out.pop(key, None)
     out["msg_sync_status"] = "running"
     return out
+
+
+def record_subscription_staging_cleanup(audit, cleanup, reason):
+    cleaned_at = int(time.time())
+    audit["staging_cleanup"] = {
+        **dict(cleanup or {}),
+        "status": "cleaned",
+        "reason": str(reason or "cleanup").strip() or "cleanup",
+        "cleaned_at": cleaned_at,
+    }
+    audit["staging_cleaned_at"] = cleaned_at
+    return audit["staging_cleanup"]
 
 
 def offline_task_poll_attempt(task):

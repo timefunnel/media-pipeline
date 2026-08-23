@@ -2572,7 +2572,82 @@ class PipelineBotService:
     def cleanup_subscription_staging(self, category, staging):
         client = self._build_openlist_client()
         staging_path = subscription_staging_path(staging)
-        client.remove_names(posixpath.dirname(staging_path), [posixpath.basename(staging_path)])
+        task_root_path, work_path = subscription_staging_cleanup_paths(
+            self.config.subscription_staging_root,
+            staging_path,
+        )
+        task_already_absent = False
+        try:
+            client.remove_names(work_path, [posixpath.basename(staging_path)])
+        except RuntimeError as exc:
+            if not openlist_missing_error(exc):
+                raise
+            task_already_absent = True
+
+        parent_pruned = False
+        parent_already_absent = False
+        parent_prune_error = None
+        try:
+            work_response = client.list_path(work_path, refresh=True, page=1, per_page=1)
+            work_entries = ((work_response or {}).get("data") or {}).get("content") or []
+        except RuntimeError as exc:
+            work_entries = None
+            if openlist_missing_error(exc):
+                parent_already_absent = True
+            else:
+                parent_prune_error = str(exc)
+        if work_entries == [] and not parent_already_absent:
+            try:
+                client.remove_names(task_root_path, [posixpath.basename(work_path)])
+                parent_pruned = True
+            except RuntimeError as exc:
+                if openlist_missing_error(exc):
+                    parent_already_absent = True
+                else:
+                    parent_prune_error = str(exc)
+        return {
+            "path": staging_path,
+            "task_already_absent": task_already_absent,
+            "parent_path": work_path,
+            "parent_pruned": parent_pruned,
+            "parent_already_absent": parent_already_absent,
+            "parent_prune_error": parent_prune_error,
+        }
+
+    def settle_subscription_staging(self, category, staging, terminal_status, promoted=False):
+        terminal_status = str(terminal_status or "").strip().lower()
+        if terminal_status not in {"failed", "canceled"}:
+            raise ValueError("subscription staging terminal status must be failed or canceled")
+        staging_path = subscription_staging_path(staging)
+        if terminal_status == "failed" and not promoted:
+            client = self._build_openlist_client()
+            try:
+                response = client.list_path(staging_path, refresh=True, page=1, per_page=1)
+                data = (response or {}).get("data") or {}
+                entries = data.get("content") or []
+                entry_count = int(data.get("total") or len(entries))
+            except RuntimeError as exc:
+                if not openlist_missing_error(exc):
+                    raise
+                entries = []
+                entry_count = 0
+            if entries:
+                return {
+                    "status": "retained",
+                    "reason": "retryable_content_before_promotion",
+                    "path": staging_path,
+                    "entry_count": entry_count,
+                }
+        cleanup = self.cleanup_subscription_staging(category, staging)
+        reason = "task_canceled" if terminal_status == "canceled" else (
+            "promoted_files_no_longer_need_staging" if promoted else "empty_failed_staging"
+        )
+        return {
+            **cleanup,
+            "status": "cleaned",
+            "reason": reason,
+            "cleaned_at": int(time.time()),
+        }
 
     def _build_openlist_client(self):
         return OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
@@ -4163,6 +4238,22 @@ def subscription_staging_path(staging):
     return path
 
 
+def subscription_staging_cleanup_paths(staging_root, staging_path):
+    root_path = normalize_openlist_path(staging_root)
+    task_path = normalize_openlist_path(staging_path)
+    if not root_path or not task_path:
+        raise RuntimeError("OpenList subscription cleanup path missing")
+    task_root_path = normalize_openlist_path(posixpath.join(root_path, "追更任务"))
+    work_path = normalize_openlist_path(posixpath.dirname(task_path))
+    if posixpath.dirname(work_path) != task_root_path:
+        raise RuntimeError("OpenList subscription cleanup path is outside the task root")
+    task_name = posixpath.basename(task_path)
+    work_name = posixpath.basename(work_path)
+    if not task_name or not work_name or task_name in {".", ".."} or work_name in {".", ".."}:
+        raise RuntimeError("OpenList subscription cleanup path is invalid")
+    return task_root_path, work_path
+
+
 def subscription_receives_directly_to_staging(staging):
     return str((staging or {}).get("receive_mode") or "").strip().lower() == "direct_task_directory"
 
@@ -4575,13 +4666,12 @@ def classify_subscription_follow_videos(
             item = raw_videos[0]
             videos.append({**video_fields(item["item"], item["name"]), "episode": expected[0]})
         elif len(raw_videos) > 1:
-            ordered = sorted(raw_videos, key=lambda item: item["size"], reverse=True)
-            primary, second = ordered[0], ordered[1]
-            if primary["size"] > 0 and second["size"] > 0 and primary["size"] >= second["size"] * 5:
-                videos.append({**video_fields(primary["item"], primary["name"]), "episode": expected[0]})
-                supplemental = [item["name"] for item in ordered[1:]]
-            else:
-                ambiguous = [item["name"] for item in raw_videos]
+            for item in raw_videos:
+                episode = parse_multi_video_episode(item["name"], season)
+                if episode is None:
+                    unknown.append(item["name"])
+                    continue
+                videos.append({**video_fields(item["item"], item["name"]), "episode": episode})
     else:
         for item in raw_videos:
             episode = parse_follow_episode(
@@ -4608,6 +4698,30 @@ def classify_subscription_follow_videos(
             str(episode): names for episode, names in by_episode.items() if len(names) > 1
         },
     }
+
+
+def parse_multi_video_episode(name, expected_season):
+    """Parse one video in a multi-file resource, excluding years/resolutions."""
+    stem = posixpath.splitext(str(name or ""))[0]
+    season_episode = re.search(
+        r"(?i)(?:^|[^A-Za-z])S(?P<season>\d{1,2})E(?P<episode>\d{1,4})(?:[^0-9]|$)",
+        stem,
+    )
+    if season_episode:
+        if int(season_episode.group("season")) != int(expected_season or 1):
+            return None
+        return int(season_episode.group("episode"))
+    cjk_episode = re.search(r"第\s*(?P<episode>\d{1,4})\s*[集话話期]", stem)
+    if cjk_episode:
+        return int(cjk_episode.group("episode"))
+    values = []
+    for match in re.finditer(r"(?<!\d)(\d{1,4})(?!\d)", stem):
+        value = int(match.group(1))
+        if 1900 <= value <= 2099 or value in {480, 720, 1080, 1440, 2160, 4320}:
+            continue
+        if value > 0 and value not in values:
+            values.append(value)
+    return values[0] if len(values) == 1 else None
 
 
 def list_115_descendants(client, folder_id, request_count=None, max_entries=20000):
