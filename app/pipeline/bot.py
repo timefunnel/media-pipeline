@@ -4666,13 +4666,12 @@ def classify_subscription_follow_videos(
             item = raw_videos[0]
             videos.append({**video_fields(item["item"], item["name"]), "episode": expected[0]})
         elif len(raw_videos) > 1:
-            ordered = sorted(raw_videos, key=lambda item: item["size"], reverse=True)
-            primary, second = ordered[0], ordered[1]
-            if primary["size"] > 0 and second["size"] > 0 and primary["size"] >= second["size"] * 5:
-                videos.append({**video_fields(primary["item"], primary["name"]), "episode": expected[0]})
-                supplemental = [item["name"] for item in ordered[1:]]
-            else:
-                ambiguous = [item["name"] for item in raw_videos]
+            for item in raw_videos:
+                episode = parse_multi_video_episode(item["name"], season)
+                if episode is None:
+                    unknown.append(item["name"])
+                    continue
+                videos.append({**video_fields(item["item"], item["name"]), "episode": episode})
     else:
         for item in raw_videos:
             episode = parse_follow_episode(
@@ -4699,6 +4698,30 @@ def classify_subscription_follow_videos(
             str(episode): names for episode, names in by_episode.items() if len(names) > 1
         },
     }
+
+
+def parse_multi_video_episode(name, expected_season):
+    """Parse one video in a multi-file resource, excluding years/resolutions."""
+    stem = posixpath.splitext(str(name or ""))[0]
+    season_episode = re.search(
+        r"(?i)(?:^|[^A-Za-z])S(?P<season>\d{1,2})E(?P<episode>\d{1,4})(?:[^0-9]|$)",
+        stem,
+    )
+    if season_episode:
+        if int(season_episode.group("season")) != int(expected_season or 1):
+            return None
+        return int(season_episode.group("episode"))
+    cjk_episode = re.search(r"第\s*(?P<episode>\d{1,4})\s*[集话話期]", stem)
+    if cjk_episode:
+        return int(cjk_episode.group("episode"))
+    values = []
+    for match in re.finditer(r"(?<!\d)(\d{1,4})(?!\d)", stem):
+        value = int(match.group(1))
+        if 1900 <= value <= 2099 or value in {480, 720, 1080, 1440, 2160, 4320}:
+            continue
+        if value > 0 and value not in values:
+            values.append(value)
+    return values[0] if len(values) == 1 else None
 
 
 def list_115_descendants(client, folder_id, request_count=None, max_entries=20000):

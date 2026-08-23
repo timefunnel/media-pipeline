@@ -23,6 +23,7 @@ for category in ("movie", "tv", "anime", "adult", "other"):
 from pipeline.bot import BotConfig, PipelineBotService
 from pipeline.bot import (
     classify_115_resource_entries,
+    parse_multi_video_episode,
     parse_follow_episode,
     wait_openlist_directory,
     wait_openlist_offline_result_names,
@@ -2200,7 +2201,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(classified["verified_episodes"], [150])
         self.assertEqual(classified["videos"][0]["episode"], 150)
 
-    def test_automatic_subscription_accepts_a_clearly_larger_primary_video(self):
+    def test_automatic_subscription_rejects_multiple_videos_without_episode_labels(self):
         classified = classify_115_resource_entries(
             [
                 {"fid": "main", "fc": "1", "fn": "main.mkv", "s": 2_000_000_000},
@@ -2209,9 +2210,8 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             1,
             expected_episodes=[150],
         )
-        self.assertEqual(classified["verified_episodes"], [150])
-        self.assertEqual(classified["videos"][0]["file_id"], "main")
-        self.assertEqual(classified["supplemental_videos"], ["sample.mkv"])
+        self.assertEqual(classified["verified_episodes"], [])
+        self.assertEqual(classified["unknown_videos"], ["main.mkv", "sample.mkv"])
 
         ambiguous = classify_115_resource_entries(
             [
@@ -2221,7 +2221,24 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
             1,
             expected_episodes=[150],
         )
-        self.assertEqual(ambiguous["ambiguous_videos"], ["first.mkv", "second.mkv"])
+        self.assertEqual(ambiguous["unknown_videos"], ["first.mkv", "second.mkv"])
+
+    def test_multi_video_resource_extracts_episode_from_each_filename(self):
+        self.assertEqual(parse_multi_video_episode("[GM-Team][吞噬星空][2021][167][1080P].mp4", 1), 167)
+        self.assertEqual(parse_multi_video_episode("Tunshi Xingkong - 171 (2160p HQ).mkv", 1), 171)
+        self.assertIsNone(parse_multi_video_episode("[GM-Team][吞噬星空][2021][1080P].mp4", 1))
+
+        classified = classify_115_resource_entries(
+            [
+                {"fid": "167", "fc": "1", "fn": "[GM-Team][吞噬星空][2021][167][1080P].mp4"},
+                {"fid": "168", "fc": "1", "fn": "[GM-Team][吞噬星空][2021][168][1080P].mp4"},
+                {"fid": "169", "fc": "1", "fn": "[GM-Team][吞噬星空][2021][169][1080P].mp4"},
+            ],
+            1,
+            expected_episodes=[167],
+        )
+        self.assertEqual(classified["verified_episodes"], [167, 168, 169])
+        self.assertEqual(classified["ambiguous_videos"], [])
 
     def test_subscription_source_block_key_uses_115_share_code_and_subdirectory(self):
         self.assertEqual(
