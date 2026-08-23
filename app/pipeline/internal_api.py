@@ -769,6 +769,21 @@ class InternalApiStore:
                 task["msg_sync_status"] = "running"
                 task["msg_error"] = None
                 result["task"] = task
+                if request.get("subscription_follow"):
+                    # A subscription retry that reached 115 success but failed
+                    # while validating/promoting the staged resource must
+                    # re-inspect the current staging contents.  Keeping the
+                    # previous resource_manifest makes a multi-video retry
+                    # compare the old failed classification with the fresh
+                    # OpenList scan and fail again before episode mapping.
+                    follow_result = dict(result.get("subscription_follow") or {})
+                    follow_result.pop("resource_manifest", None)
+                    follow_result.pop("ambiguous_videos", None)
+                    follow_result.pop("unknown_videos", None)
+                    follow_result.pop("duplicate_episodes", None)
+                    follow_result.pop("verified_episodes", None)
+                    follow_result.pop("selected_episodes", None)
+                    result["subscription_follow"] = follow_result
                 if resume_stage:
                     result["retry_from_stage"] = resume_stage
                 else:
