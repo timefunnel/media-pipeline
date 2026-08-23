@@ -3781,7 +3781,7 @@ class TelegramBotTest(unittest.TestCase):
             service = FakeBotService(statuses_response={"ABC": {"info_hash": "ABC", "status_name": "downloading", "percent_done": 50}})
             bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
 
-            count = bot.recover_active_115_tasks_once(now=1600)
+            count = bot.recover_active_115_tasks_once(now=1599)
 
         self.assertEqual(count, 0)
         self.assertEqual(service.statuses_calls, [])
@@ -3797,19 +3797,19 @@ class TelegramBotTest(unittest.TestCase):
                     9001,
                     "movie",
                     "Sintel",
-                    {"info_hash": "ABC", "status_name": "downloading", "poll_count": 10, "last_polled_at": 1100},
+                    {"info_hash": "ABC", "status_name": "downloading", "poll_count": 10, "last_polled_at": 800},
                 )
             telegram = FakeTelegram()
             service = FakeBotService(statuses_response={"ABC": {"info_hash": "ABC", "status_name": "downloading", "percent_done": 50}})
             bot = TelegramBot(BotConfig("token", {700656624}, store.db_path), telegram, store, service)
 
-            count = bot.recover_active_115_tasks_once(now=1700)
+            count = bot.recover_active_115_tasks_once(now=1501)
             saved = store.load_task("ABC")["task"]
 
         self.assertEqual(count, 1)
         self.assertEqual(service.statuses_calls, [("movie", ("ABC",))])
         self.assertEqual(saved["poll_count"], 11)
-        self.assertEqual(saved["last_polled_at"], 1700)
+        self.assertEqual(saved["last_polled_at"], 1501)
         self.assertEqual(saved["percent_done"], 50)
 
     def test_recover_active_115_tasks_auto_cancels_timeout_and_notifies(self):
@@ -3844,7 +3844,7 @@ class TelegramBotTest(unittest.TestCase):
         self.assertEqual(service.statuses_calls, [])
         self.assertEqual(saved["status_name"], "cancelled")
         self.assertEqual(saved["auto_cancelled_at"], 8200)
-        self.assertIn("超过3600秒", saved["auto_cancel_reason"])
+        self.assertIn("超过600秒", saved["auto_cancel_reason"])
         self.assertEqual(telegram.messages[0]["chat_id"], 9001)
         self.assertIn("任务超时已自动取消", telegram.messages[0]["text"])
         self.assertIn("当前状态：已取消 · 80%", telegram.messages[0]["text"])

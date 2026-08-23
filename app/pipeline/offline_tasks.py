@@ -14,7 +14,7 @@ FINAL_STATUS_NAMES = {"success", "failed", "cancelled"}
 
 def normalize_task(task):
     status = int(task.get("status") or 0)
-    return {
+    normalized = {
         "info_hash": task.get("info_hash"),
         "name": task.get("name"),
         "status": status,
@@ -25,6 +25,10 @@ def normalize_task(task):
         "wp_path_id": task.get("wp_path_id"),
         "url": task.get("url"),
     }
+    for key in ("message", "msg", "error", "code", "state", "errmsg", "errcode"):
+        if key in task:
+            normalized[key] = task.get(key)
+    return normalized
 
 
 def find_task_by_info_hash(client, info_hash, max_pages=10):

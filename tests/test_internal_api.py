@@ -2691,7 +2691,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(cleanup["reason"], "terminal_failed_cleanup")
         self.assertEqual(cleanup["error"], "OpenList cleanup failed: permission denied")
 
-    def test_failed_offline_task_cleans_staging_and_blocks_the_magnet(self):
+    def test_failed_offline_task_stops_without_blocking_without_failure_evidence(self):
         service = FakePipelineService(download_delay=0.01)
         service, store, manager, application = self.build_components(service)
 
@@ -2715,8 +2715,33 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
 
         self.assertEqual(completed["status"], "failed")
         audit = completed["result"]["subscription_follow"]
-        self.assertEqual(audit["outcome"], "source_unavailable")
+        self.assertEqual(audit["outcome"], "failed")
         self.assertEqual(len(service.subscription_cleanup_calls), 1)
+        source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
+        self.assertIsNone(store.get_subscription_source_block(source_key))
+
+    def test_failed_offline_task_with_explicit_invalid_resource_evidence_blocks_source(self):
+        service = FakePipelineService(download_delay=0.01)
+        service, store, manager, application = self.build_components(service)
+
+        def failed_status(_category, info_hash):
+            return {
+                "info_hash": info_hash,
+                "name": "凡人修仙传.115",
+                "status_name": "failed",
+                "message": "资源不存在",
+                "percent_done": 0,
+            }
+
+        service.task_status = failed_status
+        task, _ = manager.create_import("owner-a", "fanren-offline-invalid-resource", self.payload(application, service))
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "failed")
         source_key = subscription_source_block_key(completed["request"]["candidate"]["download_uri"])
         self.assertEqual(store.get_subscription_source_block(source_key)["reason"], "offline_failed")
 

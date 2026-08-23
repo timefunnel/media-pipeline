@@ -1797,7 +1797,7 @@ class ImportTaskManager:
         while offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
             status_name = offline_task.get("status_name")
             if status_name in OFFLINE_FAILED_STATUSES:
-                raise RuntimeError("115 offline task ended with status: %s" % status_name)
+                raise RuntimeError(format_offline_task_failure(offline_task))
             if status_name not in OFFLINE_ACTIVE_STATUSES:
                 raise RuntimeError("115 offline task returned invalid status: %s" % (status_name or "-"))
             self._raise_if_stopping()
@@ -2276,7 +2276,7 @@ class ImportTaskManager:
                             while offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
                                 status_name = offline_task.get("status_name")
                                 if status_name in OFFLINE_FAILED_STATUSES:
-                                    raise RuntimeError("115 offline task ended with status: %s" % status_name)
+                                    raise RuntimeError(format_offline_task_failure(offline_task))
                                 if status_name not in OFFLINE_ACTIVE_STATUSES:
                                     raise RuntimeError(
                                         "115 offline task returned invalid status: %s" % (status_name or "-")
@@ -3646,9 +3646,37 @@ def subscription_source_failure_block_reason(error):
     message = str(error or "").casefold()
     if any(marker in message for marker in ("链接已过期", "链接过期", "share expired", "link expired")):
         return "share_expired"
-    if "115 offline task ended with status: failed" in message:
+    if "115 offline task exceeded" in message:
+        return "offline_failed"
+    if "115 offline task ended with status: failed" in message and any(
+        marker in message
+        for marker in (
+            "资源失效",
+            "资源不存在",
+            "种子不存在",
+            "下载链接无效",
+            "invalid torrent",
+            "invalid magnet",
+            "torrent not found",
+            "magnet not found",
+            "resource unavailable",
+            "resource not found",
+            "source unavailable",
+        )
+    ):
         return "offline_failed"
     return None
+
+
+def format_offline_task_failure(task):
+    task = task or {}
+    details = []
+    for key in ("message", "msg", "error", "code", "state", "errmsg", "errcode"):
+        value = str(task.get(key) or "").strip()
+        if value and value not in details:
+            details.append(value)
+    suffix = ": " + ", ".join(details) if details else ""
+    return "115 offline task ended with status: %s%s" % (task.get("status_name") or "failed", suffix)
 
 
 def subscription_source_block_is_effective(block):
