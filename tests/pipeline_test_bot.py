@@ -3844,7 +3844,7 @@ class TelegramBotTest(unittest.TestCase):
         self.assertEqual(service.statuses_calls, [])
         self.assertEqual(saved["status_name"], "cancelled")
         self.assertEqual(saved["auto_cancelled_at"], 8200)
-        self.assertIn("超过7200秒", saved["auto_cancel_reason"])
+        self.assertIn("超过3600秒", saved["auto_cancel_reason"])
         self.assertEqual(telegram.messages[0]["chat_id"], 9001)
         self.assertIn("任务超时已自动取消", telegram.messages[0]["text"])
         self.assertIn("当前状态：已取消 · 80%", telegram.messages[0]["text"])
