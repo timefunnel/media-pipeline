@@ -84,6 +84,7 @@ def search_profile_indexer_results(
     early_return_after_seconds=DEFAULT_PROWLARR_EARLY_RETURN_AFTER_SECONDS,
     early_return_min_results=DEFAULT_PROWLARR_EARLY_RETURN_MIN_RESULTS,
     early_return_required_priority=DEFAULT_PROWLARR_EARLY_RETURN_REQUIRED_PRIORITY,
+    required_indexer_names=(),
 ):
     if indexers is None:
         indexers = prowlarr.indexers()
@@ -115,6 +116,7 @@ def search_profile_indexer_results(
         early_return_after_seconds=early_return_after_seconds,
         early_return_min_results=early_return_min_results,
         early_return_required_priority=early_return_required_priority,
+        required_indexer_names=required_indexer_names,
     )
 
 
@@ -196,6 +198,7 @@ def search_indexers_concurrently(
     early_return_after_seconds=DEFAULT_PROWLARR_EARLY_RETURN_AFTER_SECONDS,
     early_return_min_results=DEFAULT_PROWLARR_EARLY_RETURN_MIN_RESULTS,
     early_return_required_priority=DEFAULT_PROWLARR_EARLY_RETURN_REQUIRED_PRIORITY,
+    required_indexer_names=(),
 ):
     results = []
     if not indexers:
@@ -208,6 +211,7 @@ def search_indexers_concurrently(
     future_started = {future: time.monotonic() for future in future_to_indexer}
     pending = set(future_to_indexer)
     required_futures = required_priority_futures(future_to_indexer, early_return_required_priority)
+    required_futures.update(required_named_futures(future_to_indexer, required_indexer_names))
     started = time.monotonic()
     deadline = started + max(0, float(timeout_seconds or 0))
     early_after = float(early_return_after_seconds or 0)
@@ -290,6 +294,18 @@ def required_priority_futures(future_to_indexer, required_priority):
         if priority <= threshold:
             required.add(future)
     return required
+
+
+def required_named_futures(future_to_indexer, names):
+    wanted = {str(name or "").strip().casefold() for name in names or ()}
+    wanted.discard("")
+    if not wanted:
+        return set()
+    return {
+        future
+        for future, indexer in future_to_indexer.items()
+        if str(indexer.get("name") or "").strip().casefold() in wanted
+    }
 
 
 def should_early_return_indexer_search(now, early_deadline, results, pending, required_futures, min_results):

@@ -366,6 +366,9 @@ class FakePipelineService:
             metadata={"profile": category},
         )
 
+    def search_subscription_follow(self, query, category, limit=20):
+        return self.search(query, category, limit=limit)
+
     def search_capabilities(self):
         return {"pansou": True, "bt4g": True, "llm_rerank": False}
 
@@ -914,6 +917,31 @@ class SubtitleApiTest(InternalApiTestCase):
 
 
 class SearchResponseTest(InternalApiTestCase):
+    def test_subscription_follow_uses_the_dedicated_follow_search(self):
+        class FollowSearchService(FakePipelineService):
+            def __init__(self):
+                super().__init__()
+                self.follow_calls = []
+
+            def search(self, *_args, **_kwargs):
+                raise AssertionError("subscription follow must use the dedicated search path")
+
+            def search_subscription_follow(self, query, category, limit=20):
+                self.follow_calls.append((query, category, limit))
+                return ResultList(
+                    [{"title": "Test Show 176 2160p", "download_uri": "magnet:?xt=urn:btih:FOLLOW", "rank": 1}],
+                    metadata={"profile": "anime"},
+                )
+
+        service = FollowSearchService()
+        _, _, _, application = self.build_components(service)
+        response = application.search(
+            {"owner_id": "owner-a", "query": "Test Show 176", "category": "anime", "source": "default", "subscription_follow": True}
+        )
+
+        self.assertEqual(service.follow_calls, [("Test Show 176", "anime", 200)])
+        self.assertEqual(response["items"][0]["title"], "Test Show 176 2160p")
+
     def test_empty_search_is_a_successful_response_with_pansou_capability(self):
         class EmptySearchService(FakePipelineService):
             def search(self, query, category, limit=20):

@@ -2918,6 +2918,8 @@ class InternalApiApplication:
                 result = self.service.search_pansou(query, limit=search_limit)
             elif source == "bt4g":
                 result = self.service.search_bt4g(query, limit=search_limit)
+            elif subscription_follow:
+                result = self.service.search_subscription_follow(query, category, limit=search_limit)
             else:
                 result = self.service.search(query, category, limit=search_limit)
         except ApiError as exc:

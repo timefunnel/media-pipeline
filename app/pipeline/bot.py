@@ -411,6 +411,7 @@ from pipeline.subtitle_asr import (
 )
 TYPING_ACTION_INTERVAL_SECONDS = 4
 DEFAULT_BT4G_SEARCH_TIMEOUT_SECONDS = 12
+DEFAULT_SUBSCRIPTION_FOLLOW_SEARCH_TIMEOUT_SECONDS = 45
 DEFAULT_SUBSCRIPTION_STAGING_ROOT = "/115/临时"
 
 
@@ -426,6 +427,7 @@ class BotConfig:
     prowlarr_config: str = DEFAULT_PROWLARR_CONFIG
     prowlarr_search_timeout_seconds: int = DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS
     prowlarr_bt4g_search_timeout_seconds: int = DEFAULT_BT4G_SEARCH_TIMEOUT_SECONDS
+    prowlarr_subscription_follow_search_timeout_seconds: int = DEFAULT_SUBSCRIPTION_FOLLOW_SEARCH_TIMEOUT_SECONDS
     pansou_enabled: bool = False
     pansou_url: str = DEFAULT_PANSOU_URL
     pansou_token: str = ""
@@ -582,6 +584,15 @@ class BotConfig:
                     env.get(
                         "PROWLARR_BT4G_SEARCH_TIMEOUT_SECONDS",
                         str(DEFAULT_BT4G_SEARCH_TIMEOUT_SECONDS),
+                    )
+                ),
+            ),
+            prowlarr_subscription_follow_search_timeout_seconds=max(
+                1,
+                int(
+                    env.get(
+                        "PROWLARR_SUBSCRIPTION_FOLLOW_SEARCH_TIMEOUT_SECONDS",
+                        str(DEFAULT_SUBSCRIPTION_FOLLOW_SEARCH_TIMEOUT_SECONDS),
                     )
                 ),
             ),
@@ -1807,7 +1818,7 @@ class PipelineBotService:
             self._search_capabilities_cached_at = now
             return dict(capabilities)
 
-    def search(self, query, category, limit=DEFAULT_SEARCH_LIMIT, profile=None):
+    def search(self, query, category, limit=DEFAULT_SEARCH_LIMIT, profile=None, subscription_follow=False):
         profile = profile or search_profile_for_query(category, query)
         stats = SearchStats()
         categories_by_profile = self.config.search_profile_categories or SEARCH_PROFILE_CATEGORIES
@@ -1822,6 +1833,10 @@ class PipelineBotService:
             profile,
             self.config.prowlarr_search_timeout_seconds,
         )
+        required_indexer_names = ()
+        if subscription_follow:
+            timeout_seconds = max(timeout_seconds, self.config.prowlarr_subscription_follow_search_timeout_seconds)
+            required_indexer_names = ("BT4G",)
         api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
         prowlarr = ProwlarrClient(
             self.config.prowlarr_url,
@@ -1839,6 +1854,7 @@ class PipelineBotService:
         search_settings = {
             "upstream_limit": int(upstream_limit),
             "timeout_seconds": int(timeout_seconds),
+            "required_indexers": list(required_indexer_names),
             "max_workers": int(max_workers),
             "categories": list(categories_by_profile.get(profile, ())),
             "tag_labels": list(tag_labels_by_profile.get(profile, ())),
@@ -1863,6 +1879,7 @@ class PipelineBotService:
             early_return_after_seconds=self.config.prowlarr_early_return_after_seconds,
             early_return_min_results=self.config.prowlarr_early_return_min_results,
             early_return_required_priority=self.config.prowlarr_early_return_required_priority,
+            required_indexer_names=required_indexer_names,
         )
         empty_metadata = stats.to_metadata(
             profile=profile,
@@ -1884,6 +1901,9 @@ class PipelineBotService:
             ranked,
             metadata=stats.to_metadata(profile=profile, raw_count=len(candidates), selected_count=len(ranked), settings=search_settings),
         )
+
+    def search_subscription_follow(self, query, category, limit=DEFAULT_SEARCH_LIMIT):
+        return self.search(query, category, limit=limit, subscription_follow=True)
 
     def rerank_search_candidates(self, query, category, candidates):
         if not self.config.llm_search_rerank_enabled:

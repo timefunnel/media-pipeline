@@ -2345,6 +2345,54 @@ class SearchProfileTest(unittest.TestCase):
         self.assertEqual(metadata["skipped_count"], 1)
         self.assertEqual(next(source for source in metadata["sources"] if source["source"] == "SlowLowPriority")["status"], "skipped")
 
+    def test_profile_search_waits_for_explicit_required_indexer(self):
+        import time
+
+        from pipeline.bot import SEARCH_PROFILE_GENERAL, search_profile_indexer_results
+        from pipeline.search_stats import SearchStats
+
+        class DelayedProwlarr(FakeProwlarr):
+            def search(self, query, limit=20, indexer_ids=None, categories=None):
+                if tuple(indexer_ids or []) == (2,):
+                    time.sleep(0.05)
+                return super().search(query, limit=limit, indexer_ids=indexer_ids, categories=categories)
+
+        fake_prowlarr = DelayedProwlarr(
+            [],
+            indexers=[
+                {"id": 1, "name": "FastIndexer", "enable": True, "priority": 5, "capabilities": {"categories": [{"id": 2000}]}},
+                {"id": 2, "name": "BT4G", "enable": True, "priority": 15, "capabilities": {"categories": [{"id": 2000}]}},
+            ],
+            indexer_results={
+                (1,): [
+                    {"title": "Sintel Fast 1", "indexer": "FastIndexer", "seeders": 2, "infoHash": "F1"},
+                    {"title": "Sintel Fast 2", "indexer": "FastIndexer", "seeders": 2, "infoHash": "F2"},
+                ],
+                (2,): [{"title": "Sintel BT4G", "indexer": "BT4G", "seeders": 2, "infoHash": "B1"}],
+            },
+        )
+        stats = SearchStats()
+
+        started = time.monotonic()
+        results = search_profile_indexer_results(
+            fake_prowlarr,
+            "sintel",
+            SEARCH_PROFILE_GENERAL,
+            100,
+            indexers=fake_prowlarr.indexers(),
+            timeout_seconds=0.5,
+            stats=stats,
+            max_workers=2,
+            early_return_after_seconds=0.01,
+            early_return_min_results=2,
+            early_return_required_priority=10,
+            required_indexer_names=("BT4G",),
+        )
+
+        self.assertGreaterEqual(time.monotonic() - started, 0.04)
+        self.assertEqual({item["infoHash"] for item in results}, {"F1", "F2", "B1"})
+        self.assertEqual(stats.to_metadata(raw_count=len(results), selected_count=len(results))["skipped_count"], 0)
+
     def test_bot_search_uses_profile_specific_tuning_settings(self):
         from pipeline.bot import BotConfig, PipelineBotService, SEARCH_PROFILE_ADULT
         from pipeline.search_stats import search_result_metadata
@@ -2380,6 +2428,41 @@ class SearchProfileTest(unittest.TestCase):
         self.assertEqual(metadata["settings"]["timeout_seconds"], 8)
         self.assertEqual(metadata["settings"]["max_workers"], 1)
         self.assertEqual(prowlarr_cls.call_args.kwargs["timeout"], 8)
+
+    def test_bot_subscription_follow_requires_bt4g_with_extended_timeout(self):
+        from pipeline.bot import BotConfig, PipelineBotService, SEARCH_PROFILE_ANIME
+        from pipeline.search_stats import search_result_metadata
+
+        fake_prowlarr = FakeProwlarr(
+            [],
+            indexers=[
+                {"id": 1, "name": "Mikan", "enable": True, "priority": 5, "capabilities": {"categories": [{"id": 2000}]}},
+                {"id": 2, "name": "BT4G", "enable": True, "priority": 15, "capabilities": {"categories": [{"id": 2000}]}},
+            ],
+            indexer_results={
+                (1,): [{"title": "Test Show 176 1080p", "indexer": "Mikan", "seeders": 2, "infoHash": "M1"}],
+                (2,): [{"title": "Test Show 176 2160p", "indexer": "BT4G", "seeders": 2, "infoHash": "B1"}],
+            },
+        )
+
+        with patch("pipeline.bot.ProwlarrConfig") as config_cls, patch("pipeline.bot.ProwlarrClient", return_value=fake_prowlarr) as prowlarr_cls:
+            config_cls.return_value.load_api_key.return_value = "prowlarr-key"
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    search_profile_timeout_seconds={SEARCH_PROFILE_ANIME: 4},
+                    prowlarr_subscription_follow_search_timeout_seconds=45,
+                )
+            )
+            results = service.search_subscription_follow("Test Show 176", "anime", limit=5)
+
+        metadata = search_result_metadata(results)
+        self.assertEqual({item["infoHash"] for item in results}, {"M1", "B1"})
+        self.assertEqual(metadata["settings"]["timeout_seconds"], 45)
+        self.assertEqual(metadata["settings"]["required_indexers"], ["BT4G"])
+        self.assertEqual(prowlarr_cls.call_args.kwargs["timeout"], 45)
 
     def test_bot_search_bt4g_uses_only_bt4g_indexer(self):
         from pipeline.bot import BotConfig, PipelineBotService, SEARCH_PROFILE_GENERAL

@@ -211,6 +211,7 @@ class BotConfigTest(unittest.TestCase):
                 "PROWLARR_PROFILE_GENERAL_TIMEOUT_SECONDS": "3",
                 "PROWLARR_PROFILE_ADULT_TIMEOUT_SECONDS": "5",
                 "PROWLARR_PROFILE_ANIME_TIMEOUT_SECONDS": "2",
+                "PROWLARR_SUBSCRIPTION_FOLLOW_SEARCH_TIMEOUT_SECONDS": "45",
                 "PROWLARR_PROFILE_GENERAL_MAX_WORKERS": "4",
                 "PROWLARR_PROFILE_ADULT_MAX_WORKERS": "6",
                 "PROWLARR_PROFILE_ANIME_MAX_WORKERS": "2",
@@ -238,6 +239,7 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.search_profile_timeout_seconds["general"], 3)
         self.assertEqual(config.search_profile_timeout_seconds["adult"], 5)
         self.assertEqual(config.search_profile_timeout_seconds["anime"], 2)
+        self.assertEqual(config.prowlarr_subscription_follow_search_timeout_seconds, 45)
         self.assertEqual(config.search_profile_max_workers["general"], 4)
         self.assertEqual(config.search_profile_max_workers["adult"], 6)
         self.assertEqual(config.search_profile_max_workers["anime"], 2)
