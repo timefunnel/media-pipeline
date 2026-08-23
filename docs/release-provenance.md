@@ -18,15 +18,15 @@ Before server verification or production deployment, run:
 The gate rejects shallow clones, dirty worktrees, commits outside the remote
 branch ancestry, and tags that do not resolve to the requested commit.
 
-Protected development branches must reject force pushes and deletion, and
-require pull requests. Before any history migration, first push an
+Protected release branches must reject force pushes and deletion. Direct
+updates to `main` are allowed only after the user explicitly authorizes a
+release and the exact release tag is created. Before any history migration, first push an
 `archive/...` tag for every legacy tip. A `forced-update` or shallow fetch is a
 release blocker until the ancestry and semantic differences are audited.
 
 ## Branch Protection
 
-As of 2026-08-23, this public repository has an active GitHub ruleset named
-`Protect codex/local-dev`. It targets only `codex/local-dev`, requires pull
-requests, and blocks branch deletion and force pushes. The provenance script
-and annotated release tags remain mandatory release gates alongside that
-server-side protection.
+The active GitHub ruleset targets `main`, blocks branch deletion and force
+pushes, and permits direct release updates after explicit user authorization.
+The provenance script and annotated release tags remain mandatory release gates
+alongside that server-side protection.
