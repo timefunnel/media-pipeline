@@ -1798,6 +1798,8 @@ class ImportTaskManager:
         offline_wait_deadline = time.monotonic() + self.offline_wait_slice_seconds
         while offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
             status_name = offline_task.get("status_name")
+            if status_name in {"cancelled", "canceled"}:
+                raise ImportCanceled("import task canceled")
             if status_name in OFFLINE_FAILED_STATUSES:
                 raise RuntimeError(format_offline_task_failure(offline_task))
             if status_name not in OFFLINE_ACTIVE_STATUSES:
@@ -2277,6 +2279,8 @@ class ImportTaskManager:
                             offline_wait_deadline = time.monotonic() + self.offline_wait_slice_seconds
                             while offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
                                 status_name = offline_task.get("status_name")
+                                if status_name in {"cancelled", "canceled"}:
+                                    raise ImportCanceled("import task canceled")
                                 if status_name in OFFLINE_FAILED_STATUSES:
                                     raise RuntimeError(format_offline_task_failure(offline_task))
                                 if status_name not in OFFLINE_ACTIVE_STATUSES:
@@ -2295,17 +2299,16 @@ class ImportTaskManager:
                                     self.store.save_running(
                                         task["id"], "waiting_download", result=result, info_hash=info_hash
                                     )
-                                    if offline_task.get("status_name") != OFFLINE_SUCCESS_STATUS:
-                                        error = RuntimeError(
-                                            "115 offline task exceeded %s seconds without success" % ACTIVE_115_TIMEOUT_SECONDS
-                                        )
-                                        persist_blocked_source(
-                                            error,
-                                            block_reason="offline_failed",
-                                            outcome="source_unavailable",
-                                        )
-                                        raise error
-                                    continue
+                                    error = RuntimeError(
+                                        "115 offline task exceeded %s seconds and was canceled"
+                                        % ACTIVE_115_TIMEOUT_SECONDS
+                                    )
+                                    persist_blocked_source(
+                                        error,
+                                        block_reason="offline_failed",
+                                        outcome="source_unavailable",
+                                    )
+                                    raise ImportCanceled("import task canceled")
                                 self.store.save_running(
                                     task["id"], "waiting_download", result=result, info_hash=info_hash
                                 )

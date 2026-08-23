@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -2034,6 +2035,35 @@ class ImportPersistenceTest(InternalApiTestCase):
 
 
 class ImportResultSemanticsTest(InternalApiTestCase):
+    def test_canceled_offline_task_finishes_import_as_canceled(self):
+        service = FakePipelineService(download_delay=0.01)
+        service, _store, manager, application = self.build_components(service)
+
+        def canceled_status(category, info_hash):
+            service.task_status_calls.append((category, info_hash))
+            return {
+                "info_hash": info_hash,
+                "name": "120集全",
+                "status_name": "cancelled",
+                "percent_done": 0,
+            }
+
+        service.task_status = canceled_status
+        session_id, candidate_id, _ = self.search_candidate(application)
+        task, _ = manager.create_import(
+            "owner-a", "canceled-offline-task", self.import_payload(session_id, candidate_id)
+        )
+
+        manager.start()
+        try:
+            canceled = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(canceled["status"], "canceled")
+        self.assertEqual(canceled["stage"], "canceled")
+        self.assertEqual(canceled["error"], "import task canceled")
+
     def test_media_id_with_subtitle_failure_is_completed_with_warning(self):
         service, store, manager, application = self.build_components(FakePipelineService(warning=True))
         session_id, candidate_id, _ = self.search_candidate(application)
@@ -2319,6 +2349,34 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         audit = {"offline_started_at": 100}
         self.assertFalse(subscription_offline_wait_timed_out(audit, now=99 + ACTIVE_115_TIMEOUT_SECONDS))
         self.assertTrue(subscription_offline_wait_timed_out(audit, now=100 + ACTIVE_115_TIMEOUT_SECONDS))
+
+    def test_subscription_offline_timeout_is_canceled_after_cancel_response_reports_success(self):
+        service = FakePipelineService(download_delay=0.01)
+        service, store, manager, application = self.build_components(service)
+
+        def cancel_reports_success(category, info_hash):
+            service.cancel_calls.append((category, info_hash))
+            return {"info_hash": info_hash, "status_name": "success"}
+
+        service.cancel_task = cancel_reports_success
+        task, _ = manager.create_import(
+            "owner-a", "fanren-offline-timeout", self.payload(application, service)
+        )
+
+        with mock.patch("pipeline.internal_api.subscription_offline_wait_timed_out", return_value=True):
+            manager.start()
+            try:
+                canceled = self.wait_final(manager, "owner-a", task["id"])
+            finally:
+                manager.stop()
+
+        self.assertEqual(canceled["status"], "canceled")
+        self.assertEqual(canceled["stage"], "canceled")
+        self.assertEqual(canceled["error"], "import task canceled")
+        self.assertEqual(service.cancel_calls, [("anime", "HASH001")])
+        self.assertEqual(store.get_subscription_source_block(subscription_source_block_key(
+            canceled["request"]["candidate"]["download_uri"]
+        ))["reason"], "offline_failed")
 
     def test_subscription_search_excludes_blocked_source_and_returns_an_alternative(self):
         service, store, _manager, application = self.build_components()
