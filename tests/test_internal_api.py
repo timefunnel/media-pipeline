@@ -3083,6 +3083,44 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(retried["result"]["submit"], submit_result)
         self.assertEqual(retried["result"]["subscription_follow"]["staging"], staging)
 
+    def test_retry_preserves_active_subscription_offline_task_without_resubmitting(self):
+        service, store, manager, application = self.build_components()
+        task, _ = manager.create_import("owner-a", "fanren-retry-active-offline", self.payload(application, service))
+        staging = {
+            "receive_root_folder_id": "temporary-root-cid",
+            "receive_root_path": "/115/temp",
+            "openlist_path": "/115/temp/staging/retry-active",
+        }
+        submit_result = {
+            "submit_kind": "115_offline",
+            "tasks": [{"info_hash": "ACTIVEHASH", "status_name": "downloading"}],
+            "task_status": {"info_hash": "ACTIVEHASH", "status_name": "downloading"},
+        }
+        result = {
+            "submit": submit_result,
+            "task": {"info_hash": "ACTIVEHASH", "status_name": "downloading", "percent_done": 0},
+            "subscription_follow": {"staging": staging},
+        }
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                update internal_api_imports
+                set status = 'failed', stage = 'failed', result_json = ?, error = ?, info_hash = ?
+                where id = ?
+                """,
+                (json.dumps(result), "temporary OpenList error", "ACTIVEHASH", task["id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        retried = manager.retry_import("owner-a", task["id"])
+
+        self.assertEqual(retried["status"], "queued")
+        self.assertEqual(retried["info_hash"], "ACTIVEHASH")
+        self.assertEqual(retried["result"]["submit"], submit_result)
+
     def test_received_share_with_unknown_root_item_fails_without_resubmitting(self):
         service, store, manager, application = self.build_components()
         payload = self.payload(application, service)

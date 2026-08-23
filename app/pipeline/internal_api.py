@@ -748,7 +748,14 @@ class InternalApiStore:
             retry_resubmit = subscription_retry_resubmit(result, request, row["msg_media_id"])
             preserve_sync = bool(
                 not retry_resubmit
-                and (row["msg_media_id"] or result_task_is_offline_success(result))
+                and (
+                    row["msg_media_id"]
+                    or result_task_is_offline_success(result)
+                    or (
+                        request.get("subscription_follow")
+                        and result_task_is_offline_active(result)
+                    )
+                )
             )
             resume_stage = warning_retry_stage(result, request) if preserve_sync else ""
             if retry_resubmit:
@@ -3833,6 +3840,13 @@ def first_submit_info_hash(result):
 
 def result_task_is_offline_success(result):
     return isinstance(result, dict) and (result.get("task") or {}).get("status_name") == OFFLINE_SUCCESS_STATUS
+
+
+def result_task_is_offline_active(result):
+    return (
+        isinstance(result, dict)
+        and (result.get("task") or {}).get("status_name") in OFFLINE_ACTIVE_STATUSES
+    )
 
 
 def subscription_direct_receive_scan_ready(result):
