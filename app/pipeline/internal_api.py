@@ -2155,10 +2155,14 @@ class ImportTaskManager:
 
             direct_receive = subscription_receives_directly_to_staging(staging)
             if direct_receive and not staging.get("claimed_at"):
-                if result.get("submit"):
+                if subscription_direct_receive_scan_ready(result):
                     staging_state = inspect_staging(staging)
                     has_staged_files = bool(staging_state.get("entries"))
                 else:
+                    # While 115 is still active, the receive directory is not
+                    # authoritative yet. Avoid an early OpenList scan here:
+                    # a transient listing/TLS error must not abort the 115
+                    # wait before the shared long-offline timeout is reached.
                     has_staged_files = False
             else:
                 staging_state = inspect_staging(staging)
@@ -2169,7 +2173,7 @@ class ImportTaskManager:
                     self._acquire_target_lock(receive_lock)
                 try:
                     if direct_receive:
-                        if result.get("submit"):
+                        if subscription_direct_receive_scan_ready(result):
                             staging_state = inspect_staging(staging)
                             has_staged_files = bool(staging_state.get("entries"))
                         else:
@@ -3829,6 +3833,11 @@ def first_submit_info_hash(result):
 
 def result_task_is_offline_success(result):
     return isinstance(result, dict) and (result.get("task") or {}).get("status_name") == OFFLINE_SUCCESS_STATUS
+
+
+def subscription_direct_receive_scan_ready(result):
+    """Only inspect direct receive staging after 115 reports offline success."""
+    return bool(isinstance(result, dict) and result.get("submit") and result_task_is_offline_success(result))
 
 
 def subscription_retry_resubmit(result, request, msg_media_id=None):

@@ -2081,6 +2081,32 @@ class ImportResultSemanticsTest(InternalApiTestCase):
 
 
 class SubscriptionFollowImportTest(InternalApiTestCase):
+    def test_direct_receive_does_not_scan_staging_before_115_success(self):
+        service = FakePipelineService(download_delay=0.02)
+        service, _store, manager, application = self.build_components(service)
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115}
+        ]
+        inspected = []
+        original_inspect = service.inspect_subscription_staging
+
+        def inspect_after_success(category, staging, season, episode_hints=None):
+            inspected.append(dict(staging))
+            return original_inspect(category, staging, season, episode_hints)
+
+        service.inspect_subscription_staging = inspect_after_success
+        task, _ = manager.create_import(
+            "owner-a", "direct-receive-waits-for-115", self.payload(application, service)
+        )
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertGreaterEqual(len(inspected), 1)
+
     def test_episode_filename_parser_does_not_treat_resolution_as_episode(self):
         self.assertEqual(parse_follow_episode("凡人修仙传.S01E115.1080p.mkv", 1), 115)
         self.assertEqual(parse_follow_episode("第120集.mp4", 1), 120)
