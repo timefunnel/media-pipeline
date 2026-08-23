@@ -2306,6 +2306,12 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
 
         self.assertEqual(subscription_source_block_key(first), subscription_source_block_key(second))
 
+    def test_subscription_source_block_key_ignores_prowlarr_download_token(self):
+        first = "prowlarr-download://14?link=first-token&file=%E9%81%AE%E5%A4%A9.176.2160p"
+        second = "prowlarr-download://14?link=rotated-token&file=%E9%81%AE%E5%A4%A9.176.2160p"
+
+        self.assertEqual(subscription_source_block_key(first), subscription_source_block_key(second))
+
     def test_subscription_offline_wait_uses_the_shared_115_auto_cancel_timeout(self):
         from pipeline.internal_api import subscription_offline_wait_timed_out
         from pipeline.task_state import ACTIVE_115_TIMEOUT_SECONDS

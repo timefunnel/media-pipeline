@@ -192,6 +192,7 @@ class InternalApiStore:
                 )
                 """
             )
+            migrate_subscription_source_block_aliases(conn)
             conn.execute(
                 """
                 create table if not exists internal_api_subtitle_asr_tasks (
@@ -3591,10 +3592,44 @@ def subscription_source_block_key(download_uri):
     parsed = parse_115_share_url(uri)
     if parsed is not None:
         return "115-share:%s:%s" % (parsed.share_code.casefold(), str(parsed.pdir_fid or "0").strip() or "0")
+    if urllib.parse.urlsplit(uri).scheme.casefold() == "prowlarr-download":
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(uri).query)
+        file_name = str((query.get("file") or [""])[0]).strip()
+        if file_name:
+            return "prowlarr-file-sha256:" + hashlib.sha256(file_name.casefold().encode("utf-8")).hexdigest()
     info_hash = str(candidate_info_hash({"download_uri": uri}) or "").strip().casefold()
     if info_hash:
         return "info-hash:" + info_hash
     return "uri-sha256:" + hashlib.sha256(uri.encode("utf-8")).hexdigest()
+
+
+def migrate_subscription_source_block_aliases(conn):
+    """Add stable Prowlarr filename aliases for legacy URI-hash blocks."""
+    rows = conn.execute(
+        """
+        select b.source_key, b.reason, b.origin_import_id, b.created_at, i.request_json
+        from internal_api_subscription_source_blocks b
+        left join internal_api_imports i on i.id = b.origin_import_id
+        where b.source_key like 'uri-sha256:%'
+        """
+    ).fetchall()
+    for row in rows:
+        try:
+            request = json.loads(row["request_json"] or "{}")
+            uri = (request.get("candidate") or {}).get("download_uri")
+            alias = subscription_source_block_key(uri)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not alias or alias == row["source_key"]:
+            continue
+        conn.execute(
+            """
+            insert or ignore into internal_api_subscription_source_blocks
+                (source_key, reason, origin_import_id, created_at)
+            values (?, ?, ?, ?)
+            """,
+            (alias, row["reason"], row["origin_import_id"], row["created_at"]),
+        )
 
 
 def subscription_receives_directly_to_staging(staging):
