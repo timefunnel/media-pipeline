@@ -1810,15 +1810,6 @@ class PipelineBotService:
     def search(self, query, category, limit=DEFAULT_SEARCH_LIMIT, profile=None):
         profile = profile or search_profile_for_query(category, query)
         stats = SearchStats()
-        api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
-        prowlarr = ProwlarrClient(
-            self.config.prowlarr_url,
-            api_key,
-            timeout=self.config.prowlarr_search_timeout_seconds,
-            search_cache=self._prowlarr_search_cache,
-        )
-        indexers = prowlarr.indexers()
-        tags = safe_prowlarr_tags(prowlarr)
         categories_by_profile = self.config.search_profile_categories or SEARCH_PROFILE_CATEGORIES
         tag_labels_by_profile = self.config.search_profile_tag_labels or SEARCH_PROFILE_TAG_LABELS
         upstream_limit = search_profile_value(
@@ -1831,6 +1822,15 @@ class PipelineBotService:
             profile,
             self.config.prowlarr_search_timeout_seconds,
         )
+        api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
+        prowlarr = ProwlarrClient(
+            self.config.prowlarr_url,
+            api_key,
+            timeout=max(self.config.prowlarr_search_timeout_seconds, timeout_seconds),
+            search_cache=self._prowlarr_search_cache,
+        )
+        indexers = prowlarr.indexers()
+        tags = safe_prowlarr_tags(prowlarr)
         max_workers = search_profile_value(
             self.config.search_profile_max_workers,
             profile,

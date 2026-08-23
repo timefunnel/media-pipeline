@@ -2359,7 +2359,7 @@ class SearchProfileTest(unittest.TestCase):
             },
         )
 
-        with patch("pipeline.bot.ProwlarrConfig") as config_cls, patch("pipeline.bot.ProwlarrClient", return_value=fake_prowlarr):
+        with patch("pipeline.bot.ProwlarrConfig") as config_cls, patch("pipeline.bot.ProwlarrClient", return_value=fake_prowlarr) as prowlarr_cls:
             config_cls.return_value.load_api_key.return_value = "prowlarr-key"
             service = PipelineBotService(
                 BotConfig(
@@ -2367,7 +2367,7 @@ class SearchProfileTest(unittest.TestCase):
                     {700656624},
                     "/tmp/state.db",
                     search_profile_upstream_limits={SEARCH_PROFILE_ADULT: 42},
-                    search_profile_timeout_seconds={SEARCH_PROFILE_ADULT: 2},
+                    search_profile_timeout_seconds={SEARCH_PROFILE_ADULT: 8},
                     search_profile_max_workers={SEARCH_PROFILE_ADULT: 1},
                 )
             )
@@ -2377,8 +2377,9 @@ class SearchProfileTest(unittest.TestCase):
         self.assertEqual([item["infoHash"] for item in results], ["S1"])
         self.assertEqual(fake_prowlarr.search_calls, [("MIDE-882", 42, (8,), (6000,))])
         self.assertEqual(metadata["settings"]["upstream_limit"], 42)
-        self.assertEqual(metadata["settings"]["timeout_seconds"], 2)
+        self.assertEqual(metadata["settings"]["timeout_seconds"], 8)
         self.assertEqual(metadata["settings"]["max_workers"], 1)
+        self.assertEqual(prowlarr_cls.call_args.kwargs["timeout"], 8)
 
     def test_bot_search_bt4g_uses_only_bt4g_indexer(self):
         from pipeline.bot import BotConfig, PipelineBotService, SEARCH_PROFILE_GENERAL
