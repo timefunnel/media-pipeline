@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -3104,6 +3105,8 @@ class InternalApiApplication:
         }
 
     def search_season_subtitles(self, payload):
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_request", "request body must be a JSON object")
         owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
         media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
         try:
@@ -3121,8 +3124,11 @@ class InternalApiApplication:
             raise ApiError(400, "invalid_limit", "limit must be an integer")
         if limit < 1 or limit > 50:
             raise ApiError(400, "invalid_limit", "limit must be between 1 and 50")
+        episodes = normalize_season_subtitle_episode_requests(payload.get("episodes"), season)
         try:
-            result = self.service.subtitle_search_season_candidates(media_id, season, title=title, limit=limit)
+            result = self.service.subtitle_search_season_candidates(
+                media_id, season, title=title, targets=episodes, limit=limit,
+            )
         except (RuntimeError, ValueError) as exc:
             raise ApiError(502, "subtitle_season_search_failed", str(exc))
         if not isinstance(result, dict) or not isinstance(result.get("candidates"), list):
@@ -3131,13 +3137,15 @@ class InternalApiApplication:
         for item in result.get("candidates") or []:
             if not isinstance(item, dict) or str(item.get("provider") or "") != "subhd":
                 raise ApiError(502, "subtitle_season_search_failed", "pipeline season subtitle search returned an invalid candidate")
-            candidates.append({**item, "media_id": media_id, "season": season})
+            candidates.append({**item, "season": season})
         metadata = {
             "media_id": media_id,
             "season": season,
             "title": title,
             "query": str(result.get("query") or ""),
             "category": str(result.get("category") or ""),
+            "detail_url": str(result.get("detail_url") or ""),
+            "detail_title": str(result.get("detail_title") or ""),
             "selected_count": len(candidates),
         }
         session_id, expires_at, stored = self.store.save_search(
@@ -3159,27 +3167,33 @@ class InternalApiApplication:
         owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
         media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
         session_id = require_text(payload.get("search_session_id"), "search_session_id", max_length=200)
-        candidate_id = require_text(payload.get("candidate_id"), "candidate_id", max_length=200)
         try:
             season = int(payload.get("season"))
         except (TypeError, ValueError):
             raise ApiError(400, "invalid_season", "season must be an integer")
         if season < 1 or season > 99:
             raise ApiError(400, "invalid_season", "season must be between 1 and 99")
-        loaded = self.store.load_search_candidate(owner_id, session_id, candidate_id)
-        if loaded.get("source") != "subtitle_season":
-            raise ApiError(404, "season_subtitle_candidate_not_found", "season subtitle candidate not found")
-        candidate = loaded.get("candidate")
-        if (
-            not isinstance(candidate, dict)
-            or str(candidate.get("media_id") or "").strip() != media_id
-            or int(candidate.get("season") or 0) != season
-            or str(candidate.get("provider") or "") != "subhd"
-        ):
-            raise ApiError(409, "season_subtitle_candidate_mismatch", "season subtitle candidate does not match this request")
+        requests = normalize_season_subtitle_episode_requests(
+            payload.get("episodes"), season, require_candidate=True,
+        )
+        targets = []
+        for request in requests:
+            loaded = self.store.load_search_candidate(owner_id, session_id, request["candidate_id"])
+            if loaded.get("source") != "subtitle_season":
+                raise ApiError(404, "season_subtitle_candidate_not_found", "season subtitle candidate not found")
+            candidate = loaded.get("candidate")
+            if (
+                not isinstance(candidate, dict)
+                or str(candidate.get("media_id") or "").strip() != request["media_id"]
+                or int(candidate.get("season") or 0) != season
+                or str(candidate.get("episode_key") or "").strip().upper() != request["episode_key"]
+                or str(candidate.get("provider") or "") != "subhd"
+            ):
+                raise ApiError(409, "season_subtitle_candidate_mismatch", "season subtitle candidate does not match this episode")
+            targets.append({**request, "candidate": candidate})
         try:
             return self.season_subtitle_manager.create_task(
-                owner_id, media_id, season, candidate, payload.get("episodes"),
+                owner_id, media_id, season, targets,
             )
         except (RuntimeError, ValueError) as exc:
             raise ApiError(400, "season_subtitle_task_invalid", str(exc))
@@ -3191,6 +3205,21 @@ class InternalApiApplication:
             return self.season_subtitle_manager.get_task(owner_id, task_id)
         except (RuntimeError, ValueError) as exc:
             raise ApiError(404, "season_subtitle_task_not_found", str(exc))
+
+    def retry_season_subtitle_task(self, task_id, payload):
+        if self.season_subtitle_manager is None:
+            raise ApiError(503, "season_subtitle_unavailable", "season subtitle task manager unavailable")
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_request", "request body must be a JSON object")
+        owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
+        try:
+            return self.season_subtitle_manager.retry_failed_task(
+                owner_id,
+                task_id,
+                payload.get("media_ids"),
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise ApiError(400, "season_subtitle_retry_invalid", str(exc))
 
     def preview_subtitle(self, payload):
         _owner_id, media_id, record = self._subtitle_candidate(payload)
@@ -3285,7 +3314,7 @@ class InternalApiApplication:
         session_id = require_text(payload.get("search_session_id"), "search_session_id", max_length=200)
         candidate_id = require_text(payload.get("candidate_id"), "candidate_id", max_length=200)
         loaded = self.store.load_search_candidate(owner_id, session_id, candidate_id)
-        if loaded.get("source") != "subtitles":
+        if loaded.get("source") not in {"subtitles", "subtitle_season"}:
             raise ApiError(404, "subtitle_candidate_not_found", "subtitle candidate not found")
         record = loaded.get("candidate")
         if not isinstance(record, dict) or str(record.get("media_id") or "").strip() != media_id:
@@ -3404,6 +3433,11 @@ class InternalApiServer:
                 return
             if handler.command == "POST" and path == "/v1/subtitles/season/apply":
                 task, created = self.application.create_season_subtitle_task(self._read_json(handler))
+                self._send_json(handler, 202 if created else 200, task)
+                return
+            if handler.command == "POST" and path.startswith("/v1/subtitles/season/tasks/") and path.endswith("/retry"):
+                task_id = path.split("/")[-2]
+                task, created = self.application.retry_season_subtitle_task(task_id, self._read_json(handler))
                 self._send_json(handler, 202 if created else 200, task)
                 return
             if handler.command == "GET" and path.startswith("/v1/subtitles/season/tasks/"):
@@ -3583,7 +3617,52 @@ def public_subtitle_candidate(item):
         "language": str(item.get("language") or ""),
         "source_score": int(item.get("source_score") or 0),
         "rank": int(item.get("rank") or 0),
+        "media_id": str(item.get("media_id") or ""),
+        "episode_key": str(item.get("episode_key") or ""),
+        "url": str(item.get("url") or ""),
+        "subtitle_group": str(item.get("subtitle_group") or ""),
+        "source_type": str(item.get("source_type") or ""),
+        "language_tags": public_text_list(item.get("language_tags")),
+        "formats": public_text_list(item.get("formats")),
+        "like_count": int(item.get("like_count") or 0),
+        "download_count": int(item.get("download_count") or 0),
+        "uploader": str(item.get("uploader") or ""),
+        "uploaded_at": str(item.get("uploaded_at") or ""),
+        "uploaded_date": str(item.get("uploaded_date") or ""),
     }
+
+
+def public_text_list(value):
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item).strip() for item in value if str(item or "").strip()]
+
+
+def normalize_season_subtitle_episode_requests(items, season, require_candidate=False):
+    if not isinstance(items, list) or not items:
+        raise ApiError(400, "season_subtitle_episodes_required", "season subtitle episodes are required")
+    if len(items) > 500:
+        raise ApiError(400, "season_subtitle_episode_limit", "season subtitle episode count exceeds 500")
+    expected_prefix = "S%02dE" % int(season)
+    seen_media_ids = set()
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ApiError(400, "season_subtitle_episode_invalid", "season subtitle episode is invalid")
+        media_id = require_text(item.get("media_id"), "episode media_id", max_length=200)
+        episode_key = require_text(item.get("episode_key"), "episode_key", max_length=20).upper()
+        if not re.fullmatch(r"S\d{2}E\d{2,3}", episode_key) or not episode_key.startswith(expected_prefix):
+            raise ApiError(400, "season_subtitle_episode_invalid", "season subtitle episode key is invalid")
+        if media_id in seen_media_ids:
+            raise ApiError(400, "season_subtitle_episode_duplicate", "season subtitle episode media_id is duplicated")
+        seen_media_ids.add(media_id)
+        normalized_item = {"media_id": media_id, "episode_key": episode_key}
+        if require_candidate:
+            normalized_item["candidate_id"] = require_text(
+                item.get("candidate_id"), "candidate_id", max_length=200,
+            )
+        normalized.append(normalized_item)
+    return normalized
 
 
 def owner_from_request(handler, query, body=None):

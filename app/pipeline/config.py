@@ -252,6 +252,15 @@ def msg_library_roots():
     return roots
 
 
+def configured_msg_library_roots():
+    roots = {}
+    for category in sorted(MSG_LIBRARY_ROOTS.keys()):
+        root = dict(MSG_LIBRARY_ROOTS[category])
+        if not msg_library_root_needs_discovery(root):
+            roots[category] = root
+    return roots
+
+
 def msg_library_root_needs_discovery(root):
     return is_placeholder_or_empty(root.get("library_id")) or is_placeholder_or_empty(root.get("root_id"))
 

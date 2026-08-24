@@ -155,6 +155,7 @@ class BotConfigTest(unittest.TestCase):
                 "SUBTITLE_PROVIDERS": "assrt,opensubtitles",
                 "SUBTITLE_SEARCH_TIMEOUT_SECONDS": "9",
                 "SUBTITLE_DOWNLOAD_MAX_BYTES": "123456",
+                "SUBHD_DOWNLOAD_MAX_BYTES": "654321",
                 "SUBTITLE_BACKFILL_DEFAULT_LIMIT": "7",
                 "ASSRT_API_TOKEN": "assrt-token",
                 "OPENSUBTITLES_API_KEY": "opensubtitles-key",
@@ -170,6 +171,7 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.subtitle_providers, ("assrt", "opensubtitles"))
         self.assertEqual(config.subtitle_search_timeout_seconds, 9)
         self.assertEqual(config.subtitle_download_max_bytes, 123456)
+        self.assertEqual(config.subhd_download_max_bytes, 654321)
         self.assertEqual(config.subtitle_backfill_default_limit, 7)
         self.assertEqual(config.assrt_api_token, "assrt-token")
         self.assertEqual(config.opensubtitles_api_key, "opensubtitles-key")
@@ -4330,6 +4332,25 @@ class LlmSearchRerankClientTest(unittest.TestCase):
 
 
 class PipelineBotServiceTest(unittest.TestCase):
+    def test_subtitle_category_ignores_unconfigured_unrelated_library(self):
+        import copy
+
+        from pipeline.bot import subtitle_category_from_media
+        from pipeline.config import MSG_LIBRARY_ROOTS
+
+        original_roots = copy.deepcopy(MSG_LIBRARY_ROOTS)
+        try:
+            MSG_LIBRARY_ROOTS["tv"]["library_id"] = "local-tv-library"
+            MSG_LIBRARY_ROOTS["tv"]["root_id"] = "local-tv-root"
+            MSG_LIBRARY_ROOTS["adult"]["library_id"] = "REPLACE_WITH_MSG_ADULT_LIBRARY_ID"
+            MSG_LIBRARY_ROOTS["adult"]["root_id"] = "REPLACE_WITH_MSG_ADULT_ROOT_ID"
+            category = subtitle_category_from_media({"library_id": "local-tv-library"})
+        finally:
+            MSG_LIBRARY_ROOTS.clear()
+            MSG_LIBRARY_ROOTS.update(original_roots)
+
+        self.assertEqual(category, "tv")
+
     def test_finalize_import_target_keeps_single_resource_directory_inside_permanent_container(self):
         from pipeline.bot import BotConfig, PipelineBotService
 

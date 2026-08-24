@@ -3,8 +3,10 @@ import html
 import http.cookiejar
 import io
 import json
+import locale
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import urllib.error
@@ -20,6 +22,7 @@ from pipeline.mediastation import extract_codes
 DEFAULT_SUBTITLE_CACHE_DIR = "/subtitle-cache"
 DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS = 12
 DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES = 2 * 1024 * 1024
+DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES = 32 * 1024 * 1024
 DEFAULT_SUBTITLE_PROVIDERS = ("subhd", "subtitlecat", "assrt", "opensubtitles")
 SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
 LOCAL_SUBTITLE_SCHEME = "local-subtitle"
@@ -252,11 +255,22 @@ class LocalSubtitleProvider:
 class SubHDProvider:
     name = "subhd"
 
-    def __init__(self, base_url=SUBHD_BASE_URL, transport=None, timeout=DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS, max_bytes=DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES):
+    def __init__(
+        self,
+        base_url=SUBHD_BASE_URL,
+        transport=None,
+        timeout=DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS,
+        max_bytes=DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES,
+        download_max_bytes=DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES,
+    ):
         self.base_url = str(base_url or SUBHD_BASE_URL).rstrip("/") + "/"
         self.transport = transport
         self.timeout = timeout
-        self.max_bytes = max_bytes
+        self.max_bytes = max(1024, int(max_bytes or DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES))
+        self.download_max_bytes = max(
+            self.max_bytes,
+            int(download_max_bytes or DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES),
+        )
 
     def enabled(self):
         return bool(self.base_url)
@@ -268,78 +282,73 @@ class SubHDProvider:
         transport = self._transport()
         url = urllib.parse.urljoin(self.base_url, "search/" + urllib.parse.quote(search_text, safe=""))
         text = transport.text_request(url, headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
-        return extract_subhd_search_results(text, self.base_url)
+        candidates = extract_subhd_search_results(text, self.base_url)
+        detail_pages = extract_subhd_search_detail_pages(text, self.base_url)
+        selected = select_subhd_season_detail_page(detail_pages, search_text)
+        if selected is None:
+            return candidates
+        detail_html = transport.text_request(
+            str(selected.get("url") or ""),
+            headers=self._headers(referer=url),
+            timeout=self.timeout,
+            max_bytes=self.max_bytes,
+        )
+        details = {
+            str(item.get("id") or ""): item
+            for item in extract_subhd_movie_detail_results(detail_html, self.base_url)
+        }
+        enriched = []
+        for candidate in candidates:
+            detail = details.get(str(candidate.get("id") or ""))
+            if detail is None:
+                enriched.append(candidate)
+                continue
+            source_score = int(candidate.get("_score") or 0)
+            media_title = str(candidate.get("media_title") or "")
+            enriched.append({**candidate, **detail, "_score": source_score, "media_title": media_title})
+        return enriched
+
+    def search_season(self, query, season):
+        search_text = str(query or "").strip()
+        if not search_text:
+            raise RuntimeError("SubHD season query missing")
+        try:
+            season = int(season)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("SubHD season must be an integer") from exc
+        if season < 1 or season > 99:
+            raise RuntimeError("SubHD season must be between 1 and 99")
+
+        transport = self._transport()
+        search_url = urllib.parse.urljoin(self.base_url, "search/" + urllib.parse.quote(search_text, safe=""))
+        search_html = transport.text_request(
+            search_url,
+            headers=self._headers(),
+            timeout=self.timeout,
+            max_bytes=self.max_bytes,
+        )
+        detail_pages = extract_subhd_search_detail_pages(search_html, self.base_url)
+        selected = select_subhd_season_detail_page(detail_pages, search_text)
+        if selected is None:
+            raise RuntimeError("SubHD season detail page match missing")
+        detail_url = str(selected.get("url") or "").strip()
+        detail_html = transport.text_request(
+            detail_url,
+            headers=self._headers(referer=search_url),
+            timeout=self.timeout,
+            max_bytes=self.max_bytes,
+        )
+        return {
+            "detail_url": detail_url,
+            "detail_title": str(selected.get("title") or ""),
+            "candidates": extract_subhd_detail_results(detail_html, season, self.base_url),
+        }
 
     def download(self, candidate, query, code=""):
         return self._download(candidate, query, code=code, require_chinese_body=True)
 
     def download_for_review(self, candidate, query, code=""):
         return self._download(candidate, query, code=code, require_chinese_body=False)
-
-    def download_season(self, candidate, query, code=""):
-        sid = str((candidate or {}).get("id") or (candidate or {}).get("provider_id") or "").strip()
-        if not re.fullmatch(r"[0-9A-Za-z_-]{2,32}", sid):
-            raise RuntimeError("SubHD subtitle id invalid")
-        if not subtitle_candidate_is_chinese(candidate):
-            raise RuntimeError("SubHD candidate is not Chinese")
-        transport = self._transport()
-        detail_url = urllib.parse.urljoin(self.base_url, "a/" + sid)
-        transport.text_request(detail_url, headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
-        prepare = transport.json_request(
-            "POST",
-            urllib.parse.urljoin(self.base_url, "api/sub/prepare-download"),
-            headers=self._headers(referer=detail_url),
-            data={"sid": sid},
-            timeout=self.timeout,
-        )
-        down_url = subhd_down_page_url(self.base_url, prepare, sid)
-        transport.text_request(
-            down_url,
-            headers=self._headers(referer=detail_url),
-            timeout=self.timeout,
-            max_bytes=self.max_bytes,
-        )
-        payload = transport.json_request(
-            "POST",
-            urllib.parse.urljoin(self.base_url, "api/sub/down"),
-            headers=self._headers(referer=down_url),
-            data={"sid": sid},
-            timeout=self.timeout,
-        )
-        download_url = subhd_download_url(payload)
-        extension = subtitle_extension(urllib.parse.urlparse(download_url).path)
-        body = transport.download(download_url, headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
-        if extension in (".zip", ".7z", ".rar"):
-            episode_keys = subhd_archive_episode_keys(body, extension, self.max_bytes, self.timeout)
-            downloads = []
-            for episode_key in episode_keys:
-                filename, subtitle_body = extract_chinese_subtitle_from_archive(
-                    body,
-                    extension,
-                    candidate,
-                    self.max_bytes,
-                    query=episode_key,
-                    timeout=self.timeout,
-                    require_chinese_body=True,
-                )
-                lang, label = subtitle_lang_label(filename, candidate.get("language"))
-                downloads.append(SubtitleDownload(
-                    source=self.name, provider_id=sid, filename=filename, body=subtitle_body,
-                    lang=lang, label=label, query=query, score=int((candidate or {}).get("_score") or 0),
-                ))
-            if not downloads:
-                raise RuntimeError("SubHD season archive contains no episode subtitle")
-            return downloads
-        if extension not in SUBTITLE_EXTENSIONS:
-            raise RuntimeError("SubHD subtitle archive unsupported: %s" % (extension or "unknown"))
-        filename = subhd_download_filename(candidate, sid, extension)
-        if not subtitle_body_is_chinese(body, filename):
-            raise RuntimeError("SubHD downloaded subtitle is not Chinese")
-        lang, label = subtitle_lang_label(filename, candidate.get("language"))
-        return [SubtitleDownload(
-            source=self.name, provider_id=sid, filename=filename, body=body,
-            lang=lang, label=label, query=query, score=int((candidate or {}).get("_score") or 0),
-        )]
 
     def _download(self, candidate, query, code="", require_chinese_body=True):
         sid = str((candidate or {}).get("id") or (candidate or {}).get("provider_id") or "").strip()
@@ -374,13 +383,18 @@ class SubHDProvider:
         )
         download_url = subhd_download_url(payload)
         extension = subtitle_extension(urllib.parse.urlparse(download_url).path)
-        body = transport.download(download_url, headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
+        body = transport.download(
+            download_url,
+            headers=self._headers(),
+            timeout=self.timeout,
+            max_bytes=self.download_max_bytes,
+        )
         if extension in (".zip", ".7z", ".rar"):
             filename, body = extract_chinese_subtitle_from_archive(
                 body,
                 extension,
                 candidate,
-                self.max_bytes,
+                self.download_max_bytes,
                 query=query,
                 timeout=self.timeout,
                 require_chinese_body=require_chinese_body,
@@ -772,6 +786,50 @@ class SubtitleMatcher:
             raise RuntimeError("; ".join(errors[:3]))
         return ranked_subtitle_candidate_records(records)
 
+    def search_season_candidates(self, query, season, targets, limit=20):
+        provider = next((item for item in self.providers if item.name == "subhd" and item.enabled()), None)
+        if provider is None:
+            raise RuntimeError("subtitle provider missing: subhd")
+        search_season = getattr(provider, "search_season", None)
+        if not callable(search_season):
+            raise RuntimeError("SubHD provider does not support season detail search")
+        result = search_season(query, season)
+        if not isinstance(result, dict) or not isinstance(result.get("candidates"), list):
+            raise RuntimeError("SubHD season detail search returned invalid response")
+
+        limit = max(1, min(50, int(limit or 20)))
+        by_episode = {}
+        for candidate in result.get("candidates") or []:
+            episode_key = str((candidate or {}).get("episode_key") or "").strip().upper()
+            if episode_key:
+                by_episode.setdefault(episode_key, []).append(candidate)
+        records = []
+        for target in targets or []:
+            media_id = str((target or {}).get("media_id") or "").strip()
+            episode_key = str((target or {}).get("episode_key") or "").strip().upper()
+            if not media_id or not episode_key:
+                raise RuntimeError("season subtitle target is invalid")
+            candidates = sorted(
+                by_episode.get(episode_key) or [],
+                key=subhd_detail_candidate_sort_key,
+            )[:limit]
+            for episode_rank, candidate in enumerate(candidates, start=1):
+                record = subtitle_candidate_record(provider, episode_key, "", candidate)
+                record.update(
+                    {
+                        "media_id": media_id,
+                        "season": int(season),
+                        "episode_key": episode_key,
+                        "rank": episode_rank,
+                    }
+                )
+                records.append(record)
+        return {
+            "detail_url": str(result.get("detail_url") or ""),
+            "detail_title": str(result.get("detail_title") or ""),
+            "candidates": records,
+        }
+
     def apply_candidate(self, media_id, candidate_record):
         media_id = str(media_id or "").strip()
         if not media_id:
@@ -797,25 +855,6 @@ class SubtitleMatcher:
             source=provider.name,
             query=query,
             filename=track.get("filename"),
-        )
-
-    def download_season_candidate(self, candidate_record):
-        provider_name = str((candidate_record or {}).get("provider") or "").strip()
-        if provider_name != "subhd":
-            raise RuntimeError("season subtitle candidate must use SubHD")
-        provider = next((item for item in self.providers if item.name == provider_name and item.enabled()), None)
-        if provider is None:
-            raise RuntimeError("subtitle provider not enabled: %s" % provider_name)
-        candidate = (candidate_record or {}).get("candidate")
-        if not isinstance(candidate, dict):
-            raise RuntimeError("subtitle candidate payload missing")
-        download_season = getattr(provider, "download_season", None)
-        if not callable(download_season):
-            raise RuntimeError("subtitle provider does not support season packages")
-        return download_season(
-            candidate,
-            str((candidate_record or {}).get("query") or "").strip(),
-            code=str((candidate_record or {}).get("code") or "").strip(),
         )
 
     def save_download(self, media_id, download):
@@ -862,6 +901,11 @@ def build_subtitle_matcher_from_config(config):
                 SubHDProvider(
                     timeout=getattr(config, "subtitle_search_timeout_seconds", DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS),
                     max_bytes=getattr(config, "subtitle_download_max_bytes", DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES),
+                    download_max_bytes=getattr(
+                        config,
+                        "subhd_download_max_bytes",
+                        DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES,
+                    ),
                 )
             )
         elif normalized == "subtitlecat":
@@ -912,7 +956,7 @@ def subtitle_result(status, count=0, source="", query="", filename="", reason=""
 
 def subtitle_candidate_record(provider, query, code, candidate):
     candidate = dict(candidate or {})
-    return {
+    record = {
         "provider": str(getattr(provider, "name", "") or ""),
         "query": str(query or ""),
         "code": str(code or ""),
@@ -923,6 +967,22 @@ def subtitle_candidate_record(provider, query, code, candidate):
         "source_score": int(candidate.get("_score") or 0),
         "candidate": candidate,
     }
+    for key in (
+        "url",
+        "subtitle_group",
+        "source_type",
+        "language_tags",
+        "formats",
+        "like_count",
+        "download_count",
+        "uploader",
+        "uploaded_at",
+        "uploaded_date",
+        "episode_key",
+    ):
+        if key in candidate:
+            record[key] = candidate[key]
+    return record
 
 
 def ranked_subtitle_candidate_records(records):
@@ -1139,7 +1199,8 @@ def extract_subhd_search_results(text, base_url=SUBHD_BASE_URL):
             segment,
             flags=re.IGNORECASE | re.DOTALL,
         )
-        metadata = strip_html_text(metadata_match.group("metadata") if metadata_match else "")
+        metadata_html = metadata_match.group("metadata") if metadata_match else ""
+        metadata = strip_html_text(metadata_html)
         if not subtitle_language_value_is_chinese(metadata):
             continue
         supported_formats = re.findall(
@@ -1160,6 +1221,41 @@ def extract_subhd_search_results(text, base_url=SUBHD_BASE_URL):
         format_match = re.search(r"(?<![A-Za-z])(?:ASS|SRT|SSA|VTT)(?![A-Za-z])", metadata, flags=re.IGNORECASE)
         extension = "." + format_match.group(0).lower() if format_match else ".srt"
         filename = safe_subtitle_filename(release + extension) or ("subhd-%s%s" % (sid, extension))
+        source_type = ""
+        language_tags = []
+        formats = []
+        for span in re.finditer(r"<span\b(?P<attrs>[^>]*)>(?P<body>.*?)</span>", metadata_html, flags=re.IGNORECASE | re.DOTALL):
+            attrs = span.group("attrs")
+            class_match = re.search(r"\bclass=[\"'](?P<class>[^\"']*)[\"']", attrs, flags=re.IGNORECASE)
+            classes = set((class_match.group("class") if class_match else "").split())
+            value = strip_html_text(span.group("body"))
+            if not value:
+                continue
+            if "text-white" in classes and not source_type:
+                source_type = value
+            elif "fw-bold" in classes:
+                language_tags.append(value)
+            elif "text-secondary" in classes:
+                formats.extend(re.findall(r"(?<![A-Za-z])(?:ASS|SRT|SSA|VTT|SUP|PGS|VOBSUB|IDX|SUB)(?![A-Za-z])", value, flags=re.IGNORECASE))
+        formats = unique_values([value.upper() for value in formats])
+        stats_match = re.search(
+            r"<div\b[^>]*class=[\"'][^\"']*\bpt-2\b[^\"']*\btext-secondary\b[^\"']*\bf12\b[^\"']*[\"'][^>]*>(?P<body>.*?)</div>",
+            segment,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        stats_spans = re.findall(
+            r"<span\b[^>]*class=[\"'][^\"']*\balign-text-top\b[^\"']*[\"'][^>]*>(?P<body>.*?)</span>",
+            stats_match.group("body") if stats_match else "",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        download_count = subhd_integer(strip_html_text(stats_spans[1])) if len(stats_spans) > 1 else 0
+        group_match = re.search(r"<a\b[^>]*href=[\"']/zu/[^\"']+[\"'][^>]*>(?P<group>.*?)</a>", segment, flags=re.IGNORECASE | re.DOTALL)
+        uploader_match = re.search(r"<a\b[^>]*href=[\"']/u/[^\"']+[\"'][^>]*>(?P<uploader>.*?)</a>", segment, flags=re.IGNORECASE | re.DOTALL)
+        date_match = re.search(
+            r"<time\b[^>]*datetime=[\"'](?P<datetime>[^\"']+)[\"'][^>]*>(?P<date>.*?)</time>",
+            segment,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
         out.append(
             {
                 "id": sid,
@@ -1169,11 +1265,252 @@ def extract_subhd_search_results(text, base_url=SUBHD_BASE_URL):
                 "media_title": title,
                 "release": release,
                 "filename": filename,
-                "language": metadata,
+                "language": " ".join(language_tags) or metadata,
+                "language_tags": language_tags,
+                "formats": [value for value in formats if "." + value.lower() in SUBTITLE_EXTENSIONS],
+                "subtitle_group": strip_html_text(group_match.group("group") if group_match else ""),
+                "source_type": source_type,
+                "like_count": 0,
+                "download_count": download_count,
+                "uploader": strip_html_text(uploader_match.group("uploader") if uploader_match else ""),
+                "uploaded_at": str(date_match.group("datetime") if date_match else ""),
+                "uploaded_date": strip_html_text(date_match.group("date") if date_match else ""),
                 "_score": 200 + max(0, 100 - index) + chinese_score({"language": metadata}),
             }
         )
     return out
+
+
+def extract_subhd_search_detail_pages(text, base_url=SUBHD_BASE_URL):
+    source = str(text or "")
+    marker = re.compile(
+        r"<div\b[^>]*class=[\"'][^\"']*\bbg-white\b[^\"']*\bshadow-sm\b[^\"']*\bmb-4\b[^\"']*[\"'][^>]*>",
+        flags=re.IGNORECASE,
+    )
+    matches = list(marker.finditer(source))
+    pages = []
+    seen = set()
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
+        block = source[match.start():end]
+        detail_match = re.search(r"href\s*=\s*[\"']/d/(?P<id>\d+)[\"']", block, flags=re.IGNORECASE)
+        if detail_match is None or detail_match.group("id") in seen:
+            continue
+        title_match = re.search(r"<img\b[^>]*\balt=[\"'](?P<title>.*?)[\"']", block, flags=re.IGNORECASE | re.DOTALL)
+        if title_match is None:
+            title_match = re.search(
+                r"<a\b[^>]*class=[\"'][^\"']*\balign-middle\b[^\"']*[\"'][^>]*>(?P<title>.*?)</a>",
+                block,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        title = strip_html_text(title_match.group("title") if title_match else "")
+        if not title:
+            continue
+        seen.add(detail_match.group("id"))
+        pages.append(
+            {
+                "id": detail_match.group("id"),
+                "title": title,
+                "url": urllib.parse.urljoin(base_url, "/d/" + detail_match.group("id")),
+            }
+        )
+    return pages
+
+
+def select_subhd_season_detail_page(pages, query):
+    ranked = []
+    for index, page in enumerate(pages or []):
+        score = subhd_season_title_match_score(query, (page or {}).get("title"))
+        if score > 0:
+            ranked.append((score, -index, page))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return ranked[0][2]
+
+
+def subhd_season_title_match_score(query, title):
+    expected = normalize_subhd_series_title(query)
+    actual = normalize_subhd_series_title(title)
+    if not expected or not actual:
+        return 0
+    if expected == actual:
+        return 10000
+    if expected in actual or actual in expected:
+        return 5000 + min(len(expected), len(actual))
+    expected_tokens = {token for token in expected.split() if len(token) > 1}
+    actual_tokens = {token for token in actual.split() if len(token) > 1}
+    overlap = expected_tokens & actual_tokens
+    return len(overlap) * 100 if overlap else 0
+
+
+def normalize_subhd_series_title(value):
+    text = html.unescape(str(value or "")).casefold()
+    text = re.sub(r"(?<![a-z0-9])s\d{1,2}(?![a-z0-9])", " ", text)
+    text = re.sub(r"\bseason\s*\d{1,2}\b", " ", text)
+    text = re.sub(r"第\s*[0-9一二三四五六七八九十百零两]+\s*季", " ", text)
+    text = re.sub(r"\((?:19|20)\d{2}\)", " ", text)
+    text = re.sub(r"[^\w\u3400-\u9fff]+", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_subhd_detail_results(text, season, base_url=SUBHD_BASE_URL):
+    source = str(text or "")
+    header = re.search(r">\s*字幕信息\s*<", source)
+    if header is None:
+        return []
+    end = source.find("同系列作品", header.end())
+    section = source[header.start():end if end >= 0 else len(source)]
+    token_pattern = re.compile(
+        r"(?P<header><div\b[^>]*class=[\"'][^\"']*\btext-danger\b[^\"']*\bfw-bold\b[^\"']*[\"'][^>]*>.*?</div>)"
+        r"|(?P<row><div\b[^>]*class=[\"'][^\"']*\brow\b[^\"']*\bpt-2\b[^\"']*\bmb-2\b[^\"']*[\"'][^>]*>.*?<hr\b[^>]*class=[\"'][^\"']*\bmy-0\b[^\"']*[\"'][^>]*>)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    current_episode_key = ""
+    out = []
+    for token in token_pattern.finditer(section):
+        if token.group("header") is not None:
+            label = strip_html_text(token.group("header"))
+            episode_match = re.fullmatch(r"第\s*(\d{1,3})\s*集", label)
+            current_episode_key = (
+                "S%02dE%02d" % (int(season), int(episode_match.group(1)))
+                if episode_match is not None
+                else ""
+            )
+            continue
+        if not current_episode_key:
+            continue
+        candidate = extract_subhd_detail_candidate(token.group("row"), current_episode_key, base_url)
+        if candidate is not None:
+            out.append(candidate)
+    return out
+
+
+def extract_subhd_movie_detail_results(text, base_url=SUBHD_BASE_URL):
+    source = str(text or "")
+    header = re.search(r">\s*字幕信息\s*<", source)
+    if header is None:
+        return []
+    end = source.find("同系列作品", header.end())
+    section = source[header.start():end if end >= 0 else len(source)]
+    row_pattern = re.compile(
+        r"<div\b[^>]*class=[\"'][^\"']*\brow\b[^\"']*\bpt-2\b[^\"']*\bmb-2\b[^\"']*[\"'][^>]*>.*?<hr\b[^>]*class=[\"'][^\"']*\bmy-0\b[^\"']*[\"'][^>]*>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return [
+        candidate
+        for candidate in (
+            extract_subhd_detail_candidate(match.group(0), "", base_url)
+            for match in row_pattern.finditer(section)
+        )
+        if candidate is not None
+    ]
+
+
+def extract_subhd_detail_candidate(row, episode_key, base_url=SUBHD_BASE_URL):
+    title_match = re.search(
+        r"<a\b[^>]*class=[\"'][^\"']*\blink-dark\b[^\"']*[\"'][^>]*href=[\"'](?P<href>/a/(?P<sid>[0-9A-Za-z_-]+))[\"'][^>]*>(?P<title>.*?)</a>",
+        row,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if title_match is None:
+        return None
+    title = strip_html_text(title_match.group("title"))
+    if not title:
+        return None
+
+    view_match = re.search(
+        r"<div\b[^>]*class=[\"'][^\"']*\bview-text\b[^\"']*[\"'][^>]*>(?P<body>.*?)</div>",
+        row,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    view = view_match.group("body") if view_match else ""
+    group_match = re.search(r"<a\b[^>]*href=[\"']/zu/[^\"']+[\"'][^>]*>(?P<group>.*?)</a>", view, flags=re.IGNORECASE | re.DOTALL)
+    subtitle_group = strip_html_text(group_match.group("group") if group_match else "")
+
+    metadata_match = re.search(
+        r"<div\b[^>]*class=[\"'][^\"']*\bpt-1\b[^\"']*\bf11\b[^\"']*[\"'][^>]*>(?P<body>.*?)</div>",
+        row,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    metadata = metadata_match.group("body") if metadata_match else ""
+    source_type = ""
+    language_tags = []
+    formats = []
+    like_count = 0
+    for span in re.finditer(r"<span\b(?P<attrs>[^>]*)>(?P<body>.*?)</span>", metadata, flags=re.IGNORECASE | re.DOTALL):
+        attrs = span.group("attrs")
+        class_match = re.search(r"\bclass=[\"'](?P<class>[^\"']*)[\"']", attrs, flags=re.IGNORECASE)
+        classes = set((class_match.group("class") if class_match else "").split())
+        value = strip_html_text(span.group("body"))
+        if not value:
+            continue
+        if "text-white" in classes and not source_type:
+            source_type = value
+        elif "fw-bold" in classes:
+            language_tags.append(value)
+        elif "text-secondary" in classes:
+            formats.extend(re.findall(r"(?<![A-Za-z])(?:ASS|SRT|SSA|VTT|SUP|PGS|VOBSUB|IDX|SUB)(?![A-Za-z])", value, flags=re.IGNORECASE))
+        elif "text-danger" in classes:
+            like_count = subhd_integer(value)
+    formats = unique_values([value.upper() for value in formats])
+    if not subtitle_language_value_is_chinese(" ".join(language_tags)):
+        return None
+    supported_formats = [value for value in formats if "." + value.lower() in SUBTITLE_EXTENSIONS]
+    if formats and not supported_formats:
+        return None
+
+    download_match = re.search(
+        r"<div\b[^>]*class=[\"'][^\"']*\bpx-3\b[^\"']*\bpy-2\b[^\"']*\btext-end\b[^\"']*\btext-secondary\b[^\"']*[\"'][^>]*>\s*(?P<count>[0-9,]+)\s*</div>",
+        row,
+        flags=re.IGNORECASE,
+    )
+    uploader_match = re.search(r"<a\b[^>]*href=[\"']/u/[^\"']+[\"'][^>]*>(?P<uploader>.*?)</a>", row, flags=re.IGNORECASE | re.DOTALL)
+    date_match = re.search(
+        r"<time\b[^>]*datetime=[\"'](?P<datetime>[^\"']+)[\"'][^>]*>(?P<date>.*?)</time>",
+        row,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    sid = title_match.group("sid")
+    extension = "." + (supported_formats[0].lower() if supported_formats else "srt")
+    filename = safe_subtitle_filename(title + extension) or ("subhd-%s%s" % (sid, extension))
+    download_count = subhd_integer(download_match.group("count") if download_match else "")
+    return {
+        "id": sid,
+        "provider_id": sid,
+        "url": urllib.parse.urljoin(base_url, title_match.group("href")),
+        "title": title,
+        "release": title,
+        "filename": filename,
+        "language": " ".join(language_tags),
+        "language_tags": language_tags,
+        "formats": supported_formats or formats,
+        "subtitle_group": subtitle_group,
+        "source_type": source_type,
+        "like_count": like_count,
+        "download_count": download_count,
+        "uploader": strip_html_text(uploader_match.group("uploader") if uploader_match else ""),
+        "uploaded_at": str(date_match.group("datetime") if date_match else ""),
+        "uploaded_date": strip_html_text(date_match.group("date") if date_match else ""),
+        "episode_key": str(episode_key or "").strip().upper(),
+        "_score": 200 + min(download_count, 1000000),
+    }
+
+
+def subhd_integer(value):
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    return int(digits) if digits else 0
+
+
+def subhd_detail_candidate_sort_key(candidate):
+    candidate = candidate or {}
+    return (
+        -int(candidate.get("download_count") or 0),
+        -int(candidate.get("like_count") or 0),
+        str(candidate.get("uploader") or "").casefold(),
+        str(candidate.get("uploaded_at") or ""),
+        str(candidate.get("provider_id") or candidate.get("id") or ""),
+    )
 
 
 def subhd_down_page_url(base_url, payload, sid):
@@ -1239,12 +1576,23 @@ def extract_chinese_subtitle_from_archive(
             body,
             candidate,
             max_bytes,
+            extension=extension,
             query=query,
             timeout=timeout,
             require_chinese_body=require_chinese_body,
         )
     if extension != ".7z":
         raise RuntimeError("SubHD subtitle archive unsupported: %s" % (extension or "unknown"))
+    if subhd_7z_extractor() == "bsdtar":
+        return extract_chinese_subtitle_with_bsdtar(
+            body,
+            candidate,
+            max_bytes,
+            extension=extension,
+            query=query,
+            timeout=timeout,
+            require_chinese_body=require_chinese_body,
+        )
     return extract_chinese_subtitle_with_7zip(
         body,
         extension,
@@ -1269,12 +1617,13 @@ def subhd_archive_episode_keys(body, extension, max_bytes, timeout):
                 for item in archive.infolist()
             ]
     elif extension in (".7z", ".rar"):
-        command = ["7zz", "l", "-slt"] if extension == ".7z" else ["bsdtar", "-tvf"]
+        extractor = subhd_7z_extractor() if extension == ".7z" else "bsdtar"
+        command = ["7zz", "l", "-slt"] if extractor == "7zz" else ["bsdtar", "-tvf"]
         with tempfile.TemporaryDirectory(prefix="subhd-season-list-") as tmp:
             root = Path(tmp)
             archive_path = root / ("subtitle" + extension)
             archive_path.write_bytes(bytes(body or b""))
-            if extension == ".7z":
+            if extractor == "7zz":
                 command = command + ["--", str(archive_path)]
             else:
                 command = command + [str(archive_path)]
@@ -1289,13 +1638,12 @@ def subhd_archive_episode_keys(body, extension, max_bytes, timeout):
                     check=False,
                 )
             except FileNotFoundError as exc:
-                extractor = "7zz" if extension == ".7z" else "bsdtar"
                 raise RuntimeError("SubHD archive extractor missing: %s" % extractor) from exc
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError("SubHD archive listing timed out") from exc
             if listed.returncode != 0:
                 raise RuntimeError("SubHD archive listing failed: %s" % listed.stderr.strip()[:200])
-            entries = parse_7zip_archive_entries(listed.stdout) if extension == ".7z" else parse_bsdtar_archive_entries(listed.stdout)
+            entries = parse_7zip_archive_entries(listed.stdout) if extractor == "7zz" else parse_bsdtar_archive_entries(listed.stdout)
     else:
         raise RuntimeError("SubHD subtitle archive unsupported: %s" % (extension or "unknown"))
     subtitle_entries = validate_subtitle_archive_entries(entries, max_bytes)
@@ -1394,20 +1742,21 @@ def extract_chinese_subtitle_with_bsdtar(
     body,
     candidate,
     max_bytes,
+    extension=".rar",
     query="",
     timeout=DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS,
     require_chinese_body=True,
 ):
     with tempfile.TemporaryDirectory(prefix="subhd-subtitle-") as tmp:
         root = Path(tmp)
-        archive_path = root / "subtitle.rar"
+        archive_path = root / ("subtitle" + extension)
         archive_path.write_bytes(bytes(body or b""))
         try:
             listed = subprocess.run(
                 ["bsdtar", "-tvf", str(archive_path)],
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
+                encoding=locale.getpreferredencoding(False),
                 errors="replace",
                 timeout=max(1, int(timeout or DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS)),
                 check=False,
@@ -1436,7 +1785,7 @@ def extract_chinese_subtitle_with_bsdtar(
                 ],
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
+                encoding=locale.getpreferredencoding(False),
                 errors="replace",
                 timeout=max(1, int(timeout or DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS)),
                 check=False,
@@ -1457,6 +1806,14 @@ def extract_chinese_subtitle_with_bsdtar(
     if require_chinese_body:
         raise RuntimeError("SubHD archive contains no Chinese subtitle")
     raise RuntimeError("SubHD archive contains no readable subtitle")
+
+
+def subhd_7z_extractor():
+    if shutil.which("7zz"):
+        return "7zz"
+    if shutil.which("bsdtar"):
+        return "bsdtar"
+    raise RuntimeError("SubHD archive extractor missing: 7zz or bsdtar")
 
 
 def parse_7zip_archive_entries(output):

@@ -26,7 +26,13 @@ from pipeline.client115 import (
     qrcode_status_label,
     share_receive_task_id,
 )
-from pipeline.config import category_to_folder_id, category_to_msg_library_root, category_to_openlist_path, msg_library_roots
+from pipeline.config import (
+    category_to_folder_id,
+    category_to_msg_library_root,
+    category_to_openlist_path,
+    configured_msg_library_roots,
+    msg_library_roots,
+)
 from pipeline.dedupe import (
     candidate_dedupe_identities,
     candidate_info_hash,
@@ -55,6 +61,7 @@ from pipeline.llm import (
     SearchRerankClient,
 )
 from pipeline.external_subtitles import (
+    DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES,
     DEFAULT_SUBTITLE_CACHE_DIR,
     DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES,
     DEFAULT_SUBTITLE_PROVIDERS,
@@ -456,6 +463,7 @@ class BotConfig:
     subtitle_providers: tuple = DEFAULT_SUBTITLE_PROVIDERS
     subtitle_search_timeout_seconds: int = DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS
     subtitle_download_max_bytes: int = DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES
+    subhd_download_max_bytes: int = DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES
     subtitle_backfill_default_limit: int = DEFAULT_SUBTITLE_BACKFILL_LIMIT
     assrt_api_token: str = ""
     opensubtitles_api_key: str = ""
@@ -639,6 +647,10 @@ class BotConfig:
             subtitle_download_max_bytes=max(
                 1024,
                 int(env.get("SUBTITLE_DOWNLOAD_MAX_BYTES", str(DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES))),
+            ),
+            subhd_download_max_bytes=max(
+                1024,
+                int(env.get("SUBHD_DOWNLOAD_MAX_BYTES", str(DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES))),
             ),
             subtitle_backfill_default_limit=normalize_subtitle_backfill_limit(
                 env.get("SUBTITLE_BACKFILL_DEFAULT_LIMIT", str(DEFAULT_SUBTITLE_BACKFILL_LIMIT))
@@ -3041,7 +3053,7 @@ class PipelineBotService:
             "candidates": normalized,
         }
 
-    def subtitle_search_season_candidates(self, media_id, season, title="", limit=DEFAULT_SUBTITLE_REMATCH_LIMIT):
+    def subtitle_search_season_candidates(self, media_id, season, title="", targets=None, limit=DEFAULT_SUBTITLE_REMATCH_LIMIT):
         if not self.config.msg_enabled:
             raise RuntimeError("MediaStationGo is disabled")
         media_id = str(media_id or "").strip()
@@ -3064,23 +3076,19 @@ class PipelineBotService:
         if category not in ("tv", "anime"):
             raise ValueError("season subtitle search is only available for TV or anime media")
         query = subtitle_season_search_query(media, season, title)
-        task = subtitle_backfill_task_from_media(media, category=category)
-        candidates = self._build_subtitle_matcher().search_task_candidates(
-            category, query, task, limit=limit, manual=True, provider_names=("subhd",),
+        normalized_targets = normalize_season_subtitle_targets(targets, season)
+        result = self._build_subtitle_matcher().search_season_candidates(
+            query, season, normalized_targets, limit=limit,
         )
         return {
             "media_id": media_id,
             "category": category,
             "season": season,
             "query": query,
-            "candidates": candidates,
+            "detail_url": str(result.get("detail_url") or ""),
+            "detail_title": str(result.get("detail_title") or ""),
+            "candidates": list(result.get("candidates") or []),
         }
-
-    def subtitle_download_season_candidate(self, candidate_record):
-        return self._build_subtitle_matcher().download_season_candidate(candidate_record)
-
-    def subtitle_cache_season_download(self, media_id, download):
-        return self._build_subtitle_matcher().save_download(media_id, download)
 
     def subtitle_find_adult(self, query, limit=DEFAULT_SUBTITLE_FIND_LIMIT):
         if not self.config.msg_enabled:
@@ -7834,11 +7842,31 @@ def subtitle_season_search_query(media, season, title=""):
     return "%s S%02d" % (base, season)
 
 
+def normalize_season_subtitle_targets(targets, season):
+    if not isinstance(targets, list) or not targets:
+        raise ValueError("season subtitle episodes are required")
+    expected_prefix = "S%02dE" % int(season)
+    seen_media_ids = set()
+    normalized = []
+    for item in targets:
+        if not isinstance(item, dict):
+            raise ValueError("season subtitle episode is invalid")
+        media_id = str(item.get("media_id") or "").strip()
+        episode_key = str(item.get("episode_key") or "").strip().upper()
+        if not media_id or media_id in seen_media_ids:
+            raise ValueError("season subtitle episode media_id is invalid")
+        if not re.fullmatch(r"S\d{2}E\d{2,3}", episode_key) or not episode_key.startswith(expected_prefix):
+            raise ValueError("season subtitle episode key is invalid")
+        seen_media_ids.add(media_id)
+        normalized.append({"media_id": media_id, "episode_key": episode_key})
+    return normalized
+
+
 def subtitle_category_from_media(media):
     library_id = str(media_first_value(media, ("library_id", "libraryId")) or "").strip()
     if not library_id:
         raise RuntimeError("MediaStationGo media detail missing library_id")
-    for category, root in msg_library_roots().items():
+    for category, root in configured_msg_library_roots().items():
         if str(root.get("library_id") or "").strip() == library_id:
             return category
     raise RuntimeError("media library is not configured in pipeline: %s" % library_id)

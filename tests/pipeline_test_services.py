@@ -266,13 +266,14 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertEqual(len(transport.text_urls), 1)
 
     def test_subhd_provider_only_returns_chinese_candidates_and_downloads_direct_subtitle(self):
-        from pipeline.external_subtitles import SubHDProvider
+        from pipeline.external_subtitles import DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES, SubHDProvider
 
         class FakeTransport:
             def __init__(self):
                 self.text_urls = []
                 self.json_calls = []
                 self.download_urls = []
+                self.download_limits = []
 
             def text_request(self, url, headers=None, timeout=None, max_bytes=None):
                 self.text_urls.append(url)
@@ -295,6 +296,7 @@ class ExternalSubtitleTest(unittest.TestCase):
 
             def download(self, url, headers=None, timeout=None, max_bytes=None):
                 self.download_urls.append(url)
+                self.download_limits.append(max_bytes)
                 return "1\n00:00:01,000 --> 00:00:02,000\n这是中文字幕正文\n".encode("utf-8")
 
         transport = FakeTransport()
@@ -310,6 +312,7 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertEqual(len(transport.text_urls), 3)
         self.assertEqual([item[0] for item in transport.json_calls], ["POST", "POST"])
         self.assertEqual(transport.download_urls, ["https://dlus.subhd.me/2026/07/chinese1.srt"])
+        self.assertEqual(transport.download_limits, [DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES])
 
     def test_subhd_search_excludes_bitmap_only_candidates(self):
         from pipeline.external_subtitles import extract_subhd_search_results
@@ -401,6 +404,47 @@ class ExternalSubtitleTest(unittest.TestCase):
             )
 
         self.assertEqual(filename, "movie.chs.srt")
+        self.assertIn("这是中文字幕正文", body.decode("utf-8"))
+        self.assertEqual([call.args[0][0] for call in run.call_args_list], ["bsdtar", "bsdtar"])
+
+    def test_subhd_7z_uses_bsdtar_when_7zz_is_unavailable(self):
+        import subprocess
+        from pathlib import Path
+        from unittest import mock
+
+        from pipeline.external_subtitles import extract_chinese_subtitle_from_archive
+
+        def fake_run(command, **kwargs):
+            if command[1] == "-tvf":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="-rw-r--r--  0 0 0 76 Jul 27 00:00 show.S01E02.chs.ass\n",
+                    stderr="",
+                )
+            extract_root = Path(command[command.index("-C") + 1])
+            (extract_root / "show.S01E02.chs.ass").write_text(
+                "[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,这是中文字幕正文\n",
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        def fake_which(command):
+            return "C:/tools/bsdtar.exe" if command == "bsdtar" else None
+
+        with mock.patch("pipeline.external_subtitles.shutil.which", side_effect=fake_which), mock.patch(
+            "pipeline.external_subtitles.subprocess.run",
+            side_effect=fake_run,
+        ) as run:
+            filename, body = extract_chinese_subtitle_from_archive(
+                b"7z archive",
+                ".7z",
+                {"language": "简体"},
+                32 * 1024 * 1024,
+                query="S01E02",
+            )
+
+        self.assertEqual(filename, "show.S01E02.chs.ass")
         self.assertIn("这是中文字幕正文", body.decode("utf-8"))
         self.assertEqual([call.args[0][0] for call in run.call_args_list], ["bsdtar", "bsdtar"])
 
@@ -1075,6 +1119,23 @@ class CategoryConfigTest(unittest.TestCase):
 
         self.assertEqual(root["library_id"], "movie-library-explicit")
         self.assertEqual(root["root_id"], "movie-root-explicit")
+
+    def test_configured_msg_roots_skip_unrelated_missing_categories(self):
+        from pipeline.config import MSG_LIBRARY_ROOTS, configured_msg_library_roots
+
+        original_roots = copy.deepcopy(MSG_LIBRARY_ROOTS)
+        try:
+            MSG_LIBRARY_ROOTS["tv"]["library_id"] = "tv-library-explicit"
+            MSG_LIBRARY_ROOTS["tv"]["root_id"] = "tv-root-explicit"
+            MSG_LIBRARY_ROOTS["adult"]["library_id"] = "REPLACE_WITH_MSG_ADULT_LIBRARY_ID"
+            MSG_LIBRARY_ROOTS["adult"]["root_id"] = "REPLACE_WITH_MSG_ADULT_ROOT_ID"
+            roots = configured_msg_library_roots()
+        finally:
+            MSG_LIBRARY_ROOTS.clear()
+            MSG_LIBRARY_ROOTS.update(original_roots)
+
+        self.assertEqual(roots["tv"]["library_id"], "tv-library-explicit")
+        self.assertNotIn("adult", roots)
 
     def test_load_category_config_rejects_conflicting_external_sources(self):
         from pipeline.config import load_category_config

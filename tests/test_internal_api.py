@@ -347,6 +347,7 @@ class FakePipelineService:
         self.max_download_active = 0
         self.subtitle_preview_calls = []
         self.subtitle_apply_calls = []
+        self.subtitle_season_search_calls = []
         self.subscription_staging = None
         self.subscription_stagings = {}
         self.subscription_entries = []
@@ -448,6 +449,48 @@ class FakePipelineService:
             "tasks": [task],
             "task_status": task,
             "raw": {"data": {"items": [{"name": "120集全"}]}},
+        }
+
+    def subtitle_search_season_candidates(self, media_id, season, title="", targets=None, limit=20):
+        self.subtitle_season_search_calls.append((media_id, season, title, list(targets or []), limit))
+        candidates = []
+        for target in targets or []:
+            candidates.append(
+                {
+                    "media_id": target["media_id"],
+                    "season": season,
+                    "episode_key": target["episode_key"],
+                    "title": target["episode_key"] + ".CHS-ENG",
+                    "provider": "subhd",
+                    "provider_id": target["media_id"] + "-candidate",
+                    "filename": target["episode_key"] + ".ass",
+                    "language": "双语 简体 英语",
+                    "language_tags": ["双语", "简体", "英语"],
+                    "formats": ["ASS"],
+                    "subtitle_group": "测试字幕组",
+                    "source_type": "原创翻译",
+                    "like_count": 11,
+                    "download_count": 11883,
+                    "uploader": "Teclast",
+                    "uploaded_at": "2022-07-11T08:30:00+08:00",
+                    "uploaded_date": "2022-07-11",
+                    "url": "https://subhd.tv/a/" + target["media_id"],
+                    "source_score": 12083,
+                    "rank": 1,
+                    "query": target["episode_key"],
+                    "code": "",
+                    "candidate": {"id": target["media_id"] + "-candidate", "language": "简体"},
+                }
+            )
+        return {
+            "media_id": media_id,
+            "title": title,
+            "category": "tv",
+            "season": season,
+            "query": title + " S%02d" % season,
+            "detail_url": "https://subhd.tv/d/35069688",
+            "detail_title": "测试剧 第一季",
+            "candidates": candidates[:limit],
         }
 
     def prepare_import_target(self, category, import_id, title, purpose="import"):
@@ -913,6 +956,81 @@ class SubtitleApiTest(InternalApiTestCase):
                 )
             self.assertEqual(raised.exception.status, 409)
             self.assertEqual(raised.exception.code, "subtitle_media_mismatch")
+        finally:
+            manager.stop()
+
+    def test_season_search_preview_and_apply_use_per_episode_candidates(self):
+        class SeasonManager:
+            def __init__(self):
+                self.calls = []
+                self.retry_calls = []
+
+            def create_task(self, owner_id, media_id, season, targets):
+                self.calls.append((owner_id, media_id, season, targets))
+                return {"id": "season-task-1", "status": "queued", "targets": targets}, True
+
+            def retry_failed_task(self, owner_id, task_id, media_ids):
+                self.retry_calls.append((owner_id, task_id, media_ids))
+                return {"id": "season-task-2", "status": "queued"}, True
+
+        service, store, manager, _application = self.build_components()
+        season_manager = SeasonManager()
+        application = InternalApiApplication(service, store, manager, season_subtitle_manager=season_manager)
+        episodes = [
+            {"media_id": "episode-1", "episode_key": "S01E01"},
+            {"media_id": "episode-2", "episode_key": "S01E02"},
+        ]
+        try:
+            search = application.search_season_subtitles(
+                {
+                    "owner_id": "admin",
+                    "media_id": "episode-1",
+                    "season": 1,
+                    "title": "测试剧",
+                    "limit": 20,
+                    "episodes": episodes,
+                }
+            )
+            self.assertEqual(search["detail_url"], "https://subhd.tv/d/35069688")
+            self.assertEqual(search["items"][0]["download_count"], 11883)
+            self.assertEqual(search["items"][0]["subtitle_group"], "测试字幕组")
+            self.assertNotIn("comment_count", search["items"][0])
+
+            preview = application.preview_subtitle(
+                {
+                    "owner_id": "admin",
+                    "media_id": "episode-2",
+                    "search_session_id": search["session_id"],
+                    "candidate_id": search["items"][1]["candidate_id"],
+                }
+            )
+            self.assertEqual(preview["content_sample"], "第一行字幕\n第二行字幕")
+
+            applied, created = application.create_season_subtitle_task(
+                {
+                    "owner_id": "admin",
+                    "media_id": "episode-1",
+                    "season": 1,
+                    "search_session_id": search["session_id"],
+                    "episodes": [
+                        {**episodes[0], "candidate_id": search["items"][0]["candidate_id"]},
+                        {**episodes[1], "candidate_id": search["items"][1]["candidate_id"]},
+                    ],
+                }
+            )
+            self.assertTrue(created)
+            self.assertEqual(applied["id"], "season-task-1")
+            self.assertEqual(len(season_manager.calls), 1)
+            targets = season_manager.calls[0][3]
+            self.assertEqual([item["candidate"]["media_id"] for item in targets], ["episode-1", "episode-2"])
+
+            retried, retry_created = application.retry_season_subtitle_task(
+                "season-task-1",
+                {"owner_id": "admin", "media_ids": ["episode-2"]},
+            )
+            self.assertTrue(retry_created)
+            self.assertEqual(retried["id"], "season-task-2")
+            self.assertEqual(season_manager.retry_calls, [("admin", "season-task-1", ["episode-2"])])
         finally:
             manager.stop()
 

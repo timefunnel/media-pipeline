@@ -4,14 +4,13 @@ import sqlite3
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-
-from pipeline.external_subtitles import subtitle_episode_key
-
 
 FINAL_SEASON_SUBTITLE_STATUSES = {"completed", "failed"}
 ACTIVE_SEASON_SUBTITLE_STATUSES = {"queued", "running"}
 MAX_SEASON_SUBTITLE_EPISODES = 500
+SEASON_SUBTITLE_DOWNLOAD_WORKERS = 2
 
 
 class SeasonSubtitleTaskStore:
@@ -67,7 +66,7 @@ class SeasonSubtitleTaskStore:
         finally:
             conn.close()
 
-    def create_task(self, owner_id, media_id, season, candidate, targets):
+    def create_task(self, owner_id, media_id, season, selection, targets):
         now = int(time.time())
         task_id = uuid.uuid4().hex
         conn = self._connect()
@@ -98,7 +97,7 @@ class SeasonSubtitleTaskStore:
                     owner_id,
                     media_id,
                     season,
-                    json_dumps(candidate),
+                    json_dumps(selection),
                     json_dumps(targets),
                     now,
                     now,
@@ -116,6 +115,12 @@ class SeasonSubtitleTaskStore:
             conn.close()
 
     def get_task(self, owner_id, task_id):
+        return self._get_task(owner_id, task_id, include_internal=False)
+
+    def get_task_internal(self, owner_id, task_id):
+        return self._get_task(owner_id, task_id, include_internal=True)
+
+    def _get_task(self, owner_id, task_id, include_internal):
         conn = self._connect()
         try:
             row = conn.execute(
@@ -129,7 +134,7 @@ class SeasonSubtitleTaskStore:
             conn.close()
         if row is None:
             raise RuntimeError("season subtitle task not found")
-        return season_subtitle_task_row(row)
+        return season_subtitle_task_row(row, include_internal=include_internal)
 
     def recover_running_tasks(self):
         now = int(time.time())
@@ -251,6 +256,53 @@ class SeasonSubtitleTaskStore:
         finally:
             conn.close()
 
+    def save_retry_result(self, task_id, target, status, count=0, error=""):
+        if status not in {"success", "skipped", "failed"}:
+            raise RuntimeError("season subtitle episode status invalid")
+        media_id = str((target or {}).get("media_id") or "").strip()
+        episode_key = str((target or {}).get("episode_key") or "").strip()
+        if not media_id or not episode_key:
+            raise RuntimeError("season subtitle episode target invalid")
+        conn = self._connect()
+        try:
+            conn.execute("begin immediate")
+            row = conn.execute(
+                "select details_json from internal_api_season_subtitle_tasks where id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("season subtitle parent task not found")
+            details = json_loads_list(row["details_json"])
+            if not any(str(item.get("media_id") or "") == media_id for item in details):
+                raise RuntimeError("season subtitle parent task does not contain retry target")
+            details = [
+                item for item in details
+                if str(item.get("media_id") or "") != media_id
+            ]
+            details.append(
+                {
+                    "media_id": media_id,
+                    "episode_key": episode_key,
+                    "status": status,
+                    "count": max(0, int(count or 0)),
+                    "error": str(error or ""),
+                }
+            )
+            conn.execute(
+                """
+                update internal_api_season_subtitle_tasks
+                set details_json = ?, updated_at = ?
+                where id = ?
+                """,
+                (json_dumps(details), int(time.time()), task_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def finish_task(self, task_id, status, error=""):
         if status not in FINAL_SEASON_SUBTITLE_STATUSES:
             raise RuntimeError("season subtitle final status invalid")
@@ -300,16 +352,19 @@ class SeasonSubtitleTaskManager:
             self._thread.join(timeout=5)
             self._thread = None
 
-    def create_task(self, owner_id, media_id, season, candidate, targets):
+    def create_task(self, owner_id, media_id, season, targets, retry_of=""):
         owner_id = require_task_text(owner_id, "owner_id")
         media_id = require_task_text(media_id, "media_id")
         season = int(season)
         if season < 1 or season > 99:
             raise RuntimeError("season must be between 1 and 99")
-        if not isinstance(candidate, dict) or str(candidate.get("provider") or "") != "subhd":
-            raise RuntimeError("season subtitle candidate must be a SubHD candidate")
         targets = normalize_targets(targets, season)
-        task, created = self.store.create_task(owner_id, media_id, season, candidate, targets)
+        selection = {
+            "mode": "retry_failed" if retry_of else "per_episode",
+            "candidate_count": len(targets),
+            "retry_of": str(retry_of or ""),
+        }
+        task, created = self.store.create_task(owner_id, media_id, season, selection, targets)
         if created:
             with self._condition:
                 self._condition.notify_all()
@@ -319,6 +374,43 @@ class SeasonSubtitleTaskManager:
         return self.store.get_task(
             require_task_text(owner_id, "owner_id"),
             require_task_text(task_id, "task_id"),
+        )
+
+    def retry_failed_task(self, owner_id, task_id, media_ids=None):
+        owner_id = require_task_text(owner_id, "owner_id")
+        task_id = require_task_text(task_id, "task_id")
+        task = self.store.get_task_internal(owner_id, task_id)
+        if task["status"] not in FINAL_SEASON_SUBTITLE_STATUSES:
+            raise RuntimeError("season subtitle task is still active")
+
+        details_by_media = {
+            str(item.get("media_id") or "").strip(): item
+            for item in task["details"]
+            if isinstance(item, dict)
+        }
+        retriable_ids = []
+        for target in task["targets"]:
+            media_id = str(target.get("media_id") or "").strip()
+            detail = details_by_media.get(media_id)
+            if detail is None or detail.get("status") == "failed":
+                retriable_ids.append(media_id)
+
+        requested_ids = normalize_retry_media_ids(media_ids)
+        selected_ids = requested_ids or retriable_ids
+        if not selected_ids:
+            raise RuntimeError("season subtitle task has no failed or unfinished episodes")
+        invalid_ids = [media_id for media_id in selected_ids if media_id not in retriable_ids]
+        if invalid_ids:
+            raise RuntimeError("season subtitle retry can only include failed or unfinished episodes")
+        selected = set(selected_ids)
+        targets = [target for target in task["targets"] if target.get("media_id") in selected]
+        parent_task_id = task.get("retry_of") or task_id
+        return self.create_task(
+            owner_id,
+            task["media_id"],
+            task["season"],
+            targets,
+            retry_of=parent_task_id,
         )
 
     def _worker_loop(self):
@@ -340,36 +432,50 @@ class SeasonSubtitleTaskManager:
                 self.store.finish_task(task["id"], "failed", error=str(exc))
 
     def _apply_task(self, task):
+        targets = list(task["targets"])
         self.store.save_stage(task["id"], "download")
-        downloads = list(self.service.subtitle_download_season_candidate(task["candidate"]) or [])
-        by_episode = {}
-        for download in downloads:
-            key = subtitle_episode_key(getattr(download, "filename", ""))
-            if key:
-                by_episode.setdefault(key, []).append(download)
-
-        for target in task["targets"]:
-            self._raise_if_stopping()
-            key = target["episode_key"]
-            self.store.save_stage(task["id"], "applying", key)
-            matched = by_episode.get(key) or []
-            if not matched:
+        with ThreadPoolExecutor(
+            max_workers=min(SEASON_SUBTITLE_DOWNLOAD_WORKERS, len(targets)),
+            thread_name_prefix="season-subtitle-download",
+        ) as executor:
+            pending = [
+                (target, executor.submit(self._apply_target, target))
+                for target in targets
+            ]
+            for target, future in pending:
+                self._raise_if_stopping()
+                status, count, error = future.result()
                 self.store.save_episode_result(
                     task["id"],
                     target,
-                    "skipped",
-                    error="the season package has no strict %s subtitle filename match" % key,
+                    status,
+                    count=count,
+                    error=error,
                 )
-                continue
-            count = 0
-            try:
-                for download in matched:
-                    self.service.subtitle_cache_season_download(target["media_id"], download)
-                    count += 1
-            except Exception as exc:
-                self.store.save_episode_result(task["id"], target, "failed", count=count, error=str(exc))
-                continue
-            self.store.save_episode_result(task["id"], target, "success", count=count)
+                if task.get("retry_of"):
+                    self.store.save_retry_result(
+                        task["retry_of"],
+                        target,
+                        status,
+                        count=count,
+                        error=error,
+                    )
+
+    def _apply_target(self, target):
+        self._raise_if_stopping()
+        try:
+            result = self.service.apply_subtitle_candidate(target["candidate"])
+        except Exception as exc:
+            return "failed", 0, str(exc)
+        status = str((result or {}).get("subtitle_match_status") or "").strip()
+        count = max(0, int((result or {}).get("subtitle_match_count") or 0))
+        if status == "success" and count > 0:
+            return "success", count, ""
+        if status == "skipped":
+            reason = str((result or {}).get("subtitle_match_reason") or "subtitle apply skipped")
+            return "skipped", count, reason
+        error = str((result or {}).get("subtitle_match_error") or "subtitle apply failed")
+        return "failed", count, error
 
     def _wait_or_stop(self):
         with self._condition:
@@ -382,6 +488,7 @@ class SeasonSubtitleTaskManager:
 
 def season_subtitle_task_row(row, include_internal=False):
     details = json_loads_list(row["details_json"])
+    selection = json_loads_dict(row["candidate_json"])
     result = {
         "id": str(row["id"]),
         "owner_id": str(row["owner_id"]),
@@ -400,10 +507,11 @@ def season_subtitle_task_row(row, include_internal=False):
         "updated_at": int(row["updated_at"] or 0),
         "started_at": int(row["started_at"] or 0),
         "completed_at": int(row["completed_at"] or 0),
+        "retry_of": str(selection.get("retry_of") or ""),
         "details": details,
     }
     if include_internal:
-        result["candidate"] = json_loads_dict(row["candidate_json"])
+        result["candidate"] = selection
         result["targets"] = json_loads_list(row["targets_json"])
     return result
 
@@ -415,7 +523,6 @@ def normalize_targets(targets, season):
         raise RuntimeError("season subtitle target count exceeds %d" % MAX_SEASON_SUBTITLE_EPISODES)
     expected_prefix = "S%02dE" % season
     seen_media_ids = set()
-    seen_episode_keys = set()
     normalized = []
     for item in targets:
         if not isinstance(item, dict):
@@ -424,11 +531,35 @@ def normalize_targets(targets, season):
         episode_key = str(item.get("episode_key") or "").strip().upper()
         if not re.fullmatch(r"S\d{2}E\d{2,3}", episode_key) or not episode_key.startswith(expected_prefix):
             raise RuntimeError("season subtitle episode key is invalid")
-        if media_id in seen_media_ids or episode_key in seen_episode_keys:
-            raise RuntimeError("season subtitle targets contain duplicate episodes")
+        candidate = item.get("candidate")
+        if not isinstance(candidate, dict) or str(candidate.get("provider") or "") != "subhd":
+            raise RuntimeError("season subtitle candidate must be a SubHD candidate")
+        if str(candidate.get("media_id") or "").strip() != media_id:
+            raise RuntimeError("season subtitle candidate media mismatch")
+        if str(candidate.get("episode_key") or "").strip().upper() != episode_key:
+            raise RuntimeError("season subtitle candidate episode mismatch")
+        if media_id in seen_media_ids:
+            raise RuntimeError("season subtitle targets contain duplicate media")
         seen_media_ids.add(media_id)
-        seen_episode_keys.add(episode_key)
-        normalized.append({"media_id": media_id, "episode_key": episode_key})
+        normalized.append({"media_id": media_id, "episode_key": episode_key, "candidate": candidate})
+    return normalized
+
+
+def normalize_retry_media_ids(media_ids):
+    if media_ids is None:
+        return []
+    if not isinstance(media_ids, list):
+        raise RuntimeError("season subtitle retry media_ids must be a list")
+    if len(media_ids) > MAX_SEASON_SUBTITLE_EPISODES:
+        raise RuntimeError("season subtitle retry target count exceeds %d" % MAX_SEASON_SUBTITLE_EPISODES)
+    normalized = []
+    seen = set()
+    for value in media_ids:
+        media_id = require_task_text(value, "episode media_id")
+        if media_id in seen:
+            raise RuntimeError("season subtitle retry targets contain duplicate media")
+        seen.add(media_id)
+        normalized.append(media_id)
     return normalized
 
 
