@@ -1,10 +1,7 @@
 name: Publish immutable candidate image
-run-name: candidate ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+run-name: candidate ${{ inputs.ref }}
 
 on:
-  push:
-    branches:
-      - codex/local-dev
   workflow_dispatch:
     inputs:
       ref:
@@ -23,7 +20,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: media-pipeline-candidate-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+  group: media-pipeline-candidate-${{ inputs.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -32,13 +29,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          ref: ${{ inputs.ref }}
 
       - name: Resolve immutable metadata
         id: release
         shell: bash
         env:
-          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           revision="$(git rev-parse HEAD)"
