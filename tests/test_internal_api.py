@@ -922,6 +922,8 @@ class SubtitleApiTest(InternalApiTestCase):
             self.assertEqual(search["items"][0]["provider"], "subtitlecat")
             self.assertNotIn("candidate", search["items"][0])
             self.assertNotIn("provider_id", search["items"][0])
+            self.assertRegex(search["items"][0]["application_key"], r"^[0-9a-f]{64}$")
+            self.assertNotIn("private-result", search["items"][0]["application_key"])
 
             selection = {
                 "owner_id": "admin",
@@ -995,6 +997,10 @@ class SubtitleApiTest(InternalApiTestCase):
             self.assertEqual(search["items"][0]["download_count"], 11883)
             self.assertEqual(search["items"][0]["subtitle_group"], "测试字幕组")
             self.assertNotIn("comment_count", search["items"][0])
+            self.assertTrue(search["items"][0]["can_apply"])
+            self.assertEqual(search["items"][0]["unavailable_reason"], "")
+            self.assertTrue(search["items"][0]["can_preview"])
+            self.assertEqual(search["items"][0]["preview_unavailable_reason"], "")
 
             preview = application.preview_subtitle(
                 {
@@ -4161,6 +4167,7 @@ class HttpAuthenticationTest(InternalApiTestCase):
             self.assertEqual(result["items"][0]["provider"], "subtitlecat")
             self.assertNotIn("candidate", result["items"][0])
             self.assertNotIn("provider_id", result["items"][0])
+            self.assertRegex(result["items"][0]["application_key"], r"^[0-9a-f]{64}$")
         finally:
             server.stop()
 

@@ -314,8 +314,12 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertEqual(transport.download_urls, ["https://dlus.subhd.me/2026/07/chinese1.srt"])
         self.assertEqual(transport.download_limits, [DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES])
 
-    def test_subhd_search_excludes_bitmap_only_candidates(self):
-        from pipeline.external_subtitles import extract_subhd_search_results
+    def test_subhd_search_keeps_bitmap_only_candidates_for_server_application(self):
+        from pipeline.external_subtitles import (
+            extract_subhd_search_results,
+            subtitle_candidate_application_status,
+            subtitle_candidate_preview_status,
+        )
 
         html = """
         <a class="link-dark align-middle" href='/a/sup-only'>SUP only</a>
@@ -328,8 +332,13 @@ class ExternalSubtitleTest(unittest.TestCase):
 
         items = extract_subhd_search_results(html)
 
-        self.assertEqual([item["id"] for item in items], ["ass-sup"])
-        self.assertTrue(items[0]["filename"].endswith(".ass"))
+        self.assertEqual([item["id"] for item in items], ["sup-only", "ass-sup"])
+        self.assertEqual(items[0]["formats"], ["SUP"])
+        self.assertTrue(subtitle_candidate_application_status(items[0])[0])
+        self.assertFalse(subtitle_candidate_preview_status(items[0])[0])
+        self.assertTrue(items[1]["filename"].endswith(".ass"))
+        self.assertTrue(subtitle_candidate_application_status(items[1])[0])
+        self.assertTrue(subtitle_candidate_preview_status(items[1])[0])
 
     def test_subhd_zip_selects_chinese_subtitle(self):
         import io
@@ -889,7 +898,7 @@ class ExternalSubtitleTest(unittest.TestCase):
                     "provider": "fake",
                     "query": "SSIS-218",
                     "code": "SSIS-218",
-                    "candidate": {"id": "candidate-2"},
+                    "candidate": {"id": "candidate-2", "title": "SSIS-218 官方简体字幕"},
                 },
             )
             tracks = cache.list_tracks("media-1")
@@ -898,6 +907,49 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertEqual(provider.download_args, ("candidate-2", "SSIS-218", "SSIS-218"))
         self.assertEqual(len(tracks), 1)
         self.assertEqual(tracks[0]["source"], "fake")
+        self.assertEqual(tracks[0]["name"], "SSIS-218 官方简体字幕")
+
+    def test_subtitle_matcher_applies_sup_without_text_preview_gate(self):
+        from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
+
+        class FakeProvider:
+            name = "subhd"
+
+            def enabled(self):
+                return True
+
+            def download_for_review(self, candidate, query, code=""):
+                self.download_args = (candidate["id"], query, code)
+                return SubtitleDownload(
+                    source=self.name,
+                    provider_id=candidate["id"],
+                    filename="Star.Trek.S01E01.sup",
+                    body=b"PGS\x00\x01",
+                    query=query,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = SubtitleCache(tmp)
+            provider = FakeProvider()
+            matcher = SubtitleMatcher(cache, [provider], enabled=True, adult_only=False)
+            result = matcher.apply_candidate(
+                "media-1",
+                {
+                    "provider": "subhd",
+                    "query": "Star Trek S01E01",
+                    "candidate": {
+                        "id": "sup-1",
+                        "title": "Star Trek S01E01 PGS",
+                        "formats": ["SUP"],
+                    },
+                },
+            )
+            tracks = cache.list_tracks("media-1")
+
+        self.assertEqual(result["subtitle_match_status"], "success")
+        self.assertEqual(provider.download_args, ("sup-1", "Star Trek S01E01", ""))
+        self.assertEqual(tracks[0]["filename"], "subhd-zh.sup")
+        self.assertEqual(tracks[0]["name"], "Star Trek S01E01 PGS")
 
     def test_subtitle_matcher_preview_candidate_downloads_body_without_cache(self):
         from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher

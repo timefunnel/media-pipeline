@@ -23,6 +23,11 @@ from pipeline.search import (
     valid_btih_info_hash,
 )
 from pipeline.season_subtitles import SeasonSubtitleTaskManager
+from pipeline.external_subtitles import (
+    subtitle_application_key,
+    subtitle_candidate_application_status,
+    subtitle_candidate_preview_status,
+)
 from pipeline.subtitle_asr import DEFAULT_ASR_MODEL, SubtitleAsrProcessor
 from pipeline.telegram_ui import task_from_submit_result
 from pipeline.task_state import ACTIVE_115_TIMEOUT_SECONDS
@@ -3609,9 +3614,16 @@ def subtitle_asr_task_path_match(path):
 
 def public_subtitle_candidate(item):
     item = item or {}
+    can_apply, unavailable_reason = subtitle_candidate_application_status(item)
+    can_preview, preview_unavailable_reason = subtitle_candidate_preview_status(item)
     return {
         "candidate_id": str(item.get("candidate_id") or ""),
         "provider": str(item.get("provider") or ""),
+        "application_key": subtitle_application_key(item.get("provider"), item.get("provider_id")),
+        "can_apply": can_apply,
+        "unavailable_reason": unavailable_reason,
+        "can_preview": can_preview,
+        "preview_unavailable_reason": preview_unavailable_reason,
         "title": str(item.get("subtitle_title") or item.get("filename") or ""),
         "filename": str(item.get("filename") or ""),
         "language": str(item.get("language") or ""),

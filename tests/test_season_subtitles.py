@@ -295,6 +295,35 @@ class SubHDSeasonDetailTest(unittest.TestCase):
         self.assertEqual(result["candidates"][0]["episode_key"], "S01E01")
         self.assertEqual(len(transport.urls), 2)
 
+    def test_keeps_highest_download_sup_candidate_for_display(self):
+        html = """
+        <div>字幕信息</div>
+        <div class="text-danger fw-bold">第 1 集</div>
+        <div class="row pt-2 mb-2">
+          <a class="link-dark" href="/a/first-sup">星际迷航.新世界.S01E01.HDR.2160p.WEBRip.HEVC.chs.eng-STCFanSub</a>
+          <div class="view-text"><a href="/zu/42">星际迷航中国字幕组</a></div>
+          <div class="pt-1 f11">
+            <span class="bg-success text-white">原创翻译</span>
+            <span class="fw-bold">双语</span><span class="fw-bold">简体</span><span class="fw-bold">英语</span>
+            <span class="text-secondary">SUP</span>
+            <span class="text-danger">16</span>
+          </div>
+          <div class="px-3 py-2 text-end text-secondary">23474</div>
+          <a href="/u/teclast">Teclast</a>
+          <time datetime="2022-07-11T08:30:00+08:00">2022-07-11</time>
+          <hr class="my-0">
+        </div>
+        <aside>同系列作品</aside>
+        """
+
+        candidates = extract_subhd_detail_results(html, 1)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["title"], "星际迷航.新世界.S01E01.HDR.2160p.WEBRip.HEVC.chs.eng-STCFanSub")
+        self.assertEqual(candidates[0]["formats"], ["SUP"])
+        self.assertEqual(candidates[0]["download_count"], 23474)
+        self.assertEqual(candidates[0]["subtitle_group"], "星际迷航中国字幕组")
+
 
 class SubHDMovieDetailTest(unittest.TestCase):
     def test_search_enriches_movie_candidates_from_the_matching_detail_page(self):

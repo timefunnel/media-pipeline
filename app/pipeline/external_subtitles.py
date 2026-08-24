@@ -24,7 +24,8 @@ DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS = 12
 DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES = 2 * 1024 * 1024
 DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES = 32 * 1024 * 1024
 DEFAULT_SUBTITLE_PROVIDERS = ("subhd", "subtitlecat", "assrt", "opensubtitles")
-SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
+SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".sup", ".vtt"}
+TEXT_SUBTITLE_EXTENSIONS = {".ass", ".srt", ".ssa", ".vtt"}
 LOCAL_SUBTITLE_SCHEME = "local-subtitle"
 CHINESE_LANGUAGE_CODES = ("zh-cn", "zh-tw", "ze")
 SUBHD_BASE_URL = "https://subhd.tv/"
@@ -150,7 +151,7 @@ class SubtitleCache:
             out.append(item)
         return out
 
-    def save_download(self, media_id, download):
+    def save_download(self, media_id, download, display_name=""):
         if not media_id:
             raise RuntimeError("subtitle cache media_id missing")
         if not isinstance(download, SubtitleDownload):
@@ -179,6 +180,7 @@ class SubtitleCache:
         track = {
             "media_id": str(media_id),
             "filename": stored_name,
+            "name": subtitle_display_name(display_name, stored_name),
             "lang": download.lang or "zh",
             "label": download.label or "中文字幕",
             "path": local_subtitle_uri(media_id, stored_name),
@@ -401,7 +403,7 @@ class SubHDProvider:
             )
         elif extension in SUBTITLE_EXTENSIONS:
             filename = subhd_download_filename(candidate, sid, extension)
-            if require_chinese_body and not subtitle_body_is_chinese(body, filename):
+            if not subtitle_body_matches_candidate(body, filename, require_chinese_body):
                 raise RuntimeError("SubHD downloaded subtitle is not Chinese")
         else:
             raise RuntimeError("SubHD subtitle archive unsupported: %s" % (extension or "unknown"))
@@ -845,10 +847,17 @@ class SubtitleMatcher:
         candidate = (candidate_record or {}).get("candidate")
         if not isinstance(candidate, dict):
             raise RuntimeError("subtitle candidate payload missing")
+        supported, reason = subtitle_candidate_application_status(candidate)
+        if not supported:
+            raise RuntimeError(reason)
         download = download_subtitle_candidate_for_review(provider, candidate, query, code=code)
         if not download:
             return subtitle_result("skipped", source=provider.name, query=query, reason="download_missing")
-        track = self.cache.save_download(media_id, download)
+        track = self.cache.save_download(
+            media_id,
+            download,
+            display_name=subtitle_candidate_title(candidate),
+        )
         return subtitle_result(
             "success",
             count=1,
@@ -872,6 +881,9 @@ class SubtitleMatcher:
         candidate = (candidate_record or {}).get("candidate")
         if not isinstance(candidate, dict):
             raise RuntimeError("subtitle candidate payload missing")
+        previewable, reason = subtitle_candidate_preview_status(candidate)
+        if not previewable:
+            raise RuntimeError(reason)
         download = download_subtitle_candidate_for_review(provider, candidate, query, code=code)
         if not download:
             raise RuntimeError("subtitle preview download missing")
@@ -1017,6 +1029,32 @@ def subtitle_candidate_title(candidate):
         if value:
             return value
     return ""
+
+
+def subtitle_candidate_application_status(candidate):
+    raw_formats = (candidate or {}).get("formats")
+    if not isinstance(raw_formats, (list, tuple)):
+        raw_formats = [raw_formats] if raw_formats else []
+    formats = unique_values(
+        [str(value).strip().upper() for value in raw_formats if str(value).strip()]
+    )
+    if not formats:
+        return True, ""
+    if any("." + value.lower() in SUBTITLE_EXTENSIONS for value in formats):
+        return True, ""
+    return False, "%s 不是当前服务端可保存的字幕格式" % "、".join(formats)
+
+
+def subtitle_candidate_preview_status(candidate):
+    raw_formats = (candidate or {}).get("formats")
+    if not isinstance(raw_formats, (list, tuple)):
+        raw_formats = [raw_formats] if raw_formats else []
+    formats = unique_values(
+        [str(value).strip().upper() for value in raw_formats if str(value).strip()]
+    )
+    if not formats or any("." + value.lower() in TEXT_SUBTITLE_EXTENSIONS for value in formats):
+        return True, ""
+    return False, "%s 是图形字幕，当前没有可展示的文本预览" % "、".join(formats)
 
 
 def subtitle_candidate_filename(candidate):
@@ -1203,22 +1241,14 @@ def extract_subhd_search_results(text, base_url=SUBHD_BASE_URL):
         metadata = strip_html_text(metadata_html)
         if not subtitle_language_value_is_chinese(metadata):
             continue
-        supported_formats = re.findall(
-            r"(?<![A-Za-z])(?:ASS|SRT|SSA|VTT)(?![A-Za-z])",
-            metadata,
-            flags=re.IGNORECASE,
-        )
-        unsupported_formats = re.findall(
-            r"(?<![A-Za-z])(?:SUP|PGS|VOBSUB|IDX|SUB)(?![A-Za-z])",
-            metadata,
-            flags=re.IGNORECASE,
-        )
-        if unsupported_formats and not supported_formats:
-            continue
         sid = match.group("sid")
         title = strip_html_text(match.group("title"))
         release = strip_html_text(release_match.group("release") if release_match else "") or title
-        format_match = re.search(r"(?<![A-Za-z])(?:ASS|SRT|SSA|VTT)(?![A-Za-z])", metadata, flags=re.IGNORECASE)
+        format_match = re.search(
+            r"(?<![A-Za-z])(?:ASS|SRT|SSA|VTT|SUP|PGS|VOBSUB|IDX|SUB)(?![A-Za-z])",
+            metadata,
+            flags=re.IGNORECASE,
+        )
         extension = "." + format_match.group(0).lower() if format_match else ".srt"
         filename = safe_subtitle_filename(release + extension) or ("subhd-%s%s" % (sid, extension))
         source_type = ""
@@ -1238,6 +1268,14 @@ def extract_subhd_search_results(text, base_url=SUBHD_BASE_URL):
             elif "text-secondary" in classes:
                 formats.extend(re.findall(r"(?<![A-Za-z])(?:ASS|SRT|SSA|VTT|SUP|PGS|VOBSUB|IDX|SUB)(?![A-Za-z])", value, flags=re.IGNORECASE))
         formats = unique_values([value.upper() for value in formats])
+        if not formats:
+            formats = unique_values(
+                re.findall(
+                    r"(?<![A-Za-z])(?:ASS|SRT|SSA|VTT|SUP|PGS|VOBSUB|IDX|SUB)(?![A-Za-z])",
+                    metadata,
+                    flags=re.IGNORECASE,
+                )
+            )
         stats_match = re.search(
             r"<div\b[^>]*class=[\"'][^\"']*\bpt-2\b[^\"']*\btext-secondary\b[^\"']*\bf12\b[^\"']*[\"'][^>]*>(?P<body>.*?)</div>",
             segment,
@@ -1267,7 +1305,7 @@ def extract_subhd_search_results(text, base_url=SUBHD_BASE_URL):
                 "filename": filename,
                 "language": " ".join(language_tags) or metadata,
                 "language_tags": language_tags,
-                "formats": [value for value in formats if "." + value.lower() in SUBTITLE_EXTENSIONS],
+                "formats": formats,
                 "subtitle_group": strip_html_text(group_match.group("group") if group_match else ""),
                 "source_type": source_type,
                 "like_count": 0,
@@ -1454,10 +1492,15 @@ def extract_subhd_detail_candidate(row, episode_key, base_url=SUBHD_BASE_URL):
         elif "text-danger" in classes:
             like_count = subhd_integer(value)
     formats = unique_values([value.upper() for value in formats])
+    if not formats:
+        formats = unique_values(
+            re.findall(
+                r"(?<![A-Za-z])(?:ASS|SRT|SSA|VTT|SUP|PGS|VOBSUB|IDX|SUB)(?![A-Za-z])",
+                metadata,
+                flags=re.IGNORECASE,
+            )
+        )
     if not subtitle_language_value_is_chinese(" ".join(language_tags)):
-        return None
-    supported_formats = [value for value in formats if "." + value.lower() in SUBTITLE_EXTENSIONS]
-    if formats and not supported_formats:
         return None
 
     download_match = re.search(
@@ -1472,7 +1515,11 @@ def extract_subhd_detail_candidate(row, episode_key, base_url=SUBHD_BASE_URL):
         flags=re.IGNORECASE | re.DOTALL,
     )
     sid = title_match.group("sid")
-    extension = "." + (supported_formats[0].lower() if supported_formats else "srt")
+    preferred_format = next(
+        (value for value in formats if "." + value.lower() in SUBTITLE_EXTENSIONS),
+        formats[0] if formats else "SRT",
+    )
+    extension = "." + preferred_format.lower()
     filename = safe_subtitle_filename(title + extension) or ("subhd-%s%s" % (sid, extension))
     download_count = subhd_integer(download_match.group("count") if download_match else "")
     return {
@@ -1484,7 +1531,7 @@ def extract_subhd_detail_candidate(row, episode_key, base_url=SUBHD_BASE_URL):
         "filename": filename,
         "language": " ".join(language_tags),
         "language_tags": language_tags,
-        "formats": supported_formats or formats,
+        "formats": formats,
         "subtitle_group": subtitle_group,
         "source_type": source_type,
         "like_count": like_count,
@@ -1669,7 +1716,7 @@ def extract_chinese_subtitle_from_zip(body, candidate, max_bytes, query="", requ
         for entry in rank_subtitle_archive_entries(subtitle_entries, candidate, query=query):
             data = archive.read(entry["path"])
             filename = safe_subtitle_filename(posix_basename(entry["path"]))
-            if filename and (not require_chinese_body or subtitle_body_is_chinese(data, filename)):
+            if filename and subtitle_body_matches_candidate(data, filename, require_chinese_body):
                 return filename, data
     if require_chinese_body:
         raise RuntimeError("SubHD archive contains no Chinese subtitle")
@@ -1731,7 +1778,7 @@ def extract_chinese_subtitle_with_7zip(
                 continue
             data = target.read_bytes()
             filename = safe_subtitle_filename(posix_basename(entry["path"]))
-            if filename and (not require_chinese_body or subtitle_body_is_chinese(data, filename)):
+            if filename and subtitle_body_matches_candidate(data, filename, require_chinese_body):
                 return filename, data
     if require_chinese_body:
         raise RuntimeError("SubHD archive contains no Chinese subtitle")
@@ -1801,7 +1848,7 @@ def extract_chinese_subtitle_with_bsdtar(
                 continue
             data = target.read_bytes()
             filename = safe_subtitle_filename(posix_basename(entry["path"]))
-            if filename and (not require_chinese_body or subtitle_body_is_chinese(data, filename)):
+            if filename and subtitle_body_matches_candidate(data, filename, require_chinese_body):
                 return filename, data
     if require_chinese_body:
         raise RuntimeError("SubHD archive contains no Chinese subtitle")
@@ -1965,6 +2012,14 @@ def subtitle_body_is_chinese(body, filename):
     if extension == ".vtt":
         return "WEBVTT" in text or "-->" in text
     return "-->" in text
+
+
+def subtitle_body_matches_candidate(body, filename, require_chinese_body):
+    if not require_chinese_body:
+        return True
+    if subtitle_extension(filename) == ".sup":
+        return True
+    return subtitle_body_is_chinese(body, filename)
 
 
 def extract_subtitlecat_search_results(text, base_url=SUBTITLECAT_BASE_URL):
@@ -2197,6 +2252,13 @@ def safe_subtitle_filename(value):
     return name[:180]
 
 
+def subtitle_display_name(value, fallback=""):
+    name = re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
+    if not name:
+        name = str(fallback or "").strip()
+    return name[:500]
+
+
 def subtitle_storage_token(value, fallback):
     token = re.sub(r"[^0-9A-Za-z_-]+", "-", str(value or "").strip()).strip("-_")
     return token or fallback
@@ -2253,6 +2315,14 @@ def subtitle_track_key(track):
     if provider_id:
         return "%s:%s" % (source, provider_id)
     return "%s:%s" % (source, track.get("filename"))
+
+
+def subtitle_application_key(source, provider_id):
+    source = str(source or "").strip().casefold()
+    provider_id = str(provider_id or "").strip()
+    if not source or not provider_id:
+        return ""
+    return hashlib.sha256((source + "\x00" + provider_id).encode("utf-8")).hexdigest()
 
 
 def compact_text(value):
