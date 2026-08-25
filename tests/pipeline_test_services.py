@@ -314,7 +314,7 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertEqual(transport.download_urls, ["https://dlus.subhd.me/2026/07/chinese1.srt"])
         self.assertEqual(transport.download_limits, [DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES])
 
-    def test_subhd_search_keeps_bitmap_only_candidates_for_server_application(self):
+    def test_subhd_search_parser_identifies_bitmap_candidates(self):
         from pipeline.external_subtitles import (
             extract_subhd_search_results,
             subtitle_candidate_application_status,
@@ -334,11 +334,31 @@ class ExternalSubtitleTest(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in items], ["sup-only", "ass-sup"])
         self.assertEqual(items[0]["formats"], ["SUP"])
-        self.assertTrue(subtitle_candidate_application_status(items[0])[0])
+        self.assertFalse(subtitle_candidate_application_status(items[0])[0])
         self.assertFalse(subtitle_candidate_preview_status(items[0])[0])
         self.assertTrue(items[1]["filename"].endswith(".ass"))
         self.assertTrue(subtitle_candidate_application_status(items[1])[0])
         self.assertTrue(subtitle_candidate_preview_status(items[1])[0])
+
+    def test_subhd_search_hides_sup_candidates(self):
+        from pipeline.external_subtitles import SubHDProvider
+
+        html = """
+        <a class="link-dark align-middle" href='/a/sup-only'>SUP only</a>
+        <div class="view-text text-secondary"><a href='/a/sup-only'>SUP only</a></div>
+        <div class="text-truncate py-2 f11"><span>简体</span><span>SUP</span></div>
+        <a class="link-dark align-middle" href='/a/ass-only'>ASS only</a>
+        <div class="view-text text-secondary"><a href='/a/ass-only'>ASS only</a></div>
+        <div class="text-truncate py-2 f11"><span>简体</span><span>ASS</span></div>
+        """
+
+        class Transport:
+            def text_request(self, url, **kwargs):
+                return html
+
+        candidates = SubHDProvider(transport=Transport()).search("test")
+
+        self.assertEqual([item["id"] for item in candidates], ["ass-only"])
 
     def test_subhd_zip_selects_chinese_subtitle(self):
         import io
@@ -909,7 +929,7 @@ class ExternalSubtitleTest(unittest.TestCase):
         self.assertEqual(tracks[0]["source"], "fake")
         self.assertEqual(tracks[0]["name"], "SSIS-218 官方简体字幕")
 
-    def test_subtitle_matcher_applies_sup_without_text_preview_gate(self):
+    def test_subtitle_matcher_rejects_sup_application(self):
         from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher
 
         class FakeProvider:
@@ -932,24 +952,23 @@ class ExternalSubtitleTest(unittest.TestCase):
             cache = SubtitleCache(tmp)
             provider = FakeProvider()
             matcher = SubtitleMatcher(cache, [provider], enabled=True, adult_only=False)
-            result = matcher.apply_candidate(
-                "media-1",
-                {
-                    "provider": "subhd",
-                    "query": "Star Trek S01E01",
-                    "candidate": {
-                        "id": "sup-1",
-                        "title": "Star Trek S01E01 PGS",
-                        "formats": ["SUP"],
+            with self.assertRaisesRegex(RuntimeError, "SUP 图形字幕暂不支持应用"):
+                matcher.apply_candidate(
+                    "media-1",
+                    {
+                        "provider": "subhd",
+                        "query": "Star Trek S01E01",
+                        "candidate": {
+                            "id": "sup-1",
+                            "title": "Star Trek S01E01 PGS",
+                            "formats": ["SUP"],
+                        },
                     },
-                },
-            )
+                )
             tracks = cache.list_tracks("media-1")
 
-        self.assertEqual(result["subtitle_match_status"], "success")
-        self.assertEqual(provider.download_args, ("sup-1", "Star Trek S01E01", ""))
-        self.assertEqual(tracks[0]["filename"], "subhd-zh.sup")
-        self.assertEqual(tracks[0]["name"], "Star Trek S01E01 PGS")
+        self.assertEqual(tracks, [])
+        self.assertFalse(hasattr(provider, "download_args"))
 
     def test_subtitle_matcher_preview_candidate_downloads_body_without_cache(self):
         from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher

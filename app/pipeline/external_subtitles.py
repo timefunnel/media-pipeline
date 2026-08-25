@@ -284,7 +284,10 @@ class SubHDProvider:
         transport = self._transport()
         url = urllib.parse.urljoin(self.base_url, "search/" + urllib.parse.quote(search_text, safe=""))
         text = transport.text_request(url, headers=self._headers(), timeout=self.timeout, max_bytes=self.max_bytes)
-        candidates = extract_subhd_search_results(text, self.base_url)
+        candidates = [
+            item for item in extract_subhd_search_results(text, self.base_url)
+            if not subtitle_candidate_is_sup(item)
+        ]
         detail_pages = extract_subhd_search_detail_pages(text, self.base_url)
         selected = select_subhd_season_detail_page(detail_pages, search_text)
         if selected is None:
@@ -308,7 +311,7 @@ class SubHDProvider:
             source_score = int(candidate.get("_score") or 0)
             media_title = str(candidate.get("media_title") or "")
             enriched.append({**candidate, **detail, "_score": source_score, "media_title": media_title})
-        return enriched
+        return [item for item in enriched if not subtitle_candidate_is_sup(item)]
 
     def search_season(self, query, season):
         search_text = str(query or "").strip()
@@ -343,7 +346,11 @@ class SubHDProvider:
         return {
             "detail_url": detail_url,
             "detail_title": str(selected.get("title") or ""),
-            "candidates": extract_subhd_detail_results(detail_html, season, self.base_url),
+            "candidates": [
+                item
+                for item in extract_subhd_detail_results(detail_html, season, self.base_url)
+                if not subtitle_candidate_is_sup(item)
+            ],
         }
 
     def download(self, candidate, query, code=""):
@@ -776,6 +783,8 @@ class SubtitleMatcher:
                     errors.append("%s: %s" % (provider.name, exc))
                     continue
                 for candidate in candidates:
+                    if subtitle_candidate_is_sup(candidate):
+                        continue
                     record = subtitle_candidate_record(provider, query, code, candidate)
                     key = subtitle_candidate_record_key(record)
                     if key in seen:
@@ -1032,6 +1041,8 @@ def subtitle_candidate_title(candidate):
 
 
 def subtitle_candidate_application_status(candidate):
+    if subtitle_candidate_is_sup(candidate):
+        return False, "SUP 图形字幕暂不支持应用"
     raw_formats = (candidate or {}).get("formats")
     if not isinstance(raw_formats, (list, tuple)):
         raw_formats = [raw_formats] if raw_formats else []
@@ -1043,6 +1054,20 @@ def subtitle_candidate_application_status(candidate):
     if any("." + value.lower() in SUBTITLE_EXTENSIONS for value in formats):
         return True, ""
     return False, "%s 不是当前服务端可保存的字幕格式" % "、".join(formats)
+
+
+def subtitle_candidate_is_sup(candidate):
+    raw_formats = (candidate or {}).get("formats")
+    if not isinstance(raw_formats, (list, tuple)):
+        raw_formats = [raw_formats] if raw_formats else []
+    formats = {str(value).strip().casefold().lstrip(".") for value in raw_formats if str(value).strip()}
+    text_formats = {"ass", "srt", "ssa", "vtt"}
+    if "sup" in formats and not formats.intersection(text_formats):
+        return True
+    for key in ("filename", "file_name", "name", "title"):
+        if subtitle_extension(str((candidate or {}).get(key) or "")) == ".sup":
+            return True
+    return False
 
 
 def subtitle_candidate_preview_status(candidate):
