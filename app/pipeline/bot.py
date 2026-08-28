@@ -137,6 +137,7 @@ from pipeline.mediastation import (
     MediaStationApiError,
     MediaStationClient,
     extract_codes,
+    extract_years,
     extract_media_id,
     extract_media_items,
     find_matching_media,
@@ -2826,17 +2827,31 @@ class PipelineBotService:
             return None
         client = self._build_msg_client()
         root = self._msg_target(category, target)
-        media = find_matching_media(
-            extract_media_items(client.search_media(queries[0], limit=20)),
-            queries,
-            library_id=root["library_id"],
-        )
+        candidate_year = duplicate_candidate_year(query, candidate)
+        external_ids = duplicate_external_ids(candidate)
+        search_items = []
+        media = None
+        for search_query in duplicate_media_search_queries(query, candidate, queries):
+            search_items.extend(extract_media_items(client.search_media(search_query, limit=20)))
+            media = find_matching_media(
+                search_items,
+                queries,
+                library_id=root["library_id"],
+                required_year=candidate_year,
+                required_media_type=root.get("media_type"),
+                external_ids=external_ids,
+            )
+            if media is not None:
+                break
         codes = extract_codes(" ".join(queries))
         if media is None and category == "adult" and codes:
             media = find_matching_media(
                 extract_media_items(client.list_library_media(root["library_id"], page=1, page_size=200, group_versions=0)),
                 queries,
                 library_id=root["library_id"],
+                required_year=candidate_year,
+                required_media_type=root.get("media_type"),
+                external_ids=external_ids,
             )
         if media is None:
             return None
@@ -7868,8 +7883,22 @@ def preferred_scrape_title(value):
 
 def duplicate_media_queries(category, query, candidate):
     values = []
-    for value in (query, (candidate or {}).get("title"), (candidate or {}).get("name"), (candidate or {}).get("file_name")):
+    candidate = candidate or {}
+    for value in (query, candidate.get("title"), candidate.get("name"), candidate.get("file_name")):
         if value:
+            values.append(str(value))
+
+    pansou_fields = candidate.get("pansou_fields")
+    if isinstance(pansou_fields, dict):
+        for key in ("title", "filename", "name"):
+            value = pansou_fields.get(key)
+            if value:
+                values.append(str(value))
+    for key in ("aliases", "alias", "alternative_titles", "original_name", "original_title"):
+        value = candidate.get(key)
+        if isinstance(value, (list, tuple, set)):
+            values.extend(str(item) for item in value if str(item or "").strip())
+        elif value:
             values.append(str(value))
 
     if category == "adult":
@@ -7890,7 +7919,75 @@ def duplicate_media_queries(category, query, candidate):
         cleaned = duplicate_title_query(value)
         if cleaned:
             queries.append(cleaned)
+        queries.extend(extract_title_fragments(value, allow_english=True))
     return unique_nonempty_values(queries)
+
+
+def duplicate_media_search_queries(query, candidate, queries):
+    """Search a year-qualified title, then base titles and explicit aliases."""
+    out = [queries[0]] if queries else []
+    candidate = candidate or {}
+    values = [query, candidate.get("title"), candidate.get("name"), candidate.get("file_name")]
+    fields = candidate.get("pansou_fields")
+    if isinstance(fields, dict):
+        values.extend(fields.get(key) for key in ("title", "filename", "name"))
+    for key in ("aliases", "alias", "alternative_titles", "original_name", "original_title"):
+        value = candidate.get(key)
+        if isinstance(value, (list, tuple, set)):
+            values.extend(value)
+        elif value:
+            values.append(value)
+
+    # Keep the user's original query in the search sequence even when the
+    # candidate-specific year query was prepended to ``queries``. This matters
+    # when the user query is an English alias and the candidate title is Chinese
+    # (or vice versa) without explicit brackets around the alias. Do not add the
+    # full candidate filename here: it is often a release string and would
+    # create a redundant second request for ordinary candidates.
+    cleaned_query = duplicate_title_query(query)
+    if cleaned_query and cleaned_query not in out:
+        out.append(cleaned_query)
+    alias_fields = (
+        candidate.get("aliases"),
+        candidate.get("alias"),
+        candidate.get("alternative_titles"),
+        candidate.get("original_name"),
+        candidate.get("original_title"),
+    )
+    for value in alias_fields:
+        values_to_add = value if isinstance(value, (list, tuple, set)) else [value]
+        for alias_value in values_to_add:
+            cleaned = duplicate_title_query(alias_value)
+            if cleaned and cleaned not in out:
+                out.append(cleaned)
+    for value in values:
+        for alias in extract_title_fragments(value, allow_english=True):
+            if alias and alias not in out:
+                out.append(alias)
+    return unique_nonempty_values(out[:5])
+
+
+def duplicate_candidate_year(query, candidate):
+    candidate = candidate or {}
+    preferred = [candidate.get("title"), candidate.get("name"), candidate.get("file_name"), query]
+    for value in preferred:
+        years = sorted(extract_years(value))
+        if years:
+            return years[0]
+    return None
+
+
+def duplicate_external_ids(candidate):
+    candidate = candidate or {}
+    fields = candidate.get("pansou_fields")
+    fields = fields if isinstance(fields, dict) else {}
+    values = {
+        "tmdb": candidate.get("tmdb_id") or candidate.get("tmdbId") or candidate.get("tm_db_id") or fields.get("tmdb"),
+        "douban": candidate.get("douban_id") or candidate.get("doubanId") or fields.get("douban"),
+        "bangumi": candidate.get("bangumi_id") or candidate.get("bangumiId") or fields.get("bangumi"),
+        "thetvdb": candidate.get("thetvdb_id") or candidate.get("thetvdbId") or fields.get("thetvdb"),
+    }
+    return {key: str(value).strip() for key, value in values.items() if str(value or "").strip()}
 
 
 def duplicate_title_query(value):

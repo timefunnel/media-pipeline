@@ -424,7 +424,14 @@ def extract_media_id(item):
     return None
 
 
-def find_matching_media(items, queries, library_id=None):
+def find_matching_media(
+    items,
+    queries,
+    library_id=None,
+    required_year=None,
+    required_media_type=None,
+    external_ids=None,
+):
     filtered = [item for item in items if media_belongs_to_library(item, library_id)]
 
     codes = set()
@@ -440,17 +447,40 @@ def find_matching_media(items, queries, library_id=None):
     best = None
     best_score = 0
     for item in filtered:
-        score = media_match_score(item, codes, normalized_queries)
+        score = media_match_score(
+            item,
+            codes,
+            normalized_queries,
+            required_year=required_year,
+            required_media_type=required_media_type,
+            external_ids=external_ids,
+        )
         if score > best_score:
             best = item
             best_score = score
     return best
 
 
-def media_match_score(item, codes, normalized_queries):
+def media_match_score(
+    item,
+    codes,
+    normalized_queries,
+    required_year=None,
+    required_media_type=None,
+    external_ids=None,
+):
+    if required_year and not media_year_matches(item, required_year):
+        return 0
+    if required_media_type and not media_type_matches(item, required_media_type):
+        return 0
+
     haystack = media_haystack(item)
     normalized_haystack = normalize_text(haystack)
     score = 0
+    external_score = media_external_id_score(item, external_ids)
+    if external_score < 0:
+        return 0
+    score += external_score
     if codes and codes.intersection(extract_codes(haystack)):
         score += 1000
     for query in normalized_queries:
@@ -463,6 +493,117 @@ def media_match_score(item, codes, normalized_queries):
     if media_looks_like_extra(item):
         score -= 500
     return max(score, 0)
+
+
+def media_year_matches(item, required_year):
+    try:
+        year = int(required_year)
+    except (TypeError, ValueError):
+        return True
+    if year < 1900 or year > 2099:
+        return True
+    years = media_release_years(item)
+    return not years or year in years
+
+
+def media_release_years(item):
+    if not isinstance(item, dict):
+        return set()
+    structured_years = set()
+    for key in ("year", "release_year", "releaseYear", "release_date", "releaseDate"):
+        value = item.get(key)
+        if isinstance(value, (int, float)) and 1900 <= int(value) <= 2099:
+            structured_years.add(int(value))
+        else:
+            structured_years.update(extract_years(value))
+    # A populated metadata year is authoritative. Paths and filenames often
+    # contain unrelated years such as remux dates or season folder names.
+    if structured_years:
+        return structured_years
+
+    years = set()
+    for key in (
+        "title",
+        "name",
+        "original_name",
+        "original_title",
+        "file_name",
+        "filename",
+        "path",
+        "file_path",
+        "source_path",
+        "relative_path",
+    ):
+        years.update(extract_years(item.get(key)))
+    return years
+
+
+def extract_years(value):
+    text = str(value or "")
+    return {int(match.group(0)) for match in re.finditer(r"(?<!\d)(?:19|20)\d{2}(?!\d)", text)}
+
+
+def media_type_matches(item, required_media_type):
+    required = str(required_media_type or "").strip().lower()
+    if required in ("", "other"):
+        return True
+    if not isinstance(item, dict):
+        return True
+    explicit = item.get("media_type") or item.get("mediaType")
+    if explicit:
+        explicit = str(explicit).strip().lower()
+        if explicit in ("series", "show"):
+            explicit = "tv"
+        if required == "anime":
+            return explicit in ("anime", "tv")
+        return explicit == required
+    series_id = item.get("series_id") or item.get("seriesId")
+    if not series_id:
+        nested = item.get("series")
+        if isinstance(nested, dict):
+            series_id = nested.get("id") or nested.get("series_id")
+    is_series = bool(str(series_id or "").strip())
+    if required == "movie":
+        return not is_series
+    if required in ("tv", "anime"):
+        return is_series
+    return True
+
+
+def media_external_id_score(item, external_ids):
+    if not external_ids or not isinstance(item, dict):
+        return 0
+    score = 0
+    matched = 0
+    for provider, expected in external_ids.items():
+        expected = str(expected or "").strip().lower()
+        if not expected:
+            continue
+        keys = {
+            "tmdb": ("tmdb_id", "tmdbId", "tm_db_id"),
+            "douban": ("douban_id", "doubanId"),
+            "bangumi": ("bangumi_id", "bangumiId"),
+            "thetvdb": ("thetvdb_id", "thetvdbId", "tvdb_id", "tvdbId"),
+        }.get(str(provider).strip().lower())
+        if not keys:
+            continue
+        actual = ""
+        for key in keys:
+            value = item.get(key)
+            if value not in (None, "", 0, "0"):
+                actual = str(value).strip().lower()
+                break
+        if not actual:
+            continue
+        if actual != expected:
+            return -1
+        matched += 1
+        score += 5000
+    # Once the candidate carries an external ID, title/year similarity alone
+    # is not enough. MSG rows without that ID are treated as unknown rather
+    # than as a match; callers may fall back to title+year only when the
+    # candidate itself has no external IDs.
+    return score if matched else -1
 
 
 def extract_size_bytes(item):

@@ -275,6 +275,27 @@ class PanSouIntegrationTest(unittest.TestCase):
         self.assertIn("中英特效字幕", candidate["pansou_fields"]["subtitles"])
         self.assertEqual(candidate["pansou_fields"]["tags"], "#2160p / #速度与激情 / #动作 / #犯罪 / #惊悚")
 
+    def test_pansou_client_extracts_douban_id_structured_field(self):
+        transport = FakePanSouTransport(
+            {
+                "code": 0,
+                "data": {
+                    "results": [
+                        {
+                            "channel": "douban-source",
+                            "title": "某部电影",
+                            "content": "名称：某部电影 豆瓣 ID：1292052",
+                            "links": [{"type": "115", "url": "https://115.com/s/douban111"}],
+                        }
+                    ]
+                },
+            }
+        )
+
+        candidate = PanSouClient("http://pansou.local", transport=transport).search("某部电影", limit=1)[0]
+
+        self.assertEqual(candidate["pansou_fields"]["douban"], "1292052")
+
     def test_pansou_client_prefers_result_content_and_infers_title_features(self):
         title = "异形(七部合集)【4K.REMUX UHD原盘】【HDR&杜比视界】【国英多音轨】【简繁英双语特效字幕】"
         content = (

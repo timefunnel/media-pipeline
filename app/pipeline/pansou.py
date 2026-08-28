@@ -21,6 +21,7 @@ PANSOU_CONTENT_FIELD_LABELS = {
     "file_count": ("文件",),
     "resource_type": ("资源类型", "质量", "画质", "规格"),
     "tmdb": ("TMDB ID", "TMDBID", "TMDB"),
+    "douban": ("豆瓣 ID", "豆瓣ID", "豆瓣"),
     "size": ("大小", "容量"),
     "tags": ("标签",),
     "cast": ("主演",),

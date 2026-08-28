@@ -1,7 +1,8 @@
 import json
 import posixpath
+import re
 
-from pipeline.mediastation import extract_codes, iter_code_matches
+from pipeline.mediastation import extract_codes, extract_years, iter_code_matches
 from pipeline.openlist_utils import (
     is_openlist_video_file,
     normalize_openlist_path,
@@ -17,6 +18,52 @@ from pipeline.task_state import TASK_STATE
 
 
 DEDUPE_CATEGORIES = {"movie", "tv", "anime", "adult", "other"}
+
+# Bracketed release attributes are useful for display but are not title
+# aliases. Keeping them out of the index prevents a later candidate from
+# matching on generic values such as ``1080p`` or ``REMUX``.
+DEDUPE_ALIAS_NOISE = {
+    "4k",
+    "4khdr",
+    "8bit",
+    "10bit",
+    "2160p",
+    "1080p",
+    "720p",
+    "480p",
+    "hdr",
+    "sdr",
+    "dv",
+    "uhd",
+    "bluray",
+    "brrip",
+    "webrip",
+    "webdl",
+    "web",
+    "hdtv",
+    "remux",
+    "h264",
+    "h265",
+    "hevc",
+    "x264",
+    "x265",
+    "avc",
+    "mkv",
+    "mp4",
+    "avi",
+    "mov",
+    "aac",
+    "ac3",
+    "dts",
+    "flac",
+    "truehd",
+    "atmos",
+    "chs",
+    "cht",
+    "eng",
+    "sub",
+    "dub",
+}
 
 
 def find_local_duplicate(records, category, candidate_record, candidate):
@@ -50,10 +97,19 @@ def find_local_duplicate(records, category, candidate_record, candidate):
 
 def find_index_duplicate(store, category, candidate_record, candidate):
     identities = candidate_dedupe_identities(category, candidate_record, candidate)
+    has_external_ids = bool(candidate_external_ids(candidate))
     for identity in identities:
-        matches = store.find_dedupe_entries(category, [identity], limit=1)
-        if matches:
-            return duplicate_from_dedupe_entry(identity, matches[0])
+        if has_external_ids and identity.get("identity_type") == "normalized_title":
+            continue
+        matches = store.find_dedupe_entries(category, [identity], limit=20)
+        for match in matches:
+            if identity.get("identity_type") == "normalized_title" and not dedupe_years_compatible(
+                candidate_record,
+                candidate,
+                match,
+            ):
+                continue
+            return duplicate_from_dedupe_entry(identity, match)
     return None
 
 
@@ -63,16 +119,27 @@ def candidate_dedupe_identities(category, candidate_record, candidate):
     if info_hash:
         identities.append({"identity_type": "info_hash", "identity_value": info_hash})
 
-    values = [candidate_record.get("query"), candidate.get("title"), candidate.get("download_uri")]
+    candidate = candidate or {}
+    values = [candidate_record.get("query"), candidate.get("title"), candidate.get("name"), candidate.get("file_name"), candidate.get("download_uri")]
+    fields = candidate.get("pansou_fields")
+    if isinstance(fields, dict):
+        values.extend(fields.get(key) for key in ("title", "filename", "name"))
     if category == "adult":
         code = first_adult_code(values)
         if code:
             identities.append({"identity_type": "adult_code", "identity_value": code})
 
-    for value in (candidate_record.get("query"), candidate.get("title")):
+    alias_values = [candidate_record.get("query"), candidate.get("title"), candidate.get("name"), candidate.get("file_name")]
+    if isinstance(fields, dict):
+        alias_values.extend(fields.get(key) for key in ("title", "filename", "name"))
+    for value in alias_values:
         normalized_title = dedupe_title_identity(value)
         if normalized_title:
             identities.append({"identity_type": "normalized_title", "identity_value": normalized_title})
+        for alias in dedupe_title_aliases(value):
+            normalized_alias = dedupe_title_identity(alias)
+            if normalized_alias:
+                identities.append({"identity_type": "normalized_title", "identity_value": normalized_alias})
     return unique_dedupe_identities(identities)
 
 
@@ -201,6 +268,16 @@ def dedupe_entries_from_openlist_work_item(client, category, root_path, item):
                 "identity_value": normalized_title,
             }
         )
+    for alias in dedupe_title_aliases(name):
+        normalized_alias = dedupe_title_identity(alias)
+        if normalized_alias and normalized_alias != normalized_title:
+            entries.append(
+                {
+                    **base,
+                    "identity_type": "normalized_title",
+                    "identity_value": normalized_alias,
+                }
+            )
 
     info_hash = str((item or {}).get("info_hash") or (item or {}).get("infoHash") or "").strip()
     if info_hash:
@@ -320,6 +397,81 @@ def dedupe_title_identity(value):
     if len(normalized) < 4:
         return ""
     return normalized
+
+
+def dedupe_title_aliases(value):
+    text = str(value or "")
+    aliases = []
+    for match in re.finditer(r"[\[\(（【]([^\]\)）】]{2,120})[\]\)）】]", text):
+        alias = match.group(1).strip()
+        if (
+            alias
+            and not is_dedupe_alias_noise(alias)
+            and not extract_codes(alias)
+        ):
+            aliases.append(alias)
+    return unique_text_values(aliases)
+
+
+def candidate_external_ids(candidate):
+    candidate = candidate or {}
+    fields = candidate.get("pansou_fields")
+    fields = fields if isinstance(fields, dict) else {}
+    values = {
+        "tmdb": candidate.get("tmdb_id") or candidate.get("tmdbId") or candidate.get("tm_db_id") or fields.get("tmdb"),
+        "douban": candidate.get("douban_id") or candidate.get("doubanId") or fields.get("douban"),
+        "bangumi": candidate.get("bangumi_id") or candidate.get("bangumiId") or fields.get("bangumi"),
+        "thetvdb": candidate.get("thetvdb_id") or candidate.get("thetvdbId") or fields.get("thetvdb"),
+    }
+    return {key: str(value).strip() for key, value in values.items() if str(value or "").strip()}
+
+
+def is_dedupe_alias_noise(value):
+    normalized = normalize_openlist_text(value)
+    if not normalized:
+        return True
+    if normalized in DEDUPE_ALIAS_NOISE or re.fullmatch(r"(?:19|20)\d{2}", normalized):
+        return True
+
+    # A single bracket can contain several release attributes, for example
+    # ``[1080p REMUX x265]``. Treat it as noise only when every token is known
+    # release metadata, preserving real aliases that happen to include a tag.
+    tokens = re.findall(r"[a-z0-9]+", str(value or "").casefold())
+    return bool(tokens) and all(
+        token in DEDUPE_ALIAS_NOISE or re.fullmatch(r"(?:19|20)\d{2}", token)
+        for token in tokens
+    )
+
+
+def unique_text_values(values):
+    seen = set()
+    out = []
+    for value in values:
+        text = str(value or "").strip()
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out
+
+
+def dedupe_years_compatible(candidate_record, candidate, entry):
+    candidate_year = first_title_year(
+        (candidate or {}).get("title"),
+        (candidate or {}).get("name"),
+        (candidate or {}).get("file_name"),
+        (candidate_record or {}).get("query"),
+    )
+    entry_year = first_title_year((entry or {}).get("title"), (entry or {}).get("path"))
+    return not candidate_year or not entry_year or candidate_year == entry_year
+
+
+def first_title_year(*values):
+    for value in values:
+        years = sorted(extract_years(value))
+        if years:
+            return years[0]
+    return None
 
 
 def dedupe_source_label(source):

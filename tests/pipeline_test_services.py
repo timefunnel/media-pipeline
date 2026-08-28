@@ -1635,6 +1635,79 @@ class MediaStationClientTest(unittest.TestCase):
 
         self.assertEqual(extract_media_id(media), "main-1")
 
+    def test_external_id_match_is_required_when_candidate_has_external_id(self):
+        items = [
+            {
+                "id": "same-title-without-id",
+                "library_id": "library-1",
+                "title": "流浪地球2",
+                "original_name": "The Wandering Earth 2",
+                "year": 2023,
+            },
+            {
+                "id": "exact-id",
+                "library_id": "library-1",
+                "title": "流浪地球2",
+                "original_name": "The Wandering Earth 2",
+                "year": 2023,
+                "tmdb_id": 1895,
+            },
+        ]
+
+        media = find_matching_media(
+            items,
+            ["流浪地球2"],
+            library_id="library-1",
+            required_year=2023,
+            required_media_type="movie",
+            external_ids={"tmdb": "1895"},
+        )
+
+        self.assertEqual(extract_media_id(media), "exact-id")
+
+    def test_external_id_match_does_not_fallback_to_title_when_id_is_missing(self):
+        items = [
+            {
+                "id": "same-title-without-id",
+                "library_id": "library-1",
+                "title": "流浪地球2",
+                "original_name": "The Wandering Earth 2",
+                "year": 2023,
+            }
+        ]
+
+        media = find_matching_media(
+            items,
+            ["流浪地球2"],
+            library_id="library-1",
+            required_year=2023,
+            required_media_type="movie",
+            external_ids={"tmdb": "1895"},
+        )
+
+        self.assertIsNone(media)
+
+    def test_media_year_match_prefers_structured_year_over_path_year(self):
+        items = [
+            {
+                "id": "wrong-year",
+                "library_id": "library-1",
+                "title": "同名作品",
+                "year": 2002,
+                "path": "cloud://openlist/115/电影/同名作品 (2019)/movie.mkv",
+            }
+        ]
+
+        media = find_matching_media(
+            items,
+            ["同名作品"],
+            library_id="library-1",
+            required_year=2019,
+            required_media_type="movie",
+        )
+
+        self.assertIsNone(media)
+
     def test_extract_codes_ignores_codec_tags_and_years(self):
         codes = extract_codes("[HEVC-10bit][H264-1080][WEB-DL.1080p][Sintel.2010][ABF-363][GANA-2525]")
 

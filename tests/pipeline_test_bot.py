@@ -7380,6 +7380,211 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(duplicate["media_id"], "media-original")
         self.assertEqual(duplicate["title"], "黑衣人")
 
+    def test_check_duplicate_rejects_same_title_with_different_year(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-remake",
+                            "library_id": "test-movie-library",
+                            "title": "无间道",
+                            "original_name": "Infernal Affairs",
+                            "year": 2002,
+                            "path": "cloud://openlist/115/电影/无间道 (2002)/movie.mkv",
+                        }
+                    ]
+                }
+            }
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                )
+            )
+            duplicate = service.check_duplicate(
+                "movie",
+                "Infernal Affairs",
+                {"title": "Infernal Affairs 2019 1080p"},
+                target={
+                    "library_id": "test-movie-library",
+                    "root_id": "test-movie-root",
+                    "root_openlist_path": "/115/电影",
+                    "provider": "tmdb",
+                    "media_type": "movie",
+                },
+            )
+
+        self.assertIsNone(duplicate)
+
+    def test_check_duplicate_requires_external_id_when_candidate_has_one(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "same-title-without-id",
+                            "library_id": "test-movie-library",
+                            "title": "流浪地球2",
+                            "original_name": "The Wandering Earth 2",
+                            "year": 2023,
+                        }
+                    ]
+                }
+            }
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                )
+            )
+            duplicate = service.check_duplicate(
+                "movie",
+                "流浪地球2",
+                {"title": "流浪地球2 2023 2160p", "pansou_fields": {"tmdb": "1895"}},
+                target={
+                    "library_id": "test-movie-library",
+                    "root_id": "test-movie-root",
+                    "root_openlist_path": "/115/电影",
+                    "provider": "tmdb",
+                    "media_type": "movie",
+                },
+            )
+
+        self.assertIsNone(duplicate)
+
+    def test_check_duplicate_matches_explicit_alias_when_primary_title_differs(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            search_response={
+                "data": {
+                    "items": [
+                        {
+                            "id": "media-alias",
+                            "library_id": "test-movie-library",
+                            "title": "流浪地球2",
+                            "original_name": "The Wandering Earth 2",
+                            "year": 2023,
+                        }
+                    ]
+                }
+            }
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                )
+            )
+            duplicate = service.check_duplicate(
+                "movie",
+                "流浪地球2",
+                {"title": "[The Wandering Earth 2] 2023 2160p"},
+                target={
+                    "library_id": "test-movie-library",
+                    "root_id": "test-movie-root",
+                    "root_openlist_path": "/115/电影",
+                    "provider": "tmdb",
+                    "media_type": "movie",
+                },
+            )
+
+        self.assertEqual(duplicate["media_id"], "media-alias")
+
+    def test_check_duplicate_searches_original_query_after_year_qualified_title(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class QueryAwareFakeMediaStationClient(FakeMediaStationClient):
+            def __init__(self, responses):
+                super().__init__()
+                self.responses = responses
+
+            def search_media(self, query, limit=20):
+                self.search_calls.append((query, limit))
+                return self.responses.get(query, {"data": {"items": []}})
+
+        fake_msg = QueryAwareFakeMediaStationClient(
+            {
+                "流浪地球2 2023": {"data": {"items": []}},
+                "The Wandering Earth 2": {
+                    "data": {
+                        "items": [
+                            {
+                                "id": "media-alias",
+                                "library_id": "test-movie-library",
+                                "title": "流浪地球2",
+                                "original_name": "The Wandering Earth 2",
+                                "year": 2023,
+                            }
+                        ]
+                    }
+                },
+            }
+        )
+
+        with patch("pipeline.bot.MediaStationClient", return_value=fake_msg):
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    msg_admin_user="admin",
+                    msg_admin_password="secret",
+                    msg_enabled=True,
+                )
+            )
+            duplicate = service.check_duplicate(
+                "movie",
+                "The Wandering Earth 2",
+                {"title": "流浪地球2 2023 2160p"},
+                target={
+                    "library_id": "test-movie-library",
+                    "root_id": "test-movie-root",
+                    "root_openlist_path": "/115/电影",
+                    "provider": "tmdb",
+                    "media_type": "movie",
+                },
+            )
+
+        self.assertEqual(
+            fake_msg.search_calls,
+            [("流浪地球2 2023", 20), ("The Wandering Earth 2", 20)],
+        )
+        self.assertEqual(duplicate["media_id"], "media-alias")
+
+    def test_dedupe_title_aliases_ignores_release_metadata(self):
+        from pipeline.dedupe import dedupe_title_aliases
+
+        self.assertEqual(
+            dedupe_title_aliases("Movie (1080p REMUX x265) [2023] (The Film)"),
+            ["The Film"],
+        )
+
     def test_upgrade_duplicate_matches_another_episode_in_same_tmdb_series(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
