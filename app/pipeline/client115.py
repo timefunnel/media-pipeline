@@ -1,4 +1,5 @@
 import json
+import posixpath
 import re
 import time
 import urllib.error
@@ -353,15 +354,35 @@ class Share115Client:
                     return out
                 offset += len(page)
 
-        top_items = list_items(cid)
+        top_items = []
+        for item in list_items(cid):
+            row = dict(item)
+            row["relative_path"] = str(row.get("name") or "").strip()
+            top_items.append(row)
         manifest = list(top_items)
-        stack = [item["file_id"] for item in top_items if item.get("is_dir")]
+        stack = [
+            (item["file_id"], item["relative_path"])
+            for item in top_items
+            if item.get("is_dir")
+        ]
         while stack:
-            children = list_items(stack.pop())
+            folder_id, parent_path = stack.pop()
+            children = []
+            for item in list_items(folder_id):
+                row = dict(item)
+                row["relative_path"] = posixpath.join(
+                    parent_path,
+                    str(row.get("name") or "").strip(),
+                )
+                children.append(row)
             manifest.extend(children)
             if len(manifest) > int(max_entries):
                 raise RuntimeError("115 share entry limit exceeded")
-            stack.extend(item["file_id"] for item in children if item.get("is_dir"))
+            stack.extend(
+                (item["file_id"], item["relative_path"])
+                for item in children
+                if item.get("is_dir")
+            )
         return top_items, manifest, request_count
 
     def _snap(self, cookie_jar, share_code, receive_code="", cid="0", limit=50, offset=0):

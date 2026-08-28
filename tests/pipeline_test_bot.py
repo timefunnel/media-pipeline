@@ -5433,6 +5433,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                     "import_target_openlist_path": "/115/电影/Movie",
                     "import_target_original_openlist_path": "/115/电影/Movie",
                     "import_target_purpose": "import",
+                    "transfer_verify_status": "success",
                 },
             )
 

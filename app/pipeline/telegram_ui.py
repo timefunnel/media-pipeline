@@ -405,6 +405,18 @@ def append_task_lines(lines, task, category=None):
         lines.append("wp_path_id：%s" % task.get("wp_path_id"))
     if task.get("content_profile"):
         lines.append("内容分类：%s" % CONTENT_PROFILE_LABELS.get(task.get("content_profile"), task.get("content_profile")))
+    if task.get("transfer_verify_status"):
+        verification = task.get("transfer_verification") or {}
+        direct_count = ((verification.get("direct_manifest") or {}).get("entry_count"))
+        openlist_count = ((verification.get("openlist_manifest") or {}).get("entry_count"))
+        if task.get("transfer_verify_status") == "success":
+            lines.append("文件完整性：已校验（115 %s / OpenList %s）" % (direct_count or 0, openlist_count or 0))
+        elif task.get("transfer_verify_status") == "running":
+            lines.append("文件完整性：等待115与OpenList一致（115 %s / OpenList %s）" % (direct_count or 0, openlist_count or 0))
+        else:
+            lines.append("文件完整性：失败")
+            if task.get("transfer_verify_error"):
+                lines.append("完整性错误：%s" % task.get("transfer_verify_error"))
     if task.get("msg_sync_status"):
         if task.get("msg_sync_status") == "success":
             lines.append("MSG同步：已完成")

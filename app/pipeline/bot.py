@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import posixpath
@@ -261,6 +262,8 @@ DEFAULT_INTERNAL_API_WORKERS = 3
 DEFAULT_INTERNAL_API_OWNER_WORKERS = 2
 DEFAULT_INTERNAL_API_OFFLINE_WAIT_SLICE_SECONDS = 5 * 60
 DEFAULT_INTERNAL_API_SEARCH_TTL_SECONDS = 15 * 60
+IMPORT_TRANSFER_RETRY_INITIAL_SECONDS = 15
+IMPORT_TRANSFER_RETRY_MAX_SECONDS = 300
 CATEGORY_LABELS = {"movie": "电影库", "tv": "剧集库", "anime": "动漫库", "adult": "成人库", "other": "其他库"}
 CONTENT_PROFILE_LABELS = {
     "adult": "成人",
@@ -2136,6 +2139,21 @@ class PipelineBotService:
         client = self._build_115_share_client()
         response = client.receive_share_url(download_uri, folder_id)
         data = response.get("data") or {}
+        received_file_ids = normalize_transfer_file_ids(data.get("save_as_top_fids"))
+        received_item_names = normalize_transfer_item_names(
+            (item or {}).get("name") for item in data.get("items") or []
+        )
+        if not received_file_ids and not received_item_names:
+            raise RuntimeError("115分享转存响应缺少可校验的顶层文件")
+        source_manifest = build_transfer_manifest(
+            data.get("manifest_items") or data.get("items") or [],
+            item_name=lambda item: str((item or {}).get("name") or "").strip(),
+            item_is_dir=lambda item: bool((item or {}).get("is_dir")),
+            item_size=lambda item: int((item or {}).get("size") or 0),
+            item_relative_path=lambda item: str(
+                (item or {}).get("relative_path") or (item or {}).get("name") or ""
+            ).strip(),
+        )
         task_id = share_receive_task_id(data.get("share_code"))
         task = {
             "info_hash": task_id,
@@ -2144,10 +2162,13 @@ class PipelineBotService:
             "status_name": "success",
             "percent_done": 100,
             "wp_path_id": folder_id,
-            "file_id": first_value(data.get("save_as_top_fids")),
+            "file_id": received_file_ids[0] if received_file_ids else None,
+            "received_file_ids": received_file_ids,
+            "received_item_names": received_item_names,
             "share_code": data.get("share_code"),
             "source_url": data.get("source_url") or download_uri,
             "received_item_count": len(data.get("items") or []),
+            "source_manifest": source_manifest,
         }
         if self.config.msg_enabled:
             task["msg_sync_status"] = "running"
@@ -2230,6 +2251,30 @@ class PipelineBotService:
             "import_target_finalized_at": int(time.time()),
             "import_target_finalize_error": None,
         }
+
+    def verify_import_transfer(self, category, task):
+        task = dict(task or {})
+        target_path = normalize_openlist_path(task.get("import_target_openlist_path"))
+        if not target_path:
+            raise ValueError("入库目标 OpenList 路径缺失")
+        previous = dict(task.get("transfer_verification") or {})
+        now = int(time.time())
+        if (
+            previous.get("status") == "running"
+            and int(previous.get("next_probe_at") or 0) > now
+        ):
+            return previous
+        openlist_client = self._build_openlist_scan_client()
+        if task.get("source_manifest") or previous.get("direct_manifest_locked"):
+            return probe_import_transfer_visibility(None, openlist_client, task)
+        return self._call_115(
+            category,
+            lambda client: probe_import_transfer_visibility(
+                client,
+                openlist_client,
+                task,
+            ),
+        )
 
     def _ensure_category_directory(self, category, folder_name):
         root_folder_id = str(category_to_folder_id(category) or "").strip()
@@ -2926,6 +2971,45 @@ class PipelineBotService:
             out.update(progress)
             if progress_callback:
                 progress_callback(dict(progress))
+
+        if out.get("import_target_openlist_path") and out.get("transfer_verify_status") != "success":
+            capture_progress(
+                {
+                    "transfer_verify_status": "running",
+                    "transfer_verify_reason": "probing_115_and_openlist",
+                    "transfer_verify_error": None,
+                    "msg_sync_status": "running",
+                    "msg_error": None,
+                }
+            )
+            try:
+                verification = self.verify_import_transfer(category, out)
+            except (RuntimeError, ValueError) as exc:
+                verification = {
+                    "status": "failed",
+                    "reason": "verification_error",
+                    "error": str(exc),
+                    "observed_at": int(time.time()),
+                }
+            verify_status = str(verification.get("status") or "").strip().lower()
+            verify_error = str(verification.get("error") or "").strip() or None
+            updates = {
+                "transfer_verification": verification,
+                "transfer_verify_status": verify_status,
+                "transfer_verify_reason": verification.get("reason"),
+                "transfer_verify_error": verify_error,
+            }
+            if verify_status == "running":
+                updates.update({"msg_sync_status": "running", "msg_error": None})
+                capture_progress(updates)
+                return out
+            if verify_status != "success":
+                error = verify_error or "115入库文件完整性校验失败"
+                updates.update({"msg_sync_status": "failed", "msg_error": error})
+                capture_progress(updates)
+                return out
+            updates.update({"msg_sync_status": "running", "msg_error": None})
+            capture_progress(updates)
 
         if out.get("import_target_openlist_path") and out.get("import_target_finalize_status") != "success":
             try:
@@ -4510,7 +4594,360 @@ def wait_openlist_names_moved(client, src_dir, dst_dir, names, timeout_seconds=3
         time.sleep(max(0.01, float(poll_seconds)))
 
 
-def list_openlist_descendants(client, root_path, max_entries=20000):
+def normalize_transfer_file_ids(value):
+    if isinstance(value, (list, tuple, set)):
+        values = list(value)
+    elif isinstance(value, str) and "," in value:
+        values = value.split(",")
+    else:
+        values = [value]
+    out = []
+    seen = set()
+    for item in values:
+        file_id = str(item or "").strip()
+        if file_id and file_id not in seen:
+            seen.add(file_id)
+            out.append(file_id)
+    return out
+
+
+def normalize_transfer_item_names(values):
+    out = []
+    seen = set()
+    for value in values or []:
+        name = str(value or "").strip()
+        key = name.casefold()
+        if not name:
+            continue
+        if key in seen:
+            raise RuntimeError("115入库顶层清单存在重复名称: %s" % name)
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+def build_transfer_manifest(entries, item_name, item_is_dir, item_size, item_relative_path):
+    records = []
+    seen_paths = set()
+    file_count = 0
+    dir_count = 0
+    total_file_size = 0
+    for item in entries or []:
+        name = str(item_name(item) or "").strip()
+        relative_path = str(item_relative_path(item) or name).strip().replace("\\", "/")
+        relative_path = posixpath.normpath(relative_path).lstrip("/")
+        if (
+            not name
+            or not relative_path
+            or relative_path in {".", ".."}
+            or relative_path.startswith("../")
+        ):
+            raise RuntimeError("115入库清单存在无效路径")
+        if relative_path in seen_paths:
+            raise RuntimeError("115入库清单存在重复路径: %s" % relative_path)
+        seen_paths.add(relative_path)
+        is_dir = bool(item_is_dir(item))
+        size = 0 if is_dir else max(0, int(item_size(item) or 0))
+        records.append([relative_path, "dir" if is_dir else "file", size])
+        if is_dir:
+            dir_count += 1
+        else:
+            file_count += 1
+            total_file_size += size
+    records.sort(key=lambda row: (row[0].casefold(), row[0], row[1], row[2]))
+    encoded = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return {
+        "entry_count": len(records),
+        "file_count": file_count,
+        "dir_count": dir_count,
+        "total_file_size": total_file_size,
+        "fingerprint": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def transfer_manifests_match(expected, actual):
+    expected = dict(expected or {})
+    actual = dict(actual or {})
+    return bool(
+        expected.get("fingerprint")
+        and expected.get("fingerprint") == actual.get("fingerprint")
+        and int(expected.get("entry_count") or 0) == int(actual.get("entry_count") or 0)
+        and int(expected.get("file_count") or 0) == int(actual.get("file_count") or 0)
+        and int(expected.get("dir_count") or 0) == int(actual.get("dir_count") or 0)
+    )
+
+
+def inspect_115_import_task_entries(client, task, max_entries=20000):
+    task = dict(task or {})
+    root_ids = normalize_transfer_file_ids(
+        task.get("received_file_ids") or task.get("file_id")
+    )
+    root_names = normalize_transfer_item_names(task.get("received_item_names") or [])
+    if not root_ids and not root_names:
+        raise RuntimeError("115已完成任务缺少结果文件 ID 或顶层名称")
+    parent_id = str(task.get("wp_path_id") or "").strip()
+    if not parent_id:
+        raise RuntimeError("115已完成任务缺少目标目录 ID")
+
+    parent_items, request_count = client.list_all_files_with_request_count(
+        parent_id, page_size=7000
+    )
+    parent_by_id = defaultdict(list)
+    parent_by_name = defaultdict(list)
+    for item in parent_items:
+        row = dict(item or {})
+        parent_by_id[p115_open_item_id(row)].append(row)
+        parent_by_name[p115_open_item_name(row).casefold()].append(row)
+
+    entries = []
+    missing_root_ids = []
+    missing_root_names = []
+    stack = []
+    root_selectors = [("id", value) for value in root_ids] or [
+        ("name", value) for value in root_names
+    ]
+    for selector_kind, selector_value in root_selectors:
+        matches = (
+            parent_by_id.get(selector_value)
+            if selector_kind == "id"
+            else parent_by_name.get(selector_value.casefold())
+        ) or []
+        if not matches:
+            if selector_kind == "id":
+                missing_root_ids.append(selector_value)
+            else:
+                missing_root_names.append(selector_value)
+            continue
+        if len(matches) != 1:
+            raise RuntimeError(
+                "115入库结果顶层项存在重复匹配: %s" % selector_value
+            )
+        row = dict(matches[0])
+        name = p115_open_item_name(row)
+        if not name:
+            raise RuntimeError("115入库结果缺少文件名: %s" % selector_value)
+        row["_transfer_relative_path"] = name
+        entries.append(row)
+        if p115_open_item_is_dir(row):
+            root_id = p115_open_item_id(row)
+            if not root_id:
+                raise RuntimeError("115入库结果顶层目录缺少文件 ID: %s" % name)
+            stack.append((root_id, name))
+
+    while stack:
+        folder_id, parent_path = stack.pop()
+        children, requests = client.list_all_files_with_request_count(folder_id, page_size=7000)
+        request_count += requests
+        for item in children:
+            row = dict(item or {})
+            name = p115_open_item_name(row)
+            if not name:
+                raise RuntimeError("115入库子项缺少文件名: %s" % folder_id)
+            row["_transfer_relative_path"] = posixpath.join(parent_path, name)
+            entries.append(row)
+            if len(entries) > int(max_entries):
+                raise RuntimeError("115入库结果超过目录项上限")
+            if p115_open_item_is_dir(row):
+                child_id = p115_open_item_id(row)
+                if not child_id:
+                    raise RuntimeError("115入库子目录缺少文件 ID")
+                stack.append((child_id, row["_transfer_relative_path"]))
+
+    return {
+        "entries": entries,
+        "missing_root_ids": missing_root_ids,
+        "missing_root_names": missing_root_names,
+        "request_count": request_count,
+    }
+
+
+def probe_import_transfer_visibility(
+    p115_client,
+    openlist_client,
+    task,
+    now_fn=time.time,
+):
+    task = dict(task or {})
+    target_path = normalize_openlist_path(task.get("import_target_openlist_path"))
+    if not target_path:
+        raise RuntimeError("入库目标 OpenList 路径缺失")
+    now = int(now_fn())
+    source_kind = str(task.get("source_kind") or "115_offline").strip() or "115_offline"
+    expected_manifest = dict(task.get("source_manifest") or {})
+    previous = dict(task.get("transfer_verification") or {})
+    if previous.get("status") == "running" and int(previous.get("next_probe_at") or 0) > now:
+        return previous
+
+    probe_attempt = int(previous.get("probe_attempt") or 0) + 1
+    inspected = None
+    direct_manifest_locked = False
+    if expected_manifest:
+        direct_manifest = expected_manifest
+        direct_manifest_locked = True
+        direct_request_count = 0
+    elif previous.get("direct_manifest_locked") and (previous.get("direct_manifest") or {}).get(
+        "fingerprint"
+    ):
+        direct_manifest = dict(previous["direct_manifest"])
+        direct_manifest_locked = True
+        direct_request_count = int(previous.get("direct_request_count") or 0)
+    else:
+        if p115_client is None:
+            raise RuntimeError("115离线下载完整性校验缺少115客户端")
+        inspected = inspect_115_import_task_entries(p115_client, task)
+        direct_manifest = build_transfer_manifest(
+            inspected["entries"],
+            item_name=p115_open_item_name,
+            item_is_dir=p115_open_item_is_dir,
+            item_size=subscription_follow_item_size,
+            item_relative_path=lambda item: (item or {}).get("_transfer_relative_path"),
+        )
+        direct_request_count = int(inspected.get("request_count") or 0)
+
+    result = {
+        "status": "running",
+        "reason": "waiting_115_result",
+        "source_kind": source_kind,
+        "expected_manifest": expected_manifest or None,
+        "direct_manifest": direct_manifest,
+        "direct_manifest_locked": direct_manifest_locked,
+        "direct_request_count": direct_request_count,
+        "openlist_manifest": None,
+        "missing_root_ids": list((inspected or {}).get("missing_root_ids") or []),
+        "missing_root_names": list((inspected or {}).get("missing_root_names") or []),
+        "probe_attempt": probe_attempt,
+        "next_probe_at": None,
+        "observed_at": now,
+        "error": None,
+    }
+
+    def wait_for_retry(reason):
+        retry_seconds = min(
+            IMPORT_TRANSFER_RETRY_MAX_SECONDS,
+            IMPORT_TRANSFER_RETRY_INITIAL_SECONDS * (2 ** min(max(0, probe_attempt - 1), 8)),
+        )
+        result.update(
+            {
+                "status": "running",
+                "reason": reason,
+                "next_probe_at": now + retry_seconds,
+                "retry_after_seconds": retry_seconds,
+            }
+        )
+        return result
+
+    if result["missing_root_ids"] or result["missing_root_names"]:
+        return wait_for_retry("waiting_115_result")
+    if int(direct_manifest.get("file_count") or 0) <= 0:
+        return wait_for_retry("waiting_115_files")
+    result["direct_manifest_locked"] = True
+
+    direct_count = int(direct_manifest.get("entry_count") or 0)
+    try:
+        cached_manifest, cached_request_count = inspect_openlist_transfer_manifest(
+            openlist_client, target_path, refresh=False
+        )
+    except RuntimeError as exc:
+        if not openlist_missing_error(exc) and not openlist_receive_operation_is_retryable_error(exc):
+            raise
+        cached_manifest = None
+        cached_request_count = 0
+        result["openlist_cached_error"] = str(exc)
+    result["openlist_cached_manifest"] = cached_manifest
+    result["openlist_cached_request_count"] = cached_request_count
+    if cached_manifest and transfer_manifests_match(direct_manifest, cached_manifest):
+        result.update(
+            {
+                "status": "success",
+                "reason": "manifest_verified_from_cache",
+                "openlist_manifest": cached_manifest,
+                "openlist_query_mode": "cache_hit",
+                "openlist_refresh_performed": False,
+                "openlist_refresh_request_count": 0,
+                "next_probe_at": None,
+                "retry_after_seconds": None,
+                "verified_at": now,
+            }
+        )
+        return result
+
+    try:
+        openlist_manifest, refresh_request_count = inspect_openlist_transfer_manifest(
+            openlist_client, target_path, refresh=True
+        )
+    except RuntimeError as exc:
+        if not openlist_missing_error(exc) and not openlist_receive_operation_is_retryable_error(exc):
+            raise
+        result.update(
+            {
+                "openlist_query_mode": "refresh_failed",
+                "openlist_refresh_performed": True,
+                "openlist_refresh_error": str(exc),
+            }
+        )
+        return wait_for_retry("waiting_openlist_path")
+    result.update(
+        {
+            "openlist_manifest": openlist_manifest,
+            "openlist_query_mode": "refreshed",
+            "openlist_refresh_performed": True,
+            "openlist_refresh_request_count": refresh_request_count,
+        }
+    )
+    openlist_count = int(openlist_manifest.get("entry_count") or 0)
+    if openlist_count < direct_count:
+        return wait_for_retry("waiting_openlist_manifest")
+    if openlist_count > direct_count or not transfer_manifests_match(
+        direct_manifest, openlist_manifest
+    ):
+        result.update(
+            {
+                "status": "failed",
+                "reason": "openlist_manifest_mismatch",
+                "error": "OpenList入库目录与115结果不一致: expected=%d actual=%d"
+                % (direct_count, openlist_count),
+            }
+        )
+        return result
+    result.update(
+        {
+            "status": "success",
+            "reason": "manifest_verified",
+            "next_probe_at": None,
+            "retry_after_seconds": None,
+            "verified_at": now,
+        }
+    )
+    return result
+
+
+def inspect_openlist_transfer_manifest(client, target_path, refresh=False):
+    request_count = [0]
+    entries = list_openlist_descendants(
+        client,
+        target_path,
+        refresh=refresh,
+        request_count=request_count,
+    )
+    manifest = build_transfer_manifest(
+        entries,
+        item_name=openlist_item_name,
+        item_is_dir=openlist_item_is_dir,
+        item_size=openlist_item_size,
+        item_relative_path=lambda item: posixpath.relpath(
+            str((item or {}).get("path") or ""), target_path
+        ),
+    )
+    return manifest, request_count[0]
+
+
+def list_openlist_descendants(
+    client,
+    root_path,
+    max_entries=20000,
+    refresh=True,
+    request_count=None,
+):
     root = normalize_openlist_path(root_path)
     if not root:
         raise RuntimeError("OpenList staging root path missing")
@@ -4518,7 +4955,9 @@ def list_openlist_descendants(client, root_path, max_entries=20000):
     stack = [root]
     while stack:
         current = stack.pop()
-        for item in client.list_all(current, refresh=True):
+        if request_count is not None:
+            request_count[0] += 1
+        for item in client.list_all(current, refresh=bool(refresh)):
             row = dict(item or {})
             row["path"] = openlist_item_path(current, row)
             out.append(row)
@@ -4649,7 +5088,7 @@ def classify_115_resource_entries(
 def subscription_follow_item_size(item):
     if not isinstance(item, dict):
         return 0
-    for key in ("size", "size_bytes", "sizeBytes", "s"):
+    for key in ("size", "size_bytes", "sizeBytes", "fs", "s"):
         try:
             value = int(item.get(key) or 0)
         except (TypeError, ValueError):
@@ -9152,15 +9591,6 @@ def p115_cookie_qr_reply_markup(session_id):
             ]
         ]
     }
-
-
-def first_value(value):
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            if item:
-                return item
-        return None
-    return value
 
 
 def subtitle_backfill_record_from_row(row):

@@ -4135,6 +4135,8 @@ def warning_retry_stage(result, request=None):
 
 def sync_stage(task):
     task = task or {}
+    if task.get("transfer_verify_status") == "running":
+        return "verifying_source"
     if task.get("msg_scan_status") == "running" or task.get("msg_ingest_status") == "running":
         return "scanning"
     if task.get("msg_scrape_status") == "running":
@@ -4268,6 +4270,7 @@ def import_status_message(status, stage, error):
         "preparing_upgrade": "正在准备整剧升级目录",
         "submitted": "115 任务已提交",
         "waiting_download": "等待 115 下载完成",
+        "verifying_source": "正在校验 115 与 OpenList 文件完整性",
         "syncing": "正在同步 MediaStationGo",
         "scanning": "MediaStationGo 正在扫描入库",
         "scraping": "MediaStationGo 正在刮削",

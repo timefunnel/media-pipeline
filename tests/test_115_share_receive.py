@@ -29,7 +29,9 @@ from pipeline.bot import (
     CandidateStore,
     PipelineBotService,
     TelegramBot,
+    build_transfer_manifest,
     inspect_115_offline_result,
+    probe_import_transfer_visibility,
     share115_candidate_from_text,
 )
 from pipeline.client115 import P115QRCodeLoginClient, Share115Client, p115_cookie_is_valid, parse_115_share_url
@@ -220,6 +222,10 @@ class Share115ReceiveTest(unittest.TestCase):
             ["ABF-001.mp4", "ABF-001", "ABF-002.mp4"],
         )
         self.assertEqual(result["data"]["manifest_request_count"], 2)
+        self.assertEqual(
+            [item["relative_path"] for item in result["data"]["manifest_items"]],
+            ["ABF-001.mp4", "ABF-001", "ABF-001/ABF-002.mp4"],
+        )
 
     def test_pipeline_submit_115_share_uses_share_client_not_offline_open_api(self):
         class FakeShareClient:
@@ -253,6 +259,338 @@ class Share115ReceiveTest(unittest.TestCase):
         self.assertEqual(result["task_status"]["status_name"], "success")
         self.assertEqual(result["task_status"]["source_kind"], "115_share")
         self.assertEqual(result["task_status"]["share_code"], "swabc123")
+        self.assertEqual(result["task_status"]["received_file_ids"], ["saved-1"])
+        self.assertEqual(result["task_status"]["received_item_names"], ["ABF-001.mp4"])
+        self.assertEqual(result["task_status"]["source_manifest"]["entry_count"], 1)
+
+    def test_pipeline_share_submit_uses_top_level_names_when_115_returns_no_saved_ids(self):
+        class FakeShareClient:
+            def receive_share_url(self, url, folder_id):
+                return {
+                    "state": True,
+                    "code": 0,
+                    "data": {
+                        "share_code": "swabc123",
+                        "source_url": url,
+                        "items": [{"name": "Show", "is_dir": True}],
+                        "manifest_items": [
+                            {"name": "Show", "relative_path": "Show", "is_dir": True},
+                            {
+                                "name": "01.mkv",
+                                "relative_path": "Show/01.mkv",
+                                "is_dir": False,
+                                "size": 100,
+                            },
+                        ],
+                        "save_as_top_fids": [],
+                    },
+                }
+
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}, p115_cookie="UID=u"))
+        with patch.object(service, "_build_115_share_client", return_value=FakeShareClient()):
+            result = service.submit(
+                "anime",
+                "https://115.com/s/swabc123",
+                target_folder_id="task-folder",
+            )
+
+        task = result["task_status"]
+        self.assertIsNone(task["file_id"])
+        self.assertEqual(task["received_file_ids"], [])
+        self.assertEqual(task["received_item_names"], ["Show"])
+        self.assertEqual(task["source_manifest"]["entry_count"], 2)
+
+    def test_share_transfer_uses_source_manifest_and_backs_off_openlist_refresh(self):
+        source_entries = [
+            {"name": "Show", "relative_path": "Show", "is_dir": True, "size": 0},
+            {"name": "01.mkv", "relative_path": "Show/01.mkv", "is_dir": False, "size": 100},
+            {"name": "02.mkv", "relative_path": "Show/02.mkv", "is_dir": False, "size": 200},
+        ]
+        expected = build_transfer_manifest(
+            source_entries,
+            item_name=lambda item: item["name"],
+            item_is_dir=lambda item: item["is_dir"],
+            item_size=lambda item: item["size"],
+            item_relative_path=lambda item: item["relative_path"],
+        )
+
+        class FakeOpenList:
+            def __init__(self):
+                self.complete = False
+                self.calls = []
+
+            def list_all(self, path, refresh=False):
+                self.calls.append((path, refresh))
+                if path == "/115/anime/import-task":
+                    return [{"name": "Show", "is_dir": True, "size": 0}]
+                if path == "/115/anime/import-task/Show":
+                    files = [{"name": "01.mkv", "is_dir": False, "size": 100}]
+                    if self.complete:
+                        files.append({"name": "02.mkv", "is_dir": False, "size": 200})
+                    return files
+                raise AssertionError("unexpected OpenList path: %s" % path)
+
+        task = {
+            "source_kind": "115_share",
+            "source_manifest": expected,
+            "received_file_ids": [],
+            "received_item_names": ["Show"],
+            "file_id": None,
+            "wp_path_id": "target-folder",
+            "import_target_openlist_path": "/115/anime/import-task",
+        }
+        openlist = FakeOpenList()
+
+        waiting_openlist = probe_import_transfer_visibility(None, openlist, task, now_fn=lambda: 100)
+        self.assertEqual(waiting_openlist["status"], "running")
+        self.assertEqual(waiting_openlist["reason"], "waiting_openlist_manifest")
+        self.assertEqual(waiting_openlist["direct_request_count"], 0)
+        self.assertEqual(waiting_openlist["next_probe_at"], 115)
+        self.assertTrue(waiting_openlist["openlist_refresh_performed"])
+
+        task["transfer_verification"] = waiting_openlist
+        openlist.complete = True
+        calls_before_backoff = len(openlist.calls)
+        deferred = probe_import_transfer_visibility(None, openlist, task, now_fn=lambda: 101)
+        self.assertEqual(deferred, waiting_openlist)
+        self.assertEqual(len(openlist.calls), calls_before_backoff)
+
+        verified = probe_import_transfer_visibility(None, openlist, task, now_fn=lambda: 115)
+        self.assertEqual(verified["status"], "success")
+        self.assertEqual(verified["direct_manifest"]["entry_count"], 3)
+        self.assertEqual(verified["openlist_manifest"]["entry_count"], 3)
+        self.assertEqual(verified["openlist_query_mode"], "cache_hit")
+        self.assertIn(False, [refresh for _path, refresh in openlist.calls])
+        self.assertIn(True, [refresh for _path, refresh in openlist.calls])
+
+    def test_stale_openlist_cache_refreshes_only_after_manifest_mismatch(self):
+        expected = build_transfer_manifest(
+            [
+                {"name": "Show", "relative_path": "Show", "is_dir": True, "size": 0},
+                {"name": "01.mkv", "relative_path": "Show/01.mkv", "is_dir": False, "size": 100},
+                {"name": "02.mkv", "relative_path": "Show/02.mkv", "is_dir": False, "size": 200},
+            ],
+            item_name=lambda item: item["name"],
+            item_is_dir=lambda item: item["is_dir"],
+            item_size=lambda item: item["size"],
+            item_relative_path=lambda item: item["relative_path"],
+        )
+
+        class FakeOpenList:
+            def __init__(self):
+                self.calls = []
+
+            def list_all(self, path, refresh=False):
+                self.calls.append((path, refresh))
+                if path == "/115/anime/import-task":
+                    return [{"name": "Show", "is_dir": True, "size": 0}]
+                if path == "/115/anime/import-task/Show":
+                    files = [{"name": "01.mkv", "is_dir": False, "size": 100}]
+                    if refresh:
+                        files.append({"name": "02.mkv", "is_dir": False, "size": 200})
+                    return files
+                raise AssertionError("unexpected OpenList path: %s" % path)
+
+        openlist = FakeOpenList()
+        result = probe_import_transfer_visibility(
+            None,
+            openlist,
+            {
+                "source_kind": "115_share",
+                "source_manifest": expected,
+                "import_target_openlist_path": "/115/anime/import-task",
+            },
+            now_fn=lambda: 100,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["openlist_query_mode"], "refreshed")
+        self.assertEqual(result["openlist_refresh_request_count"], 2)
+        self.assertEqual(
+            openlist.calls,
+            [
+                ("/115/anime/import-task", False),
+                ("/115/anime/import-task/Show", False),
+                ("/115/anime/import-task", True),
+                ("/115/anime/import-task/Show", True),
+            ],
+        )
+
+    def test_openlist_target_error_triggers_one_refreshed_read(self):
+        expected = build_transfer_manifest(
+            [{"name": "movie.mkv", "is_dir": False, "size": 100}],
+            item_name=lambda item: item["name"],
+            item_is_dir=lambda item: item["is_dir"],
+            item_size=lambda item: item["size"],
+            item_relative_path=lambda item: item["name"],
+        )
+
+        class FakeOpenList:
+            def __init__(self):
+                self.calls = []
+
+            def list_all(self, path, refresh=False):
+                self.calls.append((path, refresh))
+                if not refresh:
+                    raise RuntimeError("OpenList list failed: object not found")
+                return [{"name": "movie.mkv", "is_dir": False, "size": 100}]
+
+        openlist = FakeOpenList()
+        result = probe_import_transfer_visibility(
+            None,
+            openlist,
+            {
+                "source_kind": "115_share",
+                "source_manifest": expected,
+                "import_target_openlist_path": "/115/movie/import-task",
+            },
+            now_fn=lambda: 100,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["openlist_query_mode"], "refreshed")
+        self.assertEqual(
+            openlist.calls,
+            [
+                ("/115/movie/import-task", False),
+                ("/115/movie/import-task", True),
+            ],
+        )
+
+    def test_offline_transfer_reads_115_once_then_reuses_locked_manifest(self):
+        class Fake115:
+            def __init__(self):
+                self.calls = 0
+
+            def list_all_files_with_request_count(self, folder_id, page_size=1000):
+                self.calls += 1
+                if folder_id != "target-folder":
+                    raise AssertionError("unexpected 115 folder: %s" % folder_id)
+                return ([{"fid": "video-1", "fn": "movie.mkv", "fc": "1", "fs": 100}], 1)
+
+        class FakeOpenList:
+            def __init__(self):
+                self.complete = False
+                self.calls = 0
+
+            def list_all(self, path, refresh=False):
+                self.calls += 1
+                if path != "/115/movie/import-task":
+                    raise AssertionError("unexpected OpenList request")
+                if not self.complete:
+                    return []
+                return [{"name": "movie.mkv", "is_dir": False, "size": 100}]
+
+        task = {
+            "file_id": "video-1",
+            "wp_path_id": "target-folder",
+            "import_target_openlist_path": "/115/movie/import-task",
+        }
+        p115 = Fake115()
+        openlist = FakeOpenList()
+        first = probe_import_transfer_visibility(p115, openlist, task, now_fn=lambda: 100)
+        self.assertEqual(first["status"], "running")
+        self.assertTrue(first["direct_manifest_locked"])
+        self.assertEqual(first["direct_request_count"], 1)
+        self.assertEqual(p115.calls, 1)
+        task["transfer_verification"] = first
+        openlist.complete = True
+        openlist_calls = openlist.calls
+        second = probe_import_transfer_visibility(None, openlist, task, now_fn=lambda: 105)
+        self.assertEqual(second, first)
+        self.assertEqual(openlist.calls, openlist_calls)
+        third = probe_import_transfer_visibility(None, openlist, task, now_fn=lambda: 115)
+        self.assertEqual(third["status"], "success")
+        self.assertEqual(third["openlist_query_mode"], "cache_hit")
+        self.assertEqual(third["direct_request_count"], 1)
+        self.assertEqual(p115.calls, 1)
+
+    def test_transfer_backoff_skips_client_creation_before_next_probe(self):
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        previous = {
+            "status": "running",
+            "reason": "waiting_openlist_manifest",
+            "next_probe_at": 115,
+        }
+        task = {
+            "import_target_openlist_path": "/115/movie/import-task",
+            "transfer_verification": previous,
+        }
+        with patch("pipeline.bot.time.time", return_value=100), patch.object(
+            service,
+            "_build_openlist_scan_client",
+            side_effect=AssertionError("OpenList client must not be created during backoff"),
+        ), patch.object(
+            service,
+            "_call_115",
+            side_effect=AssertionError("115 client must not be created during backoff"),
+        ):
+            result = service.verify_import_transfer("movie", task)
+
+        self.assertEqual(result, previous)
+
+    def test_share_verification_never_calls_direct_115_api(self):
+        expected = build_transfer_manifest(
+            [{"name": "movie.mkv", "is_dir": False, "size": 100}],
+            item_name=lambda item: item["name"],
+            item_is_dir=lambda item: item["is_dir"],
+            item_size=lambda item: item["size"],
+            item_relative_path=lambda item: item["name"],
+        )
+
+        class FakeOpenList:
+            def list_all(self, path, refresh=False):
+                self.request = (path, refresh)
+                return [{"name": "movie.mkv", "is_dir": False, "size": 100}]
+
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        openlist = FakeOpenList()
+        with patch.object(service, "_build_openlist_scan_client", return_value=openlist), patch.object(
+            service,
+            "_call_115",
+            side_effect=AssertionError("share verification must not call direct 115 API"),
+        ):
+            result = service.verify_import_transfer(
+                "movie",
+                {
+                    "source_kind": "115_share",
+                    "source_manifest": expected,
+                    "import_target_openlist_path": "/115/movie/import-task",
+                },
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["direct_request_count"], 0)
+        self.assertEqual(result["openlist_query_mode"], "cache_hit")
+        self.assertEqual(openlist.request, ("/115/movie/import-task", False))
+
+    def test_msg_sync_does_not_start_before_transfer_verification(self):
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        task = {
+            "info_hash": "HASH",
+            "status_name": "success",
+            "import_target_openlist_path": "/115/anime/import-task",
+            "msg_sync_status": "running",
+        }
+        with patch.object(
+            service,
+            "verify_import_transfer",
+            return_value={
+                "status": "running",
+                "reason": "waiting_openlist_manifest",
+                "direct_manifest": {"entry_count": 283},
+                "openlist_manifest": {"entry_count": 172},
+            },
+        ), patch.object(
+            service,
+            "finalize_import_target",
+            side_effect=AssertionError("target must not finalize before transfer verification"),
+        ):
+            result = service.sync_completed_task("anime", "完美世界", task)
+
+        self.assertEqual(result["transfer_verify_status"], "running")
+        self.assertEqual(result["msg_sync_status"], "running")
+        self.assertNotIn("import_target_finalize_status", result)
 
     def test_direct_message_can_create_115_share_candidate(self):
         candidate = share115_candidate_from_text("转存 https://115cdn.com/s/swabc123 提取码 xy99")
