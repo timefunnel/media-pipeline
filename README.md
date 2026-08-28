@@ -26,12 +26,12 @@ Telegram search result
 ```text
 Telegram 115 share link
 -> choose target library
--> 115 web share receive with state.db P115 cookie or P115_COOKIE fallback
+-> 115 web share receive with the Cookie managed by MediaStationGo's cloud115 storage config
 -> OpenList 115 mount
 -> MediaStationGo cloud root scan and scrape
 ```
 
-Use `/p115_cookie` in the Telegram Bot to check or refresh the 115 web cookie by QR login. The saved cookie is stored in the Bot state database and takes effect without restarting the container. `P115_COOKIE` remains only a startup fallback.
+Maintain the 115 web Cookie in the MediaStationGo admin UI under `外部存储 -> 115网盘`, either by entering it or using 115 App QR login. The Bot reads that decrypted admin storage config when receiving a share; it does not persist or update a second Cookie in its own state database. `/p115_cookie` only points to the MSG management page for older clients.
 
 The compose file includes a local PanSou API service bound to `127.0.0.1:8888`. Keep `PANSOU_TOKEN` empty unless PanSou auth is enabled; the Bot only calls it from the host network and requests `cloud_types=["115"]`.
 

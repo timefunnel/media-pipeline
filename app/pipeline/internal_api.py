@@ -3021,6 +3021,26 @@ class InternalApiApplication:
             "capabilities": capabilities,
         }
 
+    def validate_media_migration(self, payload):
+        _owner_id, candidate, target_category = normalize_media_migration_request(payload)
+        try:
+            result = self.service.validate_media_candidate_migration(candidate, target_category)
+        except (RuntimeError, ValueError) as exc:
+            raise ApiError(409, "migration_invalid", str(exc))
+        if not isinstance(result, dict):
+            raise ApiError(502, "migration_invalid_response", "pipeline migration validation returned invalid response")
+        return result
+
+    def apply_media_migration(self, payload):
+        _owner_id, candidate, target_category = normalize_media_migration_request(payload)
+        try:
+            result = self.service.migrate_media_candidate(candidate, target_category)
+        except (RuntimeError, ValueError) as exc:
+            raise ApiError(409, "migration_failed", str(exc))
+        if not isinstance(result, dict) or not result.get("openlist_moved"):
+            raise ApiError(502, "migration_invalid_response", "pipeline migration apply returned invalid response")
+        return result
+
     def prepare_manual_candidate(self, payload):
         if not isinstance(payload, dict):
             raise ApiError(400, "invalid_request", "request body must be a JSON object")
@@ -3429,6 +3449,12 @@ class InternalApiServer:
                 return
             if handler.command == "POST" and path == "/v1/manual-candidates":
                 self._send_json(handler, 200, self.application.prepare_manual_candidate(self._read_json(handler)))
+                return
+            if handler.command == "POST" and path == "/v1/migrations/validate":
+                self._send_json(handler, 200, self.application.validate_media_migration(self._read_json(handler)))
+                return
+            if handler.command == "POST" and path == "/v1/migrations/apply":
+                self._send_json(handler, 200, self.application.apply_media_migration(self._read_json(handler)))
                 return
             if handler.command == "POST" and path == "/v1/subtitles/search":
                 self._send_json(handler, 200, self.application.search_subtitles(self._read_json(handler)))
@@ -3869,6 +3895,38 @@ def normalize_episode_numbers(value, field):
             seen.add(episode)
             out.append(episode)
     return sorted(out)
+
+
+def normalize_media_migration_request(payload):
+    if not isinstance(payload, dict):
+        raise ApiError(400, "invalid_request", "request body must be a JSON object")
+    owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
+    target_category = require_category(payload.get("target_category"))
+    raw_candidate = payload.get("candidate")
+    if not isinstance(raw_candidate, dict):
+        raise ApiError(400, "invalid_candidate", "candidate must be a JSON object")
+    source_kind = str(raw_candidate.get("source_kind") or "").strip().lower()
+    if source_kind not in {"file", "folder"}:
+        raise ApiError(400, "invalid_source_kind", "candidate source_kind must be file or folder")
+    title = str(raw_candidate.get("title") or "").strip()
+    if len(title) > 500:
+        raise ApiError(400, "invalid_title", "candidate title is too long")
+    source_path = require_text(
+        raw_candidate.get("source_openlist_path"), "source_openlist_path", max_length=2000
+    )
+    if not source_path.startswith("/"):
+        raise ApiError(400, "invalid_source_path", "source_openlist_path must be absolute")
+    candidate = {
+        "title": title,
+        "category": require_category(raw_candidate.get("category")),
+        "library_id": require_text(raw_candidate.get("library_id"), "library_id", max_length=200),
+        "library_root_id": require_text(
+            raw_candidate.get("library_root_id"), "library_root_id", max_length=200
+        ),
+        "source_openlist_path": source_path,
+        "source_kind": source_kind,
+    }
+    return owner_id, candidate, target_category
 
 
 def require_category(value):

@@ -18,13 +18,11 @@ from pathlib import Path
 
 from pipeline.client115 import (
     Client115,
-    P115QRCodeLoginClient,
     Share115Client,
     ensure_115_open_success,
     is_115_share_url,
     mask_p115_cookie,
     p115_cookie_is_valid,
-    qrcode_status_label,
     share_receive_task_id,
 )
 from pipeline.config import (
@@ -288,7 +286,7 @@ HELP_TEXT = """使用说明
 /migrate 迁移已有媒体到其他库，下一条消息输入关键词
 /subtitle_report 查看成人库字幕补齐统计
 /subtitle_find <番号或标题> 查找成人库影片并重配字幕
-/p115_cookie 查看或扫码更新 115 分享转存 Cookie
+/p115_cookie 查看 Cookie 管理提示
 /dedupe_refresh 刷新已入库记录（需二次确认）
 /cancel 退出当前等待输入
 /version 查看当前版本
@@ -304,7 +302,7 @@ BOT_COMMANDS = [
     {"command": "migrate", "description": "迁移已入库媒体到其他库"},
     {"command": "subtitle_report", "description": "查看成人库字幕补齐统计"},
     {"command": "subtitle_find", "description": "按番号或标题查找字幕影片"},
-    {"command": "p115_cookie", "description": "查看或扫码更新 115 分享转存 Cookie"},
+    {"command": "p115_cookie", "description": "查看 115 Cookie 管理提示"},
     {"command": "dedupe_refresh", "description": "刷新重复判断索引（需二次确认）"},
     {"command": "cancel", "description": "退出当前等待输入"},
     {"command": "version", "description": "查看当前版本"},
@@ -509,6 +507,8 @@ class BotConfig:
     asr_translation_timeout_seconds: int = DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS
     asr_translation_thinking_disabled: bool = True
     asr_cache_dir: str = "/bot-data/subtitle-asr-cache"
+    # Deprecated compatibility field.  115 share credentials are managed by
+    # MediaStationGo's cloud115 storage configuration.
     p115_cookie: str = ""
     subscription_staging_root: str = DEFAULT_SUBSCRIPTION_STAGING_ROOT
     subscription_staging_folder_id: str = ""
@@ -723,13 +723,7 @@ class BotConfig:
                 parse_bool(env.get("LLM_THINKING_DISABLED"), True),
             ),
             asr_cache_dir=env.get("ASR_CACHE_DIR", "/bot-data/subtitle-asr-cache"),
-            p115_cookie=(
-                env.get("P115_COOKIE")
-                or env.get("SHARE115_COOKIE")
-                or env.get("CLOUD115_COOKIE")
-                or env.get("PAN115_COOKIE")
-                or ""
-            ),
+            p115_cookie="",
             subscription_staging_root=normalize_openlist_path(
                 env.get("MEDIA_PIPELINE_SUBSCRIPTION_STAGING_ROOT", DEFAULT_SUBSCRIPTION_STAGING_ROOT)
             ),
@@ -1795,9 +1789,8 @@ class MediaStationIngestPending(RuntimeError):
 
 
 class PipelineBotService:
-    def __init__(self, config, p115_cookie_provider=None):
+    def __init__(self, config):
         self.config = config
-        self.p115_cookie_provider = p115_cookie_provider
         self._llm_rerank_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-rerank")
         self._llm_rerank_lock = threading.Lock()
         self._subtitle_matcher = None
@@ -2744,7 +2737,10 @@ class PipelineBotService:
             lambda client: reset_task_for_resubmit(client, info_hash, max_pages=10),
         )
 
-    def migrate_media_candidate(self, candidate, target_category):
+    def validate_media_candidate_migration(self, candidate, target_category):
+        return self._prepare_media_candidate_migration(candidate, target_category)[4]
+
+    def _prepare_media_candidate_migration(self, candidate, target_category):
         target = build_migration_target(candidate, target_category)
         msg_client = self._build_msg_client()
         source = {
@@ -2766,6 +2762,12 @@ class PipelineBotService:
             or validation.get("target_openlist_path") != target.get("target_openlist_path")
         ):
             raise RuntimeError("MediaStationGo migration validation returned invalid response")
+        return target, msg_client, source, msg_target, validation
+
+    def migrate_media_candidate(self, candidate, target_category):
+        target, msg_client, source, msg_target, _validation = self._prepare_media_candidate_migration(
+            candidate, target_category
+        )
 
         openlist_client = OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
         source_path = candidate["source_openlist_path"]
@@ -3380,11 +3382,7 @@ class PipelineBotService:
         return Client115(token.access_token)
 
     def _build_115_share_client(self):
-        cookie = ""
-        if self.p115_cookie_provider is not None:
-            cookie = str(self.p115_cookie_provider() or "").strip()
-        if not cookie:
-            cookie = self.config.p115_cookie
+        cookie = self._build_msg_client().get_cloud115_cookie()
         return Share115Client(cookie)
 
     def _sync_mediastation(
@@ -5683,14 +5681,8 @@ class TelegramBot:
             )
             return
         if target == "p115":
-            self.telegram.answer_callback_query(callback_id, "115 Cookie")
-            self._update_callback_message(
-                chat_id,
-                message_id,
-                format_p115_cookie_status_message(self.store.get_p115_cookie()),
-                reply_markup=p115_cookie_status_reply_markup(),
-                fallback_chat_id=chat_id,
-            )
+            self.telegram.answer_callback_query(callback_id, "请到 MSG 管理后台维护")
+            self._update_callback_message(chat_id, message_id, p115_cookie_management_hint(), fallback_chat_id=chat_id)
             return
         self.telegram.answer_callback_query(callback_id, "不支持的菜单操作")
 
@@ -6560,136 +6552,20 @@ class TelegramBot:
         )
 
     def _handle_p115_cookie_command(self, chat_id):
-        cookie = self.store.get_p115_cookie() or self.config.p115_cookie
-        self.telegram.send_message(
-            chat_id,
-            format_p115_cookie_status_message(cookie),
-            reply_markup=p115_cookie_status_reply_markup(),
-        )
+        self.telegram.send_message(chat_id, p115_cookie_management_hint())
 
     def _handle_p115_cookie_start_callback(self, user_id, chat_id, message_id, callback_id):
-        self.telegram.answer_callback_query(callback_id, "正在生成二维码")
-        try:
-            session = P115QRCodeLoginClient().start()
-            session_id = self.store.create_p115_qr_session(user_id, chat_id, session)
-        except Exception as exc:
-            self._update_callback_message(
-                chat_id,
-                message_id,
-                "生成 115 扫码登录二维码失败：%s" % exc,
-                reply_markup=p115_cookie_status_reply_markup(),
-            )
-            return
-
-        self._update_callback_message(
-            chat_id,
-            message_id,
-            format_p115_qr_message(session_id, session, status_label="等待扫码"),
-            reply_markup=p115_cookie_qr_reply_markup(session_id),
-        )
+        self._reply_p115_cookie_management_hint(chat_id, message_id, callback_id)
 
     def _handle_p115_cookie_check_callback(self, user_id, chat_id, message_id, callback_id, session_id):
-        record = self._load_owned_p115_qr_session(user_id, callback_id, session_id)
-        if record is None:
-            return
-        if record["status"] in {"confirmed", "cancelled", "expired"}:
-            self.telegram.answer_callback_query(callback_id, qrcode_session_final_label(record["status"]))
-            self._update_callback_message(
-                chat_id,
-                message_id,
-                format_p115_qr_final_message(record["status"], self.store.get_p115_cookie()),
-                reply_markup=p115_cookie_status_reply_markup(),
-                fallback_chat_id=record["chat_id"],
-            )
-            return
-
-        client = P115QRCodeLoginClient(app=(record["session"] or {}).get("app") or "web")
-        try:
-            status = client.status(record["session"])
-        except Exception as exc:
-            self.telegram.answer_callback_query(callback_id, "状态查询失败")
-            self._update_callback_message(
-                chat_id,
-                message_id,
-                "查询 115 扫码状态失败：%s" % exc,
-                reply_markup=p115_cookie_qr_reply_markup(record["id"]),
-                fallback_chat_id=record["chat_id"],
-            )
-            return
-
-        status_code = int(status.get("status") or 0)
-        if status_code == 2:
-            try:
-                cookie = client.login(record["session"], require_confirmed=False)
-                self.store.set_p115_cookie(cookie)
-                self.store.update_p115_qr_session(record["id"], "confirmed")
-            except Exception as exc:
-                self.telegram.answer_callback_query(callback_id, "保存失败")
-                self._update_callback_message(
-                    chat_id,
-                    message_id,
-                    "115 扫码已确认，但保存 Cookie 失败：%s" % exc,
-                    reply_markup=p115_cookie_qr_reply_markup(record["id"]),
-                    fallback_chat_id=record["chat_id"],
-                )
-                return
-            self.telegram.answer_callback_query(callback_id, "已保存 115 Cookie")
-            self._update_callback_message(
-                chat_id,
-                message_id,
-                format_p115_cookie_saved_message(cookie),
-                reply_markup=p115_cookie_status_reply_markup(),
-                fallback_chat_id=record["chat_id"],
-            )
-            return
-
-        if status_code == -1:
-            self.store.update_p115_qr_session(record["id"], "expired")
-            self.telegram.answer_callback_query(callback_id, "二维码已过期")
-            self._update_callback_message(
-                chat_id,
-                message_id,
-                format_p115_qr_final_message("expired", self.store.get_p115_cookie()),
-                reply_markup=p115_cookie_status_reply_markup(),
-                fallback_chat_id=record["chat_id"],
-            )
-            return
-
-        if status_code == -2:
-            self.store.update_p115_qr_session(record["id"], "cancelled")
-            self.telegram.answer_callback_query(callback_id, "已取消")
-            self._update_callback_message(
-                chat_id,
-                message_id,
-                format_p115_qr_final_message("cancelled", self.store.get_p115_cookie()),
-                reply_markup=p115_cookie_status_reply_markup(),
-                fallback_chat_id=record["chat_id"],
-            )
-            return
-
-        status_label = qrcode_status_label(status_code)
-        self.telegram.answer_callback_query(callback_id, status_label)
-        self._update_callback_message(
-            chat_id,
-            message_id,
-            format_p115_qr_message(record["id"], record["session"], status_label=status_label),
-            reply_markup=p115_cookie_qr_reply_markup(record["id"]),
-            fallback_chat_id=record["chat_id"],
-        )
+        self._reply_p115_cookie_management_hint(chat_id, message_id, callback_id)
 
     def _handle_p115_cookie_cancel_callback(self, user_id, chat_id, message_id, callback_id, session_id):
-        record = self._load_owned_p115_qr_session(user_id, callback_id, session_id)
-        if record is None:
-            return
-        self.store.update_p115_qr_session(record["id"], "cancelled")
-        self.telegram.answer_callback_query(callback_id, "已取消")
-        self._update_callback_message(
-            chat_id,
-            message_id,
-            format_p115_qr_final_message("cancelled", self.store.get_p115_cookie()),
-            reply_markup=p115_cookie_status_reply_markup(),
-            fallback_chat_id=record["chat_id"],
-        )
+        self._reply_p115_cookie_management_hint(chat_id, message_id, callback_id)
+
+    def _reply_p115_cookie_management_hint(self, chat_id, message_id, callback_id):
+        self.telegram.answer_callback_query(callback_id, "请到 MSG 管理后台维护")
+        self._update_callback_message(chat_id, message_id, p115_cookie_management_hint())
 
     def _handle_status_command(self, chat_id, user_id, argument):
         info_hash = argument.strip()
@@ -9534,6 +9410,10 @@ def format_p115_cookie_status_message(cookie):
     return "115 分享转存 Cookie：未配置或格式无效\n\n点击“扫码更新”，使用 115 App 扫码确认后保存。Bot 不会回显完整 Cookie。"
 
 
+def p115_cookie_management_hint():
+    return "115 分享转存 Cookie 已统一由 MSG 管理后台维护。请打开 MSG 管理后台的“外部存储 → 115网盘”，使用 Cookie 输入框或 115 App 扫码登录后保存；Bot 不再保存或更新 Cookie。"
+
+
 def format_p115_cookie_saved_message(cookie):
     return "115 Cookie 已保存，后续 115 分享链接转存会直接使用。\n%s" % mask_p115_cookie(cookie)
 
@@ -9994,7 +9874,7 @@ def build_bot(config=None):
     config = config or BotConfig.from_env()
     telegram = TelegramApi(config.token, timeout=config.telegram_timeout)
     store = CandidateStore(config.state_db_path)
-    service = PipelineBotService(config, p115_cookie_provider=store.get_p115_cookie)
+    service = PipelineBotService(config)
     internal_api = None
     if config.internal_api_enabled:
         from pipeline.internal_api import InternalApiServer

@@ -1440,6 +1440,31 @@ class OpenListClientTest(unittest.TestCase):
 
 
 class MediaStationClientTest(unittest.TestCase):
+    def test_cloud115_cookie_reads_decrypted_msg_admin_storage_config(self):
+        transport = SequenceTransport(
+            [
+                {"tokens": {"access_token": "msg-token"}},
+                {"type": "cloud115", "enabled": True, "config": {"cookie": "UID=uid;CID=cid;SEID=seid"}},
+            ]
+        )
+        client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
+
+        self.assertEqual(client.get_cloud115_cookie(), "UID=uid;CID=cid;SEID=seid")
+        self.assertEqual(transport.calls[1]["method"], "GET")
+        self.assertEqual(transport.calls[1]["url"], "http://127.0.0.1:18080/api/admin/storage/cloud115")
+
+    def test_cloud115_cookie_rejects_missing_or_invalid_msg_config(self):
+        for config in ({}, {"cookie": "UID=uid;CID=cid"}):
+            transport = SequenceTransport(
+                [
+                    {"tokens": {"access_token": "msg-token"}},
+                    {"type": "cloud115", "config": config},
+                ]
+            )
+            client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
+            with self.assertRaisesRegex(RuntimeError, "cloud115 Cookie missing or invalid"):
+                client.get_cloud115_cookie()
+
     def test_subtitle_translation_accepts_direct_msg_response(self):
         transport = SequenceTransport(
             [

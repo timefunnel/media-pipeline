@@ -414,10 +414,9 @@ MSG_ADMIN_PASSWORD
 MEDIA_PIPELINE_*_FOLDER_ID
   115 目录 cid
 
-P115_COOKIE
-  115 网页 Cookie
-  仅用于 115 分享链接转存到当前账号目录；推荐部署后在 Telegram Bot 里使用 /p115_cookie 扫码写入 state.db
-  state.db 中已保存的 Cookie 优先于 P115_COOKIE，更新后无需重启 Bot
+115 Cookie
+  115 分享链接转存使用的网页 Cookie 由 MediaStationGo 管理后台维护：打开“外部存储 -> 115网盘”，填写 Cookie 或使用 115 App 扫码登录后保存。
+  Bot 通过 MSG 管理员账号读取该配置，不再在 Bot state.db 或环境变量中维护第二份 Cookie；`/p115_cookie` 仅返回管理入口提示。
   磁链离线和目录读取仍复用 OpenList 维护的 115 Open access_token/refresh_token
 
 PANSOU_ENABLED / PANSOU_URL

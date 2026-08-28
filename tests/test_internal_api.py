@@ -362,6 +362,8 @@ class FakePipelineService:
         self.subscription_receive_active = 0
         self.subscription_receive_max_active = 0
         self.reset_resubmit_calls = []
+        self.migration_validate_calls = []
+        self.migration_apply_calls = []
     def search(self, query, category, limit=20):
         return ResultList(
             [{"title": query, "download_uri": "magnet:?xt=urn:btih:%s" % query.upper(), "rank": 1}],
@@ -382,6 +384,27 @@ class FakePipelineService:
             [{"title": query, "download_uri": "magnet:?xt=urn:btih:BT4G%s" % query.upper(), "rank": 1}],
             metadata={"profile": "bt4g"},
         )
+
+    def validate_media_candidate_migration(self, candidate, target_category):
+        self.migration_validate_calls.append((dict(candidate), target_category))
+        return {
+            "source_openlist_path": candidate["source_openlist_path"],
+            "target_openlist_path": "/115/动漫/作品",
+            "target_category": target_category,
+            "media_count": 2,
+            "series_count": 1,
+        }
+
+    def migrate_media_candidate(self, candidate, target_category):
+        self.migration_apply_calls.append((dict(candidate), target_category))
+        return {
+            "source_openlist_path": candidate["source_openlist_path"],
+            "target_openlist_path": "/115/动漫/作品",
+            "target_category": target_category,
+            "media_count": 2,
+            "series_count": 1,
+            "openlist_moved": True,
+        }
 
 
     def subtitle_search_candidates(self, media_id, limit=20):
@@ -875,6 +898,45 @@ class InternalApiTestCase(unittest.TestCase):
                 return task
             time.sleep(0.01)
         self.fail("import task did not reach a final state")
+
+
+class MediaMigrationApiTest(InternalApiTestCase):
+    def migration_payload(self):
+        return {
+            "owner_id": "admin-id",
+            "target_category": "anime",
+            "candidate": {
+                "title": "作品",
+                "category": "tv",
+                "library_id": "tv-library",
+                "library_root_id": "tv-root",
+                "source_openlist_path": "/115/剧集/作品",
+                "source_kind": "folder",
+                "ignored": "must-not-cross-the-boundary",
+            },
+        }
+
+    def test_validate_and_apply_reuse_pipeline_bot_migration(self):
+        service, _store, _manager, application = self.build_components()
+
+        validated = application.validate_media_migration(self.migration_payload())
+        applied = application.apply_media_migration(self.migration_payload())
+
+        self.assertEqual(validated["target_openlist_path"], "/115/动漫/作品")
+        self.assertTrue(applied["openlist_moved"])
+        self.assertEqual(service.migration_validate_calls[0][1], "anime")
+        self.assertEqual(service.migration_apply_calls[0][1], "anime")
+        self.assertNotIn("ignored", service.migration_apply_calls[0][0])
+
+    def test_rejects_untrusted_migration_shape_before_service_call(self):
+        service, _store, _manager, application = self.build_components()
+        payload = self.migration_payload()
+        payload["candidate"]["source_kind"] = "directory"
+
+        with self.assertRaisesRegex(ApiError, "source_kind"):
+            application.apply_media_migration(payload)
+
+        self.assertEqual(service.migration_apply_calls, [])
 
 
 class BotApiConfigTest(InternalApiTestCase):
@@ -4082,6 +4144,41 @@ class HttpAuthenticationTest(InternalApiTestCase):
             self.assertEqual(raised.exception.code, 401)
             unauthorized = json.loads(raised.exception.read().decode("utf-8"))
             self.assertEqual(unauthorized["error"]["code"], "unauthorized")
+        finally:
+            server.stop()
+
+    def test_http_migration_endpoints_require_token_and_reuse_bot_service(self):
+        service = FakePipelineService()
+        port = free_tcp_port()
+        server = InternalApiServer(service, self.db_path, token="secret", port=port, workers=1, owner_workers=1)
+        server.start()
+        payload = {
+            "owner_id": "admin-id",
+            "target_category": "anime",
+            "candidate": {
+                "title": "作品",
+                "category": "tv",
+                "library_id": "tv-library",
+                "library_root_id": "tv-root",
+                "source_openlist_path": "/115/剧集/作品",
+                "source_kind": "folder",
+            },
+        }
+        try:
+            validated = http_json(
+                "http://127.0.0.1:%d/v1/migrations/validate" % port,
+                payload,
+                token="secret",
+            )
+            applied = http_json(
+                "http://127.0.0.1:%d/v1/migrations/apply" % port,
+                payload,
+                token="secret",
+            )
+            self.assertEqual(validated["target_openlist_path"], "/115/动漫/作品")
+            self.assertTrue(applied["openlist_moved"])
+            self.assertEqual(len(service.migration_validate_calls), 1)
+            self.assertEqual(len(service.migration_apply_calls), 1)
         finally:
             server.stop()
 

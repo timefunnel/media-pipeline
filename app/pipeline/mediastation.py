@@ -5,6 +5,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from pipeline.client115 import p115_cookie_is_valid
+
 DEFAULT_MSG_BASE_URL = "http://127.0.0.1:18080/api"
 CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,10})[\s._-]+(\d{3,4})(?![\d-])", re.IGNORECASE)
 FC2_PPV_PATTERN = re.compile(r"(?<![A-Za-z0-9])FC2[\s._-]*PPV[\s._-]*(\d{5,10})(?!\d)", re.IGNORECASE)
@@ -208,6 +210,20 @@ class MediaStationClient:
 
     def get_media(self, media_id):
         return self._request("GET", "/media/%s" % quote_path(media_id))
+
+    def get_storage_config(self, storage_type):
+        storage_type = str(storage_type or "").strip()
+        if not storage_type:
+            raise ValueError("storage type is required")
+        return self._request("GET", "/admin/storage/%s" % quote_path(storage_type))
+
+    def get_cloud115_cookie(self):
+        response = self.get_storage_config("cloud115")
+        config = response.get("config") if isinstance(response, dict) else None
+        cookie = str(config.get("cookie") or "").strip() if isinstance(config, dict) else ""
+        if not p115_cookie_is_valid(cookie):
+            raise RuntimeError("MediaStationGo cloud115 Cookie missing or invalid; configure it in the admin storage settings")
+        return cookie
 
     def soft_delete_media(self, media_id):
         return self._request("DELETE", "/media/%s" % quote_path(media_id))

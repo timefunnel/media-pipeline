@@ -536,7 +536,7 @@ def home_reply_markup():
             ],
             [
                 {"text": "媒体迁移", "callback_data": "home:migrate"},
-                {"text": "115 Cookie", "callback_data": "home:p115"},
+                {"text": "115 Cookie（MSG 管理）", "callback_data": "home:p115"},
             ],
         ]
     }

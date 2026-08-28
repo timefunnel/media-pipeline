@@ -625,18 +625,28 @@ class Share115ReceiveTest(unittest.TestCase):
         self.assertEqual(session["session"]["uid"], "qr-uid")
         self.assertEqual(updated["status"], "confirmed")
 
-    def test_pipeline_share_client_prefers_state_cookie_provider(self):
+    def test_pipeline_share_client_reads_cookie_from_msg_storage(self):
+        class FakeMediaStationClient:
+            def get_cloud115_cookie(self):
+                return "UID=msg;CID=msg;SEID=msg"
+
         service = PipelineBotService(
-            BotConfig(token="token", allowed_user_ids={1}, p115_cookie="UID=env;CID=env;SEID=env"),
-            p115_cookie_provider=lambda: "UID=db;CID=db;SEID=db",
+            BotConfig(
+                token="token",
+                allowed_user_ids={1},
+                msg_admin_user="admin",
+                msg_admin_password="secret",
+            )
         )
 
-        with patch("pipeline.bot.Share115Client") as client_cls:
+        with patch("pipeline.bot.MediaStationClient", return_value=FakeMediaStationClient()), patch(
+            "pipeline.bot.Share115Client"
+        ) as client_cls:
             service._build_115_share_client()
 
-        client_cls.assert_called_once_with("UID=db;CID=db;SEID=db")
+        client_cls.assert_called_once_with("UID=msg;CID=msg;SEID=msg")
 
-    def test_p115_cookie_bot_flow_saves_cookie_after_scan_confirmed(self):
+    def test_p115_cookie_bot_command_points_to_msg_management(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = BotConfig(token="token", allowed_user_ids={1}, state_db_path=os.path.join(tmp, "state.db"))
             store = CandidateStore(config.state_db_path)
@@ -644,34 +654,10 @@ class Share115ReceiveTest(unittest.TestCase):
             bot = TelegramBot(config, telegram, store, PipelineBotService(config))
 
             bot.handle_update({"message": {"chat": {"id": 10}, "from": {"id": 1}, "text": "/p115_cookie"}})
-            with patch("pipeline.bot.P115QRCodeLoginClient", FakeQRCodeLoginClient):
-                bot.handle_update(
-                    {
-                        "callback_query": {
-                            "id": "cb-start",
-                            "from": {"id": 1},
-                            "message": {"chat": {"id": 10}, "message_id": 11},
-                            "data": "p115_cookie_start:1",
-                        }
-                    }
-                )
-                session_id = store.load_p115_qr_session(1)["id"]
-                bot.handle_update(
-                    {
-                        "callback_query": {
-                            "id": "cb-check",
-                            "from": {"id": 1},
-                            "message": {"chat": {"id": 10}, "message_id": 11},
-                            "data": "p115_cookie_check:%s" % session_id,
-                        }
-                    }
-                )
-                saved_cookie = store.get_p115_cookie()
+            saved_cookie = store.get_p115_cookie()
 
-        self.assertIn("未配置", telegram.messages[0]["text"])
-        self.assertIn("二维码链接", telegram.edits[0]["text"])
-        self.assertIn("已保存", telegram.edits[-1]["text"])
-        self.assertTrue(p115_cookie_is_valid(saved_cookie))
+        self.assertIn("MSG 管理后台", telegram.messages[0]["text"])
+        self.assertEqual(saved_cookie, "")
 
 
 if __name__ == "__main__":
