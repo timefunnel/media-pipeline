@@ -155,6 +155,7 @@ class BotConfigTest(unittest.TestCase):
                 "SUBTITLE_PROVIDERS": "assrt,opensubtitles",
                 "SUBTITLE_SEARCH_TIMEOUT_SECONDS": "9",
                 "SUBTITLE_DOWNLOAD_MAX_BYTES": "123456",
+                "SUBHD_PROXY_URL": " http://127.0.0.1:7894 ",
                 "SUBHD_DOWNLOAD_MAX_BYTES": "654321",
                 "SUBTITLE_BACKFILL_DEFAULT_LIMIT": "7",
                 "ASSRT_API_TOKEN": "assrt-token",
@@ -171,6 +172,7 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.subtitle_providers, ("assrt", "opensubtitles"))
         self.assertEqual(config.subtitle_search_timeout_seconds, 9)
         self.assertEqual(config.subtitle_download_max_bytes, 123456)
+        self.assertEqual(config.subhd_proxy_url, "http://127.0.0.1:7894")
         self.assertEqual(config.subhd_download_max_bytes, 654321)
         self.assertEqual(config.subtitle_backfill_default_limit, 7)
         self.assertEqual(config.assrt_api_token, "assrt-token")

@@ -48,6 +48,16 @@ ADULT_CODE_CHINESE_SUBTITLE_SUFFIX_PATTERN = re.compile(
 )
 
 
+def normalize_subtitle_proxy_url(value):
+    proxy_url = str(value or "").strip()
+    if not proxy_url:
+        return ""
+    parsed = urllib.parse.urlparse(proxy_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise RuntimeError("subtitle proxy URL must be an HTTP or HTTPS URL")
+    return proxy_url
+
+
 @dataclass
 class SubtitleDownload:
     source: str
@@ -61,11 +71,19 @@ class SubtitleDownload:
 
 
 class SubtitleHttpTransport:
-    def __init__(self, use_cookies=False):
-        self.opener = None
+    def __init__(self, use_cookies=False, proxy_url=""):
+        handlers = []
+        normalized_proxy_url = normalize_subtitle_proxy_url(proxy_url)
+        if normalized_proxy_url:
+            handlers.append(
+                urllib.request.ProxyHandler(
+                    {"http": normalized_proxy_url, "https": normalized_proxy_url}
+                )
+            )
         if use_cookies:
             cookie_jar = http.cookiejar.CookieJar()
-            self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+            handlers.append(urllib.request.HTTPCookieProcessor(cookie_jar))
+        self.opener = urllib.request.build_opener(*handlers) if handlers else None
 
     def _open(self, request, timeout):
         if self.opener is not None:
@@ -264,10 +282,12 @@ class SubHDProvider:
         timeout=DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS,
         max_bytes=DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES,
         download_max_bytes=DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES,
+        proxy_url="",
     ):
         self.base_url = str(base_url or SUBHD_BASE_URL).rstrip("/") + "/"
         self.transport = transport
         self.timeout = timeout
+        self.proxy_url = normalize_subtitle_proxy_url(proxy_url)
         self.max_bytes = max(1024, int(max_bytes or DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES))
         self.download_max_bytes = max(
             self.max_bytes,
@@ -428,7 +448,7 @@ class SubHDProvider:
         )
 
     def _transport(self):
-        return self.transport or SubtitleHttpTransport(use_cookies=True)
+        return self.transport or SubtitleHttpTransport(use_cookies=True, proxy_url=self.proxy_url)
 
     def _headers(self, referer=""):
         headers = {
@@ -922,6 +942,7 @@ def build_subtitle_matcher_from_config(config):
                 SubHDProvider(
                     timeout=getattr(config, "subtitle_search_timeout_seconds", DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS),
                     max_bytes=getattr(config, "subtitle_download_max_bytes", DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES),
+                    proxy_url=getattr(config, "subhd_proxy_url", ""),
                     download_max_bytes=getattr(
                         config,
                         "subhd_download_max_bytes",

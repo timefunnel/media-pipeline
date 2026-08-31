@@ -1,5 +1,6 @@
 import copy
 import json
+import urllib.request
 
 from tests.test_pipeline_core import *
 
@@ -576,6 +577,38 @@ class ExternalSubtitleTest(unittest.TestCase):
         matcher = build_subtitle_matcher_from_config(Config())
 
         self.assertEqual([provider.name for provider in matcher.providers], ["subhd", "subtitlecat", "assrt", "opensubtitles"])
+
+    def test_build_subtitle_matcher_gives_only_subhd_its_explicit_proxy(self):
+        from pipeline.external_subtitles import build_subtitle_matcher_from_config
+
+        class Config:
+            subtitle_auto_match_enabled = True
+            subhd_proxy_url = "http://127.0.0.1:7894"
+
+        matcher = build_subtitle_matcher_from_config(Config())
+        subhd = matcher.providers[0]
+        transport = subhd._transport()
+        proxy_handler = next(
+            handler
+            for handler in transport.opener.handlers
+            if isinstance(handler, urllib.request.ProxyHandler)
+        )
+
+        self.assertEqual(subhd.proxy_url, "http://127.0.0.1:7894")
+        self.assertEqual(
+            proxy_handler.proxies,
+            {
+                "http": "http://127.0.0.1:7894",
+                "https": "http://127.0.0.1:7894",
+            },
+        )
+        self.assertFalse(any(hasattr(provider, "proxy_url") for provider in matcher.providers[1:]))
+
+    def test_subhd_rejects_non_http_proxy_url(self):
+        from pipeline.external_subtitles import SubHDProvider
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP or HTTPS"):
+            SubHDProvider(proxy_url="socks5://127.0.0.1:7894")
 
     def test_subtitle_matcher_prioritizes_subhd_for_non_adult_and_excludes_it_for_adult(self):
         from pipeline.external_subtitles import SubtitleCache, SubtitleDownload, SubtitleMatcher

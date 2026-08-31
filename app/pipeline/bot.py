@@ -465,6 +465,7 @@ class BotConfig:
     subtitle_providers: tuple = DEFAULT_SUBTITLE_PROVIDERS
     subtitle_search_timeout_seconds: int = DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS
     subtitle_download_max_bytes: int = DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES
+    subhd_proxy_url: str = ""
     subhd_download_max_bytes: int = DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES
     subtitle_backfill_default_limit: int = DEFAULT_SUBTITLE_BACKFILL_LIMIT
     assrt_api_token: str = ""
@@ -652,6 +653,7 @@ class BotConfig:
                 1024,
                 int(env.get("SUBTITLE_DOWNLOAD_MAX_BYTES", str(DEFAULT_SUBTITLE_DOWNLOAD_MAX_BYTES))),
             ),
+            subhd_proxy_url=str(env.get("SUBHD_PROXY_URL") or "").strip(),
             subhd_download_max_bytes=max(
                 1024,
                 int(env.get("SUBHD_DOWNLOAD_MAX_BYTES", str(DEFAULT_SUBHD_DOWNLOAD_MAX_BYTES))),
