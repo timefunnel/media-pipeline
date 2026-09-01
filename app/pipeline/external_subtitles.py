@@ -353,7 +353,7 @@ class SubHDProvider:
             max_bytes=self.max_bytes,
         )
         detail_pages = extract_subhd_search_detail_pages(search_html, self.base_url)
-        selected = select_subhd_season_detail_page(detail_pages, search_text)
+        selected = select_subhd_season_detail_page(detail_pages, search_text, season=season)
         if selected is None:
             raise RuntimeError("SubHD season detail page match missing")
         detail_url = str(selected.get("url") or "").strip()
@@ -1536,10 +1536,15 @@ def extract_subhd_search_detail_pages(text, base_url=SUBHD_BASE_URL):
     return pages
 
 
-def select_subhd_season_detail_page(pages, query):
+def select_subhd_season_detail_page(pages, query, season=None):
+    required_season = normalize_subhd_season_number(season)
     ranked = []
     for index, page in enumerate(pages or []):
-        score = subhd_season_title_match_score(query, (page or {}).get("title"))
+        score = subhd_season_title_match_score(
+            query,
+            (page or {}).get("title"),
+            season=required_season,
+        )
         if score > 0:
             ranked.append((score, -index, page))
     if not ranked:
@@ -1548,7 +1553,10 @@ def select_subhd_season_detail_page(pages, query):
     return ranked[0][2]
 
 
-def subhd_season_title_match_score(query, title):
+def subhd_season_title_match_score(query, title, season=None):
+    required_season = normalize_subhd_season_number(season)
+    if required_season is not None and required_season not in subhd_title_season_numbers(title):
+        return 0
     expected = normalize_subhd_series_title(query)
     actual = normalize_subhd_series_title(title)
     if not expected or not actual:
@@ -1561,6 +1569,48 @@ def subhd_season_title_match_score(query, title):
     actual_tokens = {token for token in actual.split() if len(token) > 1}
     overlap = expected_tokens & actual_tokens
     return len(overlap) * 100 if overlap else 0
+
+
+def subhd_title_season_numbers(value):
+    text = html.unescape(str(value or "")).casefold()
+    seasons = set()
+    for pattern in (
+        r"(?<![a-z0-9])s\s*0?(\d{1,2})(?!\d)",
+        r"\bseason\s*0?(\d{1,2})(?!\d)",
+        r"第\s*(\d{1,2})\s*季",
+    ):
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            season = normalize_subhd_season_number(match.group(1))
+            if season is not None:
+                seasons.add(season)
+    for match in re.finditer(r"第\s*([一二三四五六七八九十百零两]+)\s*季", text):
+        season = normalize_subhd_season_number(match.group(1))
+        if season is not None:
+            seasons.add(season)
+    return seasons
+
+
+def normalize_subhd_season_number(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        season = int(text)
+        return season if 1 <= season <= 99 else None
+    digits = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    normalized = text.replace("两", "二").replace("零", "")
+    if normalized == "十":
+        return 10
+    if "十" in normalized and normalized.count("十") == 1:
+        tens_text, ones_text = normalized.split("十")
+        if len(tens_text) > 1 or len(ones_text) > 1:
+            return None
+        tens = digits.get(tens_text, 1 if not tens_text else 0)
+        ones = digits.get(ones_text, 0)
+        season = tens * 10 + ones
+        return season if 1 <= season <= 99 else None
+    season = digits.get(normalized)
+    return season if season is not None else None
 
 
 def normalize_subhd_series_title(value):

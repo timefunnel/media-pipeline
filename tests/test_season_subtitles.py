@@ -11,7 +11,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 
-from pipeline.external_subtitles import SubtitleCache, SubtitleMatcher, SubHDProvider, extract_subhd_detail_results
+from pipeline.external_subtitles import (
+    SubtitleCache,
+    SubtitleMatcher,
+    SubHDProvider,
+    extract_subhd_detail_results,
+    select_subhd_season_detail_page,
+    subhd_season_title_match_score,
+    subhd_title_season_numbers,
+)
 from pipeline.season_subtitles import SeasonSubtitleTaskManager
 
 
@@ -559,6 +567,40 @@ class SubHDSeasonDetailTest(unittest.TestCase):
         self.assertEqual(result["detail_title"], "星际迷航：奇异新世界 第一季")
         self.assertEqual(result["candidates"][0]["episode_key"], "S01E01")
         self.assertEqual(len(transport.urls), 2)
+
+    def test_requires_an_explicit_matching_season_for_detail_page(self):
+        pages = [
+            {"id": "first", "title": "路西法 第一季 Lucifer", "url": "https://subhd.tv/d/first"},
+            {"id": "sixth", "title": "路西法 第六季 Lucifer", "url": "https://subhd.tv/d/sixth"},
+            {"id": "unseasoned", "title": "路西法 Lucifer", "url": "https://subhd.tv/d/unseasoned"},
+        ]
+
+        selected = select_subhd_season_detail_page(pages, "Lucifer S06", season=6)
+
+        self.assertEqual(selected["id"], "sixth")
+        self.assertEqual(subhd_season_title_match_score("Lucifer S06", "Lucifer S01", season=6), 0)
+        self.assertEqual(subhd_season_title_match_score("Lucifer S06", "Lucifer", season=6), 0)
+        self.assertEqual(subhd_title_season_numbers("路西法 第六季 Lucifer S06"), {6})
+
+    def test_does_not_open_a_different_season_detail_page(self):
+        search_html = """
+        <div class="bg-white shadow-sm mb-4">
+          <a href="/d/first"><img alt="路西法 第一季 Lucifer"></a>
+        </div>
+        """
+
+        class Transport:
+            def __init__(self):
+                self.urls = []
+
+            def text_request(self, url, **_kwargs):
+                self.urls.append(url)
+                return search_html
+
+        transport = Transport()
+        with self.assertRaisesRegex(RuntimeError, "season detail page match missing"):
+            SubHDProvider(transport=transport).search_season("Lucifer S06", 6)
+        self.assertEqual(len(transport.urls), 1)
 
     def test_keeps_highest_download_sup_candidate_for_display(self):
         html = """
