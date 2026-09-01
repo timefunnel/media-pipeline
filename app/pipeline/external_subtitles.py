@@ -418,7 +418,20 @@ class SubHDProvider:
             timeout=self.timeout,
             max_bytes=self.download_max_bytes,
         )
+        collection = str((candidate or {}).get("scope") or "").strip().casefold() == "collection"
         if extension in (".zip", ".7z", ".rar"):
+            if collection:
+                episode_key = subtitle_episode_key(query)
+                if not episode_key:
+                    raise RuntimeError("SubHD collection candidate requires an episode key")
+                archive_episode_keys = subhd_archive_episode_keys(
+                    body,
+                    extension,
+                    self.download_max_bytes,
+                    self.timeout,
+                )
+                if episode_key not in archive_episode_keys:
+                    raise RuntimeError("SubHD collection archive does not contain %s" % episode_key)
             filename, body = extract_chinese_subtitle_from_archive(
                 body,
                 extension,
@@ -429,6 +442,8 @@ class SubHDProvider:
                 require_chinese_body=require_chinese_body,
             )
         elif extension in SUBTITLE_EXTENSIONS:
+            if collection:
+                raise RuntimeError("SubHD collection candidate is not an archive")
             filename = subhd_download_filename(candidate, sid, extension)
             if not subtitle_body_matches_candidate(body, filename, require_chinese_body):
                 raise RuntimeError("SubHD downloaded subtitle is not Chinese")
@@ -830,18 +845,25 @@ class SubtitleMatcher:
 
         limit = max(1, min(50, int(limit or 20)))
         by_episode = {}
+        collections = []
         for candidate in result.get("candidates") or []:
             episode_key = str((candidate or {}).get("episode_key") or "").strip().upper()
             if episode_key:
                 by_episode.setdefault(episode_key, []).append(candidate)
+            elif str((candidate or {}).get("scope") or "").strip().casefold() == "collection":
+                collections.append(candidate)
         records = []
         for target in targets or []:
             media_id = str((target or {}).get("media_id") or "").strip()
             episode_key = str((target or {}).get("episode_key") or "").strip().upper()
             if not media_id or not episode_key:
                 raise RuntimeError("season subtitle target is invalid")
+            collection_candidates = [
+                {**candidate, "episode_key": episode_key}
+                for candidate in collections
+            ]
             candidates = sorted(
-                by_episode.get(episode_key) or [],
+                list(by_episode.get(episode_key) or []) + collection_candidates,
                 key=subhd_detail_candidate_sort_key,
             )[:limit]
             for episode_rank, candidate in enumerate(candidates, start=1):
@@ -1451,21 +1473,27 @@ def extract_subhd_detail_results(text, season, base_url=SUBHD_BASE_URL):
         flags=re.IGNORECASE | re.DOTALL,
     )
     current_episode_key = ""
+    current_scope = ""
     out = []
     for token in token_pattern.finditer(section):
         if token.group("header") is not None:
             label = strip_html_text(token.group("header"))
             episode_match = re.fullmatch(r"第\s*(\d{1,3})\s*集", label)
-            current_episode_key = (
-                "S%02dE%02d" % (int(season), int(episode_match.group(1)))
-                if episode_match is not None
-                else ""
-            )
+            if episode_match is not None:
+                current_episode_key = "S%02dE%02d" % (int(season), int(episode_match.group(1)))
+                current_scope = "episode"
+            elif label == "合集":
+                current_episode_key = ""
+                current_scope = "collection"
+            else:
+                current_episode_key = ""
+                current_scope = ""
             continue
-        if not current_episode_key:
+        if not current_scope:
             continue
         candidate = extract_subhd_detail_candidate(token.group("row"), current_episode_key, base_url)
         if candidate is not None:
+            candidate["scope"] = current_scope
             out.append(candidate)
     return out
 

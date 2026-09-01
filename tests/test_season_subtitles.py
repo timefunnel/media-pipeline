@@ -1,15 +1,17 @@
+import io
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 
-from pipeline.external_subtitles import SubHDProvider, extract_subhd_detail_results
+from pipeline.external_subtitles import SubtitleMatcher, SubHDProvider, extract_subhd_detail_results
 from pipeline.season_subtitles import SeasonSubtitleTaskManager
 
 
@@ -213,7 +215,7 @@ class SeasonSubtitleTaskManagerTest(unittest.TestCase):
 
 
 class SubHDSeasonDetailTest(unittest.TestCase):
-    def test_parses_episode_rows_and_excludes_comments_and_collections(self):
+    def test_parses_episode_rows_and_keeps_collections_separate(self):
         html = """
         <div><span>字幕信息</span></div>
         <div class="text-danger fw-bold">第 10 集</div>
@@ -244,7 +246,7 @@ class SubHDSeasonDetailTest(unittest.TestCase):
 
         candidates = extract_subhd_detail_results(html, 1)
 
-        self.assertEqual(len(candidates), 1)
+        self.assertEqual(len(candidates), 2)
         candidate = candidates[0]
         self.assertEqual(candidate["episode_key"], "S01E10")
         self.assertEqual(candidate["title"], "Star.Trek.S01E10.CHS-ENG")
@@ -256,7 +258,105 @@ class SubHDSeasonDetailTest(unittest.TestCase):
         self.assertEqual(candidate["download_count"], 11883)
         self.assertEqual(candidate["uploader"], "Teclast")
         self.assertEqual(candidate["uploaded_date"], "2022-07-11")
+        self.assertEqual(candidate["scope"], "episode")
         self.assertNotIn("comment_count", candidate)
+        collection = candidates[1]
+        self.assertEqual(collection["provider_id"], "seasonpack")
+        self.assertEqual(collection["episode_key"], "")
+        self.assertEqual(collection["scope"], "collection")
+
+    def test_collection_candidates_are_available_to_each_target_episode(self):
+        class Provider:
+            name = "subhd"
+
+            def enabled(self):
+                return True
+
+            def search_season(self, _query, _season):
+                return {
+                    "detail_url": "https://subhd.tv/d/34148546",
+                    "detail_title": "路西法 第五季 Lucifer",
+                    "candidates": [
+                        {
+                            "id": "single",
+                            "provider_id": "single",
+                            "title": "Lucifer.S05E01",
+                            "filename": "Lucifer.S05E01.ass",
+                            "language": "简体",
+                            "formats": ["ASS"],
+                            "episode_key": "S05E01",
+                            "scope": "episode",
+                            "download_count": 100,
+                        },
+                        {
+                            "id": "complete",
+                            "provider_id": "complete",
+                            "title": "Lucifer.S05.COMPLETE",
+                            "filename": "Lucifer.S05.COMPLETE.ass",
+                            "language": "简体",
+                            "formats": ["ASS"],
+                            "episode_key": "",
+                            "scope": "collection",
+                            "download_count": 200,
+                        },
+                    ],
+                }
+
+        result = SubtitleMatcher(None, providers=[Provider()]).search_season_candidates(
+            "Lucifer S05",
+            5,
+            [
+                {"media_id": "episode-1", "episode_key": "S05E01"},
+                {"media_id": "episode-2", "episode_key": "S05E02"},
+            ],
+        )
+
+        self.assertEqual(
+            [(item["media_id"], item["provider_id"]) for item in result["candidates"]],
+            [("episode-1", "complete"), ("episode-1", "single"), ("episode-2", "complete")],
+        )
+        collection = result["candidates"][2]
+        self.assertEqual(collection["episode_key"], "S05E02")
+        self.assertEqual(collection["candidate"]["episode_key"], "S05E02")
+
+    def test_collection_download_requires_the_requested_archive_member(self):
+        archive_body = io.BytesIO()
+        with zipfile.ZipFile(archive_body, "w") as archive:
+            archive.writestr("Lucifer.S05E01.ass", "[Script Info]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,第一集中文字幕")
+            archive.writestr("Lucifer.S05E02.ass", "[Script Info]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,第二集中文字幕")
+
+        class Transport:
+            def text_request(self, _url, **_kwargs):
+                return ""
+
+            def json_request(self, _method, url, **_kwargs):
+                if url.endswith("/api/sub/prepare-download"):
+                    return {"success": True, "url": "/down/complete"}
+                return {
+                    "success": True,
+                    "pass": True,
+                    "url": "https://download.subhd.me/Lucifer.S05.COMPLETE.zip",
+                }
+
+            def download(self, _url, **_kwargs):
+                return archive_body.getvalue()
+
+        candidate = {
+            "id": "complete",
+            "provider_id": "complete",
+            "title": "Lucifer.S05.COMPLETE",
+            "release": "Lucifer.S05.COMPLETE",
+            "language": "双语 简体 英语",
+            "formats": ["ASS"],
+            "scope": "collection",
+        }
+        provider = SubHDProvider(transport=Transport())
+
+        download = provider.download_for_review(candidate, "S05E02")
+
+        self.assertEqual(download.filename, "Lucifer.S05E02.ass")
+        with self.assertRaisesRegex(RuntimeError, "does not contain S05E03"):
+            provider.download_for_review(candidate, "S05E03")
 
     def test_searches_then_reads_the_best_matching_detail_page(self):
         search_html = """
