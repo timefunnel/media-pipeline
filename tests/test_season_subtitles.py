@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 
-from pipeline.external_subtitles import SubtitleMatcher, SubHDProvider, extract_subhd_detail_results
+from pipeline.external_subtitles import SubtitleCache, SubtitleMatcher, SubHDProvider, extract_subhd_detail_results
 from pipeline.season_subtitles import SeasonSubtitleTaskManager
 
 
@@ -36,6 +36,14 @@ class SeasonSubtitleTaskManagerTest(unittest.TestCase):
                 "candidate": {"id": candidate_id, "title": episode_key},
             },
         }
+
+    def _collection_target(self, media_id, episode_key, provider_id="complete"):
+        target = self._target(media_id, episode_key, provider_id)
+        target["candidate"]["provider_id"] = provider_id
+        target["candidate"]["candidate"].update(
+            {"provider_id": provider_id, "scope": "collection"}
+        )
+        return target
 
     def test_applies_the_selected_candidate_for_each_episode(self):
         class Service:
@@ -114,6 +122,86 @@ class SeasonSubtitleTaskManagerTest(unittest.TestCase):
 
         self.assertEqual(service.max_active, 2)
         self.assertEqual(completed["succeeded"], 3)
+
+    def test_applies_one_collection_to_sixteen_episodes_with_one_batch_download(self):
+        class Service:
+            def __init__(self):
+                self.collection_calls = []
+
+            def apply_subtitle_candidate(self, _candidate):
+                raise AssertionError("collection must use the batch path")
+
+            def apply_season_subtitle_collection(self, candidates):
+                self.collection_calls.append([item["media_id"] for item in candidates])
+                return [
+                    {"subtitle_match_status": "success", "subtitle_match_count": 1}
+                    for _item in candidates
+                ]
+
+        targets = [
+            self._collection_target("episode-%d" % episode, "S05E%02d" % episode)
+            for episode in range(1, 17)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            service = Service()
+            manager = SeasonSubtitleTaskManager(service, tmp + "/state.db", poll_seconds=0.01)
+            manager.start()
+            try:
+                task, _created = manager.create_task("admin", "series-anchor", 5, targets)
+                completed = self._wait_for_final(manager, task["id"])
+            finally:
+                manager.stop()
+
+        self.assertEqual(len(service.collection_calls), 1)
+        self.assertEqual(len(service.collection_calls[0]), 16)
+        self.assertEqual(completed["succeeded"], 16)
+        self.assertEqual(completed["failed"], 0)
+
+    def test_downloads_each_selected_collection_once(self):
+        class Service:
+            def __init__(self):
+                self.collection_calls = []
+
+            def apply_subtitle_candidate(self, _candidate):
+                raise AssertionError("collection must use the batch path")
+
+            def apply_season_subtitle_collection(self, candidates):
+                self.collection_calls.append(
+                    (
+                        candidates[0]["provider_id"],
+                        [item["media_id"] for item in candidates],
+                    )
+                )
+                return [
+                    {"subtitle_match_status": "success", "subtitle_match_count": 1}
+                    for _item in candidates
+                ]
+
+        targets = [
+            self._collection_target("episode-1", "S05E01", "complete-a"),
+            self._collection_target("episode-2", "S05E02", "complete-b"),
+            self._collection_target("episode-3", "S05E03", "complete-a"),
+            self._collection_target("episode-4", "S05E04", "complete-b"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            service = Service()
+            manager = SeasonSubtitleTaskManager(service, tmp + "/state.db", poll_seconds=0.01)
+            manager.start()
+            try:
+                task, _created = manager.create_task("admin", "series-anchor", 5, targets)
+                completed = self._wait_for_final(manager, task["id"])
+            finally:
+                manager.stop()
+
+        self.assertEqual(
+            sorted(service.collection_calls),
+            [
+                ("complete-a", ["episode-1", "episode-3"]),
+                ("complete-b", ["episode-2", "episode-4"]),
+            ],
+        )
+        self.assertEqual(completed["succeeded"], 4)
+        self.assertEqual(completed["failed"], 0)
 
     def test_retry_reuses_only_failed_episode_candidates(self):
         class Service:
@@ -326,6 +414,9 @@ class SubHDSeasonDetailTest(unittest.TestCase):
             archive.writestr("Lucifer.S05E02.ass", "[Script Info]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,第二集中文字幕")
 
         class Transport:
+            def __init__(self):
+                self.download_calls = 0
+
             def text_request(self, _url, **_kwargs):
                 return ""
 
@@ -339,6 +430,7 @@ class SubHDSeasonDetailTest(unittest.TestCase):
                 }
 
             def download(self, _url, **_kwargs):
+                self.download_calls += 1
                 return archive_body.getvalue()
 
         candidate = {
@@ -350,13 +442,86 @@ class SubHDSeasonDetailTest(unittest.TestCase):
             "formats": ["ASS"],
             "scope": "collection",
         }
-        provider = SubHDProvider(transport=Transport())
+        transport = Transport()
+        provider = SubHDProvider(transport=transport)
 
         download = provider.download_for_review(candidate, "S05E02")
 
         self.assertEqual(download.filename, "Lucifer.S05E02.ass")
         with self.assertRaisesRegex(RuntimeError, "does not contain S05E03"):
             provider.download_for_review(candidate, "S05E03")
+
+    def test_collection_batch_downloads_the_archive_once_and_applies_each_member(self):
+        archive_body = io.BytesIO()
+        with zipfile.ZipFile(archive_body, "w") as archive:
+            archive.writestr("Lucifer.S05E01.ass", "[Script Info]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,第一集中文字幕")
+            archive.writestr("Lucifer.S05E02.ass", "[Script Info]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,第二集中文字幕")
+
+        class Transport:
+            def __init__(self):
+                self.download_calls = 0
+
+            def text_request(self, _url, **_kwargs):
+                return ""
+
+            def json_request(self, _method, url, **_kwargs):
+                if url.endswith("/api/sub/prepare-download"):
+                    return {"success": True, "url": "/down/complete"}
+                return {
+                    "success": True,
+                    "pass": True,
+                    "url": "https://download.subhd.me/Lucifer.S05.COMPLETE.zip",
+                }
+
+            def download(self, _url, **_kwargs):
+                self.download_calls += 1
+                return archive_body.getvalue()
+
+        candidate = {
+            "id": "complete",
+            "provider_id": "complete",
+            "title": "Lucifer.S05.COMPLETE",
+            "release": "Lucifer.S05.COMPLETE",
+            "language": "双语 简体 英语",
+            "formats": ["ASS"],
+            "scope": "collection",
+        }
+        records = [
+            {
+                "provider": "subhd",
+                "provider_id": "complete",
+                "media_id": "episode-1",
+                "query": "S05E01",
+                "candidate": {**candidate, "episode_key": "S05E01"},
+            },
+            {
+                "provider": "subhd",
+                "provider_id": "complete",
+                "media_id": "episode-2",
+                "query": "S05E02",
+                "candidate": {**candidate, "episode_key": "S05E02"},
+            },
+            {
+                "provider": "subhd",
+                "provider_id": "complete",
+                "media_id": "episode-3",
+                "query": "S05E03",
+                "candidate": {**candidate, "episode_key": "S05E03"},
+            },
+        ]
+        transport = Transport()
+        with tempfile.TemporaryDirectory() as tmp:
+            matcher = SubtitleMatcher(SubtitleCache(tmp), providers=[SubHDProvider(transport=transport)])
+            results = matcher.apply_collection_candidates(records)
+
+            self.assertEqual(results[0]["subtitle_match_status"], "success")
+            self.assertEqual(results[1]["subtitle_match_status"], "success")
+            self.assertEqual(results[2]["subtitle_match_status"], "failed")
+            self.assertIn("does not contain S05E03", results[2]["subtitle_match_error"])
+            self.assertEqual(len(SubtitleCache(tmp).list_tracks("episode-1")), 1)
+            self.assertEqual(len(SubtitleCache(tmp).list_tracks("episode-2")), 1)
+            self.assertEqual(SubtitleCache(tmp).list_tracks("episode-3"), [])
+        self.assertEqual(transport.download_calls, 1)
 
     def test_searches_then_reads_the_best_matching_detail_page(self):
         search_html = """

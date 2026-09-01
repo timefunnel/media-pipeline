@@ -8151,6 +8151,47 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(matcher.calls[0][0:2], ("movie", "The Devil Conspiracy"))
         self.assertNotIn("openlist_adult_code", matcher.calls[0][2])
 
+    def test_season_collection_batch_records_each_episode_result(self):
+        from pipeline.bot import BotConfig, CandidateStore, PipelineBotService
+
+        class FakeSubtitleMatcher:
+            def __init__(self):
+                self.calls = []
+
+            def apply_collection_candidates(self, records):
+                self.calls.append([dict(item) for item in records])
+                return [
+                    {
+                        "subtitle_match_status": "success",
+                        "subtitle_match_count": 1,
+                        "subtitle_match_source": "subhd",
+                    },
+                    {
+                        "subtitle_match_status": "failed",
+                        "subtitle_match_count": 0,
+                        "subtitle_match_source": "subhd",
+                        "subtitle_match_error": "missing S05E02",
+                    },
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_db = str(Path(tmp) / "state.db")
+            service = PipelineBotService(BotConfig("token", {700656624}, state_db))
+            matcher = FakeSubtitleMatcher()
+            records = [
+                {"media_id": "episode-1", "title": "S05E01", "code": "", "provider": "subhd"},
+                {"media_id": "episode-2", "title": "S05E02", "code": "", "provider": "subhd"},
+            ]
+            with patch.object(service, "_build_subtitle_matcher", return_value=matcher):
+                results = service.apply_season_subtitle_collection(records)
+            stored = CandidateStore(state_db).subtitle_backfill_records(["episode-1", "episode-2"])
+
+        self.assertEqual(len(matcher.calls), 1)
+        self.assertEqual([item["media_id"] for item in results], ["episode-1", "episode-2"])
+        self.assertEqual(stored["episode-1"]["status"], "success")
+        self.assertEqual(stored["episode-2"]["status"], "failed")
+        self.assertEqual(stored["episode-2"]["error"], "missing S05E02")
+
     def test_media_search_queries_ignores_single_character_chinese_fragment(self):
         from pipeline.bot import media_search_queries
 

@@ -433,33 +433,51 @@ class SeasonSubtitleTaskManager:
 
     def _apply_task(self, task):
         targets = list(task["targets"])
+        work_units = season_subtitle_apply_units(targets)
         self.store.save_stage(task["id"], "download")
         with ThreadPoolExecutor(
-            max_workers=min(SEASON_SUBTITLE_DOWNLOAD_WORKERS, len(targets)),
+            max_workers=min(SEASON_SUBTITLE_DOWNLOAD_WORKERS, len(work_units)),
             thread_name_prefix="season-subtitle-download",
         ) as executor:
             pending = [
-                (target, executor.submit(self._apply_target, target))
-                for target in targets
+                (unit, executor.submit(self._apply_unit, unit))
+                for unit in work_units
             ]
-            for target, future in pending:
+            for _unit, future in pending:
                 self._raise_if_stopping()
-                status, count, error = future.result()
-                self.store.save_episode_result(
-                    task["id"],
-                    target,
-                    status,
-                    count=count,
-                    error=error,
-                )
-                if task.get("retry_of"):
-                    self.store.save_retry_result(
-                        task["retry_of"],
+                for target, status, count, error in future.result():
+                    self.store.save_episode_result(
+                        task["id"],
                         target,
                         status,
                         count=count,
                         error=error,
                     )
+                    if task.get("retry_of"):
+                        self.store.save_retry_result(
+                            task["retry_of"],
+                            target,
+                            status,
+                            count=count,
+                            error=error,
+                        )
+
+    def _apply_unit(self, targets):
+        if season_subtitle_collection_key(targets[0]) is None:
+            target = targets[0]
+            return [(target, *self._apply_target(target))]
+        try:
+            results = self.service.apply_season_subtitle_collection(
+                [target["candidate"] for target in targets]
+            )
+            if not isinstance(results, list) or len(results) != len(targets):
+                raise RuntimeError("season subtitle collection returned an invalid result count")
+        except Exception as exc:
+            return [(target, "failed", 0, str(exc)) for target in targets]
+        return [
+            (target, *season_subtitle_apply_result(result))
+            for target, result in zip(targets, results)
+        ]
 
     def _apply_target(self, target):
         self._raise_if_stopping()
@@ -467,15 +485,7 @@ class SeasonSubtitleTaskManager:
             result = self.service.apply_subtitle_candidate(target["candidate"])
         except Exception as exc:
             return "failed", 0, str(exc)
-        status = str((result or {}).get("subtitle_match_status") or "").strip()
-        count = max(0, int((result or {}).get("subtitle_match_count") or 0))
-        if status == "success" and count > 0:
-            return "success", count, ""
-        if status == "skipped":
-            reason = str((result or {}).get("subtitle_match_reason") or "subtitle apply skipped")
-            return "skipped", count, reason
-        error = str((result or {}).get("subtitle_match_error") or "subtitle apply failed")
-        return "failed", count, error
+        return season_subtitle_apply_result(result)
 
     def _wait_or_stop(self):
         with self._condition:
@@ -543,6 +553,47 @@ def normalize_targets(targets, season):
         seen_media_ids.add(media_id)
         normalized.append({"media_id": media_id, "episode_key": episode_key, "candidate": candidate})
     return normalized
+
+
+def season_subtitle_apply_units(targets):
+    units = []
+    collection_indexes = {}
+    for target in targets or []:
+        key = season_subtitle_collection_key(target)
+        if key is None:
+            units.append([target])
+            continue
+        index = collection_indexes.get(key)
+        if index is None:
+            collection_indexes[key] = len(units)
+            units.append([target])
+        else:
+            units[index].append(target)
+    return units
+
+
+def season_subtitle_collection_key(target):
+    record = (target or {}).get("candidate")
+    candidate = (record or {}).get("candidate") if isinstance(record, dict) else None
+    if not isinstance(candidate, dict) or str(candidate.get("scope") or "").strip().casefold() != "collection":
+        return None
+    provider = str(record.get("provider") or "").strip()
+    provider_id = str(record.get("provider_id") or candidate.get("provider_id") or candidate.get("id") or "").strip()
+    if not provider or not provider_id:
+        raise RuntimeError("season subtitle collection candidate identity missing")
+    return provider, provider_id
+
+
+def season_subtitle_apply_result(result):
+    status = str((result or {}).get("subtitle_match_status") or "").strip()
+    count = max(0, int((result or {}).get("subtitle_match_count") or 0))
+    if status == "success" and count > 0:
+        return "success", count, ""
+    if status == "skipped":
+        reason = str((result or {}).get("subtitle_match_reason") or "subtitle apply skipped")
+        return "skipped", count, reason
+    error = str((result or {}).get("subtitle_match_error") or "subtitle apply failed")
+    return "failed", count, error
 
 
 def normalize_retry_media_ids(media_ids):

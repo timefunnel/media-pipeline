@@ -3256,6 +3256,23 @@ class PipelineBotService:
         out.update({"media_id": media_id, "title": title, "code": code})
         return out
 
+    def apply_season_subtitle_collection(self, candidate_records):
+        records = [dict(item or {}) for item in candidate_records or []]
+        results = self._build_subtitle_matcher().apply_collection_candidates(records)
+        if len(results) != len(records):
+            raise RuntimeError("season subtitle collection returned an invalid result count")
+        store = CandidateStore(self.config.state_db_path)
+        out = []
+        for record, result in zip(records, results):
+            media_id = str(record.get("media_id") or "").strip()
+            title = str(record.get("title") or media_id)
+            code = str(record.get("code") or "")
+            store.save_subtitle_backfill_record(media_id, title, code, result)
+            item = dict(result)
+            item.update({"media_id": media_id, "title": title, "code": code})
+            out.append(item)
+        return out
+
     def preview_subtitle_candidate(self, candidate_record, max_chars=8000):
         return self._build_subtitle_matcher().preview_candidate(candidate_record, max_chars=max_chars)
 

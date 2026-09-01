@@ -379,7 +379,36 @@ class SubHDProvider:
     def download_for_review(self, candidate, query, code=""):
         return self._download(candidate, query, code=code, require_chinese_body=False)
 
-    def _download(self, candidate, query, code="", require_chinese_body=True):
+    def download_collection_for_review(self, candidate, queries, code=""):
+        if str((candidate or {}).get("scope") or "").strip().casefold() != "collection":
+            raise RuntimeError("SubHD candidate is not a collection")
+        sid, extension, body = self._download_resource(candidate, require_chinese_body=False)
+        if extension not in (".zip", ".7z", ".rar"):
+            raise RuntimeError("SubHD collection candidate is not an archive")
+        members, errors = extract_subhd_collection_members(
+            body,
+            extension,
+            candidate,
+            queries,
+            self.download_max_bytes,
+            self.timeout,
+        )
+        downloads = {}
+        for episode_key, (filename, subtitle_body) in members.items():
+            lang, label = subtitle_lang_label(filename, candidate.get("language"))
+            downloads[episode_key] = SubtitleDownload(
+                source=self.name,
+                provider_id=sid,
+                filename=filename,
+                body=subtitle_body,
+                lang=lang,
+                label=label,
+                query=episode_key,
+                score=int((candidate or {}).get("_score") or 0),
+            )
+        return downloads, errors
+
+    def _download_resource(self, candidate, require_chinese_body):
         sid = str((candidate or {}).get("id") or (candidate or {}).get("provider_id") or "").strip()
         if not re.fullmatch(r"[0-9A-Za-z_-]{2,32}", sid):
             raise RuntimeError("SubHD subtitle id invalid")
@@ -418,6 +447,10 @@ class SubHDProvider:
             timeout=self.timeout,
             max_bytes=self.download_max_bytes,
         )
+        return sid, extension, body
+
+    def _download(self, candidate, query, code="", require_chinese_body=True):
+        sid, extension, body = self._download_resource(candidate, require_chinese_body)
         collection = str((candidate or {}).get("scope") or "").strip().casefold() == "collection"
         if extension in (".zip", ".7z", ".rar"):
             if collection:
@@ -916,6 +949,86 @@ class SubtitleMatcher:
             query=query,
             filename=track.get("filename"),
         )
+
+    def apply_collection_candidates(self, candidate_records):
+        records = [dict(item or {}) for item in candidate_records or []]
+        if not records:
+            raise RuntimeError("subtitle collection candidates missing")
+        provider_name = str(records[0].get("provider") or "").strip()
+        provider = next((item for item in self.providers if item.name == provider_name and item.enabled()), None)
+        if provider is None:
+            raise RuntimeError("subtitle provider not enabled: %s" % provider_name)
+        download_collection = getattr(provider, "download_collection_for_review", None)
+        if not callable(download_collection):
+            raise RuntimeError("subtitle provider does not support collection downloads")
+
+        provider_id = ""
+        queries = []
+        for record in records:
+            media_id = str(record.get("media_id") or "").strip()
+            query = str(record.get("query") or "").strip()
+            candidate = record.get("candidate")
+            if not media_id or not isinstance(candidate, dict):
+                raise RuntimeError("subtitle collection candidate payload invalid")
+            if str(record.get("provider") or "").strip() != provider_name:
+                raise RuntimeError("subtitle collection candidates use different providers")
+            current_provider_id = subtitle_candidate_provider_id(candidate)
+            if not current_provider_id:
+                raise RuntimeError("subtitle collection candidate id missing")
+            if provider_id and current_provider_id != provider_id:
+                raise RuntimeError("subtitle collection candidates use different archives")
+            if str(candidate.get("scope") or "").strip().casefold() != "collection":
+                raise RuntimeError("subtitle candidate is not a collection")
+            supported, reason = subtitle_candidate_application_status(candidate)
+            if not supported:
+                raise RuntimeError(reason)
+            provider_id = current_provider_id
+            queries.append(query)
+
+        first_candidate = records[0]["candidate"]
+        downloads, errors = download_collection(first_candidate, queries)
+        results = []
+        for record in records:
+            media_id = str(record.get("media_id") or "").strip()
+            query = str(record.get("query") or "").strip()
+            episode_key = subtitle_episode_key(query)
+            download = downloads.get(episode_key)
+            if download is None:
+                results.append(
+                    subtitle_result(
+                        "failed",
+                        source=provider.name,
+                        query=query,
+                        error=errors.get(episode_key) or "SubHD collection archive member missing",
+                    )
+                )
+                continue
+            try:
+                track = self.cache.save_download(
+                    media_id,
+                    download,
+                    display_name=subtitle_candidate_title(record["candidate"]),
+                )
+            except (OSError, RuntimeError) as exc:
+                results.append(
+                    subtitle_result(
+                        "failed",
+                        source=provider.name,
+                        query=query,
+                        error=str(exc),
+                    )
+                )
+                continue
+            results.append(
+                subtitle_result(
+                    "success",
+                    count=1,
+                    source=provider.name,
+                    query=query,
+                    filename=track.get("filename"),
+                )
+            )
+        return results
 
     def save_download(self, media_id, download):
         return self.cache.save_download(media_id, download)
@@ -1774,6 +1887,145 @@ def subhd_archive_episode_keys(body, extension, max_bytes, timeout):
     }
     keys.discard("")
     return sorted(keys)
+
+
+def extract_subhd_collection_members(body, extension, candidate, queries, max_bytes, timeout):
+    episode_keys = []
+    errors = {}
+    for query in unique_values(queries or []):
+        episode_key = subtitle_episode_key(query)
+        if not episode_key:
+            errors[str(query or "")] = "SubHD collection candidate requires an episode key"
+        elif episode_key not in episode_keys:
+            episode_keys.append(episode_key)
+    extension = str(extension or "").casefold()
+    if extension == ".zip":
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(bytes(body or b"")))
+        except zipfile.BadZipFile as exc:
+            raise RuntimeError("SubHD subtitle ZIP is invalid") from exc
+        with archive:
+            entries = [
+                {"path": item.filename, "size": int(item.file_size or 0), "directory": item.is_dir()}
+                for item in archive.infolist()
+            ]
+            subtitles = validate_subtitle_archive_entries(entries, max_bytes)
+            members, member_errors = select_subhd_collection_members(
+                subtitles,
+                candidate,
+                episode_keys,
+                lambda entry: archive.read(entry["path"]),
+            )
+    elif extension in (".7z", ".rar"):
+        members, member_errors = extract_subhd_collection_with_tool(
+            body,
+            extension,
+            candidate,
+            episode_keys,
+            max_bytes,
+            timeout,
+        )
+    else:
+        raise RuntimeError("SubHD subtitle archive unsupported: %s" % (extension or "unknown"))
+    errors.update(member_errors)
+    return members, errors
+
+
+def extract_subhd_collection_with_tool(body, extension, candidate, episode_keys, max_bytes, timeout):
+    extractor = subhd_7z_extractor() if extension == ".7z" else "bsdtar"
+    encoding = "utf-8" if extractor == "7zz" else locale.getpreferredencoding(False)
+    with tempfile.TemporaryDirectory(prefix="subhd-season-collection-") as tmp:
+        root = Path(tmp)
+        archive_path = root / ("subtitle" + extension)
+        archive_path.write_bytes(bytes(body or b""))
+        list_command = (
+            ["7zz", "l", "-slt", "--", str(archive_path)]
+            if extractor == "7zz"
+            else ["bsdtar", "-tvf", str(archive_path)]
+        )
+        try:
+            listed = subprocess.run(
+                list_command,
+                capture_output=True,
+                text=True,
+                encoding=encoding,
+                errors="replace",
+                timeout=max(1, int(timeout or DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS)),
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("SubHD archive extractor missing: %s" % extractor) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("SubHD archive listing timed out") from exc
+        if listed.returncode != 0:
+            raise RuntimeError("SubHD archive listing failed: %s" % listed.stderr.strip()[:200])
+        entries = parse_7zip_archive_entries(listed.stdout) if extractor == "7zz" else parse_bsdtar_archive_entries(listed.stdout)
+        subtitles = validate_subtitle_archive_entries(entries, max_bytes)
+
+        extract_root = root / "extracted"
+        extract_root.mkdir()
+        extract_command = (
+            ["7zz", "x", "-y", "-bd", "-bso0", "-bsp0", "-o%s" % extract_root, "--", str(archive_path)]
+            if extractor == "7zz"
+            else [
+                "bsdtar",
+                "-xf",
+                str(archive_path),
+                "-C",
+                str(extract_root),
+                "--no-same-owner",
+                "--no-same-permissions",
+            ]
+        )
+        try:
+            extracted = subprocess.run(
+                extract_command,
+                capture_output=True,
+                text=True,
+                encoding=encoding,
+                errors="replace",
+                timeout=max(1, int(timeout or DEFAULT_SUBTITLE_SEARCH_TIMEOUT_SECONDS)),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("SubHD archive extraction timed out") from exc
+        if extracted.returncode != 0:
+            raise RuntimeError("SubHD archive extraction failed: %s" % extracted.stderr.strip()[:200])
+        verify_extracted_archive_tree(extract_root, max_bytes)
+        return select_subhd_collection_members(
+            subtitles,
+            candidate,
+            episode_keys,
+            lambda entry: extract_root.joinpath(*archive_member_parts(entry["path"])).read_bytes(),
+        )
+
+
+def select_subhd_collection_members(subtitles, candidate, episode_keys, read_entry):
+    members = {}
+    errors = {}
+    for episode_key in episode_keys:
+        matching = [
+            entry
+            for entry in subtitles
+            if subtitle_episode_key(posix_basename(entry.get("path"))) == episode_key
+        ]
+        if not matching:
+            errors[episode_key] = "SubHD collection archive does not contain %s" % episode_key
+            continue
+        for entry in rank_subtitle_archive_entries(matching, candidate, query=episode_key):
+            try:
+                data = read_entry(entry)
+            except (KeyError, OSError, RuntimeError) as exc:
+                errors[episode_key] = "SubHD collection archive member read failed: %s" % exc
+                continue
+            filename = safe_subtitle_filename(posix_basename(entry.get("path")))
+            if filename and subtitle_body_matches_candidate(data, filename, False):
+                members[episode_key] = (filename, data)
+                errors.pop(episode_key, None)
+                break
+        if episode_key not in members and episode_key not in errors:
+            errors[episode_key] = "SubHD collection archive contains no readable subtitle for %s" % episode_key
+    return members, errors
 
 
 def extract_chinese_subtitle_from_zip(body, candidate, max_bytes, query="", require_chinese_body=True):
