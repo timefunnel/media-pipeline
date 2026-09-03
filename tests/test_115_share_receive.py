@@ -227,7 +227,7 @@ class Share115ReceiveTest(unittest.TestCase):
             ["ABF-001.mp4", "ABF-001", "ABF-001/ABF-002.mp4"],
         )
 
-    def test_share_client_does_not_warm_page_and_send_acw_cookie_to_snap(self):
+    def test_share_client_does_not_persist_acw_cookie_between_snap_requests(self):
         class AntiBotCookieJar:
             def __init__(self):
                 self.has_acw_tc = False
@@ -250,26 +250,44 @@ class Share115ReceiveTest(unittest.TestCase):
                         "headers": headers or {},
                         "data": data,
                         "parse_json": parse_json,
+                        "cookie_jar": cookie_jar,
                     }
                 )
                 if parse_json is False:
-                    cookie_jar.has_acw_tc = True
-                    return "<html></html>"
+                    raise AssertionError("share page must not be requested")
                 if "share/snap" not in url:
                     raise AssertionError("unexpected request: %s" % url)
-                if cookie_jar.has_acw_tc:
+                if cookie_jar is not None and cookie_jar.has_acw_tc:
                     raise AssertionError("ACW_TC must not be sent to share/snap")
-                return {"state": True, "data": {"list": []}}
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+                cid = (query.get("cid") or [""])[0]
+                if cookie_jar is not None:
+                    cookie_jar.has_acw_tc = True
+                if cid == "folder-1":
+                    return {
+                        "state": True,
+                        "data": {"list": [{"fid": "file-1", "n": "movie.mkv", "s": 123}]},
+                    }
+                return {
+                    "state": True,
+                    "data": {"list": [{"cid": "folder-1", "n": "collection", "fc": 0}]},
+                }
 
         transport = AntiBotPageTransport()
         client = Share115Client("UID=u; CID=c; SEID=s", transport=transport)
 
-        result = client.get_share_info("swabc123", "xy99")
+        items, manifest, request_count = client._inspect_share_tree(
+            client._create_share_session("swabc123", "xy99"),
+            "swabc123",
+            "xy99",
+        )
 
-        self.assertTrue(result["state"])
-        self.assertEqual(len(transport.calls), 1)
-        self.assertEqual(transport.calls[0]["method"], "GET")
-        self.assertIn("share/snap", transport.calls[0]["url"])
+        self.assertEqual(request_count, 2)
+        self.assertEqual([item["name"] for item in items], ["collection"])
+        self.assertEqual([item["name"] for item in manifest], ["collection", "movie.mkv"])
+        self.assertEqual(len(transport.calls), 2)
+        self.assertTrue(all(call["method"] == "GET" for call in transport.calls))
+        self.assertTrue(all(call["cookie_jar"] is None for call in transport.calls))
 
     def test_pipeline_submit_115_share_uses_share_client_not_offline_open_api(self):
         class FakeShareClient:

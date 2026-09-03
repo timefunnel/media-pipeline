@@ -301,10 +301,10 @@ class Share115Client:
         }
 
     def _create_share_session(self, share_code, receive_code=""):
-        # 直接访问分享页会下发 ACW_TC；该反爬 Cookie 随后被带到
-        # /webapi/share/snap 时，115 会返回 HTTP 405。分享 API 不依赖
-        # 该页面会话，因此使用空 CookieJar 直接请求 API。
-        return self.transport.new_cookie_jar() if hasattr(self.transport, "new_cookie_jar") else None
+        # 分享页和 share/snap 响应都可能下发 ACW_TC；只要 CookieJar
+        # 在后续 share/snap 请求中回放该 Cookie，115 就会返回 HTTP 405。
+        # 分享 API 不依赖页面会话，因此完全禁用这条请求链的 Cookie 持久化。
+        return None
 
     def _inspect_share_tree(
         self,
