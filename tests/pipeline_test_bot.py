@@ -5086,6 +5086,50 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertIn(("openlist", "/115/电影", True), events)
         self.assertEqual(token_store.tokens, ["expired-token", "fresh-token"])
 
+    def test_task_status_reuses_115_client_without_reloading_openlist_token(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        events = []
+        token_loads = []
+
+        class Cached115Client:
+            def __init__(self, token):
+                events.append(("client", token))
+
+            def get_offline_tasks(self, page=1):
+                events.append(("115_tasks", page))
+                return {
+                    "state": True,
+                    "data": {
+                        "page_count": 1,
+                        "tasks": [
+                            {"info_hash": "ABC", "status": 2, "percentDone": 100}
+                        ],
+                    },
+                }
+
+        def load_access_token(*_args, **_kwargs):
+            token_loads.append("loaded")
+            return type("Token", (), {"access_token": "stable-token"})()
+
+        with patch(
+            "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
+        ), patch(
+            "pipeline.bot.OpenListClient", side_effect=lambda url, token: RetryOpenList(events)
+        ), patch(
+            "pipeline.bot.load_access_token_from_api", side_effect=load_access_token
+        ), patch("pipeline.bot.Client115", side_effect=Cached115Client):
+            service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
+            first = service.task_status("movie", "ABC")
+            second = service.task_status("movie", "ABC")
+
+        self.assertEqual(first["status_name"], "success")
+        self.assertEqual(second["status_name"], "success")
+        self.assertEqual(token_loads, ["loaded"])
+        self.assertEqual(events.count(("openlist", "/115/电影", False)), 1)
+        self.assertEqual(events.count(("client", "stable-token")), 1)
+        self.assertEqual(events.count(("115_tasks", 1)), 2)
+
     def test_prepare_subscription_staging_refreshes_openlist_when_115_token_is_invalid(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
@@ -5140,6 +5184,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertIn(("openlist", "/115/动漫", False), events)
         self.assertIn(("openlist", "/115/动漫", True), events)
         self.assertEqual(token_store.tokens, ["expired-token", "fresh-token"])
+        self.assertFalse(any(event[0] == "get_folder" for event in events))
 
     def test_sync_completed_task_scans_root_finds_media_and_scrapes_one_item(self):
         from pipeline.bot import BotConfig, PipelineBotService

@@ -1801,6 +1801,8 @@ class PipelineBotService:
         self._search_capabilities_cache = None
         self._search_capabilities_cached_at = 0.0
         self._prowlarr_search_cache = ProwlarrSearchCache()
+        self._p115_client_lock = threading.Lock()
+        self._p115_client_cache = None
 
     def search_capabilities(self, cache_seconds=60):
         now = time.monotonic()
@@ -2102,7 +2104,6 @@ class PipelineBotService:
         category,
         download_uri,
         target_folder_id=None,
-        share_manifest_scope="top_level",
     ):
         folder_id = str(target_folder_id or "").strip()
         if not folder_id:
@@ -2112,7 +2113,6 @@ class PipelineBotService:
                 category,
                 download_uri,
                 target_folder_id=folder_id,
-                manifest_scope=share_manifest_scope,
             )
         download_uri = self._resolve_download_uri(download_uri)
         response = self._call_115(
@@ -2144,23 +2144,12 @@ class PipelineBotService:
         category,
         download_uri,
         target_folder_id=None,
-        manifest_scope="top_level",
     ):
         folder_id = str(target_folder_id or "").strip()
         if not folder_id:
             raise ValueError("115分享入库目标目录 ID 缺失")
-        manifest_scope = str(manifest_scope or "top_level").strip().lower()
-        if manifest_scope not in {"top_level", "tree"}:
-            raise ValueError("115分享清单范围无效")
         client = self._build_115_share_client()
-        if manifest_scope == "tree":
-            response = client.receive_share_url(
-                download_uri,
-                folder_id,
-                recursive_manifest=True,
-            )
-        else:
-            response = client.receive_share_url(download_uri, folder_id)
+        response = client.receive_share_url(download_uri, folder_id)
         data = response.get("data") or {}
         received_file_ids = normalize_transfer_file_ids(data.get("save_as_top_fids"))
         received_item_names = normalize_transfer_item_names(
@@ -2192,7 +2181,7 @@ class PipelineBotService:
             "source_url": data.get("source_url") or download_uri,
             "received_item_count": len(data.get("items") or []),
             "source_manifest": source_manifest,
-            "source_manifest_scope": str(data.get("manifest_scope") or manifest_scope),
+            "source_manifest_scope": "top_level",
         }
         if self.config.msg_enabled:
             task["msg_sync_status"] = "running"
@@ -2289,16 +2278,7 @@ class PipelineBotService:
         ):
             return previous
         openlist_client = self._build_openlist_scan_client()
-        if task.get("source_manifest") or previous.get("direct_manifest_locked"):
-            return probe_import_transfer_visibility(None, openlist_client, task)
-        return self._call_115(
-            category,
-            lambda client: probe_import_transfer_visibility(
-                client,
-                openlist_client,
-                task,
-            ),
-        )
+        return probe_import_transfer_visibility(openlist_client, task)
 
     def _ensure_category_directory(self, category, folder_name):
         root_folder_id = str(category_to_folder_id(category) or "").strip()
@@ -2352,11 +2332,6 @@ class PipelineBotService:
             else:
                 raise RuntimeError("115入库目录缺少文件夹 ID")
 
-        info = client.get_folder_info(folder_id)
-        ensure_115_open_success(info, "verify folder")
-        data = (info or {}).get("data") or {}
-        if p115_open_item_name(data) != folder_name:
-            raise RuntimeError("115入库目录校验失败: %s" % folder_name)
         return folder_id
 
     def validate_subscription_receive_root(self, staging):
@@ -2475,34 +2450,49 @@ class PipelineBotService:
     ):
         client = self._build_openlist_client()
         staging_path = subscription_staging_path(staging)
-        entries = list_openlist_descendants(client, staging_path)
-        classified = classify_subscription_follow_videos(
-            entries,
-            season,
-            episode_hints=episode_hints,
-            expected_episodes=expected_episodes,
-            allow_season_mismatch=category == "anime",
-            item_is_dir=openlist_item_is_dir,
-            item_name=openlist_item_name,
-            item_size=openlist_item_size,
-            video_fields=lambda item, name: {"path": item.get("path"), "name": name},
+        request_count = [0]
+        entries = list_openlist_descendants(
+            client,
+            staging_path,
+            refresh=False,
+            request_count=request_count,
         )
-        return {"entries": entries, **classified}
-
-    def inspect_subscription_offline_result(
-        self, category, task, season, episode_hints=None, expected_episodes=None
-    ):
-        return self._call_115(
-            category,
-            lambda client: inspect_115_offline_result(
-                client,
-                task,
+        def classify(entries_to_classify):
+            return classify_subscription_follow_videos(
+                entries_to_classify,
                 season,
                 episode_hints=episode_hints,
                 expected_episodes=expected_episodes,
                 allow_season_mismatch=category == "anime",
-            ),
-        )
+                item_is_dir=openlist_item_is_dir,
+                item_name=openlist_item_name,
+                item_size=openlist_item_size,
+                video_fields=lambda item, name: {"path": item.get("path"), "name": name},
+            )
+
+        classified = classify(entries)
+        expected = {int(value) for value in expected_episodes or []}
+        query_mode = "cache_hit"
+        if not classified.get("videos") or (
+            expected
+            and not expected.issubset(
+                {int(value) for value in classified.get("verified_episodes") or []}
+            )
+        ):
+            entries = list_openlist_descendants(
+                client,
+                staging_path,
+                refresh=True,
+                request_count=request_count,
+            )
+            query_mode = "refreshed"
+            classified = classify(entries)
+        return {
+            "entries": entries,
+            "openlist_query_mode": query_mode,
+            "openlist_request_count": request_count[0],
+            **classified,
+        }
 
     def inspect_subscription_submit_result(
         self,
@@ -2515,38 +2505,35 @@ class PipelineBotService:
     ):
         if (submit_result or {}).get("submit_kind") == "115_share_receive":
             data = ((submit_result or {}).get("raw") or {}).get("data") or {}
-            if str(data.get("manifest_scope") or "tree") != "tree":
-                raise RuntimeError("115分享追更任务缺少完整递归清单")
-            manifest = classify_115_resource_entries(
-                data.get("manifest_items") or data.get("items") or [],
-                season,
-                episode_hints=episode_hints,
-                expected_episodes=expected_episodes,
-                allow_season_mismatch=category == "anime",
-            )
-            manifest.update(
-                {
-                    "source_kind": "115_share",
-                    "inspection_timing": "before_transfer",
-                    "top_level_item_count": len(data.get("items") or []),
-                    "request_count": int(data.get("manifest_request_count") or 0),
-                }
-            )
-            return manifest
-        manifest = self.inspect_subscription_offline_result(
-            category,
-            completed_task,
-            season,
-            episode_hints=episode_hints,
-            expected_episodes=expected_episodes,
-        )
-        manifest.update(
-            {
-                "source_kind": "115_offline",
-                "inspection_timing": "after_download",
+            top_level_item_count = len(data.get("items") or [])
+            if top_level_item_count <= 0:
+                raise RuntimeError("115分享转存响应缺少顶层文件")
+            return {
+                "source_kind": "115_share",
+                "inspection_timing": "submit_response",
+                "top_level_item_count": top_level_item_count,
+                "request_count": int(data.get("manifest_request_count") or 0),
+                "verification_source": "openlist_after_transfer",
             }
+        completed_task = dict(completed_task or {})
+        task_has_result = bool(
+            normalize_transfer_file_ids(
+                completed_task.get("received_file_ids") or completed_task.get("file_id")
+            )
+            or normalize_transfer_item_names(
+                completed_task.get("received_item_names")
+                or [completed_task.get("name")]
+            )
         )
-        return manifest
+        if not task_has_result:
+            raise RuntimeError("115已完成任务缺少结果文件标识")
+        return {
+            "source_kind": "115_offline",
+            "inspection_timing": "task_status",
+            "top_level_item_count": 1,
+            "request_count": 0,
+            "verification_source": "openlist_after_transfer",
+        }
 
     def plan_subscription_promotion(self, staging, selected_episodes, season):
         selected = {int(value) for value in selected_episodes or []}
@@ -3025,7 +3012,7 @@ class PipelineBotService:
             capture_progress(
                 {
                     "transfer_verify_status": "running",
-                    "transfer_verify_reason": "probing_115_and_openlist",
+                    "transfer_verify_reason": "probing_openlist_transfer",
                     "transfer_verify_error": None,
                     "msg_sync_status": "running",
                     "msg_error": None,
@@ -3053,7 +3040,7 @@ class PipelineBotService:
                 capture_progress(updates)
                 return out
             if verify_status != "success":
-                error = verify_error or "115入库文件完整性校验失败"
+                error = verify_error or "入库转存可见性校验失败"
                 updates.update({"msg_sync_status": "failed", "msg_error": error})
                 capture_progress(updates)
                 return out
@@ -3439,11 +3426,15 @@ class PipelineBotService:
         return result
 
     def _build_115_client(self, category, refresh=False):
-        openlist_token = OpenListTokenProvider().load_token()
-        client = OpenListClient(self.config.openlist_url, openlist_token)
-        client.list_path(category_to_openlist_path(category), refresh=refresh)
-        token = load_access_token_from_api(self.config.openlist_url, openlist_token)
-        return Client115(token.access_token)
+        with self._p115_client_lock:
+            if self._p115_client_cache is not None and not refresh:
+                return self._p115_client_cache
+            openlist_token = OpenListTokenProvider().load_token()
+            client = OpenListClient(self.config.openlist_url, openlist_token)
+            client.list_path(category_to_openlist_path(category), refresh=refresh)
+            token = load_access_token_from_api(self.config.openlist_url, openlist_token)
+            self._p115_client_cache = Client115(token.access_token)
+            return self._p115_client_cache
 
     def _build_115_share_client(self):
         cookie = self._build_msg_client().get_cloud115_cookie()
@@ -4739,92 +4730,7 @@ def transfer_manifests_match(expected, actual):
     )
 
 
-def inspect_115_import_task_entries(client, task, max_entries=20000):
-    task = dict(task or {})
-    root_ids = normalize_transfer_file_ids(
-        task.get("received_file_ids") or task.get("file_id")
-    )
-    root_names = normalize_transfer_item_names(task.get("received_item_names") or [])
-    if not root_ids and not root_names:
-        raise RuntimeError("115已完成任务缺少结果文件 ID 或顶层名称")
-    parent_id = str(task.get("wp_path_id") or "").strip()
-    if not parent_id:
-        raise RuntimeError("115已完成任务缺少目标目录 ID")
-
-    parent_items, request_count = client.list_all_files_with_request_count(
-        parent_id, page_size=7000
-    )
-    parent_by_id = defaultdict(list)
-    parent_by_name = defaultdict(list)
-    for item in parent_items:
-        row = dict(item or {})
-        parent_by_id[p115_open_item_id(row)].append(row)
-        parent_by_name[p115_open_item_name(row).casefold()].append(row)
-
-    entries = []
-    missing_root_ids = []
-    missing_root_names = []
-    stack = []
-    root_selectors = [("id", value) for value in root_ids] or [
-        ("name", value) for value in root_names
-    ]
-    for selector_kind, selector_value in root_selectors:
-        matches = (
-            parent_by_id.get(selector_value)
-            if selector_kind == "id"
-            else parent_by_name.get(selector_value.casefold())
-        ) or []
-        if not matches:
-            if selector_kind == "id":
-                missing_root_ids.append(selector_value)
-            else:
-                missing_root_names.append(selector_value)
-            continue
-        if len(matches) != 1:
-            raise RuntimeError(
-                "115入库结果顶层项存在重复匹配: %s" % selector_value
-            )
-        row = dict(matches[0])
-        name = p115_open_item_name(row)
-        if not name:
-            raise RuntimeError("115入库结果缺少文件名: %s" % selector_value)
-        row["_transfer_relative_path"] = name
-        entries.append(row)
-        if p115_open_item_is_dir(row):
-            root_id = p115_open_item_id(row)
-            if not root_id:
-                raise RuntimeError("115入库结果顶层目录缺少文件 ID: %s" % name)
-            stack.append((root_id, name))
-
-    while stack:
-        folder_id, parent_path = stack.pop()
-        children, requests = client.list_all_files_with_request_count(folder_id, page_size=7000)
-        request_count += requests
-        for item in children:
-            row = dict(item or {})
-            name = p115_open_item_name(row)
-            if not name:
-                raise RuntimeError("115入库子项缺少文件名: %s" % folder_id)
-            row["_transfer_relative_path"] = posixpath.join(parent_path, name)
-            entries.append(row)
-            if len(entries) > int(max_entries):
-                raise RuntimeError("115入库结果超过目录项上限")
-            if p115_open_item_is_dir(row):
-                child_id = p115_open_item_id(row)
-                if not child_id:
-                    raise RuntimeError("115入库子目录缺少文件 ID")
-                stack.append((child_id, row["_transfer_relative_path"]))
-
-    return {
-        "entries": entries,
-        "missing_root_ids": missing_root_ids,
-        "missing_root_names": missing_root_names,
-        "request_count": request_count,
-    }
-
-
 def probe_import_transfer_visibility(
-    p115_client,
     openlist_client,
     task,
     now_fn=time.time,
@@ -4835,52 +4741,33 @@ def probe_import_transfer_visibility(
         raise RuntimeError("入库目标 OpenList 路径缺失")
     now = int(now_fn())
     source_kind = str(task.get("source_kind") or "115_offline").strip() or "115_offline"
-    expected_manifest = dict(task.get("source_manifest") or {})
-    source_manifest_scope = str(task.get("source_manifest_scope") or "tree").strip().lower()
-    if source_manifest_scope not in {"top_level", "tree"}:
+    source_manifest = dict(task.get("source_manifest") or {})
+    source_manifest_scope = str(task.get("source_manifest_scope") or "none").strip().lower()
+    if source_manifest_scope not in {"none", "top_level", "tree"}:
         raise RuntimeError("115入库清单范围无效")
+    expected_manifest = source_manifest if source_manifest_scope == "top_level" else {}
+    verification_scope = (
+        "source_top_level_manifest" if expected_manifest else "openlist_target_nonempty"
+    )
     previous = dict(task.get("transfer_verification") or {})
     if previous.get("status") == "running" and int(previous.get("next_probe_at") or 0) > now:
         return previous
 
     probe_attempt = int(previous.get("probe_attempt") or 0) + 1
-    inspected = None
-    direct_manifest_locked = False
-    if expected_manifest:
-        direct_manifest = expected_manifest
-        direct_manifest_locked = True
-        direct_request_count = 0
-    elif previous.get("direct_manifest_locked") and (previous.get("direct_manifest") or {}).get(
-        "fingerprint"
-    ):
-        direct_manifest = dict(previous["direct_manifest"])
-        direct_manifest_locked = True
-        direct_request_count = int(previous.get("direct_request_count") or 0)
-    else:
-        if p115_client is None:
-            raise RuntimeError("115离线下载完整性校验缺少115客户端")
-        inspected = inspect_115_import_task_entries(p115_client, task)
-        direct_manifest = build_transfer_manifest(
-            inspected["entries"],
-            item_name=p115_open_item_name,
-            item_is_dir=p115_open_item_is_dir,
-            item_size=subscription_follow_item_size,
-            item_relative_path=lambda item: (item or {}).get("_transfer_relative_path"),
-        )
-        direct_request_count = int(inspected.get("request_count") or 0)
 
     result = {
         "status": "running",
-        "reason": "waiting_115_result",
+        "reason": "waiting_openlist_path",
         "source_kind": source_kind,
         "source_manifest_scope": source_manifest_scope,
+        "verification_scope": verification_scope,
         "expected_manifest": expected_manifest or None,
-        "direct_manifest": direct_manifest,
-        "direct_manifest_locked": direct_manifest_locked,
-        "direct_request_count": direct_request_count,
+        "direct_manifest": expected_manifest or None,
+        "direct_manifest_locked": bool(expected_manifest),
+        "direct_request_count": 0,
         "openlist_manifest": None,
-        "missing_root_ids": list((inspected or {}).get("missing_root_ids") or []),
-        "missing_root_names": list((inspected or {}).get("missing_root_names") or []),
+        "missing_root_ids": [],
+        "missing_root_names": [],
         "probe_attempt": probe_attempt,
         "next_probe_at": None,
         "observed_at": now,
@@ -4902,24 +4789,13 @@ def probe_import_transfer_visibility(
         )
         return result
 
-    if result["missing_root_ids"] or result["missing_root_names"]:
-        return wait_for_retry("waiting_115_result")
-    manifest_has_content = (
-        int(direct_manifest.get("entry_count") or 0) > 0
-        if source_manifest_scope == "top_level"
-        else int(direct_manifest.get("file_count") or 0) > 0
-    )
-    if not manifest_has_content:
-        return wait_for_retry("waiting_115_files")
-    result["direct_manifest_locked"] = True
-
-    direct_count = int(direct_manifest.get("entry_count") or 0)
+    direct_count = int(expected_manifest.get("entry_count") or 0)
     try:
         cached_manifest, cached_request_count = inspect_openlist_transfer_manifest(
             openlist_client,
             target_path,
             refresh=False,
-            recursive=source_manifest_scope == "tree",
+            recursive=False,
         )
     except RuntimeError as exc:
         if not openlist_missing_error(exc) and not openlist_receive_operation_is_retryable_error(exc):
@@ -4929,11 +4805,23 @@ def probe_import_transfer_visibility(
         result["openlist_cached_error"] = str(exc)
     result["openlist_cached_manifest"] = cached_manifest
     result["openlist_cached_request_count"] = cached_request_count
-    if cached_manifest and transfer_manifests_match(direct_manifest, cached_manifest):
+    cached_matches = bool(
+        cached_manifest
+        and int(cached_manifest.get("entry_count") or 0) > 0
+        and (
+            not expected_manifest
+            or transfer_manifests_match(expected_manifest, cached_manifest)
+        )
+    )
+    if cached_matches:
         result.update(
             {
                 "status": "success",
-                "reason": "manifest_verified_from_cache",
+                "reason": (
+                    "manifest_verified_from_cache"
+                    if expected_manifest
+                    else "target_visible_from_cache"
+                ),
                 "openlist_manifest": cached_manifest,
                 "openlist_query_mode": "cache_hit",
                 "openlist_refresh_performed": False,
@@ -4950,7 +4838,7 @@ def probe_import_transfer_visibility(
             openlist_client,
             target_path,
             refresh=True,
-            recursive=source_manifest_scope == "tree",
+            recursive=False,
         )
     except RuntimeError as exc:
         if not openlist_missing_error(exc) and not openlist_receive_operation_is_retryable_error(exc):
@@ -4972,16 +4860,19 @@ def probe_import_transfer_visibility(
         }
     )
     openlist_count = int(openlist_manifest.get("entry_count") or 0)
-    if openlist_count < direct_count:
+    if openlist_count <= 0:
+        return wait_for_retry("waiting_openlist_content")
+    if expected_manifest and openlist_count < direct_count:
         return wait_for_retry("waiting_openlist_manifest")
-    if openlist_count > direct_count or not transfer_manifests_match(
-        direct_manifest, openlist_manifest
+    if expected_manifest and (
+        openlist_count > direct_count
+        or not transfer_manifests_match(expected_manifest, openlist_manifest)
     ):
         result.update(
             {
                 "status": "failed",
                 "reason": "openlist_manifest_mismatch",
-                "error": "OpenList入库目录与115结果不一致: expected=%d actual=%d"
+                "error": "OpenList入库目录与115分享顶层清单不一致: expected=%d actual=%d"
                 % (direct_count, openlist_count),
             }
         )
@@ -4989,7 +4880,7 @@ def probe_import_transfer_visibility(
     result.update(
         {
             "status": "success",
-            "reason": "manifest_verified",
+            "reason": "manifest_verified" if expected_manifest else "target_visible",
             "next_probe_at": None,
             "retry_after_seconds": None,
             "verified_at": now,
@@ -5097,59 +4988,6 @@ def parse_follow_episode(
     if len(matched_hints) == 1:
         return matched_hints[0]
     return None
-
-
-def inspect_115_offline_result(
-    client,
-    task,
-    season,
-    episode_hints=None,
-    expected_episodes=None,
-    allow_season_mismatch=False,
-    max_entries=20000,
-):
-    task = dict(task or {})
-    file_id = str(task.get("file_id") or "").strip()
-    if not file_id:
-        raise RuntimeError("115 completed offline task returned no file_id")
-    request_count = [0]
-    try:
-        entries = list_115_descendants(
-            client,
-            file_id,
-            request_count=request_count,
-            max_entries=max_entries,
-        )
-    except RuntimeError as directory_error:
-        parent_id = str(task.get("wp_path_id") or "").strip()
-        if not parent_id:
-            raise directory_error
-        parent_items, parent_requests = client.list_all_files_with_request_count(
-            parent_id, page_size=7000
-        )
-        request_count[0] += parent_requests
-        matches = [
-            item
-            for item in parent_items
-            if p115_open_item_id(item) == file_id
-        ]
-        if len(matches) != 1 or p115_open_item_is_dir(matches[0]):
-            raise directory_error
-        entries = [dict(matches[0])]
-
-    manifest = classify_115_resource_entries(
-        entries,
-        season,
-        episode_hints=episode_hints,
-        expected_episodes=expected_episodes,
-        allow_season_mismatch=allow_season_mismatch,
-    )
-    manifest.update({
-        "root_file_id": file_id,
-        "top_level_item_count": 1,
-        "request_count": request_count[0],
-    })
-    return manifest
 
 
 def classify_115_resource_entries(
@@ -5277,29 +5115,6 @@ def parse_multi_video_episode(name, expected_season):
         if value > 0 and value not in values:
             values.append(value)
     return values[0] if len(values) == 1 else None
-
-
-def list_115_descendants(client, folder_id, request_count=None, max_entries=20000):
-    out = []
-    stack = [str(folder_id or "").strip()]
-    while stack:
-        current = stack.pop()
-        if not current:
-            raise RuntimeError("115 resource directory id missing")
-        items, requests = client.list_all_files_with_request_count(current, page_size=7000)
-        if request_count is not None:
-            request_count[0] += requests
-        for item in items:
-            row = dict(item or {})
-            out.append(row)
-            if len(out) > int(max_entries):
-                raise RuntimeError("115 resource entry limit exceeded")
-            if p115_open_item_is_dir(row):
-                child_id = p115_open_item_id(row)
-                if not child_id:
-                    raise RuntimeError("115 nested resource directory missing file_id")
-                stack.append(child_id)
-    return out
 
 
 def msg_authoritative_openlist_paths(task):

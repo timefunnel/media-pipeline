@@ -409,14 +409,21 @@ def append_task_lines(lines, task, category=None):
         verification = task.get("transfer_verification") or {}
         direct_count = ((verification.get("direct_manifest") or {}).get("entry_count"))
         openlist_count = ((verification.get("openlist_manifest") or {}).get("entry_count"))
-        if task.get("transfer_verify_status") == "success":
-            lines.append("文件完整性：已校验（115 %s / OpenList %s）" % (direct_count or 0, openlist_count or 0))
+        if verification.get("verification_scope") == "source_top_level_manifest":
+            if task.get("transfer_verify_status") == "success":
+                lines.append("顶层清单：已校验（115分享 %s / OpenList %s）" % (direct_count or 0, openlist_count or 0))
+            elif task.get("transfer_verify_status") == "running":
+                lines.append("顶层清单：等待 OpenList 可见（115分享 %s / OpenList %s）" % (direct_count or 0, openlist_count or 0))
+            else:
+                lines.append("顶层清单：失败")
+        elif task.get("transfer_verify_status") == "success":
+            lines.append("转存可见性：OpenList 已发现目标内容（顶层 %s）" % (openlist_count or 0))
         elif task.get("transfer_verify_status") == "running":
-            lines.append("文件完整性：等待115与OpenList一致（115 %s / OpenList %s）" % (direct_count or 0, openlist_count or 0))
+            lines.append("转存可见性：等待 OpenList 目标内容")
         else:
-            lines.append("文件完整性：失败")
-            if task.get("transfer_verify_error"):
-                lines.append("完整性错误：%s" % task.get("transfer_verify_error"))
+            lines.append("转存可见性：失败")
+        if task.get("transfer_verify_error"):
+            lines.append("校验错误：%s" % task.get("transfer_verify_error"))
     if task.get("msg_sync_status"):
         if task.get("msg_sync_status") == "success":
             lines.append("MSG同步：已完成")

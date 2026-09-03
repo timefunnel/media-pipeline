@@ -2054,14 +2054,29 @@ class ImportTaskManager:
                 if episode not in existing and episode not in reserved
             )
 
+        staging_inspection_cache = {}
+
         def inspect_staging(current_staging):
+            cache_key = None
+            if current_staging.get("claimed_at"):
+                cache_key = (
+                    current_staging.get("openlist_path"),
+                    current_staging.get("claimed_at"),
+                    tuple(current_staging.get("received_names") or []),
+                )
+                if cache_key in staging_inspection_cache:
+                    return staging_inspection_cache[cache_key]
             if expected_episodes:
-                return self.service.inspect_subscription_staging(
+                inspected = self.service.inspect_subscription_staging(
                     category, current_staging, season, file_episode_hints, expected_episodes
                 )
-            return self.service.inspect_subscription_staging(
-                category, current_staging, season, file_episode_hints
-            )
+            else:
+                inspected = self.service.inspect_subscription_staging(
+                    category, current_staging, season, file_episode_hints
+                )
+            if cache_key is not None:
+                staging_inspection_cache[cache_key] = inspected
+            return inspected
 
         info_hash = str(task.get("info_hash") or "").strip()
         offline_task = dict(result.get("task") or {})
@@ -2257,7 +2272,6 @@ class ImportTaskManager:
                                     category,
                                     request["candidate"]["download_uri"],
                                     target_folder_id=subscription_receive_target_folder_id(staging),
-                                    share_manifest_scope="tree",
                                 )
                                 info_hash = first_submit_info_hash(submit_result)
                                 if not info_hash:
@@ -2396,15 +2410,24 @@ class ImportTaskManager:
             self.store.save_running(task["id"], "verifying_staging", result=result, info_hash=info_hash)
             staging_state = inspect_staging(staging)
             verified = {int(value) for value in staging_state.get("verified_episodes") or []}
-            source_manifest = audit.get("resource_manifest") or {}
-            source_verified = {
-                int(value)
-                for value in source_manifest.get("verified_episodes") or []
-            }
-            if source_manifest and source_verified != verified:
-                raise RuntimeError(
-                    "OpenList staging episode manifest does not match the 115 resource manifest"
-                )
+            resource_receipt = dict(audit.get("resource_manifest") or {})
+            resource_receipt.update(
+                {
+                    "inspection_timing": "after_transfer",
+                    "verification_source": "openlist",
+                    "entry_count": len(staging_state.get("entries") or []),
+                    "verified_episodes": sorted(verified),
+                    "unknown_videos": list(staging_state.get("unknown_videos") or []),
+                    "ambiguous_videos": list(staging_state.get("ambiguous_videos") or []),
+                    "supplemental_videos": list(staging_state.get("supplemental_videos") or []),
+                    "duplicate_episodes": dict(staging_state.get("duplicate_episodes") or {}),
+                    "openlist_query_mode": staging_state.get("openlist_query_mode"),
+                    "openlist_request_count": int(
+                        staging_state.get("openlist_request_count") or 0
+                    ),
+                }
+            )
+            audit["resource_manifest"] = resource_receipt
             audit.update(
                 {
                     "verified_episodes": sorted(verified),

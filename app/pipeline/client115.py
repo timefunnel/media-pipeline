@@ -1,5 +1,4 @@
 import json
-import posixpath
 import re
 import time
 import urllib.error
@@ -226,7 +225,7 @@ class Share115Client:
         cookie_jar = self._create_share_session(share_code, receive_code)
         return self._snap(cookie_jar, share_code, receive_code, cid=cid, limit=limit)
 
-    def receive_share_url(self, url, folder_id, recursive_manifest=False):
+    def receive_share_url(self, url, folder_id):
         parsed = parse_115_share_url(url)
         if parsed is None:
             raise ValueError("not a 115 share url")
@@ -236,7 +235,6 @@ class Share115Client:
             folder_id,
             cid=parsed.pdir_fid,
             source_url=parsed.url,
-            recursive_manifest=recursive_manifest,
         )
 
     def receive_share(
@@ -246,7 +244,6 @@ class Share115Client:
         folder_id,
         cid="0",
         source_url="",
-        recursive_manifest=False,
     ):
         share_code = str(share_code or "").strip()
         receive_code = str(receive_code or "").strip()
@@ -258,12 +255,11 @@ class Share115Client:
             raise ValueError("folder_id must not be empty")
 
         cookie_jar = self._create_share_session(share_code, receive_code)
-        items, manifest_items, manifest_request_count = self._inspect_share_tree(
+        items, manifest_request_count = self._inspect_share_root(
             cookie_jar,
             share_code,
             receive_code,
             cid=cid,
-            recursive=bool(recursive_manifest),
         )
         if not items:
             raise RuntimeError("115 share has no receivable items")
@@ -302,9 +298,9 @@ class Share115Client:
                 "cid": folder_id,
                 "source_cid": cid,
                 "items": items,
-                "manifest_items": manifest_items,
+                "manifest_items": items,
                 "manifest_request_count": manifest_request_count,
-                "manifest_scope": "tree" if recursive_manifest else "top_level",
+                "manifest_scope": "top_level",
                 "file_ids": file_ids,
                 "save_as_top_fids": data.get("save_as_top_fids") or data.get("file_id") or [],
                 "raw": data,
@@ -317,7 +313,7 @@ class Share115Client:
         # 分享 API 不依赖页面会话，因此完全禁用这条请求链的 Cookie 持久化。
         return None
 
-    def _inspect_share_tree(
+    def _inspect_share_root(
         self,
         cookie_jar,
         share_code,
@@ -325,7 +321,6 @@ class Share115Client:
         cid="0",
         page_size=1000,
         max_entries=20000,
-        recursive=True,
     ):
         request_count = 0
 
@@ -353,38 +348,12 @@ class Share115Client:
                     return out
                 offset += len(page)
 
-        top_items = []
+        items = []
         for item in list_items(cid):
             row = dict(item)
             row["relative_path"] = str(row.get("name") or "").strip()
-            top_items.append(row)
-        manifest = list(top_items)
-        if not recursive:
-            return top_items, manifest, request_count
-        stack = [
-            (item["file_id"], item["relative_path"])
-            for item in top_items
-            if item.get("is_dir")
-        ]
-        while stack:
-            folder_id, parent_path = stack.pop()
-            children = []
-            for item in list_items(folder_id):
-                row = dict(item)
-                row["relative_path"] = posixpath.join(
-                    parent_path,
-                    str(row.get("name") or "").strip(),
-                )
-                children.append(row)
-            manifest.extend(children)
-            if len(manifest) > int(max_entries):
-                raise RuntimeError("115 share entry limit exceeded")
-            stack.extend(
-                (item["file_id"], item["relative_path"])
-                for item in children
-                if item.get("is_dir")
-            )
-        return top_items, manifest, request_count
+            items.append(row)
+        return items, request_count
 
     def _snap(self, cookie_jar, share_code, receive_code="", cid="0", limit=50, offset=0):
         query = urllib.parse.urlencode(
