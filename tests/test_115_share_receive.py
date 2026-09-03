@@ -227,6 +227,50 @@ class Share115ReceiveTest(unittest.TestCase):
             ["ABF-001.mp4", "ABF-001", "ABF-001/ABF-002.mp4"],
         )
 
+    def test_share_client_does_not_warm_page_and_send_acw_cookie_to_snap(self):
+        class AntiBotCookieJar:
+            def __init__(self):
+                self.has_acw_tc = False
+
+            def __iter__(self):
+                return iter(())
+
+        class AntiBotPageTransport:
+            def __init__(self):
+                self.calls = []
+
+            def new_cookie_jar(self):
+                return AntiBotCookieJar()
+
+            def request(self, method, url, headers=None, data=None, timeout=None, cookie_jar=None, parse_json=True):
+                self.calls.append(
+                    {
+                        "method": method,
+                        "url": url,
+                        "headers": headers or {},
+                        "data": data,
+                        "parse_json": parse_json,
+                    }
+                )
+                if parse_json is False:
+                    cookie_jar.has_acw_tc = True
+                    return "<html></html>"
+                if "share/snap" not in url:
+                    raise AssertionError("unexpected request: %s" % url)
+                if cookie_jar.has_acw_tc:
+                    raise AssertionError("ACW_TC must not be sent to share/snap")
+                return {"state": True, "data": {"list": []}}
+
+        transport = AntiBotPageTransport()
+        client = Share115Client("UID=u; CID=c; SEID=s", transport=transport)
+
+        result = client.get_share_info("swabc123", "xy99")
+
+        self.assertTrue(result["state"])
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(transport.calls[0]["method"], "GET")
+        self.assertIn("share/snap", transport.calls[0]["url"])
+
     def test_pipeline_submit_115_share_uses_share_client_not_offline_open_api(self):
         class FakeShareClient:
             def __init__(self):

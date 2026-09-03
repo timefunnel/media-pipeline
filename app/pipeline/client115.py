@@ -301,23 +301,10 @@ class Share115Client:
         }
 
     def _create_share_session(self, share_code, receive_code=""):
-        cookie_jar = self.transport.new_cookie_jar() if hasattr(self.transport, "new_cookie_jar") else None
-        page_url = SHARE_PAGE_URL % urllib.parse.quote(str(share_code), safe="")
-        if receive_code:
-            page_url = page_url + "?password=" + urllib.parse.quote(str(receive_code), safe="")
-        try:
-            self.transport.request(
-                "GET",
-                page_url,
-                headers=self._share_headers(share_code, receive_code),
-                timeout=self.timeout,
-                cookie_jar=cookie_jar,
-                parse_json=False,
-            )
-        except RuntimeError:
-            # 访问分享页只是为了获取会话 cookie；真正的失败以后续 API 响应为准。
-            pass
-        return cookie_jar
+        # 直接访问分享页会下发 ACW_TC；该反爬 Cookie 随后被带到
+        # /webapi/share/snap 时，115 会返回 HTTP 405。分享 API 不依赖
+        # 该页面会话，因此使用空 CookieJar 直接请求 API。
+        return self.transport.new_cookie_jar() if hasattr(self.transport, "new_cookie_jar") else None
 
     def _inspect_share_tree(
         self,
