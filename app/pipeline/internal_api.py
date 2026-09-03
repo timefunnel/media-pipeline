@@ -42,8 +42,8 @@ MAX_JSON_BODY_BYTES = 1024 * 1024
 OFFLINE_ACTIVE_STATUSES = {"submitted", "allocating", "downloading", "unknown", None, ""}
 OFFLINE_SUCCESS_STATUS = "success"
 OFFLINE_FAILED_STATUSES = {"failed", "cancelled", "canceled"}
-FINAL_IMPORT_STATUSES = {"completed", "completed_with_warning", "failed", "canceled"}
-RETRYABLE_IMPORT_STATUSES = {"completed_with_warning", "failed", "canceled"}
+FINAL_IMPORT_STATUSES = {"completed", "completed_with_warning", "failed", "canceled", "needs_attention"}
+RETRYABLE_IMPORT_STATUSES = {"completed_with_warning", "failed", "canceled", "needs_attention"}
 VALID_IMPORT_STATUSES = {"queued", "running", *FINAL_IMPORT_STATUSES}
 FINAL_SUBTITLE_ASR_STATUSES = {"completed", "failed", "canceled"}
 VALID_SUBTITLE_ASR_STATUSES = {"queued", "running", *FINAL_SUBTITLE_ASR_STATUSES}
@@ -1904,6 +1904,17 @@ class ImportTaskManager:
                 if offline_task.get("msg_sync_status") == "running":
                     self._wait_or_stop()
                     continue
+                if offline_task.get("msg_sync_status") == "needs_attention":
+                    attention_error = str(offline_task.get("msg_error") or "MSG目标树在10分钟内未收敛")
+                    self.store.finish_import(
+                        task["id"],
+                        "needs_attention",
+                        "needs_attention",
+                        result=result,
+                        error=attention_error,
+                        info_hash=info_hash,
+                    )
+                    return
                 if not media_id:
                     msg_error = str(offline_task.get("msg_error") or "").strip()
                     if msg_error:
@@ -4221,6 +4232,8 @@ def sync_stage(task):
         return "verifying_source"
     if task.get("msg_scan_status") == "running" or task.get("msg_ingest_status") == "running":
         return "scanning"
+    if task.get("msg_sync_status") == "needs_attention":
+        return "needs_attention"
     if task.get("msg_scrape_status") == "running":
         return "scraping"
     if task.get("subtitle_match_status") == "running":
@@ -4342,6 +4355,8 @@ def import_status_message(status, stage, error):
         return "已入库，但后续处理存在告警"
     if status == "failed":
         return "导入失败：%s" % error if error else "导入失败"
+    if status == "needs_attention":
+        return "目录在10分钟内未收敛，需要处理"
     if status == "canceled":
         return "导入已取消"
     return {

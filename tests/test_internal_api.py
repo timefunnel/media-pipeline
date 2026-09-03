@@ -1446,6 +1446,42 @@ class PipelineTargetOverrideTest(InternalApiTestCase):
 
 
 class ImportPersistenceTest(InternalApiTestCase):
+    def test_needs_attention_is_final_and_retries_without_resubmitting_completed_transfer(self):
+        service, store, manager, _application = self.build_components()
+        task, _ = store.create_import(
+            "owner-a",
+            "needs-attention-retry",
+            {"category": "movie", "title": "珍藏包"},
+        )
+        preserved = {
+            "task": {
+                "info_hash": "completed-transfer",
+                "status_name": "success",
+                "msg_sync_status": "needs_attention",
+                "msg_ingest_status": "needs_attention",
+                "msg_error": "目标树在10分钟内未收敛",
+                "import_target_openlist_path": "/115/电影/珍藏包 [import-abc]",
+            }
+        }
+        store.finish_import(
+            task["id"],
+            "needs_attention",
+            "needs_attention",
+            result=preserved,
+            error="目标树在10分钟内未收敛",
+            info_hash="completed-transfer",
+        )
+
+        final = manager.get_import("owner-a", task["id"])
+        self.assertEqual(final["status"], "needs_attention")
+        retried = manager.retry_import("owner-a", task["id"])
+
+        self.assertEqual((retried["status"], retried["stage"]), ("queued", "queued"))
+        self.assertEqual(retried["info_hash"], "completed-transfer")
+        self.assertEqual(retried["result"]["task"]["msg_sync_status"], "running")
+        self.assertEqual(retried["result"]["task"]["msg_ingest_status"], "needs_attention")
+        self.assertEqual(service.submit_uris, [])
+
     def test_manual_magnet_candidate_creates_existing_import_task(self):
         service, _store, manager, application = self.build_components()
         info_hash = "0123456789abcdef0123456789abcdef01234567"

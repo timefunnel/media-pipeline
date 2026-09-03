@@ -24,12 +24,15 @@ CONTENT_PROFILE_LABELS = {
 TASK_STATUS_LABELS = {
     "submitted": "已提交",
     "pending": "排队中",
+    "accepted": "已接受",
+    "converging": "收敛中",
     "waiting": "等待中",
     "running": "处理中",
     "downloading": "下载中",
     "success": "已完成",
     "completed": "已完成",
     "failed": "失败",
+    "needs_attention": "需处理",
     "cancelled": "已取消",
     "canceled": "已取消",
     "skipped": "已跳过",
@@ -79,6 +82,7 @@ def msg_sync_status_label(value):
         "success": "已完成",
         "running": "进行中",
         "failed": "失败",
+        "needs_attention": "需处理",
         "skipped": "已跳过",
     }.get(value, value or "-")
 
@@ -435,6 +439,10 @@ def append_task_lines(lines, task, category=None):
                 lines.append("MSG路径：%s" % task.get("msg_match_path"))
         elif task.get("msg_sync_status") == "running":
             lines.append("MSG同步：进行中")
+        elif task.get("msg_sync_status") == "needs_attention":
+            lines.append("MSG同步：需处理")
+            if task.get("msg_error"):
+                lines.append("MSG错误：%s" % task.get("msg_error"))
         else:
             lines.append("MSG同步：失败")
             if task.get("msg_error"):
@@ -476,8 +484,23 @@ def append_task_lines(lines, task, category=None):
             lines.append("MSG扫描：已完成")
         elif task.get("msg_scan_status") == "running":
             lines.append("MSG扫描：进行中")
+        elif task.get("msg_scan_status") == "needs_attention":
+            lines.append("MSG扫描：需处理")
         else:
             lines.append("MSG扫描：失败")
+    convergence_status = task.get("msg_convergence_status")
+    if not convergence_status and task.get("msg_ingest_status") in {"accepted", "converging", "needs_attention"}:
+        convergence_status = task.get("msg_ingest_status")
+    if convergence_status:
+        lines.append(
+            "目录收敛：%s（目录 %s / 文件 %s / %s）"
+            % (
+                task_status_label(convergence_status),
+                task.get("msg_convergence_directory_count") or 0,
+                task.get("msg_convergence_file_count") or 0,
+                format_size(task.get("msg_convergence_total_file_size") or 0),
+            )
+        )
     if task.get("msg_scrape_status"):
         if task.get("msg_scrape_status") == "success":
             lines.append("MSG刮削：已完成")

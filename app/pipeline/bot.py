@@ -1791,6 +1791,10 @@ class MediaStationIngestPending(RuntimeError):
     pass
 
 
+class MediaStationIngestNeedsAttention(RuntimeError):
+    pass
+
+
 class PipelineBotService:
     def __init__(self, config):
         self.config = config
@@ -3089,6 +3093,12 @@ class PipelineBotService:
             out["msg_sync_status"] = "running"
             out["msg_error"] = None
             return out
+        except MediaStationIngestNeedsAttention as exc:
+            out["msg_sync_status"] = "needs_attention"
+            out["msg_scan_status"] = "needs_attention"
+            out["msg_error"] = str(exc)
+            out["msg_needs_attention_at"] = int(time.time())
+            return out
         except (RuntimeError, ValueError) as exc:
             mark_current_sync_stage_failed(out, str(exc))
             out["msg_sync_status"] = "failed"
@@ -4054,7 +4064,7 @@ class PipelineBotService:
         target=None,
     ):
         root = self._msg_target(category, target)
-        previous_failed = progress.get("msg_ingest_status") == "failed"
+        previous_failed = progress.get("msg_ingest_status") in {"failed", "needs_attention"}
         job_id = "" if previous_failed else str(progress.get("msg_ingest_job_id") or "").strip()
         idempotency_key = "" if previous_failed else str(progress.get("msg_ingest_idempotency_key") or "").strip()
         if not idempotency_key:
@@ -4082,6 +4092,9 @@ class PipelineBotService:
                 "repair_movie_extras": False,
                 "repair_episode_visibility": False,
             }
+            if msg_task_requires_stable_tree(progress):
+                request["require_stable_tree"] = True
+                request["target_parents_verified"] = progress.get("transfer_verify_status") == "success"
             subscription_target_season = int(progress.get("subscription_target_season") or 0)
             if category == "anime" and subscription_target_season > 0:
                 request["force_season_number"] = subscription_target_season
@@ -4104,21 +4117,41 @@ class PipelineBotService:
                 raise RuntimeError("MediaStationGo pipeline ingest returned invalid response")
             job_id = str(job.get("id") or "").strip()
             status = str(job.get("status") or "").strip()
-            if not job_id or status not in ("running", "completed", "failed"):
+            if not job_id or status not in ("accepted", "converging", "running", "completed", "failed", "needs_attention"):
                 raise RuntimeError("MediaStationGo pipeline ingest returned invalid job")
-            emit(
-                {
-                    "msg_ingest_job_id": job_id,
-                    "msg_ingest_status": status,
-                    "msg_ingest_stage": job.get("stage"),
-                    "msg_ingest_message": job.get("message"),
-                    "msg_ingest_error": job.get("error") or None,
-                }
-            )
+            job_updates = {
+                "msg_ingest_job_id": job_id,
+                "msg_ingest_status": status,
+                "msg_ingest_stage": job.get("stage"),
+                "msg_ingest_message": job.get("message"),
+                "msg_ingest_error": job.get("error") or None,
+            }
+            convergence = ((job.get("result") or {}).get("convergence"))
+            if isinstance(convergence, dict):
+                manifest = convergence.get("manifest") or {}
+                job_updates.update(
+                    {
+                        "msg_convergence_status": convergence.get("status"),
+                        "msg_convergence_attempt": int(convergence.get("attempt") or 0),
+                        "msg_convergence_stable_seconds": int(convergence.get("stable_for_seconds") or 0),
+                        "msg_convergence_max_wait_seconds": int(convergence.get("max_wait_seconds") or 0),
+                        "msg_convergence_entry_count": int(manifest.get("entry_count") or 0),
+                        "msg_convergence_directory_count": int(manifest.get("directory_count") or 0),
+                        "msg_convergence_file_count": int(manifest.get("file_count") or 0),
+                        "msg_convergence_total_file_size": int(manifest.get("total_file_size") or 0),
+                        "msg_convergence_next_probe_at": convergence.get("next_probe_at"),
+                        "msg_convergence_errors": list(convergence.get("errors") or []),
+                    }
+                )
+            emit(job_updates)
             if status == "completed":
                 break
             if status == "failed":
                 raise RuntimeError("MediaStationGo pipeline ingest failed: %s" % (job.get("error") or "unknown error"))
+            if status == "needs_attention":
+                raise MediaStationIngestNeedsAttention(
+                    job.get("message") or "MediaStationGo 目标树在10分钟内未收敛"
+                )
             if time.monotonic() >= deadline:
                 raise MediaStationIngestPending("MediaStationGo pipeline ingest is still running: %s" % job_id)
             time.sleep(interval)
@@ -5120,6 +5153,10 @@ def parse_multi_video_episode(name, expected_season):
 def msg_authoritative_openlist_paths(task):
     task = task or {}
     paths = []
+    import_target = normalize_openlist_path(task.get("import_target_openlist_path"))
+    received_names = normalize_transfer_item_names(task.get("received_item_names") or [])
+    if import_target and received_names:
+        paths.extend(posixpath.join(import_target.rstrip("/") or "/", name) for name in received_names)
     for key in (
         "import_target_openlist_path",
         "upgrade_staging_openlist_path",
@@ -5129,9 +5166,20 @@ def msg_authoritative_openlist_paths(task):
         "openlist_adult_extra_hide_path",
     ):
         value = normalize_openlist_path(task.get(key))
-        if value:
+        if value and not (key == "import_target_openlist_path" and received_names):
             paths.append(value)
     return unique_openlist_paths(paths)
+
+
+def msg_task_requires_stable_tree(task):
+    task = task or {}
+    if normalize_openlist_path(task.get("subscription_target_openlist_path")):
+        return False
+    manifests = [
+        task.get("source_manifest"),
+        (task.get("transfer_verification") or {}).get("openlist_manifest"),
+    ]
+    return any(int((manifest or {}).get("dir_count") or 0) > 0 for manifest in manifests)
 
 
 def task_openlist_target_names(task):

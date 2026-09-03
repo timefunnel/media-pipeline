@@ -6900,6 +6900,194 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(result["msg_target_scan_status"], "success")
         self.assertEqual(progress["msg_ingest_status"], "completed")
 
+    def test_nested_import_targets_received_directories_and_marks_verified_parent(self):
+        from pipeline.bot import (
+            BotConfig,
+            PipelineBotService,
+            msg_authoritative_openlist_paths,
+            msg_task_requires_stable_tree,
+        )
+
+        progress = {
+            "import_target_openlist_path": "/115/电影/珍藏包 [import-abc]",
+            "received_item_names": ["高品压制"],
+            "source_manifest": {"dir_count": 1, "file_count": 0},
+            "transfer_verify_status": "success",
+        }
+        authoritative_paths = msg_authoritative_openlist_paths(progress)
+        self.assertEqual(authoritative_paths, ["/115/电影/珍藏包 [import-abc]/高品压制"])
+        self.assertTrue(msg_task_requires_stable_tree(progress))
+
+        fake_msg = FakeMediaStationClient(
+            pipeline_ingest_response={
+                "id": "ingest-stable",
+                "status": "needs_attention",
+                "stage": "needs_attention",
+                "message": "目标树在10分钟内未收敛",
+                "result": {
+                    "convergence": {
+                        "status": "needs_attention",
+                        "attempt": 20,
+                        "max_wait_seconds": 600,
+                        "manifest": {"directory_count": 22, "file_count": 22, "total_file_size": 123},
+                    }
+                },
+            }
+        )
+        service = PipelineBotService(
+            BotConfig(
+                "token",
+                {700656624},
+                "/tmp/state.db",
+                msg_admin_user="admin",
+                msg_admin_password="secret",
+                msg_enabled=True,
+                msg_sync_poll_seconds=0,
+            )
+        )
+
+        with self.assertRaisesRegex(Exception, "10分钟"):
+            service._run_msg_pipeline_ingest(
+                fake_msg,
+                "movie",
+                "珍藏包",
+                progress,
+                ["珍藏包"],
+                authoritative_paths,
+                True,
+                progress.update,
+            )
+
+        request = fake_msg.pipeline_ingest_calls[0]
+        self.assertTrue(request["require_stable_tree"])
+        self.assertTrue(request["target_parents_verified"])
+        self.assertEqual(request["target_openlist_paths"], authoritative_paths)
+        self.assertEqual(progress["msg_ingest_status"], "needs_attention")
+        self.assertEqual(progress["msg_convergence_directory_count"], 22)
+
+        self.assertFalse(msg_task_requires_stable_tree({"source_manifest": {"dir_count": 0, "file_count": 1}}))
+        self.assertFalse(
+            msg_task_requires_stable_tree(
+                {
+                    "subscription_target_openlist_path": "/115/动漫/番剧/Season 1",
+                    "source_manifest": {"dir_count": 2},
+                }
+            )
+        )
+
+    def test_run_msg_pipeline_ingest_reports_converging_manifest_then_completes(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class ConvergingMediaStation(FakeMediaStationClient):
+            def __init__(self):
+                super().__init__()
+                self.responses = [
+                    {
+                        "id": "ingest-converging",
+                        "status": "converging",
+                        "stage": "converging",
+                        "result": {
+                            "convergence": {
+                                "status": "converging",
+                                "attempt": 1,
+                                "stable_for_seconds": 0,
+                                "max_wait_seconds": 600,
+                                "manifest": {"directory_count": 22, "file_count": 22, "total_file_size": 123},
+                            }
+                        },
+                    },
+                    {
+                        "id": "ingest-converging",
+                        "status": "completed",
+                        "stage": "completed",
+                        "result": {
+                            "convergence": {
+                                "status": "completed",
+                                "attempt": 2,
+                                "stable_for_seconds": 30,
+                                "max_wait_seconds": 600,
+                                "manifest": {"directory_count": 22, "file_count": 22, "total_file_size": 123},
+                            },
+                            "scan": {"visited": 22, "added": 22},
+                            "media": {
+                                "id": "media-pack",
+                                "title": "珍藏包",
+                                "path": "cloud://openlist/115/电影/珍藏包/高品压制/影片.mkv",
+                                "match_mode": "path",
+                                "match_path": "/115/电影/珍藏包/高品压制",
+                            },
+                            "media_items": [{"id": "media-pack"}],
+                        },
+                    },
+                ]
+
+            def pipeline_start_ingest(self, request):
+                self.pipeline_ingest_calls.append(dict(request))
+                return {"id": "ingest-converging", "status": "accepted", "stage": "queued", "result": {}}
+
+            def pipeline_get_ingest(self, job_id):
+                self.assertEqualJobID = job_id
+                return self.responses.pop(0)
+
+        fake_msg = ConvergingMediaStation()
+        service = PipelineBotService(
+            BotConfig(
+                "token",
+                {700656624},
+                "/tmp/state.db",
+                msg_admin_user="admin",
+                msg_admin_password="secret",
+                msg_enabled=True,
+                msg_sync_poll_seconds=3,
+                msg_sync_poll_interval_seconds=1,
+            )
+        )
+        progress = {"source_manifest": {"dir_count": 1}}
+
+        with patch("pipeline.bot.time.sleep"):
+            result = service._run_msg_pipeline_ingest(
+                fake_msg,
+                "movie",
+                "珍藏包",
+                progress,
+                ["珍藏包"],
+                ["/115/电影/珍藏包/高品压制"],
+                True,
+                progress.update,
+            )
+
+        self.assertEqual(fake_msg.assertEqualJobID, "ingest-converging")
+        self.assertEqual(result["_media"]["id"], "media-pack")
+        self.assertEqual(progress["msg_ingest_status"], "completed")
+        self.assertEqual(progress["msg_convergence_status"], "completed")
+        self.assertEqual(progress["msg_convergence_stable_seconds"], 30)
+        self.assertEqual(progress["msg_convergence_file_count"], 22)
+
+    def test_task_lines_show_convergence_counts_and_needs_attention_error(self):
+        from pipeline.telegram_ui import append_task_lines
+
+        lines = []
+        append_task_lines(
+            lines,
+            {
+                "status_name": "needs_attention",
+                "msg_sync_status": "needs_attention",
+                "msg_scan_status": "needs_attention",
+                "msg_error": "目标树在10分钟内未收敛",
+                "msg_convergence_status": "converging",
+                "msg_convergence_directory_count": 22,
+                "msg_convergence_file_count": 22,
+                "msg_convergence_total_file_size": 1024,
+            },
+            category="movie",
+        )
+
+        rendered = "\n".join(lines)
+        self.assertIn("状态：需处理", rendered)
+        self.assertIn("MSG同步：需处理", rendered)
+        self.assertIn("MSG错误：目标树在10分钟内未收敛", rendered)
+        self.assertIn("目录收敛：收敛中（目录 22 / 文件 22 / 1.0KB）", rendered)
+
     def test_sync_completed_task_keeps_running_while_msg_ingest_is_pending(self):
         from pipeline.bot import BotConfig, PipelineBotService
 

@@ -101,7 +101,7 @@ class TaskStateMachine:
         return bool(
             task.get("info_hash")
             and self.is_offline_success(task)
-            and task.get("msg_sync_status") == STATUS_FAILED
+            and task.get("msg_sync_status") in {STATUS_FAILED, "needs_attention"}
             and not self.msg_synced(task)
         )
 
