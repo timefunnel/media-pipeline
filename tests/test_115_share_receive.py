@@ -219,13 +219,33 @@ class Share115ReceiveTest(unittest.TestCase):
         self.assertEqual(result["data"]["save_as_top_fids"], ["saved-1"])
         self.assertEqual(
             [item["name"] for item in result["data"]["manifest_items"]],
+            ["ABF-001.mp4", "ABF-001"],
+        )
+        self.assertEqual(result["data"]["manifest_request_count"], 1)
+        self.assertEqual(result["data"]["manifest_scope"], "top_level")
+        self.assertEqual(
+            [item["relative_path"] for item in result["data"]["manifest_items"]],
+            ["ABF-001.mp4", "ABF-001"],
+        )
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_share_client_recurses_only_when_full_manifest_is_requested(self):
+        transport = FakeShareTransport()
+        client = Share115Client("UID=u; CID=c; SEID=s", transport=transport)
+
+        result = client.receive_share_url(
+            "https://115.com/s/swabc123?password=xy99",
+            "target-cid",
+            recursive_manifest=True,
+        )
+
+        self.assertEqual(
+            [item["name"] for item in result["data"]["manifest_items"]],
             ["ABF-001.mp4", "ABF-001", "ABF-002.mp4"],
         )
         self.assertEqual(result["data"]["manifest_request_count"], 2)
-        self.assertEqual(
-            [item["relative_path"] for item in result["data"]["manifest_items"]],
-            ["ABF-001.mp4", "ABF-001", "ABF-001/ABF-002.mp4"],
-        )
+        self.assertEqual(result["data"]["manifest_scope"], "tree")
+        self.assertEqual(len(transport.calls), 3)
 
     def test_share_client_does_not_persist_acw_cookie_between_snap_requests(self):
         class AntiBotCookieJar:
@@ -324,6 +344,47 @@ class Share115ReceiveTest(unittest.TestCase):
         self.assertEqual(result["task_status"]["received_file_ids"], ["saved-1"])
         self.assertEqual(result["task_status"]["received_item_names"], ["ABF-001.mp4"])
         self.assertEqual(result["task_status"]["source_manifest"]["entry_count"], 1)
+        self.assertEqual(result["task_status"]["source_manifest_scope"], "top_level")
+
+    def test_pipeline_requests_recursive_share_manifest_only_when_explicit(self):
+        class FakeShareClient:
+            def __init__(self):
+                self.recursive_manifest = None
+
+            def receive_share_url(self, url, folder_id, recursive_manifest=False):
+                self.recursive_manifest = recursive_manifest
+                return {
+                    "state": True,
+                    "data": {
+                        "share_code": "swabc123",
+                        "source_url": url,
+                        "items": [{"name": "Show", "is_dir": True}],
+                        "manifest_items": [
+                            {"name": "Show", "relative_path": "Show", "is_dir": True},
+                            {
+                                "name": "01.mkv",
+                                "relative_path": "Show/01.mkv",
+                                "is_dir": False,
+                                "size": 100,
+                            },
+                        ],
+                        "manifest_scope": "tree",
+                        "save_as_top_fids": ["saved-1"],
+                    },
+                }
+
+        fake = FakeShareClient()
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}, p115_cookie="UID=u"))
+        with patch.object(service, "_build_115_share_client", return_value=fake):
+            result = service.submit(
+                "anime",
+                "https://115.com/s/swabc123",
+                target_folder_id="task-folder",
+                share_manifest_scope="tree",
+            )
+
+        self.assertTrue(fake.recursive_manifest)
+        self.assertEqual(result["task_status"]["source_manifest_scope"], "tree")
 
     def test_pipeline_share_submit_uses_top_level_names_when_115_returns_no_saved_ids(self):
         class FakeShareClient:
@@ -344,6 +405,7 @@ class Share115ReceiveTest(unittest.TestCase):
                                 "size": 100,
                             },
                         ],
+                        "manifest_scope": "tree",
                         "save_as_top_fids": [],
                     },
                 }
@@ -361,6 +423,44 @@ class Share115ReceiveTest(unittest.TestCase):
         self.assertEqual(task["received_file_ids"], [])
         self.assertEqual(task["received_item_names"], ["Show"])
         self.assertEqual(task["source_manifest"]["entry_count"], 2)
+        self.assertEqual(task["source_manifest_scope"], "tree")
+
+    def test_top_level_share_verification_does_not_descend_openlist(self):
+        expected = build_transfer_manifest(
+            [{"name": "Collection", "relative_path": "Collection", "is_dir": True, "size": 0}],
+            item_name=lambda item: item["name"],
+            item_is_dir=lambda item: item["is_dir"],
+            item_size=lambda item: item["size"],
+            item_relative_path=lambda item: item["relative_path"],
+        )
+
+        class FakeOpenList:
+            def __init__(self):
+                self.calls = []
+
+            def list_all(self, path, refresh=False):
+                self.calls.append((path, refresh))
+                if path != "/115/movie/import-task":
+                    raise AssertionError("top-level verification must not descend into the share")
+                return [{"name": "Collection", "is_dir": True, "size": 0}]
+
+        openlist = FakeOpenList()
+        result = probe_import_transfer_visibility(
+            None,
+            openlist,
+            {
+                "source_kind": "115_share",
+                "source_manifest": expected,
+                "source_manifest_scope": "top_level",
+                "import_target_openlist_path": "/115/movie/import-task",
+            },
+            now_fn=lambda: 100,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["source_manifest_scope"], "top_level")
+        self.assertEqual(result["openlist_cached_request_count"], 1)
+        self.assertEqual(openlist.calls, [("/115/movie/import-task", False)])
 
     def test_share_transfer_uses_source_manifest_and_backs_off_openlist_refresh(self):
         source_entries = [

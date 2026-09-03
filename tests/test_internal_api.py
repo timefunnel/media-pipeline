@@ -450,13 +450,20 @@ class FakePipelineService:
             "subtitle_match_count": 1,
         }
 
-    def submit(self, category, download_uri, target_folder_id=None):
+    def submit(
+        self,
+        category,
+        download_uri,
+        target_folder_id=None,
+        share_manifest_scope="top_level",
+    ):
         if self.submit_error is not None:
             raise self.submit_error
         with self._lock:
             self._sequence += 1
             info_hash = "HASH%03d" % self._sequence
             self.submit_uris.append(download_uri)
+            self.last_share_manifest_scope = share_manifest_scope
             self.last_submit_target_folder_id = target_folder_id
             self.submit_target_folder_ids.append(target_folder_id)
         status_name = "submitted" if self.download_delay else "success"
@@ -2779,6 +2786,7 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
 
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(service.submit_target_folder_ids, ["task-folder-cid"])
+        self.assertEqual(service.last_share_manifest_scope, "tree")
         self.assertEqual(completed["result"]["subscription_follow"]["staging"]["receive_mode"], "direct_task_directory")
 
     def test_running_subscription_cancel_cleans_staging(self):

@@ -2257,6 +2257,7 @@ class ImportTaskManager:
                                     category,
                                     request["candidate"]["download_uri"],
                                     target_folder_id=subscription_receive_target_folder_id(staging),
+                                    share_manifest_scope="tree",
                                 )
                                 info_hash = first_submit_info_hash(submit_result)
                                 if not info_hash:

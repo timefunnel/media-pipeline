@@ -2097,12 +2097,23 @@ class PipelineBotService:
         return self._build_msg_client().get_media(media_id)
 
 
-    def submit(self, category, download_uri, target_folder_id=None):
+    def submit(
+        self,
+        category,
+        download_uri,
+        target_folder_id=None,
+        share_manifest_scope="top_level",
+    ):
         folder_id = str(target_folder_id or "").strip()
         if not folder_id:
             raise ValueError("115入库目标目录 ID 缺失")
         if is_115_share_url(download_uri):
-            return self._submit_115_share(category, download_uri, target_folder_id=folder_id)
+            return self._submit_115_share(
+                category,
+                download_uri,
+                target_folder_id=folder_id,
+                manifest_scope=share_manifest_scope,
+            )
         download_uri = self._resolve_download_uri(download_uri)
         response = self._call_115(
             category, lambda client: client.add_offline_urls([download_uri], folder_id)
@@ -2128,12 +2139,28 @@ class PipelineBotService:
         api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
         return ProwlarrClient(self.config.prowlarr_url, api_key).resolve_download_uri(download_uri)
 
-    def _submit_115_share(self, category, download_uri, target_folder_id=None):
+    def _submit_115_share(
+        self,
+        category,
+        download_uri,
+        target_folder_id=None,
+        manifest_scope="top_level",
+    ):
         folder_id = str(target_folder_id or "").strip()
         if not folder_id:
             raise ValueError("115分享入库目标目录 ID 缺失")
+        manifest_scope = str(manifest_scope or "top_level").strip().lower()
+        if manifest_scope not in {"top_level", "tree"}:
+            raise ValueError("115分享清单范围无效")
         client = self._build_115_share_client()
-        response = client.receive_share_url(download_uri, folder_id)
+        if manifest_scope == "tree":
+            response = client.receive_share_url(
+                download_uri,
+                folder_id,
+                recursive_manifest=True,
+            )
+        else:
+            response = client.receive_share_url(download_uri, folder_id)
         data = response.get("data") or {}
         received_file_ids = normalize_transfer_file_ids(data.get("save_as_top_fids"))
         received_item_names = normalize_transfer_item_names(
@@ -2165,6 +2192,7 @@ class PipelineBotService:
             "source_url": data.get("source_url") or download_uri,
             "received_item_count": len(data.get("items") or []),
             "source_manifest": source_manifest,
+            "source_manifest_scope": str(data.get("manifest_scope") or manifest_scope),
         }
         if self.config.msg_enabled:
             task["msg_sync_status"] = "running"
@@ -2487,6 +2515,8 @@ class PipelineBotService:
     ):
         if (submit_result or {}).get("submit_kind") == "115_share_receive":
             data = ((submit_result or {}).get("raw") or {}).get("data") or {}
+            if str(data.get("manifest_scope") or "tree") != "tree":
+                raise RuntimeError("115分享追更任务缺少完整递归清单")
             manifest = classify_115_resource_entries(
                 data.get("manifest_items") or data.get("items") or [],
                 season,
@@ -4806,6 +4836,9 @@ def probe_import_transfer_visibility(
     now = int(now_fn())
     source_kind = str(task.get("source_kind") or "115_offline").strip() or "115_offline"
     expected_manifest = dict(task.get("source_manifest") or {})
+    source_manifest_scope = str(task.get("source_manifest_scope") or "tree").strip().lower()
+    if source_manifest_scope not in {"top_level", "tree"}:
+        raise RuntimeError("115入库清单范围无效")
     previous = dict(task.get("transfer_verification") or {})
     if previous.get("status") == "running" and int(previous.get("next_probe_at") or 0) > now:
         return previous
@@ -4840,6 +4873,7 @@ def probe_import_transfer_visibility(
         "status": "running",
         "reason": "waiting_115_result",
         "source_kind": source_kind,
+        "source_manifest_scope": source_manifest_scope,
         "expected_manifest": expected_manifest or None,
         "direct_manifest": direct_manifest,
         "direct_manifest_locked": direct_manifest_locked,
@@ -4870,14 +4904,22 @@ def probe_import_transfer_visibility(
 
     if result["missing_root_ids"] or result["missing_root_names"]:
         return wait_for_retry("waiting_115_result")
-    if int(direct_manifest.get("file_count") or 0) <= 0:
+    manifest_has_content = (
+        int(direct_manifest.get("entry_count") or 0) > 0
+        if source_manifest_scope == "top_level"
+        else int(direct_manifest.get("file_count") or 0) > 0
+    )
+    if not manifest_has_content:
         return wait_for_retry("waiting_115_files")
     result["direct_manifest_locked"] = True
 
     direct_count = int(direct_manifest.get("entry_count") or 0)
     try:
         cached_manifest, cached_request_count = inspect_openlist_transfer_manifest(
-            openlist_client, target_path, refresh=False
+            openlist_client,
+            target_path,
+            refresh=False,
+            recursive=source_manifest_scope == "tree",
         )
     except RuntimeError as exc:
         if not openlist_missing_error(exc) and not openlist_receive_operation_is_retryable_error(exc):
@@ -4905,7 +4947,10 @@ def probe_import_transfer_visibility(
 
     try:
         openlist_manifest, refresh_request_count = inspect_openlist_transfer_manifest(
-            openlist_client, target_path, refresh=True
+            openlist_client,
+            target_path,
+            refresh=True,
+            recursive=source_manifest_scope == "tree",
         )
     except RuntimeError as exc:
         if not openlist_missing_error(exc) and not openlist_receive_operation_is_retryable_error(exc):
@@ -4953,14 +4998,25 @@ def probe_import_transfer_visibility(
     return result
 
 
-def inspect_openlist_transfer_manifest(client, target_path, refresh=False):
+def inspect_openlist_transfer_manifest(client, target_path, refresh=False, recursive=True):
     request_count = [0]
-    entries = list_openlist_descendants(
-        client,
-        target_path,
-        refresh=refresh,
-        request_count=request_count,
-    )
+    if recursive:
+        entries = list_openlist_descendants(
+            client,
+            target_path,
+            refresh=refresh,
+            request_count=request_count,
+        )
+    else:
+        root = normalize_openlist_path(target_path)
+        if not root:
+            raise RuntimeError("OpenList staging root path missing")
+        request_count[0] += 1
+        entries = []
+        for item in client.list_all(root, refresh=bool(refresh)):
+            row = dict(item or {})
+            row["path"] = openlist_item_path(root, row)
+            entries.append(row)
     manifest = build_transfer_manifest(
         entries,
         item_name=openlist_item_name,

@@ -226,7 +226,7 @@ class Share115Client:
         cookie_jar = self._create_share_session(share_code, receive_code)
         return self._snap(cookie_jar, share_code, receive_code, cid=cid, limit=limit)
 
-    def receive_share_url(self, url, folder_id):
+    def receive_share_url(self, url, folder_id, recursive_manifest=False):
         parsed = parse_115_share_url(url)
         if parsed is None:
             raise ValueError("not a 115 share url")
@@ -236,9 +236,18 @@ class Share115Client:
             folder_id,
             cid=parsed.pdir_fid,
             source_url=parsed.url,
+            recursive_manifest=recursive_manifest,
         )
 
-    def receive_share(self, share_code, receive_code, folder_id, cid="0", source_url=""):
+    def receive_share(
+        self,
+        share_code,
+        receive_code,
+        folder_id,
+        cid="0",
+        source_url="",
+        recursive_manifest=False,
+    ):
         share_code = str(share_code or "").strip()
         receive_code = str(receive_code or "").strip()
         folder_id = str(folder_id or "").strip()
@@ -254,6 +263,7 @@ class Share115Client:
             share_code,
             receive_code,
             cid=cid,
+            recursive=bool(recursive_manifest),
         )
         if not items:
             raise RuntimeError("115 share has no receivable items")
@@ -294,6 +304,7 @@ class Share115Client:
                 "items": items,
                 "manifest_items": manifest_items,
                 "manifest_request_count": manifest_request_count,
+                "manifest_scope": "tree" if recursive_manifest else "top_level",
                 "file_ids": file_ids,
                 "save_as_top_fids": data.get("save_as_top_fids") or data.get("file_id") or [],
                 "raw": data,
@@ -314,6 +325,7 @@ class Share115Client:
         cid="0",
         page_size=1000,
         max_entries=20000,
+        recursive=True,
     ):
         request_count = 0
 
@@ -347,6 +359,8 @@ class Share115Client:
             row["relative_path"] = str(row.get("name") or "").strip()
             top_items.append(row)
         manifest = list(top_items)
+        if not recursive:
+            return top_items, manifest, request_count
         stack = [
             (item["file_id"], item["relative_path"])
             for item in top_items
