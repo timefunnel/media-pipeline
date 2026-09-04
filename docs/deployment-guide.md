@@ -577,10 +577,10 @@ gitleaks detect --source . --redact
 
 ### 12.1 115 access_token 失效
 
-pipeline 不主动刷新 115 refresh token。115 Open token 以 OpenList 为准。115 Open 返回 `code=40140126` 时判定 access_token 已过期；`code=40140123` 是 token 格式错误，不会触发刷新。响应 `message` 可能是与响应头不一致的 GBK 字节，因此不参与业务判定。遇到 token 过期时：
+pipeline 不持有或主动刷新 115 refresh token，115 Open token 以 OpenList 为唯一来源。115 Open 返回 `40140123`（access_token 格式错误）、`40140124`（签名校验失败）、`40140125`（已过期或已解除授权）或 `40140126`（校验失败）时，都说明当前 access_token 不能继续使用。pipeline 会让 OpenList 对目标目录执行一次刷新，重新读取 OpenList 已持久化的 access_token，重建进程内 115 客户端并重试一次。并发请求共享同一次刷新；重试后仍失败则显式报错，不循环刷新。响应 `message` 可能是与响应头不一致的 GBK 字节，因此不参与业务判定。
 
 1. 先在 OpenList UI 确认 `/115` 能正常刷新和列目录。
-2. 在 Bot 中重新执行原任务或点击重试；Bot 会在识别到 access token 失效后对目标目录执行一次 OpenList 刷新并重试。
+2. 修复授权或 OpenList token 后，在 Bot 中重新执行原任务或点击重试。失败任务不会被 pipeline 静默改成成功。
 
 ### 12.2 搜索结果少或超时
 

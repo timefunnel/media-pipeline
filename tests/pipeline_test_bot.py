@@ -1,3 +1,5 @@
+import threading
+
 from tests.test_pipeline_core import *
 
 
@@ -5106,9 +5108,8 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertIn(("openlist", "/115/电影", True), events)
         self.assertEqual(token_store.tokens, ["expired-token", "fresh-token"])
 
-    def test_task_status_does_not_refresh_for_malformed_access_token(self):
+    def test_task_status_refreshes_for_malformed_access_token(self):
         from pipeline.bot import BotConfig, PipelineBotService
-        from pipeline.client115 import P115OpenAPIError
 
         events = []
         token_store = RetryTokenStore()
@@ -5119,7 +5120,15 @@ class PipelineBotServiceTest(unittest.TestCase):
 
             def get_offline_tasks(self, page=1):
                 events.append(("115_tasks", self.token, page))
-                return {"state": False, "code": 40140123, "message": "access_token 无效"}
+                if self.token == "expired-token":
+                    return {"state": False, "code": 40140123, "message": "access_token 格式错误"}
+                return {
+                    "state": True,
+                    "data": {
+                        "page_count": 1,
+                        "tasks": [{"info_hash": "ABC", "status": 2, "percentDone": 100}],
+                    },
+                }
 
         with patch("pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()), patch(
             "pipeline.bot.OpenListClient", side_effect=lambda url, token: RetryOpenList(events)
@@ -5127,12 +5136,96 @@ class PipelineBotServiceTest(unittest.TestCase):
             "pipeline.bot.load_access_token_from_api", side_effect=lambda *args, **kwargs: token_store.load_access_token()
         ), patch("pipeline.bot.Client115", side_effect=MalformedToken115Client):
             service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
+            task = service.task_status("movie", "ABC")
+
+        self.assertEqual(task["status_name"], "success")
+        self.assertEqual(token_store.tokens, ["expired-token", "fresh-token"])
+        self.assertIn(("openlist", "/115/电影", True), events)
+
+    def test_concurrent_invalid_token_failures_share_one_openlist_refresh(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        events = []
+        token_store = RetryTokenStore()
+        stale_calls_ready = threading.Barrier(2)
+
+        class Concurrent115Client:
+            def __init__(self, token):
+                self.token = token
+                events.append(("client", token))
+
+            def get_offline_tasks(self, page=1):
+                events.append(("115_tasks", self.token, page))
+                if self.token == "expired-token":
+                    stale_calls_ready.wait(timeout=5)
+                    return {"state": False, "code": 40140125, "message": "access_token 无效"}
+                return {
+                    "state": True,
+                    "data": {
+                        "page_count": 1,
+                        "tasks": [{"info_hash": "ABC", "status": 2, "percentDone": 100}],
+                    },
+                }
+
+        with patch("pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()), patch(
+            "pipeline.bot.OpenListClient", side_effect=lambda url, token: RetryOpenList(events)
+        ), patch(
+            "pipeline.bot.load_access_token_from_api", side_effect=lambda *args, **kwargs: token_store.load_access_token()
+        ), patch("pipeline.bot.Client115", side_effect=Concurrent115Client):
+            service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
+            results = []
+            errors = []
+
+            def load_status():
+                try:
+                    results.append(service.task_status("movie", "ABC"))
+                except Exception as exc:
+                    errors.append(exc)
+
+            workers = [threading.Thread(target=load_status) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=10)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertEqual([task["status_name"] for task in results], ["success", "success"])
+        self.assertEqual(token_store.tokens, ["expired-token", "fresh-token"])
+        self.assertEqual(events.count(("openlist", "/115/电影", True)), 1)
+        self.assertEqual(events.count(("client", "fresh-token")), 1)
+
+    def test_invalid_token_after_refresh_is_reported_without_refresh_loop(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+        from pipeline.client115 import P115OpenAPIError
+
+        events = []
+        token_store = RetryTokenStore()
+
+        class AlwaysInvalid115Client:
+            def __init__(self, token):
+                self.token = token
+
+            def get_offline_tasks(self, page=1):
+                events.append(("115_tasks", self.token, page))
+                return {"state": False, "code": 40140125, "message": "access_token 无效"}
+
+        with patch("pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()), patch(
+            "pipeline.bot.OpenListClient", side_effect=lambda url, token: RetryOpenList(events)
+        ), patch(
+            "pipeline.bot.load_access_token_from_api", side_effect=lambda *args, **kwargs: token_store.load_access_token()
+        ), patch("pipeline.bot.Client115", side_effect=AlwaysInvalid115Client):
+            service = PipelineBotService(BotConfig("token", {700656624}, "/tmp/state.db"))
             with self.assertRaises(P115OpenAPIError) as raised:
                 service.task_status("movie", "ABC")
 
-        self.assertEqual(raised.exception.code, 40140123)
-        self.assertEqual(token_store.tokens, ["expired-token"])
-        self.assertNotIn(("openlist", "/115/电影", True), events)
+        self.assertEqual(raised.exception.code, 40140125)
+        self.assertEqual(token_store.tokens, ["expired-token", "fresh-token"])
+        self.assertEqual(events.count(("openlist", "/115/电影", True)), 1)
+        self.assertEqual(
+            [event[:2] for event in events if event[0] == "115_tasks"],
+            [("115_tasks", "expired-token"), ("115_tasks", "fresh-token")],
+        )
 
     def test_task_status_reuses_115_client_without_reloading_openlist_token(self):
         from pipeline.bot import BotConfig, PipelineBotService
@@ -5192,7 +5285,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                 events.append(("create_folder", self.token, parent_id, name))
                 if self.token == "expired-token":
                     ensure_115_open_success(
-                        {"state": False, "code": 40140126, "message": "У��ʧ��"},
+                        {"state": False, "code": 40140126, "message": "access_token 校验失败"},
                         "create folder",
                     )
                 folder_id = "%s/%s" % (parent_id, name)
@@ -5202,7 +5295,7 @@ class PipelineBotServiceTest(unittest.TestCase):
                 events.append(("list_folder", self.token, parent_id))
                 if self.token == "expired-token":
                     ensure_115_open_success(
-                        {"state": False, "code": 40140126, "message": "У��ʧ��"},
+                        {"state": False, "code": 40140126, "message": "access_token 校验失败"},
                         "list folder",
                     )
                 return []
@@ -5210,7 +5303,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             def get_folder_info(self, folder_id):
                 events.append(("get_folder", self.token, folder_id))
                 if self.token == "expired-token":
-                    return {"state": False, "code": 40140126, "message": "У��ʧ��"}
+                    return {"state": False, "code": 40140126, "message": "access_token 校验失败"}
                 return {
                     "state": True,
                     "code": 0,

@@ -23,7 +23,7 @@ from pipeline.client115 import (
     ensure_115_open_success,
     is_115_share_url,
     mask_p115_cookie,
-    p115_access_token_expired,
+    p115_access_token_refresh_required,
     p115_cookie_is_valid,
     share_receive_task_id,
 )
@@ -3431,16 +3431,23 @@ class PipelineBotService:
         try:
             result = callback(client)
         except RuntimeError as exc:
-            if not access_token_expired_error(exc):
+            if not access_token_refresh_required_error(exc):
                 raise
-            return callback(self._build_115_client(category, refresh=True))
-        if access_token_expired_response(result):
-            return callback(self._build_115_client(category, refresh=True))
+            return callback(self._build_115_client(category, refresh=True, failed_client=client))
+        if access_token_refresh_required_response(result):
+            return callback(self._build_115_client(category, refresh=True, failed_client=client))
         return result
 
-    def _build_115_client(self, category, refresh=False):
+    def _build_115_client(self, category, refresh=False, failed_client=None):
         with self._p115_client_lock:
             if self._p115_client_cache is not None and not refresh:
+                return self._p115_client_cache
+            if (
+                refresh
+                and failed_client is not None
+                and self._p115_client_cache is not None
+                and self._p115_client_cache is not failed_client
+            ):
                 return self._p115_client_cache
             openlist_token = OpenListTokenProvider().load_token()
             client = OpenListClient(self.config.openlist_url, openlist_token)
@@ -9742,12 +9749,12 @@ def apply_import_target_to_submit_result(result, target):
     return result
 
 
-def access_token_expired_response(response):
-    return p115_access_token_expired(response)
+def access_token_refresh_required_response(response):
+    return p115_access_token_refresh_required(response)
 
 
-def access_token_expired_error(exc):
-    return isinstance(exc, P115OpenAPIError) and p115_access_token_expired(exc.response)
+def access_token_refresh_required_error(exc):
+    return isinstance(exc, P115OpenAPIError) and p115_access_token_refresh_required(exc.response)
 
 
 def format_task_diagnostics_message(record):

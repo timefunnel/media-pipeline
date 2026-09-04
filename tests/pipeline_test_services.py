@@ -2174,28 +2174,32 @@ class Client115Test(unittest.TestCase):
 
         response = type("Response", (), {"headers": Utf8Headers()})()
         raw = json.dumps(
-            {"state": False, "code": 40140126, "message": "access_token 已失效"},
+            {"state": False, "code": 40140126, "message": "access_token 校验失败"},
             ensure_ascii=False,
         ).encode("gbk")
 
         payload = json.loads(_decode_response_body(raw, response))
 
         self.assertEqual(payload["code"], 40140126)
-        self.assertEqual(payload["message"], "access_token 已失效")
+        self.assertEqual(payload["message"], "access_token 校验失败")
 
-    def test_access_token_expiry_uses_code_instead_of_message(self):
-        from pipeline.client115 import p115_access_token_expired
+    def test_access_token_refresh_requirement_uses_code_instead_of_message(self):
+        from pipeline.client115 import p115_access_token_refresh_required
 
-        self.assertTrue(
-            p115_access_token_expired(
-                {"state": False, "code": 40140126, "message": "У��ʧ��"}
-            )
-        )
-        self.assertFalse(
-            p115_access_token_expired(
-                {"state": False, "code": 40140123, "message": "access_token 无效"}
-            )
-        )
+        for code in (40140123, 40140124, 40140125, 40140126):
+            with self.subTest(code=code):
+                self.assertTrue(
+                    p115_access_token_refresh_required(
+                        {"state": False, "code": code, "message": "任意消息"}
+                    )
+                )
+        for code in (40140116, 40140117, 40140119, 40140120, 40140121):
+            with self.subTest(code=code):
+                self.assertFalse(
+                    p115_access_token_refresh_required(
+                        {"state": False, "code": code, "message": "任意消息"}
+                    )
+                )
 
     def test_folder_file_move_and_delete_use_official_open_endpoints(self):
         transport = FakeTransport({"state": True, "data": {"file_id": "task-folder"}})
@@ -2251,12 +2255,12 @@ class Client115Test(unittest.TestCase):
         self.assertEqual(call["data"], {"info_hash": "ABC", "del_source_file": "0"})
 
     def test_client_never_calls_refresh_token_endpoint(self):
-        transport = FakeTransport({"state": False, "code": 40140126, "message": "У��ʧ��"})
+        transport = FakeTransport({"state": False, "code": 40140125, "message": "access_token 无效"})
         client = Client115("expired-token", transport=transport)
 
         result = client.get_offline_tasks(page=1)
 
-        self.assertEqual(result["code"], 40140126)
+        self.assertEqual(result["code"], 40140125)
         self.assertNotIn("refreshToken", transport.calls[0]["url"])
 
     def test_get_folder_info_uses_official_folder_info_endpoint(self):

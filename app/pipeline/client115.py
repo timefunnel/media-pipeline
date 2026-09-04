@@ -9,7 +9,7 @@ from http.cookiejar import CookieJar
 
 
 API_BASE = "https://proapi.115.com"
-ACCESS_TOKEN_EXPIRED_CODE = 40140126
+ACCESS_TOKEN_REFRESH_CODES = frozenset({40140123, 40140124, 40140125, 40140126})
 ADD_OFFLINE_URLS = API_BASE + "/open/offline/add_task_urls"
 DELETE_OFFLINE_TASK = API_BASE + "/open/offline/del_task"
 OFFLINE_TASK_LIST = API_BASE + "/open/offline/get_task_list"
@@ -67,8 +67,8 @@ def p115_open_error_code(response):
         return None
 
 
-def p115_access_token_expired(response):
-    return p115_open_error_code(response) == ACCESS_TOKEN_EXPIRED_CODE
+def p115_access_token_refresh_required(response):
+    return p115_open_error_code(response) in ACCESS_TOKEN_REFRESH_CODES
 
 
 class P115OpenAPIError(RuntimeError):
