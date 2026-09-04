@@ -32,6 +32,30 @@ SHARE_DOMAIN_PATTERN = re.compile(
 )
 
 
+def _decode_response_body(raw, response=None):
+    """Decode an HTTP body, tolerating 115's GBK-encoded error payloads.
+
+    115's proapi/115cdn endpoints return JSON whose Chinese error text is GBK
+    bytes. Decoding strictly as UTF-8 turns those messages into mojibake, which
+    silently breaks access_token_invalid_text()'s literal-Chinese matching and
+    so the invalid-token refresh never triggers. Prefer the server-declared
+    charset, then UTF-8, then GBK, before falling back to replacement.
+    """
+    declared = None
+    if response is not None:
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            declared = headers.get_content_charset()
+    for encoding in (declared, "utf-8", "gbk"):
+        if not encoding:
+            continue
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
 class UrllibTransport:
     def request(self, method, url, headers=None, data=None, timeout=None):
         req_headers = dict(headers or {})
@@ -42,7 +66,7 @@ class UrllibTransport:
 
         request = urllib.request.Request(url, data=body, headers=req_headers, method=method)
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", "replace")
+            raw = _decode_response_body(response.read(), response)
         return json.loads(raw)
 
 
@@ -61,9 +85,9 @@ class UrllibShareTransport:
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar)) if cookie_jar is not None else urllib.request.build_opener()
         try:
             with opener.open(request, timeout=timeout) as response:
-                raw = response.read().decode("utf-8", "replace")
+                raw = _decode_response_body(response.read(), response)
         except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", "replace")
+            raw = _decode_response_body(exc.read(), exc)
             raise RuntimeError("115 share request failed: HTTP %s %s" % (exc.code, raw[:300])) from exc
         if not parse_json:
             return raw
