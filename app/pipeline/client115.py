@@ -9,6 +9,7 @@ from http.cookiejar import CookieJar
 
 
 API_BASE = "https://proapi.115.com"
+ACCESS_TOKEN_EXPIRED_CODE = 40140126
 ADD_OFFLINE_URLS = API_BASE + "/open/offline/add_task_urls"
 DELETE_OFFLINE_TASK = API_BASE + "/open/offline/del_task"
 OFFLINE_TASK_LIST = API_BASE + "/open/offline/get_task_list"
@@ -36,10 +37,10 @@ def _decode_response_body(raw, response=None):
     """Decode an HTTP body, tolerating 115's GBK-encoded error payloads.
 
     115's proapi/115cdn endpoints return JSON whose Chinese error text is GBK
-    bytes. Decoding strictly as UTF-8 turns those messages into mojibake, which
-    silently breaks access_token_invalid_text()'s literal-Chinese matching and
-    so the invalid-token refresh never triggers. Prefer the server-declared
-    charset, then UTF-8, then GBK, before falling back to replacement.
+    bytes even when the response declares UTF-8. Prefer strict decoding so the
+    false declaration is rejected, then try GBK to keep diagnostics readable.
+    Business decisions must use structured fields such as ``code`` rather than
+    the decoded message.
     """
     declared = None
     if response is not None:
@@ -54,6 +55,32 @@ def _decode_response_body(raw, response=None):
         except (UnicodeDecodeError, LookupError):
             continue
     return raw.decode("utf-8", "replace")
+
+
+def p115_open_error_code(response):
+    if not isinstance(response, dict):
+        return None
+    raw_code = response.get("code")
+    try:
+        return int(str(raw_code).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def p115_access_token_expired(response):
+    return p115_open_error_code(response) == ACCESS_TOKEN_EXPIRED_CODE
+
+
+class P115OpenAPIError(RuntimeError):
+    def __init__(self, operation, response):
+        self.operation = str(operation or "request")
+        self.response = dict(response or {})
+        self.code = p115_open_error_code(self.response)
+        message = self.response.get("message") or self.response.get("msg") or self.response.get("error")
+        details = "code=%s" % self.code if self.code is not None else "code=unknown"
+        if message:
+            details += ", message=%s" % message
+        super().__init__("115 %s failed: %s" % (self.operation, details))
 
 
 class UrllibTransport:
@@ -503,10 +530,7 @@ def ensure_115_open_success(response, operation):
         raise RuntimeError("115 %s returned invalid response" % operation)
     if response.get("state") is True and int(response.get("code") or 0) == 0:
         return response
-    raise RuntimeError(
-        "115 %s failed: %s"
-        % (operation, response.get("message") or response.get("error") or response.get("code"))
-    )
+    raise P115OpenAPIError(operation, response)
 
 
 def merge_cookie_header(cookie_jar, user_cookie):

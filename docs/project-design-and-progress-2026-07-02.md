@@ -219,7 +219,7 @@ offline task list code=0 count=97 page_count=4
 - pipeline 从 OpenList SQLite 只读读取 115 access token。
 - OpenList 负责维护 115 Open token。
 - `https://prioplist.timefunnel.top/d/...` 已验证可用，但当前不作为默认播放入口。2026-07-03 对比同一 CJ7 样本：公网 OpenList `/d` 三轮平均约 1.0s；MSG cloud play 命中缓存后三轮约 2ms 到 115 CDN。因此当前保留 MSG cloud play，公网反代作为备用对照入口。
-- Bot 调 115 接口时，如果遇到 `access_token 无效/过期/失效`，会触发 OpenList `refresh=True` 后重试。
+- Bot 调 115 接口时，以结构化错误码识别 token 状态：仅 `code=40140126`（access_token 过期）触发 OpenList `refresh=True` 后重试；`code=40140123` 是格式错误，不触发刷新。`message` 可能因 GBK 字节与 UTF-8 响应头不一致而乱码，不作为判定依据。
 - 独立 CLI 已移除，日常交互和任务诊断统一走 Telegram Bot。
 
 手动触发 OpenList refresh 的核验命令：

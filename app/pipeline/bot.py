@@ -18,10 +18,12 @@ from pathlib import Path
 
 from pipeline.client115 import (
     Client115,
+    P115OpenAPIError,
     Share115Client,
     ensure_115_open_success,
     is_115_share_url,
     mask_p115_cookie,
+    p115_access_token_expired,
     p115_cookie_is_valid,
     share_receive_task_id,
 )
@@ -3429,10 +3431,10 @@ class PipelineBotService:
         try:
             result = callback(client)
         except RuntimeError as exc:
-            if not access_token_invalid_error(exc):
+            if not access_token_expired_error(exc):
                 raise
             return callback(self._build_115_client(category, refresh=True))
-        if access_token_invalid_response(result):
+        if access_token_expired_response(result):
             return callback(self._build_115_client(category, refresh=True))
         return result
 
@@ -9725,25 +9727,12 @@ def apply_import_target_to_submit_result(result, target):
     return result
 
 
-def access_token_invalid_response(response):
-    if not isinstance(response, dict):
-        return False
-    text = " ".join(
-        str(response.get(key) or "")
-        for key in ("code", "message", "msg", "error", "errno")
-    )
-    return access_token_invalid_text(text)
+def access_token_expired_response(response):
+    return p115_access_token_expired(response)
 
 
-def access_token_invalid_error(exc):
-    return access_token_invalid_text(str(exc))
-
-
-def access_token_invalid_text(text):
-    value = (text or "").lower()
-    if "access_token" not in value:
-        return False
-    return any(token in value for token in ("invalid", "无效", "失效", "过期", "expired"))
+def access_token_expired_error(exc):
+    return isinstance(exc, P115OpenAPIError) and p115_access_token_expired(exc.response)
 
 
 def format_task_diagnostics_message(record):

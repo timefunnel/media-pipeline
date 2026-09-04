@@ -2164,6 +2164,39 @@ class ResourceSelectorTest(unittest.TestCase):
             selector.select_best([{"title": "Sintel 1080p", "seeders": 0, "magnetUrl": "magnet:?xt=urn:btih:abc"}])
 
 class Client115Test(unittest.TestCase):
+    def test_decodes_gbk_error_body_despite_utf8_response_header(self):
+        from pipeline.client115 import _decode_response_body
+
+        class Utf8Headers:
+            @staticmethod
+            def get_content_charset():
+                return "utf-8"
+
+        response = type("Response", (), {"headers": Utf8Headers()})()
+        raw = json.dumps(
+            {"state": False, "code": 40140126, "message": "access_token 已失效"},
+            ensure_ascii=False,
+        ).encode("gbk")
+
+        payload = json.loads(_decode_response_body(raw, response))
+
+        self.assertEqual(payload["code"], 40140126)
+        self.assertEqual(payload["message"], "access_token 已失效")
+
+    def test_access_token_expiry_uses_code_instead_of_message(self):
+        from pipeline.client115 import p115_access_token_expired
+
+        self.assertTrue(
+            p115_access_token_expired(
+                {"state": False, "code": 40140126, "message": "У��ʧ��"}
+            )
+        )
+        self.assertFalse(
+            p115_access_token_expired(
+                {"state": False, "code": 40140123, "message": "access_token 无效"}
+            )
+        )
+
     def test_folder_file_move_and_delete_use_official_open_endpoints(self):
         transport = FakeTransport({"state": True, "data": {"file_id": "task-folder"}})
         client = Client115("access-token-value", transport=transport)
@@ -2218,12 +2251,12 @@ class Client115Test(unittest.TestCase):
         self.assertEqual(call["data"], {"info_hash": "ABC", "del_source_file": "0"})
 
     def test_client_never_calls_refresh_token_endpoint(self):
-        transport = FakeTransport({"state": False, "code": 40140125, "message": "access_token invalid"})
+        transport = FakeTransport({"state": False, "code": 40140126, "message": "У��ʧ��"})
         client = Client115("expired-token", transport=transport)
 
         result = client.get_offline_tasks(page=1)
 
-        self.assertEqual(result["code"], 40140125)
+        self.assertEqual(result["code"], 40140126)
         self.assertNotIn("refreshToken", transport.calls[0]["url"])
 
     def test_get_folder_info_uses_official_folder_info_endpoint(self):

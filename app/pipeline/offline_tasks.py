@@ -1,5 +1,7 @@
 import time
 
+from pipeline.client115 import ensure_115_open_success
+
 
 STATUS_NAMES = {
     -1: "failed",
@@ -37,7 +39,7 @@ def find_task_by_info_hash(client, info_hash, max_pages=10):
     while page <= max_pages:
         response = client.get_offline_tasks(page=page)
         if response.get("state") is not True:
-            raise RuntimeError("115 offline task list failed: %s" % (response.get("message") or response.get("msg") or response.get("code")))
+            ensure_115_open_success(response, "offline task list")
 
         data = response.get("data") or {}
         for task in data.get("tasks") or []:
@@ -62,7 +64,7 @@ def find_tasks_by_info_hashes(client, info_hashes, max_pages=10):
     while page <= max_pages:
         response = client.get_offline_tasks(page=page)
         if response.get("state") is not True:
-            raise RuntimeError("115 offline task list failed: %s" % (response.get("message") or response.get("msg") or response.get("code")))
+            ensure_115_open_success(response, "offline task list")
 
         data = response.get("data") or {}
         for task in data.get("tasks") or []:
@@ -109,7 +111,7 @@ def cancel_task_if_active(client, info_hash, max_pages=10):
 
     response = client.delete_offline_task(info_hash, delete_files=False)
     if response.get("state") is not True:
-        raise RuntimeError("115 offline task cancel failed: %s" % (response.get("message") or response.get("msg") or response.get("code")))
+        ensure_115_open_success(response, "offline task cancel")
     cancelled = dict(task)
     cancelled["status_name"] = "cancelled"
     return {
@@ -135,8 +137,5 @@ def reset_task_for_resubmit(client, info_hash, max_pages=10):
 
     response = client.delete_offline_task(info_hash, delete_files=False)
     if response.get("state") is not True:
-        raise RuntimeError(
-            "115 offline task reset failed: %s"
-            % (response.get("message") or response.get("msg") or response.get("code"))
-        )
+        ensure_115_open_success(response, "offline task reset")
     return {"deleted": True, "task": task, "response": response, "reason": ""}

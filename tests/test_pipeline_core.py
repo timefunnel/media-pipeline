@@ -353,7 +353,7 @@ class Retry115Client:
     def get_offline_tasks(self, page=1):
         self.events.append(("115_tasks", self.token, page))
         if self.token == "expired-token":
-            return {"state": False, "code": 40140125, "message": "access_token 无效"}
+            return {"state": False, "code": 40140126, "message": "У��ʧ��"}
         return {"state": True, "data": {"page_count": 1, "tasks": [{"info_hash": "ABC", "status": 2, "percentDone": 100}]}}
 
 
