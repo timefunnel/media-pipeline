@@ -5535,7 +5535,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             },
         )
 
-        with tempfile.TemporaryDirectory() as tmp, patch("pipeline.bot.MediaStationClient", return_value=fake_msg), patch(
+        with tempfile.TemporaryDirectory() as tmp, patch("pipeline.bot.MediaStationClient", return_value=fake_msg) as msg_client_cls, patch(
             "pipeline.bot.OpenListTokenProvider", return_value=FakeOpenListTokenProvider()
         ), patch("pipeline.bot.OpenListClient", return_value=fake_openlist):
             state_db = str(Path(tmp) / "state.db")
@@ -5553,6 +5553,8 @@ class PipelineBotServiceTest(unittest.TestCase):
                 )
             )
             maintenance = service.sync_deleted_media_hides()
+            repeated_maintenance = service.sync_deleted_media_hides()
+            maintenance_msg_client_calls = msg_client_cls.call_count
             task = service.sync_completed_task(
                 "movie",
                 "Movie",
@@ -5561,6 +5563,8 @@ class PipelineBotServiceTest(unittest.TestCase):
             processed = CandidateStore(state_db).processed_trash_hide_media_ids(["trash-1", "trash-2"])
 
         self.assertEqual(fake_openlist.meta_hide_calls, [("/115/其他", ["^Old$"], True)])
+        self.assertEqual(maintenance_msg_client_calls, 1)
+        self.assertEqual(msg_client_cls.call_count, 2)
         self.assertEqual(fake_openlist.source_delete_calls, [])
         self.assertLess(events.index(("meta_hide", "/115/其他", ("^Old$",), True)), events.index(("scan",)))
         self.assertEqual(processed, {"trash-1", "trash-2"})
@@ -5568,6 +5572,8 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(maintenance["openlist_trash_hide_status"], "success")
         self.assertEqual(maintenance["openlist_trash_hide_hidden_count"], 1)
         self.assertEqual(maintenance["openlist_trash_hide_skipped_count"], 1)
+        self.assertEqual(repeated_maintenance["openlist_trash_hide_status"], "skipped")
+        self.assertEqual(repeated_maintenance["openlist_trash_hide_reason"], "no_pending")
         self.assertEqual(task["openlist_trash_hide_status"], "skipped")
         self.assertEqual(task["openlist_trash_hide_reason"], "independent_maintenance")
         self.assertEqual(task["msg_sync_status"], "success")

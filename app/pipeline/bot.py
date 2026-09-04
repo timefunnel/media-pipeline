@@ -1807,6 +1807,7 @@ class PipelineBotService:
         self._prowlarr_search_cache = ProwlarrSearchCache()
         self._p115_client_lock = threading.Lock()
         self._p115_client_cache = None
+        self._trash_hide_msg_client = None
 
     def search_capabilities(self, cache_seconds=60):
         now = time.monotonic()
@@ -4010,7 +4011,9 @@ class PipelineBotService:
             return {"openlist_trash_hide_status": "skipped", "openlist_trash_hide_reason": "disabled"}
         if not self.config.msg_enabled:
             return {"openlist_trash_hide_status": "skipped", "openlist_trash_hide_reason": "msg_disabled"}
-        return self._sync_msg_trash_to_openlist_hide(self._build_msg_client(), self._build_openlist_client())
+        if self._trash_hide_msg_client is None:
+            self._trash_hide_msg_client = self._build_msg_client()
+        return self._sync_msg_trash_to_openlist_hide(self._trash_hide_msg_client, self._build_openlist_client())
 
     def _hide_openlist_adult_extra_videos_before_msg(
         self,
