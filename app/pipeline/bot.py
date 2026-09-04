@@ -2798,12 +2798,12 @@ class PipelineBotService:
 
         openlist_client = OpenListClient(self.config.openlist_url, OpenListTokenProvider().load_token())
         source_path = candidate["source_openlist_path"]
-        if not openlist_child_exists(openlist_client, source_path):
+        if not openlist_path_exists(openlist_client, source_path):
             raise RuntimeError("OpenList source not found: %s" % source_path)
         if target.get("target_folder_name"):
-            if openlist_child_exists(openlist_client, target["target_parent_openlist_path"]):
+            if openlist_path_exists(openlist_client, target["target_parent_openlist_path"]):
                 raise RuntimeError("OpenList target already exists: %s" % target["target_parent_openlist_path"])
-        elif openlist_child_exists(openlist_client, target["target_openlist_path"]):
+        elif openlist_path_exists(openlist_client, target["target_openlist_path"]):
             raise RuntimeError("OpenList target already exists: %s" % target["target_openlist_path"])
 
         source_dir = posixpath.dirname(source_path.rstrip("/")) or "/"
@@ -3722,6 +3722,7 @@ class PipelineBotService:
                     msg_target,
                     preferred_scrape_queries,
                 )
+                require_msg_scrape_coverage(category, progress, scrape_result)
                 emit({"msg_scrape_status": "success", "msg_media_id": media_id, "msg_media_title": media_title, **scrape_result})
         if not stage_is_complete(progress.get("msg_scrape_status")):
             raise RuntimeError("MediaStationGo scrape stage incomplete")
@@ -7688,6 +7689,20 @@ def stage_is_complete(status):
 
 def prefixed_task_fields(task, prefix):
     return {key: value for key, value in (task or {}).items() if key.startswith(prefix)}
+
+
+def require_msg_scrape_coverage(category, task, scrape_result):
+    if str(category or "").strip().lower() not in {"tv", "anime"}:
+        return
+    ingested_count = int((task or {}).get("msg_ingest_media_count") or 0)
+    if ingested_count <= 1:
+        return
+    applied_count = int((scrape_result or {}).get("msg_scrape_applied_count") or 0)
+    if applied_count < ingested_count:
+        raise RuntimeError(
+            "MediaStationGo metadata scrape covered %d of %d ingested media items"
+            % (applied_count, ingested_count)
+        )
 
 
 STALE_MSG_MEDIA_RESET_KEYS = (

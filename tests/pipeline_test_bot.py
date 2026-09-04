@@ -4334,6 +4334,26 @@ class LlmSearchRerankClientTest(unittest.TestCase):
 
 
 class PipelineBotServiceTest(unittest.TestCase):
+    def test_tv_ingest_scrape_rejects_partial_coverage(self):
+        from pipeline.bot import require_msg_scrape_coverage
+
+        require_msg_scrape_coverage(
+            "tv",
+            {"msg_ingest_media_count": 21},
+            {"msg_scrape_applied_count": 21},
+        )
+        require_msg_scrape_coverage(
+            "movie",
+            {"msg_ingest_media_count": 2},
+            {"msg_scrape_applied_count": 1},
+        )
+        with self.assertRaisesRegex(RuntimeError, "covered 22 of 364"):
+            require_msg_scrape_coverage(
+                "tv",
+                {"msg_ingest_media_count": 364},
+                {"msg_scrape_applied_count": 22},
+            )
+
     def test_subtitle_category_ignores_unconfigured_unrelated_library(self):
         import copy
 
@@ -8191,7 +8211,10 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         fake_openlist = CleaningOpenList(
             {
-                "/115/剧集": [{"name": "成龙历险记", "is_dir": True, "size": 0}],
+                # The direct path is readable even when the cached parent
+                # listing has not learned about the newly imported folder.
+                "/115/剧集": [],
+                "/115/剧集/成龙历险记": [],
                 "/115/动漫": [],
             },
             events=events,
@@ -8226,8 +8249,8 @@ class PipelineBotServiceTest(unittest.TestCase):
             events,
             [
                 ("msg_validate_migration", "/115/剧集/成龙历险记", "anime"),
-                ("list_all", "/115/剧集", False),
-                ("list_all", "/115/动漫", False),
+                ("get_path", "/115/剧集/成龙历险记"),
+                ("get_path", "/115/动漫/成龙历险记"),
                 ("move", "/115/剧集", "/115/动漫", ("成龙历险记",)),
                 ("openlist", "/115/剧集", True),
                 ("openlist", "/115/动漫", True),
