@@ -4107,7 +4107,6 @@ class PipelineBotService:
             }
             if msg_task_requires_stable_tree(progress):
                 request["require_stable_tree"] = True
-                request["target_parents_verified"] = progress.get("transfer_verify_status") == "success"
             subscription_target_season = int(progress.get("subscription_target_season") or 0)
             if category == "anime" and subscription_target_season > 0:
                 request["force_season_number"] = subscription_target_season

@@ -7055,7 +7055,7 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(result["msg_target_scan_status"], "success")
         self.assertEqual(progress["msg_ingest_status"], "completed")
 
-    def test_nested_import_targets_received_directories_and_marks_verified_parent(self):
+    def test_nested_import_targets_received_directories_without_claiming_verified_parent(self):
         from pipeline.bot import (
             BotConfig,
             PipelineBotService,
@@ -7115,7 +7115,7 @@ class PipelineBotServiceTest(unittest.TestCase):
 
         request = fake_msg.pipeline_ingest_calls[0]
         self.assertTrue(request["require_stable_tree"])
-        self.assertTrue(request["target_parents_verified"])
+        self.assertNotIn("target_parents_verified", request)
         self.assertEqual(request["target_openlist_paths"], authoritative_paths)
         self.assertEqual(progress["msg_ingest_status"], "needs_attention")
         self.assertEqual(progress["msg_convergence_directory_count"], 22)
