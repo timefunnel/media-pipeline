@@ -134,6 +134,26 @@ class MediaStationClient:
         params = urllib.parse.urlencode({"q": query, "limit": int(limit)})
         return self._request("GET", "/media?%s" % params)
 
+    def search_media_works(self, queries, library_id, limit=100):
+        response = self._request(
+            "POST",
+            "/media/work-search",
+            data={
+                "queries": list(queries or []),
+                "library_id": str(library_id or ""),
+                "limit": int(limit),
+            },
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("items"), list):
+            raise RuntimeError("MediaStationGo work search returned invalid response")
+        media = []
+        for card in response["items"]:
+            representative = card.get("rep") if isinstance(card, dict) else None
+            if not isinstance(representative, dict) or not extract_media_id(representative):
+                raise RuntimeError("MediaStationGo work search returned invalid work card")
+            media.append(representative)
+        return media
+
     def pipeline_scrape_media(self, media_id, category, title, queries, provider, media_type):
         return self._pipeline_request(
             "POST",

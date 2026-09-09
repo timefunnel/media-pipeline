@@ -1606,6 +1606,7 @@ class MediaStationClientTest(unittest.TestCase):
         transport = SequenceTransport(
             [
                 {"tokens": {"access_token": "msg-token"}},
+                {"items": [{"rep": {"id": "work-1", "library_id": "library-1", "title": "Movie"}}]},
                 {"data": {"items": []}},
                 {"data": {"items": []}},
                 {"data": {"id": "media-1"}},
@@ -1614,22 +1615,30 @@ class MediaStationClientTest(unittest.TestCase):
         )
         client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
 
+        works = client.search_media_works(["Movie", "Movie 2024"], "library-1", limit=100)
         client.search_media("Movie", limit=20)
         client.list_library_media("library-1", page=2, page_size=100, group_versions=0)
         client.get_media("media-1")
         client.soft_delete_media_version("media-1", "media-1")
 
-        self.assertEqual(transport.calls[1]["url"], "http://127.0.0.1:18080/api/media?q=Movie&limit=20")
+        self.assertEqual(works[0]["id"], "work-1")
+        self.assertEqual(transport.calls[1]["url"], "http://127.0.0.1:18080/api/media/work-search")
+        self.assertEqual(transport.calls[1]["method"], "POST")
         self.assertEqual(
-            transport.calls[2]["url"],
+            transport.calls[1]["data"],
+            {"queries": ["Movie", "Movie 2024"], "library_id": "library-1", "limit": 100},
+        )
+        self.assertEqual(transport.calls[2]["url"], "http://127.0.0.1:18080/api/media?q=Movie&limit=20")
+        self.assertEqual(
+            transport.calls[3]["url"],
             "http://127.0.0.1:18080/api/libraries/library-1/media?page=2&page_size=100&group_versions=0",
         )
-        self.assertEqual(transport.calls[3]["url"], "http://127.0.0.1:18080/api/media/media-1")
+        self.assertEqual(transport.calls[4]["url"], "http://127.0.0.1:18080/api/media/media-1")
         self.assertEqual(
-            transport.calls[4]["url"],
+            transport.calls[5]["url"],
             "http://127.0.0.1:18080/api/media/media-1/versions/media-1",
         )
-        self.assertEqual(transport.calls[4]["method"], "DELETE")
+        self.assertEqual(transport.calls[5]["method"], "DELETE")
 
     def test_extracts_and_matches_media_items_flexibly(self):
         response = {"data": {"items": [{"id": "media-1", "library_id": "library-1", "title": "GANA-2525"}]}}

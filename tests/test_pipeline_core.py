@@ -412,6 +412,7 @@ class FakeMediaStationClient:
         }
         self.scan_calls = []
         self.search_calls = []
+        self.work_search_calls = []
         self.list_calls = []
         self.get_calls = []
         self.scrape_calls = []
@@ -427,6 +428,10 @@ class FakeMediaStationClient:
     def search_media(self, query, limit=20):
         self.search_calls.append((query, limit))
         return self.search_response
+
+    def search_media_works(self, queries, library_id, limit=100):
+        self.work_search_calls.append((list(queries), library_id, limit))
+        return extract_media_items(self.search_response)
 
     def list_library_media(self, library_id, page=1, page_size=200, group_versions=0):
         self.list_calls.append((library_id, page, page_size, group_versions))

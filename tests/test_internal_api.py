@@ -1384,13 +1384,11 @@ class PipelineTargetOverrideTest(InternalApiTestCase):
         service = PipelineBotService(config)
 
         class Client:
-            def search_media(self, query, limit=20):
-                return {
-                    "items": [
-                        {"id": "wrong-media", "title": "Sintel", "library_id": "configured-library"},
-                        {"id": "target-media", "title": "Sintel", "library_id": TARGET["library_id"]},
-                    ]
-                }
+            def search_media_works(self, queries, library_id, limit=100):
+                return [
+                    {"id": "wrong-media", "title": "Sintel", "library_id": "configured-library"},
+                    {"id": "target-media", "title": "Sintel", "library_id": TARGET["library_id"]},
+                ]
 
         service._build_msg_client = lambda: Client()
         duplicate = service.check_duplicate(

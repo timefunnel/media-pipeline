@@ -2855,20 +2855,16 @@ class PipelineBotService:
         root = self._msg_target(category, target)
         candidate_year = duplicate_candidate_year(query, candidate)
         external_ids = duplicate_external_ids(candidate)
-        search_items = []
-        media = None
-        for search_query in duplicate_media_search_queries(query, candidate, queries):
-            search_items.extend(extract_media_items(client.search_media(search_query, limit=20)))
-            media = find_matching_media(
-                search_items,
-                queries,
-                library_id=root["library_id"],
-                required_year=candidate_year,
-                required_media_type=root.get("media_type"),
-                external_ids=external_ids,
-            )
-            if media is not None:
-                break
+        search_queries = duplicate_media_search_queries(query, candidate, queries)
+        search_items = client.search_media_works(search_queries, root["library_id"], limit=100)
+        media = find_matching_media(
+            search_items,
+            queries,
+            library_id=root["library_id"],
+            required_year=candidate_year,
+            required_media_type=root.get("media_type"),
+            external_ids=external_ids,
+        )
         codes = extract_codes(" ".join(queries))
         if media is None and category == "adult" and codes:
             media = find_matching_media(

@@ -7766,7 +7766,10 @@ class PipelineBotServiceTest(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(fake_msg.search_calls, [("Men in Black 1997", 20)])
+        self.assertEqual(
+            fake_msg.work_search_calls,
+            [(["Men in Black 1997", "Men in Black"], "test-movie-library", 100)],
+        )
         self.assertEqual(duplicate["media_id"], "media-original")
         self.assertEqual(duplicate["title"], "黑衣人")
 
@@ -7914,9 +7917,12 @@ class PipelineBotServiceTest(unittest.TestCase):
                 super().__init__()
                 self.responses = responses
 
-            def search_media(self, query, limit=20):
-                self.search_calls.append((query, limit))
-                return self.responses.get(query, {"data": {"items": []}})
+            def search_media_works(self, queries, library_id, limit=100):
+                self.work_search_calls.append((list(queries), library_id, limit))
+                items = []
+                for query in queries:
+                    items.extend(extract_media_items(self.responses.get(query, {"data": {"items": []}})))
+                return items
 
         fake_msg = QueryAwareFakeMediaStationClient(
             {
@@ -7962,8 +7968,8 @@ class PipelineBotServiceTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            fake_msg.search_calls,
-            [("流浪地球2 2023", 20), ("The Wandering Earth 2", 20)],
+            fake_msg.work_search_calls,
+            [(["流浪地球2 2023", "The Wandering Earth 2"], "test-movie-library", 100)],
         )
         self.assertEqual(duplicate["media_id"], "media-alias")
 
@@ -8091,7 +8097,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             )
 
         self.assertIsNone(duplicate)
-        self.assertEqual(fake_msg.search_calls, [])
+        self.assertEqual(fake_msg.work_search_calls, [])
         self.assertEqual(fake_msg.list_calls, [])
 
     def test_check_duplicate_does_not_fallback_to_recent_library_page_for_non_adult_titles(self):
@@ -8126,7 +8132,7 @@ class PipelineBotServiceTest(unittest.TestCase):
             duplicate = service.check_duplicate("anime", "秋色之空", {"title": "秋色之空 Aki Sora"})
 
         self.assertIsNone(duplicate)
-        self.assertEqual(fake_msg.search_calls, [("秋色之空", 20)])
+        self.assertEqual(fake_msg.work_search_calls, [(["秋色之空"], "test-anime-library", 100)])
         self.assertEqual(fake_msg.list_calls, [])
 
     def test_collect_openlist_dedupe_entries_refreshes_each_library_once(self):
