@@ -16,9 +16,11 @@ DEFAULT_PRIMARY_INDEXER_TIMEOUT_SECONDS = 12
 DEFAULT_OPTIONAL_INDEXER_TIMEOUT_SECONDS = 12
 DEFAULT_PROWLARR_MAX_WORKERS = 8
 DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS = 4
-DEFAULT_PROWLARR_EARLY_RETURN_AFTER_SECONDS = 1.0
+DEFAULT_PROWLARR_EARLY_RETURN_AFTER_SECONDS = 6.0
 DEFAULT_PROWLARR_EARLY_RETURN_MIN_RESULTS = 50
 DEFAULT_PROWLARR_EARLY_RETURN_REQUIRED_PRIORITY = 10
+DEFAULT_GENERAL_PROFILE_TIMEOUT_SECONDS = 10
+DEFAULT_ADULT_PROFILE_TIMEOUT_SECONDS = 10
 ANIME_QUERY_HINT_PATTERN = re.compile(
     r"(anime|bangumi|mikan|nyaa|acg|动漫|動畫|动画|番剧|番劇|新番|日漫|"
     r"鬼灭|鬼滅|葬送|芙莉莲|芙莉蓮|海贼|海賊|火影|柯南|进击|進擊|咒术|咒術|"
@@ -678,8 +680,14 @@ def search_profile_upstream_limits_from_env(env):
 def search_profile_timeout_seconds_from_env(env):
     default_timeout = parse_int(env.get("PROWLARR_SEARCH_TIMEOUT_SECONDS"), DEFAULT_PROWLARR_SEARCH_TIMEOUT_SECONDS)
     return {
-        SEARCH_PROFILE_GENERAL: parse_int(env.get("PROWLARR_PROFILE_GENERAL_TIMEOUT_SECONDS"), default_timeout),
-        SEARCH_PROFILE_ADULT: parse_int(env.get("PROWLARR_PROFILE_ADULT_TIMEOUT_SECONDS"), default_timeout),
+        SEARCH_PROFILE_GENERAL: parse_int(
+            env.get("PROWLARR_PROFILE_GENERAL_TIMEOUT_SECONDS"),
+            max(default_timeout, DEFAULT_GENERAL_PROFILE_TIMEOUT_SECONDS),
+        ),
+        SEARCH_PROFILE_ADULT: parse_int(
+            env.get("PROWLARR_PROFILE_ADULT_TIMEOUT_SECONDS"),
+            max(default_timeout, DEFAULT_ADULT_PROFILE_TIMEOUT_SECONDS),
+        ),
         SEARCH_PROFILE_ANIME: parse_int(env.get("PROWLARR_PROFILE_ANIME_TIMEOUT_SECONDS"), default_timeout),
     }
 

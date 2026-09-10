@@ -812,7 +812,7 @@ sed -E -e 's/(OPENLIST_TOKEN:[[:space:]]*).*/\1REDACTED/' -e 's/(TG_BOT_TOKEN:[[
   - Prowlarr tag `media-adult`：sukebei.nyaa.si。
   - Prowlarr tag `media-anime`：ACG.RIP、Nyaa.si、Mikan、Bangumi Moe。
   - Prowlarr tag `media-fallback`：MagnetDownload、TorrentProject2，默认首屏不查，用于后续补漏入口。
-- Bot 搜索执行方式改为按 profile 选中的 Prowlarr indexer 并发查询，并由 `PROWLARR_SEARCH_TIMEOUT_SECONDS` 控制总等待，默认 4 秒，目标是 5 秒内返回首屏结果；默认返回上限为 100 条，每页 5 条，页码按钮支持直接跳页。
+- Bot 搜索执行方式按 profile 选中的 Prowlarr indexer 并发查询。general/adult profile 使用 10 秒硬上限；已有足量高优先级结果时仍给 BT4G 6 秒软等待，避免把通常在 2–5 秒返回的热会话结果丢在边界外。anime profile 继续使用 4 秒默认上限；默认返回上限为 100 条，每页 5 条，页码按钮支持直接跳页。
 - Prowlarr priority 已纳入 Bot 排序；后续源优先级尽量在 Prowlarr 后台调整，不在 Bot 里硬编码站点排序。
 - 强番号形态（例如 `MIDE-882`、`BDMV-001`、`FC2-PPV-1234567`）默认走成人 profile；非番号普通搜索默认不碰成人源。
 - 非番号搜索结果页提供短补查按钮：`🔞` 查成人源、`动漫` 查动漫源；点击后新发一条对应源结果消息，不覆盖原普通搜索结果。

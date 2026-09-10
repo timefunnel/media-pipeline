@@ -253,6 +253,21 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.search_profile_categories["anime"], (5070, 5080))
         self.assertEqual(config.search_profile_tag_labels["adult"], ("adult", "sukebei"))
 
+    def test_bot_config_uses_bounded_bt4g_wait_defaults(self):
+        from pipeline.bot import BotConfig
+
+        config = BotConfig.from_env(
+            {
+                "TG_BOT_TOKEN": "123:token",
+                "TG_ALLOWED_USER_IDS": "700656624",
+            }
+        )
+
+        self.assertEqual(config.prowlarr_early_return_after_seconds, 6.0)
+        self.assertEqual(config.search_profile_timeout_seconds["general"], 10)
+        self.assertEqual(config.search_profile_timeout_seconds["adult"], 10)
+        self.assertEqual(config.search_profile_timeout_seconds["anime"], 4)
+
     def test_bot_config_reads_llm_rerank_settings(self):
         from pipeline.bot import BotConfig
 
