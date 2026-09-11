@@ -76,10 +76,12 @@ from pipeline.danmaku import (
     DEFAULT_DANMAKU_CACHE_DIR,
     DEFAULT_DANMAKU_CACHE_TTL_SECONDS,
     DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS,
+    DEFAULT_DANMAKU_IMPORT_MAX_BYTES,
     DEFAULT_DANMAKU_MATCH_TTL_SECONDS,
     DEFAULT_DANMAKU_MAX_COMMENTS,
     DEFAULT_DANMAKU_PROVIDERS,
     DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS,
+    build_danmaku_local_import_from_config,
     build_danmaku_matcher_from_config,
 )
 from pipeline.danmaku_prewarm import (
@@ -497,6 +499,7 @@ class BotConfig:
     danmaku_search_timeout_seconds: int = DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS
     danmaku_comment_timeout_seconds: int = DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS
     danmaku_max_comments: int = DEFAULT_DANMAKU_MAX_COMMENTS
+    danmaku_import_max_bytes: int = DEFAULT_DANMAKU_IMPORT_MAX_BYTES
     danmaku_blacklist: tuple = ()
     danmaku_proxy_url: str = ""
     dandanplay_base_url: str = DEFAULT_DANDANPLAY_BASE_URL
@@ -720,6 +723,10 @@ class BotConfig:
             danmaku_max_comments=max(
                 1,
                 int(env.get("DANMAKU_MAX_COMMENTS", str(DEFAULT_DANMAKU_MAX_COMMENTS))),
+            ),
+            danmaku_import_max_bytes=max(
+                1024,
+                int(env.get("DANMAKU_IMPORT_MAX_BYTES", str(DEFAULT_DANMAKU_IMPORT_MAX_BYTES))),
             ),
             danmaku_blacklist=parse_csv_strings(env.get("DANMAKU_BLACKLIST"), ()),
             danmaku_proxy_url=str(env.get("DANMAKU_PROXY_URL") or "").strip(),
@@ -1872,6 +1879,7 @@ class PipelineBotService:
         self._llm_rerank_lock = threading.Lock()
         self._subtitle_matcher = None
         self._danmaku_matcher = None
+        self._danmaku_local_import = None
         self._search_capabilities_lock = threading.Lock()
         self._search_capabilities_cache = None
         self._search_capabilities_cached_at = 0.0
@@ -3496,6 +3504,11 @@ class PipelineBotService:
             self._danmaku_matcher = build_danmaku_matcher_from_config(self.config)
         return self._danmaku_matcher
 
+    def _build_danmaku_local_import(self):
+        if self._danmaku_local_import is None:
+            self._danmaku_local_import = build_danmaku_local_import_from_config(self.config)
+        return self._danmaku_local_import
+
     def _require_danmaku_matcher(self):
         """未启用/无可用源时抛 ``ValueError``（配置问题），上游故障抛 ``RuntimeError``。"""
         matcher = self._build_danmaku_matcher()
@@ -3589,6 +3602,23 @@ class PipelineBotService:
         if not keyword:
             raise ValueError("keyword is required")
         return matcher.search(keyword, episode=episode)
+
+    def danmaku_parse_local(self, content, source_format="auto", offset_seconds=0.0, ch_convert=0, title=""):
+        """解析本地弹幕文件（B 站 XML / 弹弹play JSON）。
+
+        不依赖任何上游源或凭证；文件本身有问题时抛 ``DanmakuImportError``（由 API 层
+        映射成 400），功能未启用时抛 ``ValueError``（映射成 409），两者不可混为一谈。
+        """
+        helper = self._build_danmaku_local_import()
+        if helper is None:
+            raise ValueError("danmaku is disabled")
+        return helper.payload(
+            content,
+            source_format=source_format,
+            offset_seconds=offset_seconds,
+            ch_convert=ch_convert,
+            title=title,
+        )
 
     def _call_115(self, category, callback):
         client = self._build_115_client(category)

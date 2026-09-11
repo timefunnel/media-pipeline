@@ -21,6 +21,7 @@ import json
 import re
 import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from .external_subtitles import SubtitleHttpTransport
@@ -34,7 +35,12 @@ DEFAULT_DANMAKU_MATCH_TTL_SECONDS = 24 * 3600
 DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS = 12
 DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS = 30
 DEFAULT_DANMAKU_MAX_COMMENTS = 6000
-DEFAULT_DANMAKU_MAX_BYTES = 16 * 1024 * 1024
+# 本地导入文件的体积上限：整集 B 站 XML 通常 100KB~1.5MB，8MB 足够容纳超大热番，
+# 同时保证一次请求不会把内存吃满（HTTP 层对该路由单独放宽请求体上限）。
+DEFAULT_DANMAKU_IMPORT_MAX_BYTES = 8 * 1024 * 1024
+# 本地弹幕不是任何上游源，``source``/``match_mode`` 如实标注为本地导入。
+DANMAKU_LOCAL_SOURCE_NAME = "local"
+DANMAKU_LOCAL_MATCH_MODE = "import"
 
 # 官方与社区实践：拿不到真实 hash 时用占位 hash 配合 matchMode="hashAndFileName"，
 # 这样「只有文件名」也能走 /api/v2/match。
@@ -870,4 +876,203 @@ def build_danmaku_matcher_from_config(config):
         match_ttl_seconds=getattr(config, "danmaku_match_ttl_seconds", DEFAULT_DANMAKU_MATCH_TTL_SECONDS),
         max_comments=getattr(config, "danmaku_max_comments", DEFAULT_DANMAKU_MAX_COMMENTS),
         blacklist=getattr(config, "danmaku_blacklist", ()),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 本地弹幕文件导入（B 站 XML / 弹弹play JSON）
+#
+# 这条路不访问任何外部数据源：用户在官方库里匹配不到的时候，可以把手里的弹幕文件
+# 交给服务端解析。解析出来的仍是弹弹play JSON 结构，和上游弹幕走同一套归一化、
+# 去重、模式过滤、黑名单、密度采样与偏移，客户端不需要区分来源。
+# ---------------------------------------------------------------------------
+
+DANMAKU_IMPORT_FORMATS = ("auto", "bilibili-xml", "dandanplay-json")
+DANMAKU_IMPORT_FORMAT_ALIASES = {
+    "auto": "auto",
+    "bilibili-xml": "bilibili-xml",
+    "bilibili": "bilibili-xml",
+    "xml": "bilibili-xml",
+    "dandanplay-json": "dandanplay-json",
+    "dandanplay": "dandanplay-json",
+    "json": "dandanplay-json",
+}
+
+
+class DanmakuImportError(ValueError):
+    """本地弹幕文件不可用。``code`` 由 API 层原样回给调用方，避免笼统报错。"""
+
+    def __init__(self, message, code="invalid_danmaku_file"):
+        super().__init__(message)
+        self.code = code
+
+
+def decode_danmaku_file(content):
+    """把上传内容统一成文本；非 UTF-8 如实报错，不做有损替换。
+
+    BOM 一律去掉：Windows 上导出的 JSON/XML 经常带 UTF-8 BOM，而 ``json.loads``
+    与 ``ElementTree`` 都不接受它。
+    """
+    if isinstance(content, (bytes, bytearray)):
+        try:
+            return bytes(content).decode("utf-8-sig").lstrip("\ufeff")
+        except UnicodeDecodeError as exc:
+            raise DanmakuImportError(
+                "danmaku file must be UTF-8 text: %s" % exc,
+                code="invalid_danmaku_file",
+            )
+    if content is None:
+        raise DanmakuImportError("danmaku file is empty", code="empty_danmaku_file")
+    return str(content).lstrip("\ufeff")
+
+
+def detect_danmaku_import_format(content):
+    """按内容判断格式（``auto`` 时使用）：JSON 以 ``{``/``[`` 开头，XML 以 ``<`` 开头。"""
+    text = decode_danmaku_file(content).lstrip("\ufeff \t\r\n")
+    if not text:
+        raise DanmakuImportError("danmaku file is empty", code="empty_danmaku_file")
+    head = text[0]
+    if head in ("{", "["):
+        return "dandanplay-json"
+    if head == "<":
+        return "bilibili-xml"
+    raise DanmakuImportError(
+        'unrecognised danmaku file: expected dandanplay JSON ({"comments": [...]}) or Bilibili XML (<i><d p="...">)',
+        code="unsupported_danmaku_format",
+    )
+
+
+def parse_dandanplay_json(content):
+    """解析弹弹play JSON 弹幕：``{"comments": [...]}``（官方 /comment 结构），也接受裸数组。"""
+    try:
+        payload = json.loads(decode_danmaku_file(content))
+    except (TypeError, ValueError) as exc:
+        raise DanmakuImportError("danmaku json is not valid JSON: %s" % exc, code="invalid_danmaku_file")
+    entries = payload.get("comments") if isinstance(payload, dict) else payload
+    if not isinstance(entries, list):
+        raise DanmakuImportError(
+            'danmaku json must be a comments array or {"comments": [...]}',
+            code="invalid_danmaku_file",
+        )
+    return entries
+
+
+def _xml_local_tag(tag):
+    return str(tag or "").rsplit("}", 1)[-1]
+
+
+def parse_bilibili_xml(content):
+    """解析 B 站弹幕 XML。
+
+    ``p`` 属性按 8 段原样保留（时间,模式,字号,颜色,时间戳,弹幕池,用户,行号），
+    归一化交由 :func:`normalize_danmaku_comments`；行号作为 ``cid``，让导入的弹幕
+    和上游弹幕一样有稳定标识。不可用的条目**不在这里丢弃**，由归一化如实计数。
+    """
+    try:
+        root = ET.fromstring(decode_danmaku_file(content))
+    except ET.ParseError as exc:
+        raise DanmakuImportError("danmaku xml is not well formed: %s" % exc, code="invalid_danmaku_file")
+    entries = []
+    for node in root.iter():
+        if _xml_local_tag(node.tag) != "d":
+            continue
+        raw_p = str(node.get("p") or "").strip()
+        parts = [segment.strip() for segment in raw_p.split(",")]
+        entries.append(
+            {
+                "cid": parts[7] if len(parts) >= 8 else "",
+                "p": raw_p,
+                "m": node.text or "",
+            }
+        )
+    return entries
+
+
+def parse_local_danmaku(content, source_format="auto"):
+    """解析本地弹幕文件，返回 ``(format, entries)``。
+
+    显式指定的格式必须受支持：写错了直接报 400，绝不悄悄按另一种格式重试。
+    """
+    text = decode_danmaku_file(content)
+    requested = str(source_format or "auto").strip().lower() or "auto"
+    resolved = DANMAKU_IMPORT_FORMAT_ALIASES.get(requested)
+    if resolved is None:
+        raise DanmakuImportError(
+            "unsupported danmaku format %r: expected one of %s"
+            % (source_format, ", ".join(DANMAKU_IMPORT_FORMATS)),
+            code="unsupported_danmaku_format",
+        )
+    if resolved == "auto":
+        resolved = detect_danmaku_import_format(text)
+    if resolved == "bilibili-xml":
+        return resolved, parse_bilibili_xml(text)
+    return resolved, parse_dandanplay_json(text)
+
+
+class DanmakuLocalImport:
+    """本地弹幕文件的解析 + 归一化。
+
+    - 不需要任何凭证或上游源，只受 ``DANMAKU_ENABLED`` 控制。
+    - 简繁转换（``ch_convert``）依赖上游服务端的 ``chConvert``，本地文件无法在服务端
+      完成转换，因此非 0 时如实报错，而不是假装转换过。
+    """
+
+    def __init__(
+        self,
+        max_comments=DEFAULT_DANMAKU_MAX_COMMENTS,
+        blacklist=(),
+        max_bytes=DEFAULT_DANMAKU_IMPORT_MAX_BYTES,
+    ):
+        self.max_comments = max_comments
+        self.blacklist = tuple(blacklist or ())
+        self.max_bytes = int(max_bytes or 0)
+
+    def payload(self, content, source_format="auto", offset_seconds=0.0, ch_convert=0, title=""):
+        if int(ch_convert or 0) != 0:
+            raise DanmakuImportError(
+                "ch_convert is not supported for imported danmaku files: "
+                "dandanplay performs the conversion on its side",
+                code="danmaku_ch_convert_unsupported",
+            )
+        text = decode_danmaku_file(content)
+        size = len(text.encode("utf-8"))
+        if self.max_bytes > 0 and size > self.max_bytes:
+            raise DanmakuImportError(
+                "danmaku file is %d bytes, the limit is %d bytes" % (size, self.max_bytes),
+                code="danmaku_file_too_large",
+            )
+        resolved_format, entries = parse_local_danmaku(text, source_format)
+        comments, skipped = normalize_danmaku_comments(entries)
+        if not comments:
+            raise DanmakuImportError(
+                "danmaku file has no usable comment (%d entries were skipped)" % skipped,
+                code="no_danmaku_comments",
+            )
+        payload = build_danmaku_payload(
+            comments,
+            source=DANMAKU_LOCAL_SOURCE_NAME,
+            episode_id="",
+            anime_title=str(title or ""),
+            match_mode=DANMAKU_LOCAL_MATCH_MODE,
+            offset_seconds=offset_seconds,
+            max_comments=self.max_comments,
+            blacklist=self.blacklist,
+            skipped=skipped,
+        )
+        payload["format"] = resolved_format
+        payload["size_bytes"] = size
+        return payload
+
+
+def build_danmaku_local_import_from_config(config):
+    """按配置构建本地导入器；``DANMAKU_ENABLED`` 关闭时返回 ``None``。
+
+    与 :func:`build_danmaku_matcher_from_config` 不同，这里**不要求任何源或凭证**。
+    """
+    if not getattr(config, "danmaku_enabled", False):
+        return None
+    return DanmakuLocalImport(
+        max_comments=getattr(config, "danmaku_max_comments", DEFAULT_DANMAKU_MAX_COMMENTS),
+        blacklist=getattr(config, "danmaku_blacklist", ()),
+        max_bytes=getattr(config, "danmaku_import_max_bytes", DEFAULT_DANMAKU_IMPORT_MAX_BYTES),
     )

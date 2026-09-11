@@ -23,6 +23,10 @@ from pipeline.search import (
     valid_btih_info_hash,
 )
 from pipeline.season_subtitles import SeasonSubtitleTaskManager
+from pipeline.danmaku import (
+    DEFAULT_DANMAKU_IMPORT_MAX_BYTES,
+    DanmakuImportError,
+)
 from pipeline.danmaku_prewarm import (
     DEFAULT_DANMAKU_PREWARM_DELAY_SECONDS,
     DEFAULT_DANMAKU_PREWARM_MAX_EPISODES,
@@ -3245,6 +3249,56 @@ class InternalApiApplication:
         except RuntimeError as exc:
             raise ApiError(502, "danmaku_search_failed", str(exc))
 
+    def parse_danmaku(self, payload):
+        """解析用户提供的本地弹幕文件，输出与上游弹幕同构的归一化结果。"""
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_request", "request body must be a JSON object")
+        content = payload.get("content")
+        if content is None or (isinstance(content, str) and not content.strip()):
+            raise ApiError(400, "missing_content", "content is required")
+        if not isinstance(content, str):
+            raise ApiError(400, "invalid_content", "content must be the danmaku file text")
+        source_format = str(payload.get("format") or "auto").strip().lower()
+        try:
+            ch_convert = int(payload.get("ch_convert") or 0)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_ch_convert", "ch_convert must be an integer")
+        if ch_convert not in (0, 1, 2):
+            raise ApiError(400, "invalid_ch_convert", "ch_convert must be 0, 1 or 2")
+        try:
+            offset_seconds = float(payload.get("offset_seconds") or 0.0)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_offset", "offset_seconds must be a number")
+        if offset_seconds < -600 or offset_seconds > 600:
+            raise ApiError(400, "invalid_offset", "offset_seconds must be within -600..600")
+        try:
+            return self.service.danmaku_parse_local(
+                content,
+                source_format=source_format,
+                offset_seconds=offset_seconds,
+                ch_convert=ch_convert,
+                title=str(payload.get("title") or ""),
+            )
+        except DanmakuImportError as exc:
+            raise ApiError(400, exc.code, str(exc))
+        except ValueError as exc:
+            raise ApiError(409, "danmaku_unavailable", str(exc))
+        except RuntimeError as exc:
+            raise ApiError(502, "danmaku_parse_failed", str(exc))
+
+    def danmaku_request_body_limit(self):
+        """``/v1/danmaku/parse`` 的请求体上限：以 ``DANMAKU_IMPORT_MAX_BYTES`` 为准。
+
+        其余路由仍走默认的 1MiB 限制，这里只为整集弹幕文件放宽。
+        """
+        config = getattr(self.service, "config", None)
+        raw_limit = getattr(config, "danmaku_import_max_bytes", None)
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            limit = DEFAULT_DANMAKU_IMPORT_MAX_BYTES
+        return max(limit, 64 * 1024)
+
     def search_subtitles(self, payload):
         owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
         media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
@@ -3664,6 +3718,10 @@ class InternalApiServer:
             if handler.command == "POST" and path == "/v1/danmaku/search":
                 self._send_json(handler, 200, self.application.search_danmaku(self._read_json(handler)))
                 return
+            if handler.command == "POST" and path == "/v1/danmaku/parse":
+                payload = self._read_json(handler, max_bytes=self.application.danmaku_request_body_limit())
+                self._send_json(handler, 200, self.application.parse_danmaku(payload))
+                return
             if handler.command == "POST" and path == "/v1/danmaku/season/prewarm":
                 self._send_json(handler, 202, self.application.create_danmaku_prewarm(self._read_json(handler)))
                 return
@@ -3785,7 +3843,7 @@ class InternalApiServer:
         if separator != " " or scheme.lower() != "bearer" or not hmac.compare_digest(token, self.token):
             raise ApiError(401, "unauthorized", "valid Bearer token required")
 
-    def _read_json(self, handler):
+    def _read_json(self, handler, max_bytes=MAX_JSON_BODY_BYTES):
         content_type = str(handler.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
             raise ApiError(415, "unsupported_media_type", "Content-Type must be application/json")
@@ -3796,7 +3854,7 @@ class InternalApiServer:
             length = int(raw_length)
         except ValueError:
             raise ApiError(400, "invalid_content_length", "invalid Content-Length")
-        if length < 0 or length > MAX_JSON_BODY_BYTES:
+        if length < 0 or length > int(max_bytes):
             raise ApiError(413, "request_too_large", "JSON request body is too large")
         try:
             payload = json.loads(handler.rfile.read(length).decode("utf-8"))

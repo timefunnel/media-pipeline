@@ -33,6 +33,7 @@ from pipeline.bot import (
     wait_openlist_receive_root_entries,
 )
 from pipeline.config import category_to_folder_id, category_to_openlist_path
+from pipeline.danmaku import DEFAULT_DANMAKU_IMPORT_MAX_BYTES, DanmakuImportError
 from pipeline.danmaku_prewarm import DanmakuPrewarmManager
 from pipeline.internal_api import (
     ApiError,
@@ -1110,16 +1111,18 @@ class SubtitleApiTest(InternalApiTestCase):
 
 
 class FakeDanmakuService(FakePipelineService):
-    """只补弹幕三个方法的假服务，用于验证 API 契约与错误映射。"""
+    """只补弹幕四个方法的假服务，用于验证 API 契约与错误映射。"""
 
-    def __init__(self, match_error=None, comments_error=None, search_error=None):
+    def __init__(self, match_error=None, comments_error=None, search_error=None, parse_error=None):
         super().__init__()
         self.match_error = match_error
         self.comments_error = comments_error
         self.search_error = search_error
+        self.parse_error = parse_error
         self.match_calls = []
         self.comment_calls = []
         self.search_calls = []
+        self.parse_calls = []
 
     def danmaku_match(self, media_id):
         self.match_calls.append(media_id)
@@ -1174,6 +1177,41 @@ class FakeDanmakuService(FakePipelineService):
         if self.search_error:
             raise self.search_error
         return {"keyword": keyword, "results": [{"source": "dandanplay", "animes": []}], "errors": []}
+
+    def danmaku_parse_local(self, content, source_format="auto", offset_seconds=0.0, ch_convert=0, title=""):
+        self.parse_calls.append(
+            {
+                "content": content,
+                "source_format": source_format,
+                "offset_seconds": offset_seconds,
+                "ch_convert": ch_convert,
+                "title": title,
+            }
+        )
+        if self.parse_error:
+            raise self.parse_error
+        return {
+            "media_id": "",
+            "source": "local",
+            "episode_id": "",
+            "format": "bilibili-xml" if source_format in ("auto", "bilibili-xml") else source_format,
+            "offset_seconds": offset_seconds,
+            "ch_convert": ch_convert,
+            "count": 1,
+            "total": 1,
+            "filtered": 0,
+            "skipped": 0,
+            "truncated": False,
+            "comments": [
+                {
+                    "cid": "101",
+                    "p": "1.5,1,25,16777215,1700000000,0,abc,101",
+                    "m": "本地弹幕",
+                    "time": 1.5,
+                    "mode": 1,
+                }
+            ],
+        }
 
 
 class DanmakuApiTest(InternalApiTestCase):
@@ -1287,6 +1325,97 @@ class DanmakuApiTest(InternalApiTestCase):
         finally:
             manager.stop()
 
+    def test_parse_validates_content_format_chconvert_and_offset(self):
+        service = FakeDanmakuService()
+        _service, _store, manager, application = self.build_components(service=service)
+        try:
+            cases = [
+                ({}, "missing_content"),
+                ({"content": "   "}, "missing_content"),
+                ({"content": 42}, "invalid_content"),
+                ({"content": "{}", "ch_convert": 9}, "invalid_ch_convert"),
+                ({"content": "{}", "ch_convert": "x"}, "invalid_ch_convert"),
+                ({"content": "{}", "offset_seconds": 999}, "invalid_offset"),
+                ({"content": "{}", "offset_seconds": "x"}, "invalid_offset"),
+            ]
+            for payload, expected in cases:
+                with self.assertRaises(ApiError) as raised:
+                    application.parse_danmaku(payload)
+                self.assertEqual(raised.exception.status, 400, payload)
+                self.assertEqual(raised.exception.code, expected, payload)
+            self.assertEqual(service.parse_calls, [], "invalid requests must not reach the service")
+        finally:
+            manager.stop()
+
+    def test_parse_passes_content_through_and_reports_file_errors_as_400(self):
+        service = FakeDanmakuService()
+        _service, _store, manager, application = self.build_components(service=service)
+        try:
+            result = application.parse_danmaku(
+                {
+                    "content": "<i><d p=\"1.5,1,25,16777215,1700000000,0,abc,101\">本地弹幕</d></i>",
+                    "format": "xml",
+                    "offset_seconds": -0.5,
+                    "title": "某番 第1话",
+                }
+            )
+            self.assertEqual(service.parse_calls[0]["source_format"], "xml")
+            self.assertEqual(service.parse_calls[0]["offset_seconds"], -0.5)
+            self.assertEqual(service.parse_calls[0]["title"], "某番 第1话")
+            self.assertEqual(result["source"], "local")
+            self.assertEqual(result["comments"][0]["cid"], "101")
+
+            service.parse_error = DanmakuImportError("danmaku file is empty", code="empty_danmaku_file")
+            with self.assertRaises(ApiError) as raised:
+                application.parse_danmaku({"content": " "})
+            self.assertEqual(raised.exception.status, 400)
+            self.assertEqual(raised.exception.code, "missing_content")
+
+            with self.assertRaises(ApiError) as raised:
+                application.parse_danmaku({"content": "not a danmaku file"})
+            self.assertEqual(raised.exception.status, 400)
+            self.assertEqual(raised.exception.code, "empty_danmaku_file")
+            self.assertIn("empty", raised.exception.message)
+
+            service.parse_error = ValueError("danmaku is disabled")
+            with self.assertRaises(ApiError) as raised:
+                application.parse_danmaku({"content": "not a danmaku file"})
+            self.assertEqual(raised.exception.status, 409)
+            self.assertEqual(raised.exception.code, "danmaku_unavailable")
+
+            service.parse_error = RuntimeError("boom")
+            with self.assertRaises(ApiError) as raised:
+                application.parse_danmaku({"content": "not a danmaku file"})
+            self.assertEqual(raised.exception.status, 502)
+            self.assertEqual(raised.exception.code, "danmaku_parse_failed")
+        finally:
+            manager.stop()
+
+    def test_parse_body_limit_follows_the_configured_import_size(self):
+        class Config:
+            danmaku_import_max_bytes = 4 * 1024 * 1024
+
+        class ConfiguredService(FakeDanmakuService):
+            def __init__(self):
+                super().__init__()
+                self.config = Config()
+
+        _service, _store, manager, application = self.build_components(service=ConfiguredService())
+        try:
+            self.assertEqual(application.danmaku_request_body_limit(), 4 * 1024 * 1024)
+        finally:
+            manager.stop()
+
+        _service, _store, manager, application = self.build_components(service=FakeDanmakuService())
+        try:
+            self.assertEqual(
+                application.danmaku_request_body_limit(),
+                DEFAULT_DANMAKU_IMPORT_MAX_BYTES,
+                "a service without config falls back to the documented default",
+            )
+        finally:
+            manager.stop()
+
 
 class DanmakuHttpRouteTest(InternalApiTestCase):
     def test_danmaku_routes_require_token_and_reuse_bot_service(self):
@@ -1319,6 +1448,15 @@ class DanmakuHttpRouteTest(InternalApiTestCase):
             searched = http_json(base + "/v1/danmaku/search", {"keyword": "某番"}, token="secret")
             self.assertEqual(searched["keyword"], "某番")
             self.assertEqual(service.match_calls, ["media-1"])
+
+            parsed = http_json(
+                base + "/v1/danmaku/parse",
+                {"content": "<i><d p=\"1.5,1,25,16777215,1700000000,0,abc,101\">本地弹幕</d></i>"},
+                token="secret",
+            )
+            self.assertEqual(parsed["source"], "local")
+            self.assertEqual(parsed["comments"][0]["cid"], "101")
+            self.assertEqual(service.parse_calls[0]["source_format"], "auto")
         finally:
             server.stop()
 

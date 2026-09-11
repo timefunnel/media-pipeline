@@ -12,16 +12,23 @@ sys.path.insert(0, str(ROOT / "app"))
 from pipeline.danmaku import (
     AggregatorSource,
     DanmakuCache,
+    DanmakuImportError,
+    DanmakuLocalImport,
     DanmakuMatcher,
     DandanplayProtocolSource,
     apply_danmaku_offset,
     build_danmaku_payload,
+    build_danmaku_local_import_from_config,
     dandanplay_signature,
     dedupe_danmaku,
+    detect_danmaku_import_format,
     filter_danmaku_keywords,
     normalize_danmaku_cid,
     normalize_danmaku_comments,
+    parse_bilibili_xml,
     parse_comment_p,
+    parse_dandanplay_json,
+    parse_local_danmaku,
     sample_danmaku,
 )
 
@@ -419,6 +426,167 @@ class MatcherTest(unittest.TestCase):
             matcher.match(title="x")
         with self.assertRaises(RuntimeError):
             matcher.comments("1")
+
+
+BILLIBILI_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    "<i><chatserver>chat.bilibili.com</chatserver><chatid>12345</chatid>"
+    '<d p="1.5,1,25,16777215,1700000000,0,abc123,101">前方高能 &amp; 注意</d>'
+    '<d p="2.5,5,25,16711680,1700000001,0,def456,102">顶部弹幕</d>'
+    '<d p="3.5,4,25,255,1700000002,0,ghi789,103">底部弹幕</d>'
+    '<d p="4.5,7,25,16777215,1700000003,0,jkl012,104">高级弹幕</d>'
+    '<d p="5.5,8,25,16777215,1700000004,0,mno345,105">代码弹幕</d>'
+    '<d p="6.5,1,25,16777215,1700000005,0,pqr678,106"></d>'
+    "</i>"
+)
+
+DANDANPLAY_JSON = json.dumps(
+    {
+        "count": 2,
+        "comments": [
+            {"cid": "1542278977442529280", "p": "847.66,1,16020176,14b30012", "m": "前方高能"},
+            {"cid": "1542278977442529281", "p": "848.10,5,16777215,14b30013", "m": "顶部"},
+        ],
+    },
+    ensure_ascii=False,
+)
+
+
+class LocalImportParseTest(unittest.TestCase):
+    def test_detects_json_and_xml_by_content(self):
+        self.assertEqual(detect_danmaku_import_format(DANDANPLAY_JSON), "dandanplay-json")
+        self.assertEqual(detect_danmaku_import_format("  \n" + DANDANPLAY_JSON), "dandanplay-json")
+        self.assertEqual(detect_danmaku_import_format("\ufeff" + BILLIBILI_XML), "bilibili-xml")
+        with self.assertRaises(DanmakuImportError) as raised:
+            detect_danmaku_import_format("just some text")
+        self.assertEqual(raised.exception.code, "unsupported_danmaku_format")
+        with self.assertRaises(DanmakuImportError) as raised:
+            detect_danmaku_import_format("   ")
+        self.assertEqual(raised.exception.code, "empty_danmaku_file")
+
+    def test_bilibili_xml_keeps_eight_segment_p_and_row_id_as_cid(self):
+        entries = parse_bilibili_xml(BILLIBILI_XML)
+        self.assertEqual(len(entries), 6)
+        self.assertEqual(entries[0]["p"], "1.5,1,25,16777215,1700000000,0,abc123,101")
+        self.assertEqual(entries[0]["m"], "前方高能 & 注意")
+        self.assertEqual(entries[0]["cid"], "101")
+
+    def test_dandanplay_json_accepts_wrapped_and_bare_arrays(self):
+        wrapped = parse_dandanplay_json(DANDANPLAY_JSON)
+        self.assertEqual(len(wrapped), 2)
+        bare = parse_dandanplay_json(json.dumps(wrapped, ensure_ascii=False))
+        self.assertEqual(len(bare), 2)
+        with self.assertRaises(DanmakuImportError) as raised:
+            parse_dandanplay_json('{"count": 1}')
+        self.assertEqual(raised.exception.code, "invalid_danmaku_file")
+        with self.assertRaises(DanmakuImportError) as raised:
+            parse_dandanplay_json("{not json")
+        self.assertEqual(raised.exception.code, "invalid_danmaku_file")
+
+    def test_malformed_xml_is_reported_not_guessed(self):
+        with self.assertRaises(DanmakuImportError) as raised:
+            parse_bilibili_xml("<i><d p='1,1,25,16777215,1,0,u,1'>x</d>")
+        self.assertEqual(raised.exception.code, "invalid_danmaku_file")
+
+    def test_explicit_format_is_honoured_and_unknown_format_is_rejected(self):
+        # 内容其实是 JSON，但显式声明成 XML 时按 XML 解析并如实失败，不做回退猜测。
+        with self.assertRaises(DanmakuImportError) as raised:
+            parse_local_danmaku(DANDANPLAY_JSON, source_format="bilibili-xml")
+        self.assertEqual(raised.exception.code, "invalid_danmaku_file")
+        resolved, entries = parse_local_danmaku(DANDANPLAY_JSON, source_format="json")
+        self.assertEqual(resolved, "dandanplay-json")
+        self.assertEqual(len(entries), 2)
+        with self.assertRaises(DanmakuImportError) as raised:
+            parse_local_danmaku(DANDANPLAY_JSON, source_format="ass")
+        self.assertEqual(raised.exception.code, "unsupported_danmaku_format")
+
+
+class LocalImportPayloadTest(unittest.TestCase):
+    def test_xml_payload_is_normalized_like_provider_danmaku(self):
+        payload = DanmakuLocalImport().payload(BILLIBILI_XML)
+        self.assertEqual(payload["source"], "local")
+        self.assertEqual(payload["match_mode"], "import")
+        self.assertEqual(payload["format"], "bilibili-xml")
+        self.assertEqual(payload["total"], 5, "the empty comment is dropped before filtering and counted as skipped")
+        self.assertEqual(payload["count"], 3, "the fixture's 1/4/5 comments are kept")
+        self.assertEqual(payload["dropped_modes"], 2, "mode 7 and 8 are dropped and counted")
+        self.assertEqual(payload["skipped"], 1, "the empty comment must be reported, not swallowed")
+        self.assertEqual(payload["comments"][0]["cid"], "101")
+        self.assertEqual(payload["comments"][0]["time"], 1.5)
+        self.assertEqual(
+            [item["mode"] for item in payload["comments"]],
+            [1, 5, 4],
+            "comments stay sorted by time",
+        )
+        self.assertFalse(payload["truncated"])
+
+    def test_json_payload_keeps_dandanplay_fields(self):
+        payload = DanmakuLocalImport().payload(DANDANPLAY_JSON)
+        self.assertEqual(payload["format"], "dandanplay-json")
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["comments"][0]["cid"], "1542278977442529280")
+        self.assertEqual(payload["comments"][0]["p"], "847.66,1,16020176,14b30012")
+
+    def test_offset_blacklist_and_density_cap_apply_to_imported_files(self):
+        # 5 usable comments, modes 7/8 dropped (3 left), the blacklist removes one (2 left),
+        # and a cap of 1 therefore has to sample.
+        payload = DanmakuLocalImport(max_comments=1, blacklist=["前方"]).payload(
+            BILLIBILI_XML, offset_seconds=1.0
+        )
+        texts = [item["m"] for item in payload["comments"]]
+        self.assertNotIn("前方高能 & 注意", texts)
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["offset_seconds"], 1.0)
+        self.assertEqual(payload["comments"][0]["time"], 3.5, "offset is applied to every comment")
+
+    def test_ch_convert_is_refused_instead_of_silently_ignored(self):
+        with self.assertRaises(DanmakuImportError) as raised:
+            DanmakuLocalImport().payload(DANDANPLAY_JSON, ch_convert=1)
+        self.assertEqual(raised.exception.code, "danmaku_ch_convert_unsupported")
+
+    def test_oversized_and_empty_and_unusable_files_are_reported(self):
+        with self.assertRaises(DanmakuImportError) as raised:
+            DanmakuLocalImport(max_bytes=64).payload(BILLIBILI_XML)
+        self.assertEqual(raised.exception.code, "danmaku_file_too_large")
+        with self.assertRaises(DanmakuImportError) as raised:
+            DanmakuLocalImport().payload("")
+        self.assertEqual(raised.exception.code, "empty_danmaku_file")
+        with self.assertRaises(DanmakuImportError) as raised:
+            DanmakuLocalImport().payload("<i><d p=''></d></i>")
+        self.assertEqual(raised.exception.code, "no_danmaku_comments")
+        with self.assertRaises(DanmakuImportError) as raised:
+            DanmakuLocalImport().payload("\ufeff[]")
+        self.assertEqual(raised.exception.code, "no_danmaku_comments")
+
+    def test_utf8_bytes_are_accepted_and_other_encodings_are_refused(self):
+        payload = DanmakuLocalImport().payload(DANDANPLAY_JSON.encode("utf-8"))
+        self.assertEqual(payload["count"], 2)
+        with self.assertRaises(DanmakuImportError) as raised:
+            DanmakuLocalImport().payload(DANDANPLAY_JSON.encode("utf-16"))
+        self.assertEqual(raised.exception.code, "invalid_danmaku_file")
+
+
+class LocalImportConfigTest(unittest.TestCase):
+    class Config:
+        pass
+
+    def test_disabled_danmaku_has_no_local_import(self):
+        config = self.Config()
+        config.danmaku_enabled = False
+        self.assertIsNone(build_danmaku_local_import_from_config(config))
+
+    def test_local_import_does_not_require_any_source_or_credential(self):
+        config = self.Config()
+        config.danmaku_enabled = True
+        config.danmaku_max_comments = 10
+        config.danmaku_blacklist = ("广告",)
+        config.danmaku_import_max_bytes = 2048
+        helper = build_danmaku_local_import_from_config(config)
+        self.assertIsNotNone(helper)
+        self.assertEqual(helper.max_comments, 10)
+        self.assertEqual(helper.blacklist, ("广告",))
+        self.assertEqual(helper.max_bytes, 2048)
 
 
 if __name__ == "__main__":
