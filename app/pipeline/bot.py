@@ -1857,6 +1857,7 @@ class PipelineBotService:
         self._llm_rerank_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-rerank")
         self._llm_rerank_lock = threading.Lock()
         self._subtitle_matcher = None
+        self._danmaku_matcher = None
         self._search_capabilities_lock = threading.Lock()
         self._search_capabilities_cache = None
         self._search_capabilities_cached_at = 0.0
@@ -3475,6 +3476,105 @@ class PipelineBotService:
         if self._subtitle_matcher is None:
             self._subtitle_matcher = build_subtitle_matcher_from_config(self.config)
         return self._subtitle_matcher
+
+    def _build_danmaku_matcher(self):
+        if self._danmaku_matcher is None:
+            self._danmaku_matcher = build_danmaku_matcher_from_config(self.config)
+        return self._danmaku_matcher
+
+    def _require_danmaku_matcher(self):
+        """未启用/无可用源时抛 ``ValueError``（配置问题），上游故障抛 ``RuntimeError``。"""
+        matcher = self._build_danmaku_matcher()
+        if matcher is None:
+            raise ValueError("danmaku is disabled or has no usable source configured")
+        if not matcher.enabled_sources():
+            raise ValueError("danmaku has no enabled source (missing credentials or aggregator url)")
+        return matcher
+
+    def _load_media_detail(self, media_id):
+        if not self.config.msg_enabled:
+            raise RuntimeError("MediaStationGo is disabled")
+        media_id = str(media_id or "").strip()
+        if not media_id:
+            raise ValueError("media_id is required")
+        client = self._build_msg_client()
+        media = extract_media_detail(client.get_media(media_id))
+        detail_id = extract_media_id(media)
+        if not detail_id:
+            raise RuntimeError("MediaStationGo media detail missing id: %s" % media_id)
+        if detail_id != media_id:
+            raise RuntimeError(
+                "MediaStationGo media id mismatch: expected %s, got %s" % (media_id, detail_id)
+            )
+        return media
+
+    def danmaku_match(self, media_id):
+        """按 TMDB ID → 文件名 → 标题 的顺序匹配弹幕库，并如实返回每次尝试。"""
+        matcher = self._require_danmaku_matcher()
+        media = self._load_media_detail(media_id)
+        target = danmaku_target_from_media(media)
+        match = matcher.match(
+            title=target["title"],
+            season=target["season"] or None,
+            episode=target["episode"] or None,
+            file_name=target["file_name"],
+            tmdb_id=target["tmdb_id"] or None,
+            file_size=target["file_size"],
+            video_duration=target["video_duration"],
+        )
+        return {"media_id": media_id, "target": target, "match": match}
+
+    def danmaku_comments(
+        self,
+        media_id,
+        episode_id="",
+        source="",
+        ch_convert=0,
+        offset_seconds=0.0,
+        provider_shift_seconds=0.0,
+        anime_title="",
+        episode_title="",
+        match_mode="",
+        with_related=True,
+    ):
+        """取回并归一化整集弹幕；未指定 episode_id 时先自动匹配，匹配不上就如实失败。"""
+        matcher = self._require_danmaku_matcher()
+        episode = str(episode_id or "").strip()
+        if not episode:
+            matched = self.danmaku_match(media_id)
+            match = matched.get("match") or {}
+            if not match.get("matched"):
+                raise RuntimeError(
+                    "danmaku match failed for media %s: %s"
+                    % (media_id, json.dumps(match.get("attempts") or [], ensure_ascii=False))
+                )
+            episode = match.get("episode_id") or ""
+            source = source or match.get("source") or ""
+            provider_shift_seconds = provider_shift_seconds or float(match.get("shift") or 0.0)
+            anime_title = anime_title or match.get("anime_title") or ""
+            episode_title = episode_title or match.get("episode_title") or ""
+            match_mode = match_mode or match.get("match_mode") or ""
+        payload = matcher.comments(
+            episode,
+            source_name=source,
+            with_related=with_related,
+            ch_convert=ch_convert,
+            offset_seconds=offset_seconds,
+            provider_shift_seconds=provider_shift_seconds,
+            anime_title=anime_title,
+            episode_title=episode_title,
+            match_mode=match_mode,
+        )
+        payload["media_id"] = media_id
+        return payload
+
+    def danmaku_search(self, keyword, episode=None):
+        """手动匹配用的关键词搜索。"""
+        matcher = self._require_danmaku_matcher()
+        keyword = str(keyword or "").strip()
+        if not keyword:
+            raise ValueError("keyword is required")
+        return matcher.search(keyword, episode=episode)
 
     def _call_115(self, category, callback):
         client = self._build_115_client(category)
@@ -8219,6 +8319,35 @@ def normalize_msg_subtitle_presence(value, media_id):
         "external": tracks[: len(external)],
         "embedded": tracks[len(external) :],
         "unknown_embedded": unknown_embedded,
+    }
+
+
+def danmaku_target_from_media(media):
+    """从 MSG 媒体详情里抽出弹幕匹配需要的字段。
+
+    标题优先用原名（日文原名在弹弹play 的命中率明显高于刮削后的中文译名），
+    文件名为媒体路径的 basename；``tmdb_id`` 用于首选的反查路径。
+    """
+    path = media_primary_path(media)
+    file_name = path.replace("\\", "/").rsplit("/", 1)[-1] if path else ""
+    try:
+        season = int(media_first_value(media, ("season_num", "season")) or 0)
+    except (TypeError, ValueError):
+        season = 0
+    try:
+        episode = int(media_first_value(media, ("episode_num", "episode")) or 0)
+    except (TypeError, ValueError):
+        episode = 0
+    return {
+        "media_id": extract_media_id(media),
+        "title": subtitle_search_title(media) or media_display_title(media),
+        "display_title": media_display_title(media),
+        "season": season,
+        "episode": episode,
+        "tmdb_id": normalized_media_identity(media, ("tmdb_id", "tmdbId")),
+        "file_name": file_name,
+        "file_size": media_first_value(media, ("size_bytes", "size")),
+        "video_duration": media_first_value(media, ("duration_sec", "duration")),
     }
 
 

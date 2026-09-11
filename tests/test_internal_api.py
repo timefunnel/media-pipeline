@@ -1108,6 +1108,220 @@ class SubtitleApiTest(InternalApiTestCase):
             manager.stop()
 
 
+class FakeDanmakuService(FakePipelineService):
+    """只补弹幕三个方法的假服务，用于验证 API 契约与错误映射。"""
+
+    def __init__(self, match_error=None, comments_error=None, search_error=None):
+        super().__init__()
+        self.match_error = match_error
+        self.comments_error = comments_error
+        self.search_error = search_error
+        self.match_calls = []
+        self.comment_calls = []
+        self.search_calls = []
+
+    def danmaku_match(self, media_id):
+        self.match_calls.append(media_id)
+        if self.match_error:
+            raise self.match_error
+        return {
+            "media_id": media_id,
+            "target": {"title": "某番", "season": 1, "episode": 1},
+            "match": {
+                "matched": True,
+                "source": "dandanplay",
+                "match_mode": "tmdb",
+                "episode_id": "95410010",
+                "anime_title": "某番",
+                "episode_title": "第1话",
+                "shift": 2.0,
+                "candidates": [],
+                "ambiguous": False,
+                "attempts": [{"source": "dandanplay", "mode": "tmdb", "outcome": "matched"}],
+            },
+        }
+
+    def danmaku_comments(self, media_id, **kwargs):
+        self.comment_calls.append(dict(kwargs, media_id=media_id))
+        if self.comments_error:
+            raise self.comments_error
+        return {
+            "media_id": media_id,
+            "source": kwargs.get("source") or "dandanplay",
+            "episode_id": kwargs.get("episode_id") or "95410010",
+            "provider_shift_seconds": kwargs.get("provider_shift_seconds") or 0.0,
+            "offset_seconds": kwargs.get("offset_seconds") or 0.0,
+            "ch_convert": kwargs.get("ch_convert") or 0,
+            "count": 1,
+            "total": 1,
+            "filtered": 0,
+            "skipped": 0,
+            "truncated": False,
+            "comments": [
+                {
+                    "cid": "1542278977442529280",
+                    "p": "847.66,1,16020176,14b30012",
+                    "m": "前方高能",
+                    "time": 847.66,
+                    "mode": 1,
+                }
+            ],
+        }
+
+    def danmaku_search(self, keyword, episode=None):
+        self.search_calls.append({"keyword": keyword, "episode": episode})
+        if self.search_error:
+            raise self.search_error
+        return {"keyword": keyword, "results": [{"source": "dandanplay", "animes": []}], "errors": []}
+
+
+class DanmakuApiTest(InternalApiTestCase):
+    def test_match_requires_media_id(self):
+        _service, _store, manager, application = self.build_components(service=FakeDanmakuService())
+        try:
+            with self.assertRaises(ApiError) as raised:
+                application.match_danmaku({})
+            self.assertEqual(raised.exception.status, 400)
+            self.assertEqual(raised.exception.code, "missing_media_id")
+        finally:
+            manager.stop()
+
+    def test_disabled_danmaku_maps_to_409_instead_of_pretending_success(self):
+        service = FakeDanmakuService(match_error=ValueError("danmaku is disabled or has no usable source configured"))
+        _service, _store, manager, application = self.build_components(service=service)
+        try:
+            with self.assertRaises(ApiError) as raised:
+                application.match_danmaku({"media_id": "media-1"})
+            self.assertEqual(raised.exception.status, 409)
+            self.assertEqual(raised.exception.code, "danmaku_unavailable")
+        finally:
+            manager.stop()
+
+    def test_upstream_failure_maps_to_502(self):
+        service = FakeDanmakuService(match_error=RuntimeError("dandanplay API error 3: 应用不存在"))
+        _service, _store, manager, application = self.build_components(service=service)
+        try:
+            with self.assertRaises(ApiError) as raised:
+                application.match_danmaku({"media_id": "media-1"})
+            self.assertEqual(raised.exception.status, 502)
+            self.assertEqual(raised.exception.code, "danmaku_match_failed")
+            self.assertIn("应用不存在", raised.exception.message)
+        finally:
+            manager.stop()
+
+    def test_match_returns_target_and_attempts(self):
+        service = FakeDanmakuService()
+        _service, _store, manager, application = self.build_components(service=service)
+        try:
+            result = application.match_danmaku({"media_id": "media-1"})
+            self.assertEqual(service.match_calls, ["media-1"])
+            self.assertEqual(result["match"]["episode_id"], "95410010")
+            self.assertEqual(result["match"]["attempts"][0]["outcome"], "matched")
+        finally:
+            manager.stop()
+
+    def test_fetch_validates_episode_source_chconvert_and_offset(self):
+        _service, _store, manager, application = self.build_components(service=FakeDanmakuService())
+        try:
+            cases = [
+                ({"media_id": "m", "episode_id": "abc"}, "invalid_episode_id"),
+                ({"media_id": "m", "source": "bilibili"}, "invalid_source"),
+                ({"media_id": "m", "ch_convert": 9}, "invalid_ch_convert"),
+                ({"media_id": "m", "offset_seconds": 999}, "invalid_offset"),
+                ({"media_id": "m", "provider_shift_seconds": "x"}, "invalid_provider_shift"),
+            ]
+            for payload, expected in cases:
+                with self.assertRaises(ApiError) as raised:
+                    application.fetch_danmaku(payload)
+                self.assertEqual(raised.exception.status, 400)
+                self.assertEqual(raised.exception.code, expected)
+        finally:
+            manager.stop()
+
+    def test_fetch_passes_normalized_payload_with_string_cid(self):
+        service = FakeDanmakuService()
+        _service, _store, manager, application = self.build_components(service=service)
+        try:
+            result = application.fetch_danmaku(
+                {
+                    "media_id": "media-1",
+                    "episode_id": "95410010",
+                    "source": "aggregator",
+                    "ch_convert": 1,
+                    "offset_seconds": -1.5,
+                    "provider_shift_seconds": 2,
+                    "with_related": False,
+                }
+            )
+            self.assertEqual(service.comment_calls[0]["ch_convert"], 1)
+            self.assertEqual(service.comment_calls[0]["offset_seconds"], -1.5)
+            self.assertEqual(service.comment_calls[0]["with_related"], False)
+            self.assertEqual(result["comments"][0]["cid"], "1542278977442529280")
+            self.assertIsInstance(result["comments"][0]["cid"], str)
+        finally:
+            manager.stop()
+
+    def test_fetch_without_episode_id_lets_service_auto_match(self):
+        service = FakeDanmakuService()
+        _service, _store, manager, application = self.build_components(service=service)
+        try:
+            application.fetch_danmaku({"media_id": "media-1"})
+            self.assertEqual(service.comment_calls[0]["episode_id"], "")
+        finally:
+            manager.stop()
+
+    def test_search_requires_keyword_and_validates_episode(self):
+        service = FakeDanmakuService()
+        _service, _store, manager, application = self.build_components(service=service)
+        try:
+            with self.assertRaises(ApiError) as raised:
+                application.search_danmaku({})
+            self.assertEqual(raised.exception.code, "missing_keyword")
+            with self.assertRaises(ApiError) as raised:
+                application.search_danmaku({"keyword": "某番", "episode": 0})
+            self.assertEqual(raised.exception.code, "invalid_episode")
+            result = application.search_danmaku({"keyword": "某番", "episode": 3})
+            self.assertEqual(service.search_calls, [{"keyword": "某番", "episode": 3}])
+            self.assertEqual(result["results"][0]["source"], "dandanplay")
+        finally:
+            manager.stop()
+
+
+class DanmakuHttpRouteTest(InternalApiTestCase):
+    def test_danmaku_routes_require_token_and_reuse_bot_service(self):
+        service = FakeDanmakuService()
+        port = free_tcp_port()
+        server = InternalApiServer(service, self.db_path, token="secret", port=port, workers=1, owner_workers=1)
+        server.start()
+        base = "http://127.0.0.1:%d" % port
+        try:
+            unauthorized = urllib.request.Request(
+                base + "/v1/danmaku/match",
+                data=json.dumps({"media_id": "media-1"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(unauthorized, timeout=2)
+            self.assertEqual(raised.exception.code, 401)
+
+            matched = http_json(base + "/v1/danmaku/match", {"media_id": "media-1"}, token="secret")
+            self.assertEqual(matched["match"]["episode_id"], "95410010")
+
+            fetched = http_json(
+                base + "/v1/danmaku/comment",
+                {"media_id": "media-1", "episode_id": "95410010"},
+                token="secret",
+            )
+            self.assertEqual(fetched["comments"][0]["cid"], "1542278977442529280")
+
+            searched = http_json(base + "/v1/danmaku/search", {"keyword": "某番"}, token="secret")
+            self.assertEqual(searched["keyword"], "某番")
+            self.assertEqual(service.match_calls, ["media-1"])
+        finally:
+            server.stop()
+
+
 class SearchResponseTest(InternalApiTestCase):
     def test_subscription_follow_uses_the_dedicated_follow_search(self):
         class FollowSearchService(FakePipelineService):

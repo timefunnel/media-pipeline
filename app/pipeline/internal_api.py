@@ -3120,6 +3120,82 @@ class InternalApiApplication:
         }
 
 
+    def match_danmaku(self, payload):
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_request", "request body must be a JSON object")
+        media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
+        try:
+            return self.service.danmaku_match(media_id)
+        except ValueError as exc:
+            raise ApiError(409, "danmaku_unavailable", str(exc))
+        except RuntimeError as exc:
+            raise ApiError(502, "danmaku_match_failed", str(exc))
+
+    def fetch_danmaku(self, payload):
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_request", "request body must be a JSON object")
+        media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
+        episode_id = str(payload.get("episode_id") or "").strip()
+        if episode_id and not episode_id.isdigit():
+            raise ApiError(400, "invalid_episode_id", "episode_id must be a numeric string")
+        source = str(payload.get("source") or "").strip().lower()
+        if source and source not in {"dandanplay", "aggregator"}:
+            raise ApiError(400, "invalid_source", "source must be dandanplay or aggregator")
+        try:
+            ch_convert = int(payload.get("ch_convert") or 0)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_ch_convert", "ch_convert must be an integer")
+        if ch_convert not in (0, 1, 2):
+            raise ApiError(400, "invalid_ch_convert", "ch_convert must be 0, 1 or 2")
+        try:
+            offset_seconds = float(payload.get("offset_seconds") or 0.0)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_offset", "offset_seconds must be a number")
+        if offset_seconds < -600 or offset_seconds > 600:
+            raise ApiError(400, "invalid_offset", "offset_seconds must be within -600..600")
+        try:
+            provider_shift_seconds = float(payload.get("provider_shift_seconds") or 0.0)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_provider_shift", "provider_shift_seconds must be a number")
+        try:
+            return self.service.danmaku_comments(
+                media_id,
+                episode_id=episode_id,
+                source=source,
+                ch_convert=ch_convert,
+                offset_seconds=offset_seconds,
+                provider_shift_seconds=provider_shift_seconds,
+                anime_title=str(payload.get("anime_title") or ""),
+                episode_title=str(payload.get("episode_title") or ""),
+                match_mode=str(payload.get("match_mode") or ""),
+                with_related=payload.get("with_related", True) is not False,
+            )
+        except ValueError as exc:
+            raise ApiError(409, "danmaku_unavailable", str(exc))
+        except RuntimeError as exc:
+            raise ApiError(502, "danmaku_fetch_failed", str(exc))
+
+    def search_danmaku(self, payload):
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_request", "request body must be a JSON object")
+        keyword = require_text(payload.get("keyword"), "keyword", max_length=500)
+        episode = payload.get("episode")
+        if episode not in (None, ""):
+            try:
+                episode = int(episode)
+            except (TypeError, ValueError):
+                raise ApiError(400, "invalid_episode", "episode must be an integer")
+            if episode < 1 or episode > 9999:
+                raise ApiError(400, "invalid_episode", "episode must be between 1 and 9999")
+        else:
+            episode = None
+        try:
+            return self.service.danmaku_search(keyword, episode=episode)
+        except ValueError as exc:
+            raise ApiError(409, "danmaku_unavailable", str(exc))
+        except RuntimeError as exc:
+            raise ApiError(502, "danmaku_search_failed", str(exc))
+
     def search_subtitles(self, payload):
         owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
         media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
@@ -3516,6 +3592,15 @@ class InternalApiServer:
                 return
             if handler.command == "POST" and path == "/v1/subtitles/apply":
                 self._send_json(handler, 200, self.application.apply_subtitle(self._read_json(handler)))
+                return
+            if handler.command == "POST" and path == "/v1/danmaku/match":
+                self._send_json(handler, 200, self.application.match_danmaku(self._read_json(handler)))
+                return
+            if handler.command == "POST" and path == "/v1/danmaku/comment":
+                self._send_json(handler, 200, self.application.fetch_danmaku(self._read_json(handler)))
+                return
+            if handler.command == "POST" and path == "/v1/danmaku/search":
+                self._send_json(handler, 200, self.application.search_danmaku(self._read_json(handler)))
                 return
             if handler.command == "POST" and path == "/v1/subtitles/asr":
                 task, created = self.application.create_subtitle_asr(self._read_json(handler))
