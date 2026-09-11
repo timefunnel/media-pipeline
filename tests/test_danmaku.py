@@ -173,6 +173,24 @@ class TransformTest(unittest.TestCase):
         self.assertEqual(payload["count"], 1)
         self.assertFalse(payload["truncated"])
 
+    def test_unsupported_modes_are_dropped_and_reported(self):
+        # 7=高级弹幕(带坐标脚本) 8=代码弹幕 9=BAS：三端都不渲染，服务端直接丢弃并计数。
+        payload = build_danmaku_payload(
+            [
+                {"cid": "1", "m": "滚动", "time": 1.0, "mode": 1, "color": 0xFFFFFF},
+                {"cid": "2", "m": "逆向", "time": 2.0, "mode": 6, "color": 0xFFFFFF},
+                {"cid": "3", "m": "高级", "time": 3.0, "mode": 7, "color": 0xFFFFFF},
+                {"cid": "4", "m": "代码", "time": 4.0, "mode": 8, "color": 0xFFFFFF},
+                {"cid": "5", "m": "BAS", "time": 5.0, "mode": 9, "color": 0xFFFFFF},
+            ],
+            source="dandanplay",
+            episode_id="1",
+        )
+        self.assertEqual([item["cid"] for item in payload["comments"]], ["1", "2"])
+        self.assertEqual(payload["dropped_modes"], 3)
+        self.assertEqual(payload["total"], 5)
+        self.assertEqual(payload["count"], 2)
+
 
 class CacheTest(unittest.TestCase):
     def test_round_trip_and_ttl_expiry(self):

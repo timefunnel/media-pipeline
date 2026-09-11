@@ -220,6 +220,27 @@ def dedupe_danmaku(comments):
     return out
 
 
+def filter_danmaku_modes(comments):
+    """丢掉客户端无法安全渲染的模式，返回 ``(comments, dropped)``。
+
+    保留 1/4/5（滚动/底部/顶部）与 6（逆向滚动，可降级为普通滚动）；
+    丢弃 7（高级弹幕，携带坐标脚本）、8（代码弹幕）、9（BAS）—— 这些需要执行
+    不可信内容或复杂排版，三端都不实现。丢弃数量必须上报，不能静默吞掉。
+    """
+    kept = []
+    dropped = 0
+    for item in comments or []:
+        try:
+            mode = int(item.get("mode") or 0)
+        except (TypeError, ValueError):
+            mode = 0
+        if mode in DANMAKU_RENDERABLE_MODES or mode in DANMAKU_DEGRADED_MODES:
+            kept.append(item)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
 def filter_danmaku_keywords(comments, keywords):
     """关键词/正则黑名单过滤；空规则时原样返回。"""
     patterns = []
@@ -296,8 +317,9 @@ def build_danmaku_payload(
     """把归一化后的弹幕组装成对客户端下发的结构（弹弹play JSON 字段 + 结构化补充）。"""
     items = dedupe_danmaku(comments)
     total = len(items)
+    items, dropped_modes = filter_danmaku_modes(items)
     items = filter_danmaku_keywords(items, blacklist)
-    filtered = total - len(items)
+    filtered = total - dropped_modes - len(items)
     items = apply_danmaku_offset(items, provider_shift_seconds)
     items = apply_danmaku_offset(items, offset_seconds)
     items, truncated = sample_danmaku(items, max_comments)
@@ -314,6 +336,7 @@ def build_danmaku_payload(
         "count": len(items),
         "total": total,
         "filtered": filtered,
+        "dropped_modes": dropped_modes,
         "skipped": int(skipped or 0),
         "truncated": truncated,
         "comments": items,
