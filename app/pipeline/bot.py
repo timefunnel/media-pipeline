@@ -71,6 +71,17 @@ from pipeline.external_subtitles import (
     adult_source_declares_chinese_subtitles,
     build_subtitle_matcher_from_config,
 )
+from pipeline.danmaku import (
+    DEFAULT_DANDANPLAY_BASE_URL,
+    DEFAULT_DANMAKU_CACHE_DIR,
+    DEFAULT_DANMAKU_CACHE_TTL_SECONDS,
+    DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS,
+    DEFAULT_DANMAKU_MATCH_TTL_SECONDS,
+    DEFAULT_DANMAKU_MAX_COMMENTS,
+    DEFAULT_DANMAKU_PROVIDERS,
+    DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS,
+    build_danmaku_matcher_from_config,
+)
 from pipeline.openlist_utils import (
     is_openlist_video_file,
     normalize_openlist_path,
@@ -474,6 +485,20 @@ class BotConfig:
     opensubtitles_api_key: str = ""
     opensubtitles_username: str = ""
     opensubtitles_password: str = ""
+    danmaku_enabled: bool = False
+    danmaku_providers: tuple = DEFAULT_DANMAKU_PROVIDERS
+    danmaku_cache_dir: str = DEFAULT_DANMAKU_CACHE_DIR
+    danmaku_cache_ttl_seconds: int = DEFAULT_DANMAKU_CACHE_TTL_SECONDS
+    danmaku_match_ttl_seconds: int = DEFAULT_DANMAKU_MATCH_TTL_SECONDS
+    danmaku_search_timeout_seconds: int = DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS
+    danmaku_comment_timeout_seconds: int = DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS
+    danmaku_max_comments: int = DEFAULT_DANMAKU_MAX_COMMENTS
+    danmaku_blacklist: tuple = ()
+    danmaku_proxy_url: str = ""
+    dandanplay_base_url: str = DEFAULT_DANDANPLAY_BASE_URL
+    dandanplay_app_id: str = ""
+    dandanplay_app_secret: str = ""
+    danmaku_aggregator_url: str = ""
     openlist_scan_username: str = ""
     openlist_scan_password: str = ""
     search_page_size: int = SEARCH_PAGE_SIZE
@@ -667,6 +692,35 @@ class BotConfig:
             opensubtitles_api_key=env.get("OPENSUBTITLES_API_KEY", ""),
             opensubtitles_username=env.get("OPENSUBTITLES_USERNAME", ""),
             opensubtitles_password=env.get("OPENSUBTITLES_PASSWORD", ""),
+            danmaku_enabled=parse_bool(env.get("DANMAKU_ENABLED"), False),
+            danmaku_providers=parse_csv_strings(env.get("DANMAKU_PROVIDERS"), DEFAULT_DANMAKU_PROVIDERS),
+            danmaku_cache_dir=env.get("DANMAKU_CACHE_DIR", DEFAULT_DANMAKU_CACHE_DIR),
+            danmaku_cache_ttl_seconds=max(
+                0,
+                int(env.get("DANMAKU_CACHE_TTL_SECONDS", str(DEFAULT_DANMAKU_CACHE_TTL_SECONDS))),
+            ),
+            danmaku_match_ttl_seconds=max(
+                0,
+                int(env.get("DANMAKU_MATCH_TTL_SECONDS", str(DEFAULT_DANMAKU_MATCH_TTL_SECONDS))),
+            ),
+            danmaku_search_timeout_seconds=max(
+                1,
+                int(env.get("DANMAKU_SEARCH_TIMEOUT_SECONDS", str(DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS))),
+            ),
+            danmaku_comment_timeout_seconds=max(
+                1,
+                int(env.get("DANMAKU_COMMENT_TIMEOUT_SECONDS", str(DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS))),
+            ),
+            danmaku_max_comments=max(
+                1,
+                int(env.get("DANMAKU_MAX_COMMENTS", str(DEFAULT_DANMAKU_MAX_COMMENTS))),
+            ),
+            danmaku_blacklist=parse_csv_strings(env.get("DANMAKU_BLACKLIST"), ()),
+            danmaku_proxy_url=str(env.get("DANMAKU_PROXY_URL") or "").strip(),
+            dandanplay_base_url=str(env.get("DANDANPLAY_BASE_URL") or DEFAULT_DANDANPLAY_BASE_URL).strip(),
+            dandanplay_app_id=str(env.get("DANDANPLAY_APP_ID") or "").strip(),
+            dandanplay_app_secret=str(env.get("DANDANPLAY_APP_SECRET") or "").strip(),
+            danmaku_aggregator_url=str(env.get("DANMAKU_AGGREGATOR_URL") or "").strip(),
             search_page_size=int(env.get("BOT_SEARCH_PAGE_SIZE", str(SEARCH_PAGE_SIZE))),
             task_list_page_size=int(env.get("BOT_TASK_LIST_PAGE_SIZE", str(DEFAULT_TASK_LIST_PAGE_SIZE))),
             task_list_fetch_limit=int(env.get("BOT_TASK_LIST_FETCH_LIMIT", str(DEFAULT_TASK_LIST_FETCH_LIMIT))),
