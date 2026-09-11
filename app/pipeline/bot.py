@@ -82,6 +82,10 @@ from pipeline.danmaku import (
     DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS,
     build_danmaku_matcher_from_config,
 )
+from pipeline.danmaku_prewarm import (
+    DEFAULT_DANMAKU_PREWARM_DELAY_SECONDS,
+    DEFAULT_DANMAKU_PREWARM_MAX_EPISODES,
+)
 from pipeline.openlist_utils import (
     is_openlist_video_file,
     normalize_openlist_path,
@@ -499,6 +503,8 @@ class BotConfig:
     dandanplay_app_id: str = ""
     dandanplay_app_secret: str = ""
     danmaku_aggregator_url: str = ""
+    danmaku_prewarm_delay_seconds: float = DEFAULT_DANMAKU_PREWARM_DELAY_SECONDS
+    danmaku_prewarm_max_episodes: int = DEFAULT_DANMAKU_PREWARM_MAX_EPISODES
     openlist_scan_username: str = ""
     openlist_scan_password: str = ""
     search_page_size: int = SEARCH_PAGE_SIZE
@@ -721,6 +727,14 @@ class BotConfig:
             dandanplay_app_id=str(env.get("DANDANPLAY_APP_ID") or "").strip(),
             dandanplay_app_secret=str(env.get("DANDANPLAY_APP_SECRET") or "").strip(),
             danmaku_aggregator_url=str(env.get("DANMAKU_AGGREGATOR_URL") or "").strip(),
+            danmaku_prewarm_delay_seconds=max(
+                0.0,
+                float(env.get("DANMAKU_PREWARM_DELAY_SECONDS", str(DEFAULT_DANMAKU_PREWARM_DELAY_SECONDS))),
+            ),
+            danmaku_prewarm_max_episodes=max(
+                1,
+                int(env.get("DANMAKU_PREWARM_MAX_EPISODES", str(DEFAULT_DANMAKU_PREWARM_MAX_EPISODES))),
+            ),
             search_page_size=int(env.get("BOT_SEARCH_PAGE_SIZE", str(SEARCH_PAGE_SIZE))),
             task_list_page_size=int(env.get("BOT_TASK_LIST_PAGE_SIZE", str(DEFAULT_TASK_LIST_PAGE_SIZE))),
             task_list_fetch_limit=int(env.get("BOT_TASK_LIST_FETCH_LIMIT", str(DEFAULT_TASK_LIST_FETCH_LIMIT))),

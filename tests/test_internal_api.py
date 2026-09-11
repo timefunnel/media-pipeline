@@ -33,6 +33,7 @@ from pipeline.bot import (
     wait_openlist_receive_root_entries,
 )
 from pipeline.config import category_to_folder_id, category_to_openlist_path
+from pipeline.danmaku_prewarm import DanmakuPrewarmManager
 from pipeline.internal_api import (
     ApiError,
     ImportTaskManager,
@@ -1320,6 +1321,112 @@ class DanmakuHttpRouteTest(InternalApiTestCase):
             self.assertEqual(service.match_calls, ["media-1"])
         finally:
             server.stop()
+
+
+class DanmakuPrewarmApiTest(InternalApiTestCase):
+    def build_prewarm_components(self, service=None):
+        service = service or FakeDanmakuService()
+        store = InternalApiStore(self.db_path)
+        manager = ImportTaskManager(service, store, workers=1, owner_workers=1, poll_seconds=0.01)
+        prewarm = DanmakuPrewarmManager(service, delay_seconds=0.0, sleep=lambda _seconds: None)
+        application = InternalApiApplication(service, store, manager, danmaku_prewarm_manager=prewarm)
+        return service, manager, prewarm, application
+
+    def wait_prewarm(self, prewarm, task_id, timeout=3):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            task = prewarm.get(task_id)
+            if task and task["status"] in {"completed", "failed", "canceled"}:
+                return task
+            time.sleep(0.01)
+        self.fail("prewarm task did not finish")
+
+    def test_prewarm_requires_media_season_and_episodes(self):
+        _service, manager, prewarm, application = self.build_prewarm_components()
+        prewarm.start()
+        try:
+            with self.assertRaises(ApiError) as raised:
+                application.create_danmaku_prewarm({"owner_id": "admin", "season": 1, "episodes": [{"media_id": "a"}]})
+            self.assertEqual(raised.exception.code, "missing_media_id")
+
+            with self.assertRaises(ApiError) as raised:
+                application.create_danmaku_prewarm(
+                    {"owner_id": "admin", "media_id": "season-1", "episodes": [{"media_id": "a"}]}
+                )
+            self.assertEqual(raised.exception.code, "invalid_season")
+
+            with self.assertRaises(ApiError) as raised:
+                application.create_danmaku_prewarm(
+                    {"owner_id": "admin", "media_id": "season-1", "season": 1, "episodes": []}
+                )
+            self.assertEqual(raised.exception.code, "invalid_episodes")
+
+            # 超限必须报错，不能静默截断成"整季都预热过了"。
+            with self.assertRaises(ApiError) as raised:
+                application.create_danmaku_prewarm(
+                    {
+                        "owner_id": "admin",
+                        "media_id": "season-1",
+                        "season": 1,
+                        "episodes": [{"media_id": str(index)} for index in range(200)],
+                    }
+                )
+            self.assertEqual(raised.exception.code, "invalid_episodes")
+        finally:
+            prewarm.stop()
+            manager.stop()
+
+    def test_prewarm_runs_in_the_background_and_reports_progress(self):
+        service, manager, prewarm, application = self.build_prewarm_components()
+        prewarm.start()
+        try:
+            task = application.create_danmaku_prewarm(
+                {
+                    "owner_id": "admin",
+                    "media_id": "season-1",
+                    "season": 1,
+                    "episodes": [
+                        {"media_id": "ep-1", "episode_key": "S01E01"},
+                        {"media_id": "ep-2", "episode_key": "S01E02"},
+                    ],
+                }
+            )
+            self.assertIn(task["status"], {"queued", "running"})
+            finished = self.wait_prewarm(prewarm, task["task_id"])
+            self.assertEqual(finished["status"], "completed")
+            self.assertEqual(finished["total"], 2)
+            self.assertEqual(finished["processed"], 2)
+            self.assertEqual(service.comment_calls[0]["media_id"], "ep-1")
+            self.assertEqual(service.comment_calls[1]["media_id"], "ep-2")
+
+            fetched = application.get_danmaku_prewarm(task["task_id"])
+            self.assertEqual(fetched["task_id"], task["task_id"])
+            listed = application.list_danmaku_prewarm(5)
+            self.assertEqual(listed["items"][0]["task_id"], task["task_id"])
+        finally:
+            prewarm.stop()
+            manager.stop()
+
+    def test_unknown_prewarm_task_is_404_and_missing_manager_is_503(self):
+        _service, _store, manager, application = self.build_components()
+        try:
+            with self.assertRaises(ApiError) as raised:
+                application.get_danmaku_prewarm("nope")
+            self.assertEqual(raised.exception.status, 503)
+            self.assertEqual(raised.exception.code, "danmaku_prewarm_unavailable")
+        finally:
+            manager.stop()
+
+        _service, manager, prewarm, application = self.build_prewarm_components()
+        prewarm.start()
+        try:
+            with self.assertRaises(ApiError) as raised:
+                application.get_danmaku_prewarm("nope")
+            self.assertEqual(raised.exception.status, 404)
+            self.assertEqual(raised.exception.code, "danmaku_prewarm_not_found")
+        finally:
+            prewarm.stop()
+            manager.stop()
 
 
 class SearchResponseTest(InternalApiTestCase):

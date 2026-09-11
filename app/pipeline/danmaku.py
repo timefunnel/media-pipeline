@@ -313,6 +313,7 @@ def build_danmaku_payload(
     blacklist=None,
     ch_convert=0,
     skipped=0,
+    cached=False,
 ):
     """把归一化后的弹幕组装成对客户端下发的结构（弹弹play JSON 字段 + 结构化补充）。"""
     items = dedupe_danmaku(comments)
@@ -339,6 +340,7 @@ def build_danmaku_payload(
         "dropped_modes": dropped_modes,
         "skipped": int(skipped or 0),
         "truncated": truncated,
+        "cached": bool(cached),
         "comments": items,
     }
 
@@ -787,6 +789,7 @@ class DanmakuMatcher:
             int(ch_convert or 0),
         )
         cached = self.cache.load(cache_key, self.cache_ttl_seconds)
+        served_from_cache = cached is not None
         if cached is None:
             cached = source.comment(episode, with_related=with_related, ch_convert=ch_convert)
             self.cache.save(cache_key, cached)
@@ -804,6 +807,7 @@ class DanmakuMatcher:
             blacklist=self.blacklist,
             ch_convert=ch_convert,
             skipped=int(cached.get("skipped") or 0),
+            cached=served_from_cache,
         )
 
     def search(self, keyword, episode=None):
