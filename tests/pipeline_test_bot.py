@@ -4351,6 +4351,85 @@ class LlmSearchRerankClientTest(unittest.TestCase):
 
 
 class PipelineBotServiceTest(unittest.TestCase):
+    def test_msg_ingest_episode_batch_requires_explicit_rows_and_preserves_mapping(self):
+        from pipeline.bot import msg_ingest_episode_batch
+
+        task = {
+            "msg_ingest_media_count": 2,
+            "msg_ingest_media_items": [
+                {"id": "episode-1", "season_num": 1, "episode_num": 1},
+                {"id": "episode-2", "season_num": 1, "episode_num": 2},
+            ],
+        }
+        media_ids, mappings = msg_ingest_episode_batch("anime", task, "episode-1")
+        self.assertEqual(media_ids, ["episode-1", "episode-2"])
+        self.assertEqual(mappings["episode-1"]["season_num"], 1)
+        self.assertEqual(mappings["episode-2"]["episode_num"], 2)
+        with self.assertRaisesRegex(RuntimeError, "explicit episode rows"):
+            msg_ingest_episode_batch("tv", {"msg_ingest_media_count": 2}, "episode-1")
+
+    def test_scrape_msg_media_sends_explicit_ingest_episode_batch(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        fake_msg = FakeMediaStationClient(
+            pipeline_scrape_response={
+                "mode": "apply",
+                "query": "示例剧",
+                "applied_count": 2,
+                "scrape_status": "matched",
+            }
+        )
+        service = PipelineBotService(
+            BotConfig(
+                "token",
+                {700656624},
+                "/tmp/state.db",
+                msg_admin_user="admin",
+                msg_admin_password="secret",
+                msg_enabled=True,
+            )
+        )
+        task = {
+            "msg_ingest_media_count": 2,
+            "msg_ingest_media_items": [
+                {"id": "episode-1", "season_num": 1, "episode_num": 1},
+                {"id": "episode-2", "season_num": 1, "episode_num": 2},
+            ],
+        }
+
+        result = service._scrape_msg_media(
+            fake_msg,
+            "tv",
+            "episode-1",
+            "示例剧",
+            task,
+            {"id": "episode-1", "path": "/library/示例剧/S01E01.mkv"},
+        )
+
+        self.assertEqual(result["msg_scrape_applied_count"], 2)
+        self.assertEqual(
+            fake_msg.pipeline_scrape_batch_calls,
+            [
+                (
+                    ["episode-1", "episode-2"],
+                    {
+                        "episode-1": {
+                            "season_num": 1,
+                            "episode_num": 1,
+                            "episode_end_num": 0,
+                            "episode_part_num": 0,
+                        },
+                        "episode-2": {
+                            "season_num": 1,
+                            "episode_num": 2,
+                            "episode_end_num": 0,
+                            "episode_part_num": 0,
+                        },
+                    },
+                )
+            ],
+        )
+
     def test_tv_ingest_scrape_rejects_partial_coverage(self):
         from pipeline.bot import require_msg_scrape_coverage
 

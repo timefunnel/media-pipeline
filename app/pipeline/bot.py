@@ -4068,6 +4068,13 @@ class PipelineBotService:
         root = self._msg_target(category, target)
         provider = root.get("provider")
         media_type = root.get("media_type")
+        scrape_kwargs = {}
+        episode_batch = msg_ingest_episode_batch(category, task, media_id)
+        if episode_batch is not None:
+            scrape_kwargs = {
+                "media_ids": episode_batch[0],
+                "episode_mappings": episode_batch[1],
+            }
         result = client.pipeline_scrape_media(
             media_id,
             category,
@@ -4075,6 +4082,7 @@ class PipelineBotService:
             msg_scrape_queries(title, task, media, preferred_queries),
             provider,
             media_type,
+            **scrape_kwargs,
         )
         if not isinstance(result, dict) or result.get("mode") not in ("apply", "smart"):
             raise RuntimeError("MediaStationGo pipeline scrape returned invalid response")
@@ -4386,10 +4394,33 @@ class PipelineBotService:
         }
         media_items = result.get("media_items")
         if isinstance(media_items, list):
-            media_ids = [str(item.get("id") or "").strip() for item in media_items if isinstance(item, dict)]
-            media_ids = [value for value in media_ids if value]
+            normalized_media_items = []
+            for item in media_items:
+                if not isinstance(item, dict):
+                    continue
+                media_id = str(item.get("id") or "").strip()
+                if not media_id:
+                    continue
+                normalized_media_items.append(
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "id",
+                            "title",
+                            "path",
+                            "match_mode",
+                            "match_path",
+                            "season_num",
+                            "episode_num",
+                            "episode_end_num",
+                            "episode_part_num",
+                        )
+                    }
+                )
+            media_ids = [item["id"] for item in normalized_media_items]
             updates["msg_ingest_media_ids"] = media_ids
             updates["msg_ingest_media_count"] = len(media_ids)
+            updates["msg_ingest_media_items"] = normalized_media_items
         ignored_media = result.get("ignored_media")
         if isinstance(ignored_media, list):
             updates["msg_ingest_ignored_media"] = [dict(item) for item in ignored_media if isinstance(item, dict)]
@@ -7905,6 +7936,53 @@ def require_msg_scrape_coverage(category, task, scrape_result):
         )
 
 
+def msg_ingest_episode_batch(category, task, anchor_media_id):
+    """Return explicit mappings for a multi-episode ingest, when available.
+
+    The ingest response is the authority for the rows that belong to the
+    target tree.  Passing those rows explicitly prevents the scrape stage from
+    selecting one arbitrary representative and then trying to infer season
+    numbers from heterogeneous release filenames.
+    """
+    if str(category or "").strip().lower() not in {"tv", "anime"}:
+        return None
+    ingested_count = int((task or {}).get("msg_ingest_media_count") or 0)
+    if ingested_count <= 1:
+        return None
+    items = (task or {}).get("msg_ingest_media_items")
+    if not isinstance(items, list) or len(items) != ingested_count:
+        raise RuntimeError("MediaStationGo ingest did not return explicit episode rows for batch scrape")
+
+    anchor_media_id = str(anchor_media_id or "").strip()
+    media_ids = []
+    mappings = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise RuntimeError("MediaStationGo ingest returned an invalid episode row")
+        media_id = str(item.get("id") or "").strip()
+        if not media_id or media_id in mappings:
+            raise RuntimeError("MediaStationGo ingest returned duplicate or missing episode media ID")
+        try:
+            season_num = int(item.get("season_num") or 0)
+            episode_num = int(item.get("episode_num") or 0)
+            episode_end_num = int(item.get("episode_end_num") or 0)
+            episode_part_num = int(item.get("episode_part_num") or 0)
+        except (TypeError, ValueError):
+            raise RuntimeError("MediaStationGo ingest returned an invalid episode mapping")
+        if season_num < 0 or episode_num < 1 or episode_end_num < 0 or episode_part_num < 0:
+            raise RuntimeError("MediaStationGo ingest returned an invalid episode mapping")
+        media_ids.append(media_id)
+        mappings[media_id] = {
+            "season_num": season_num,
+            "episode_num": episode_num,
+            "episode_end_num": episode_end_num,
+            "episode_part_num": episode_part_num,
+        }
+    if anchor_media_id not in mappings:
+        raise RuntimeError("MediaStationGo ingest batch does not include the selected media")
+    return media_ids, mappings
+
+
 STALE_MSG_MEDIA_RESET_KEYS = (
     "msg_media_id",
     "msg_media_title",
@@ -7922,6 +8000,7 @@ STALE_MSG_MEDIA_RESET_KEYS = (
     "msg_ingest_scan_removed",
     "msg_ingest_media_ids",
     "msg_ingest_media_count",
+    "msg_ingest_media_items",
     "msg_ingest_ignored_media",
     "msg_ingest_ignored_count",
     "msg_cloud_subtitle_status",

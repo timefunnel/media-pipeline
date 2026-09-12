@@ -419,6 +419,7 @@ class FakeMediaStationClient:
         self.scrape_search_calls = []
         self.scrape_apply_calls = []
         self.pipeline_scrape_calls = []
+        self.pipeline_scrape_batch_calls = []
         self.pipeline_maintenance_calls = []
         self.pipeline_ingest_calls = []
         self.pipeline_ingest_jobs = {}
@@ -437,8 +438,22 @@ class FakeMediaStationClient:
         self.list_calls.append((library_id, page, page_size, group_versions))
         return self.list_response
 
-    def pipeline_scrape_media(self, media_id, category, title, queries, provider, media_type):
+    def pipeline_scrape_media(
+        self,
+        media_id,
+        category,
+        title,
+        queries,
+        provider,
+        media_type,
+        media_ids=None,
+        episode_mappings=None,
+    ):
         self.pipeline_scrape_calls.append((media_id, category, title, list(queries or []), provider, media_type))
+        if media_ids is not None or episode_mappings is not None:
+            self.pipeline_scrape_batch_calls.append(
+                (list(media_ids or []), dict(episode_mappings or {}))
+            )
         if self.pipeline_scrape_response is not None:
             return self.pipeline_scrape_response
         for query in queries or []:

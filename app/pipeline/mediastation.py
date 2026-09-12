@@ -154,17 +154,36 @@ class MediaStationClient:
             media.append(representative)
         return media
 
-    def pipeline_scrape_media(self, media_id, category, title, queries, provider, media_type):
+    def pipeline_scrape_media(
+        self,
+        media_id,
+        category,
+        title,
+        queries,
+        provider,
+        media_type,
+        media_ids=None,
+        episode_mappings=None,
+    ):
+        data = {
+            "category": category,
+            "title": title,
+            "queries": list(queries or []),
+            "provider": provider,
+            "media_type": media_type,
+        }
+        if media_ids is not None:
+            data["media_ids"] = [str(value).strip() for value in media_ids if str(value).strip()]
+        if episode_mappings is not None:
+            data["episode_mappings"] = {
+                str(media_id).strip(): dict(mapping or {})
+                for media_id, mapping in episode_mappings.items()
+                if str(media_id).strip()
+            }
         return self._pipeline_request(
             "POST",
             "/pipeline/media/%s/scrape" % quote_path(media_id),
-            data={
-                "category": category,
-                "title": title,
-                "queries": list(queries or []),
-                "provider": provider,
-                "media_type": media_type,
-            },
+            data=data,
         )
 
     def pipeline_repair_movie_extras(self, media_id, target):
