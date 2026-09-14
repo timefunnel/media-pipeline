@@ -58,6 +58,23 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.subscription_staging_folder_id, "")
         self.assertFalse(config.subtitle_auto_match_adult_only)
 
+    def test_bot_config_reads_danmaku_cache_ttls(self):
+        from pipeline.bot import BotConfig
+
+        config = BotConfig.from_env(
+            {
+                "TG_BOT_TOKEN": "123:token",
+                "TG_ALLOWED_USER_IDS": "700656624",
+                "DANMAKU_CACHE_TTL_SECONDS": "604800",
+                "DANMAKU_MATCH_TTL_SECONDS": "86400",
+                "DANMAKU_SEARCH_CACHE_TTL_SECONDS": "86400",
+            }
+        )
+
+        self.assertEqual(config.danmaku_cache_ttl_seconds, 604800)
+        self.assertEqual(config.danmaku_match_ttl_seconds, 86400)
+        self.assertEqual(config.danmaku_search_cache_ttl_seconds, 86400)
+
     def test_bot_config_reads_subscription_staging_settings(self):
         from pipeline.bot import BotConfig
 

@@ -80,6 +80,7 @@ from pipeline.danmaku import (
     DEFAULT_DANMAKU_MATCH_TTL_SECONDS,
     DEFAULT_DANMAKU_MAX_COMMENTS,
     DEFAULT_DANMAKU_PROVIDERS,
+    DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS,
     DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS,
     build_danmaku_local_import_from_config,
     build_danmaku_matcher_from_config,
@@ -496,6 +497,7 @@ class BotConfig:
     danmaku_cache_dir: str = DEFAULT_DANMAKU_CACHE_DIR
     danmaku_cache_ttl_seconds: int = DEFAULT_DANMAKU_CACHE_TTL_SECONDS
     danmaku_match_ttl_seconds: int = DEFAULT_DANMAKU_MATCH_TTL_SECONDS
+    danmaku_search_cache_ttl_seconds: int = DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS
     danmaku_search_timeout_seconds: int = DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS
     danmaku_comment_timeout_seconds: int = DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS
     danmaku_max_comments: int = DEFAULT_DANMAKU_MAX_COMMENTS
@@ -711,6 +713,15 @@ class BotConfig:
             danmaku_match_ttl_seconds=max(
                 0,
                 int(env.get("DANMAKU_MATCH_TTL_SECONDS", str(DEFAULT_DANMAKU_MATCH_TTL_SECONDS))),
+            ),
+            danmaku_search_cache_ttl_seconds=max(
+                0,
+                int(
+                    env.get(
+                        "DANMAKU_SEARCH_CACHE_TTL_SECONDS",
+                        str(DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS),
+                    )
+                ),
             ),
             danmaku_search_timeout_seconds=max(
                 1,

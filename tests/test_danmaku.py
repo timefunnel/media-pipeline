@@ -1,8 +1,10 @@
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -410,6 +412,81 @@ class MatcherTest(unittest.TestCase):
         self.assertEqual(first["count"], 1)
         self.assertEqual(first["comments"][0]["time"], 12.0)
         self.assertEqual(second["comments"][0]["time"], 12.0)
+
+    def test_concurrent_comment_cache_miss_only_calls_upstream_once(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def comment_response(_url, _data):
+            started.set()
+            release.wait(1)
+            return {
+                "count": 1,
+                "comments": [{"cid": 1, "p": "1,1,16777215,u", "m": "并发"}],
+            }
+
+        transport = FakeTransport([("/api/v2/comment/8", comment_response)])
+        matcher = self._matcher(transport)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(matcher.comments, "8")
+            self.assertTrue(started.wait(1))
+            second = executor.submit(matcher.comments, "8")
+            time.sleep(0.02)
+            self.assertEqual(len(transport.calls), 1)
+            release.set()
+            first_payload = first.result(timeout=1)
+            second_payload = second.result(timeout=1)
+
+        self.assertFalse(first_payload["cached"])
+        self.assertTrue(second_payload["cached"])
+
+    def test_manual_search_cache_is_reused_by_automatic_title_match(self):
+        transport = FakeTransport(
+            [
+                (
+                    "/api/v2/search/episodes",
+                    {
+                        "animes": [
+                            {
+                                "animeId": 42,
+                                "animeTitle": "某番",
+                                "episodes": [
+                                    {"episodeId": 420003, "episodeTitle": "第3话", "episodeNumber": "3"}
+                                ],
+                            }
+                        ]
+                    },
+                ),
+                ("/api/v2/match", {"isMatched": False, "matches": []}),
+            ]
+        )
+        matcher = self._matcher(transport)
+
+        searched = matcher.search("某番")
+        matched = matcher.match(title="某番", episode=3, file_name="show.s01e03.mkv")
+
+        self.assertFalse(searched["cached"])
+        self.assertEqual(matched["match_mode"], "title")
+        self.assertTrue(matched["attempts"][-1]["cached"])
+        self.assertEqual(len(transport.calls), 2, "自动标题匹配必须复用手动搜索的本地缓存")
+
+    def test_unmatched_source_attempts_are_reused_without_another_upstream_call(self):
+        transport = FakeTransport(
+            [
+                ("/api/v2/match", {"isMatched": False, "matches": []}),
+                ("/api/v2/search/episodes", {"animes": []}),
+            ]
+        )
+        matcher = self._matcher(transport)
+
+        first = matcher.match(title="不存在", episode=1, file_name="missing.mkv")
+        second = matcher.match(title="不存在", episode=1, file_name="missing.mkv")
+
+        self.assertFalse(first["matched"])
+        self.assertFalse(second["matched"])
+        self.assertTrue(second["cached"])
+        self.assertTrue(all(item["cached"] for item in second["attempts"]))
+        self.assertEqual(len(transport.calls), 2, "第二次匹配的每一步都必须先命中本地缓存")
 
     def test_sampling_caps_large_payloads(self):
         comments = [{"cid": str(i), "p": "%d.0,1,16777215,u" % i, "m": "d%d" % i} for i in range(50)]
