@@ -220,45 +220,13 @@ class CacheTest(unittest.TestCase):
 
 
 class SourceTest(unittest.TestCase):
-    def test_match_uses_placeholder_hash_and_reports_shift(self):
-        transport = FakeTransport(
-            [
-                (
-                    "/api/v2/match",
-                    {
-                        "isMatched": True,
-                        "matches": [
-                            {
-                                "episodeId": 95410010,
-                                "animeId": 9541,
-                                "animeTitle": "进击的巨人",
-                                "episodeTitle": "第10话",
-                                "shift": 2,
-                            }
-                        ],
-                        "success": True,
-                    },
-                )
-            ]
-        )
-        source = danmaku_source(transport)
-        result = source.match("some.file.mkv")
-        self.assertTrue(result["is_matched"])
-        self.assertEqual(result["matches"][0]["episode_id"], "95410010")
-        self.assertEqual(result["matches"][0]["shift"], 2.0)
-        body = transport.calls[0]["data"]
-        self.assertEqual(body["matchMode"], "hashAndFileName")
-        self.assertTrue(body["fileHash"])
-        self.assertEqual(transport.calls[0]["headers"]["X-AppId"], "demo-app")
-        self.assertIn("X-Signature", transport.calls[0]["headers"])
-
     def test_business_error_is_raised_not_swallowed(self):
         transport = FakeTransport(
             [("/api/v2/search/episodes", {"success": False, "errorCode": 3, "errorMessage": "应用不存在"})]
         )
         source = danmaku_source(transport)
         with self.assertRaises(RuntimeError) as ctx:
-            source.search_episodes(anime="进击的巨人")
+            source.search_episodes(tmdb_id=1429)
         self.assertIn("应用不存在", str(ctx.exception))
 
     def test_comment_parses_four_segment_payload(self):
@@ -295,6 +263,13 @@ class SourceTest(unittest.TestCase):
         self.assertIn("episode=2", url)
         self.assertIn("v2=true", url)
 
+    def test_search_requires_tmdb_id_without_calling_upstream(self):
+        transport = FakeTransport([])
+        source = danmaku_source(transport)
+        with self.assertRaises(ValueError):
+            source.search_episodes(tmdb_id="")
+        self.assertEqual(transport.calls, [])
+
     def test_source_disabled_without_credentials(self):
         self.assertFalse(danmaku_source(FakeTransport([]), app_id="", app_secret="").enabled())
         self.assertFalse(danmaku_source(FakeTransport([]), app_id="id", app_secret="").enabled())
@@ -316,7 +291,7 @@ class MatcherTest(unittest.TestCase):
         options.update(kwargs)
         return DanmakuMatcher(sources or [danmaku_source(transport)], **options)
 
-    def test_tmdb_lookup_wins_over_filename(self):
+    def test_match_uses_only_tmdb_lookup(self):
         transport = FakeTransport(
             [
                 (
@@ -334,44 +309,35 @@ class MatcherTest(unittest.TestCase):
                         ]
                     },
                 ),
-                ("/api/v2/match", {"isMatched": True, "matches": [{"episodeId": 999, "animeTitle": "错的"}]}),
             ]
         )
-        result = self._matcher(transport).match(title="进击的巨人", episode=10, tmdb_id=1429, file_name="a.mkv")
+        result = self._matcher(transport).match(episode=10, tmdb_id=1429)
         self.assertTrue(result["matched"])
         self.assertEqual(result["match_mode"], "tmdb")
         self.assertEqual(result["episode_id"], "95410010")
         self.assertEqual(len(transport.calls), 1)
 
-    def test_falls_back_to_filename_match_when_tmdb_has_no_episode(self):
-        transport = FakeTransport(
-            [
-                ("/api/v2/search/episodes", {"animes": []}),
-                (
-                    "/api/v2/match",
-                    {
-                        "isMatched": True,
-                        "matches": [{"episodeId": 42, "animeTitle": "某番", "episodeTitle": "第3话", "shift": 1}],
-                    },
-                ),
-            ]
-        )
-        result = self._matcher(transport).match(title="某番", episode=3, tmdb_id=1, file_name="a.mkv")
-        self.assertEqual(result["match_mode"], "filename")
-        self.assertEqual(result["episode_id"], "42")
-        self.assertEqual(result["shift"], 1.0)
+    def test_tmdb_empty_result_does_not_fall_back_to_other_match_modes(self):
+        transport = FakeTransport([("/api/v2/search/episodes", {"animes": []})])
+        result = self._matcher(transport).match(episode=3, tmdb_id=1)
+        self.assertFalse(result["matched"])
+        self.assertEqual([item["mode"] for item in result["attempts"]], ["tmdb"])
+        self.assertEqual(len(transport.calls), 1)
 
     def test_unmatched_result_is_reported_with_attempts(self):
-        transport = FakeTransport(
-            [
-                ("/api/v2/search/episodes", {"animes": []}),
-                ("/api/v2/match", {"isMatched": False, "matches": []}),
-            ]
-        )
-        result = self._matcher(transport).match(title="不存在", episode=1, file_name="x.mkv")
+        transport = FakeTransport([("/api/v2/search/episodes", {"animes": []})])
+        result = self._matcher(transport).match(tmdb_id=1, episode=1)
         self.assertFalse(result["matched"])
         self.assertEqual(result["episode_id"], "")
         self.assertTrue(result["attempts"])
+
+    def test_missing_tmdb_id_is_explicit_and_never_calls_upstream(self):
+        transport = FakeTransport([])
+        result = self._matcher(transport).match(episode=1)
+        self.assertFalse(result["matched"])
+        self.assertEqual(result["attempts"][0]["outcome"], "skipped")
+        self.assertEqual(result["attempts"][0]["error"], "tmdb_id is required")
+        self.assertEqual(transport.calls, [])
 
     def test_aggregator_is_used_when_primary_source_fails(self):
         primary_transport = FakeTransport(
@@ -440,53 +406,57 @@ class MatcherTest(unittest.TestCase):
         self.assertFalse(first_payload["cached"])
         self.assertTrue(second_payload["cached"])
 
-    def test_manual_search_cache_is_reused_by_automatic_title_match(self):
-        transport = FakeTransport(
-            [
-                (
-                    "/api/v2/search/episodes",
-                    {
-                        "animes": [
-                            {
-                                "animeId": 42,
-                                "animeTitle": "某番",
-                                "episodes": [
-                                    {"episodeId": 420003, "episodeTitle": "第3话", "episodeNumber": "3"}
-                                ],
-                            }
-                        ]
-                    },
-                ),
-                ("/api/v2/match", {"isMatched": False, "matches": []}),
-            ]
-        )
+    def test_unmatched_tmdb_lookup_is_reused_without_another_upstream_call(self):
+        transport = FakeTransport([("/api/v2/search/episodes", {"animes": []})])
         matcher = self._matcher(transport)
 
-        searched = matcher.search("某番")
-        matched = matcher.match(title="某番", episode=3, file_name="show.s01e03.mkv")
-
-        self.assertFalse(searched["cached"])
-        self.assertEqual(matched["match_mode"], "title")
-        self.assertTrue(matched["attempts"][-1]["cached"])
-        self.assertEqual(len(transport.calls), 2, "自动标题匹配必须复用手动搜索的本地缓存")
-
-    def test_unmatched_source_attempts_are_reused_without_another_upstream_call(self):
-        transport = FakeTransport(
-            [
-                ("/api/v2/match", {"isMatched": False, "matches": []}),
-                ("/api/v2/search/episodes", {"animes": []}),
-            ]
-        )
-        matcher = self._matcher(transport)
-
-        first = matcher.match(title="不存在", episode=1, file_name="missing.mkv")
-        second = matcher.match(title="不存在", episode=1, file_name="missing.mkv")
+        first = matcher.match(tmdb_id=1, episode=1)
+        second = matcher.match(tmdb_id=1, episode=1)
 
         self.assertFalse(first["matched"])
         self.assertFalse(second["matched"])
         self.assertTrue(second["cached"])
         self.assertTrue(all(item["cached"] for item in second["attempts"]))
-        self.assertEqual(len(transport.calls), 2, "第二次匹配的每一步都必须先命中本地缓存")
+        self.assertEqual(len(transport.calls), 1, "第二次 TMDB 匹配必须先命中本地缓存")
+
+    def test_tmdb_lookup_reuses_cache_key_written_by_previous_release(self):
+        transport = FakeTransport([])
+        matcher = self._matcher(transport)
+        source = matcher.enabled_sources()[0]
+        previous_key = matcher._cache_key(
+            "source_search_v1",
+            {
+                "source": matcher._source_cache_identity(source),
+                "anime": "",
+                "tmdb_id": "1429",
+                "episode": "10",
+            },
+        )
+        matcher.cache.save(
+            previous_key,
+            {
+                "animes": [
+                    {
+                        "anime_id": "9541",
+                        "anime_title": "进击的巨人",
+                        "episodes": [
+                            {
+                                "episode_id": "95410010",
+                                "episode_title": "第10话",
+                                "episode_number": "10",
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        result = matcher.match(tmdb_id=1429, episode=10)
+
+        self.assertTrue(result["matched"])
+        self.assertTrue(result["cached"])
+        self.assertEqual(result["episode_id"], "95410010")
+        self.assertEqual(transport.calls, [])
 
     def test_sampling_caps_large_payloads(self):
         comments = [{"cid": str(i), "p": "%d.0,1,16777215,u" % i, "m": "d%d" % i} for i in range(50)]
@@ -500,7 +470,7 @@ class MatcherTest(unittest.TestCase):
     def test_no_source_configured_is_an_error(self):
         matcher = DanmakuMatcher([], cache=DanmakuCache(tempfile.mkdtemp()))
         with self.assertRaises(RuntimeError):
-            matcher.match(title="x")
+            matcher.match(tmdb_id=1)
         with self.assertRaises(RuntimeError):
             matcher.comments("1")
 

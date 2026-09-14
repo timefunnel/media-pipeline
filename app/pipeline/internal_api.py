@@ -3228,27 +3228,6 @@ class InternalApiApplication:
         except RuntimeError as exc:
             raise ApiError(502, "danmaku_fetch_failed", str(exc))
 
-    def search_danmaku(self, payload):
-        if not isinstance(payload, dict):
-            raise ApiError(400, "invalid_request", "request body must be a JSON object")
-        keyword = require_text(payload.get("keyword"), "keyword", max_length=500)
-        episode = payload.get("episode")
-        if episode not in (None, ""):
-            try:
-                episode = int(episode)
-            except (TypeError, ValueError):
-                raise ApiError(400, "invalid_episode", "episode must be an integer")
-            if episode < 1 or episode > 9999:
-                raise ApiError(400, "invalid_episode", "episode must be between 1 and 9999")
-        else:
-            episode = None
-        try:
-            return self.service.danmaku_search(keyword, episode=episode)
-        except ValueError as exc:
-            raise ApiError(409, "danmaku_unavailable", str(exc))
-        except RuntimeError as exc:
-            raise ApiError(502, "danmaku_search_failed", str(exc))
-
     def parse_danmaku(self, payload):
         """解析用户提供的本地弹幕文件，输出与上游弹幕同构的归一化结果。"""
         if not isinstance(payload, dict):
@@ -3714,9 +3693,6 @@ class InternalApiServer:
                 return
             if handler.command == "POST" and path == "/v1/danmaku/comment":
                 self._send_json(handler, 200, self.application.fetch_danmaku(self._read_json(handler)))
-                return
-            if handler.command == "POST" and path == "/v1/danmaku/search":
-                self._send_json(handler, 200, self.application.search_danmaku(self._read_json(handler)))
                 return
             if handler.command == "POST" and path == "/v1/danmaku/parse":
                 payload = self._read_json(handler, max_bytes=self.application.danmaku_request_body_limit())
