@@ -1473,6 +1473,33 @@ class OpenListClientTest(unittest.TestCase):
 
 
 class MediaStationClientTest(unittest.TestCase):
+    def test_pipeline_scrape_media_adds_episode_batch_fields_only_when_requested(self):
+        transport = SequenceTransport(
+            [
+                {"tokens": {"access_token": "msg-token"}},
+                {"code": 0, "message": "ok", "data": {"mode": "apply", "applied_count": 2}},
+            ]
+        )
+        client = MediaStationClient("http://127.0.0.1:18080/api", "admin", "secret", transport=transport)
+
+        client.pipeline_scrape_media(
+            "media-1",
+            "tv",
+            "Show",
+            ["Show"],
+            "tmdb",
+            "tv",
+            media_ids=["media-1", "media-2"],
+            episode_mappings={
+                "media-1": {"season_num": 1, "episode_num": 1},
+                "media-2": {"season_num": 1, "episode_num": 2},
+            },
+        )
+
+        payload = transport.calls[1]["data"]
+        self.assertEqual(payload["media_ids"], ["media-1", "media-2"])
+        self.assertEqual(payload["episode_mappings"]["media-2"]["episode_num"], 2)
+
     def test_cloud115_cookie_reads_decrypted_msg_admin_storage_config(self):
         transport = SequenceTransport(
             [
