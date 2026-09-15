@@ -66,12 +66,16 @@ class BotConfigTest(unittest.TestCase):
                 "TG_BOT_TOKEN": "123:token",
                 "TG_ALLOWED_USER_IDS": "700656624",
                 "DANMAKU_CACHE_TTL_SECONDS": "604800",
+                "DANMAKU_MATCH_TTL_SECONDS": "2592000",
                 "DANMAKU_SEARCH_CACHE_TTL_SECONDS": "86400",
+                "DANMAKU_FILE_MATCH_TIMEOUT_SECONDS": "31",
             }
         )
 
         self.assertEqual(config.danmaku_cache_ttl_seconds, 604800)
+        self.assertEqual(config.danmaku_match_ttl_seconds, 2592000)
         self.assertEqual(config.danmaku_search_cache_ttl_seconds, 86400)
+        self.assertEqual(config.danmaku_file_match_timeout_seconds, 31)
 
     def test_bot_config_reads_subscription_staging_settings(self):
         from pipeline.bot import BotConfig
@@ -353,6 +357,68 @@ class DanmakuMatchingPolicyTest(unittest.TestCase):
 
         self.assertEqual(matcher.calls, [{"tmdb_id": "1429", "episode": 10}])
         self.assertEqual(result["target"]["file_name"], "show.s01e10.mkv")
+
+    def test_playback_match_uses_file_identity_and_prewarms_comments(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class Matcher:
+            def __init__(self):
+                self.match_calls = []
+                self.comment_calls = []
+
+            def match_file(self, *args, **kwargs):
+                self.match_calls.append((args, kwargs))
+                return {
+                    "matched": True,
+                    "source": "dandanplay",
+                    "match_mode": "hash",
+                    "episode_id": "175500001",
+                    "anime_title": "怪兽8号",
+                    "episode_title": "第1话 成为怪兽的男人",
+                    "shift": 0.0,
+                    "attempts": [],
+                }
+
+            def comments(self, *args, **kwargs):
+                self.comment_calls.append((args, kwargs))
+                return {"cached": False, "count": 6588}
+
+        matcher = Matcher()
+        config = BotConfig("token", {700656624}, danmaku_file_match_timeout_seconds=30)
+        service = PipelineBotService(config)
+        media = {
+            "id": "media-1",
+            "path": "/media/Kaijuu.S01E01.mp4",
+            "size_bytes": 1346864288,
+            "duration_sec": 1440,
+        }
+        identity = {
+            "file_hash": "a" * 32,
+            "file_size": 1346864288,
+            "prefix_bytes": 16 * 1024 * 1024,
+        }
+
+        with patch.object(service, "_require_danmaku_matcher", return_value=matcher), patch.object(
+            service, "_load_media_detail", return_value=media
+        ), patch("pipeline.bot.fetch_danmaku_file_identity", return_value=identity) as fetch:
+            result = service.danmaku_playback_match(
+                "media-1",
+                "https://cdn.example.test/video.mp4?sign=secret",
+                headers={"User-Agent": "SenPlayer/1.0"},
+                file_name="Kaijuu.S01E01.mp4",
+                file_size=1346864288,
+                video_duration=1440,
+            )
+
+        fetch.assert_called_once_with(
+            "https://cdn.example.test/video.mp4?sign=secret",
+            headers={"User-Agent": "SenPlayer/1.0"},
+            timeout=30,
+        )
+        self.assertEqual(matcher.match_calls[0][0], ("Kaijuu.S01E01.mp4", "a" * 32))
+        self.assertEqual(matcher.match_calls[0][1]["file_size"], 1346864288)
+        self.assertEqual(matcher.comment_calls[0][0], ("175500001",))
+        self.assertEqual(result["comment_cache"], {"status": "ready", "cached": False, "count": 6588})
 
 
 class CandidateStoreTest(unittest.TestCase):

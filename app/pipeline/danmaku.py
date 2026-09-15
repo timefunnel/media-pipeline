@@ -7,7 +7,8 @@
   其中 Path 不含域名与查询参数。
 - 弹幕接口没有分页能力（``from``/``to`` 官方文档存在但实测无效），因此**整集缓存**，
   下发前再做密度采样。
-- 自动匹配只允许 TMDB ID 反查；没有 TMDB ID 时不访问上游，失败如实上报。
+- 自动匹配遵循弹弹play官方流程：先用文件信息调用 ``/api/v2/match``，只有
+  ``isMatched=true`` 且结果唯一时才自动关联；其他候选必须人工确认。
 
 字段事实（实测，勿照抄 B 站 8 段解析）：
 - 弹弹play 的 ``p`` 是 **4 段**：``时间(秒),模式,颜色(十进制RGB),用户/来源``。
@@ -21,7 +22,9 @@ import json
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -32,10 +35,13 @@ DEFAULT_DANDANPLAY_BASE_URL = "https://api.dandanplay.net"
 DEFAULT_DANMAKU_CACHE_DIR = "/danmaku-cache"
 DEFAULT_DANMAKU_PROVIDERS = ("dandanplay",)
 DEFAULT_DANMAKU_CACHE_TTL_SECONDS = 7 * 24 * 3600
+DEFAULT_DANMAKU_MATCH_TTL_SECONDS = 24 * 3600
 DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS = 24 * 3600
 DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS = 12
 DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS = 30
 DEFAULT_DANMAKU_MAX_COMMENTS = 6000
+DANMAKU_FILE_MATCH_PREFIX_BYTES = 16 * 1024 * 1024
+DEFAULT_DANMAKU_FILE_MATCH_TIMEOUT_SECONDS = 30
 # 本地导入文件的体积上限：整集 B 站 XML 通常 100KB~1.5MB，8MB 足够容纳超大热番，
 # 同时保证一次请求不会把内存吃满（HTTP 层对该路由单独放宽请求体上限）。
 DEFAULT_DANMAKU_IMPORT_MAX_BYTES = 8 * 1024 * 1024
@@ -401,11 +407,97 @@ class DanmakuSource:
     def enabled(self):
         raise NotImplementedError
 
+    def match(self, file_name, file_hash="", file_size=None, video_duration=None):
+        raise NotImplementedError
+
     def search_episodes(self, tmdb_id, episode=None):
         raise NotImplementedError
 
     def comment(self, episode_id, with_related=True, ch_convert=0):
         raise NotImplementedError
+
+
+def normalize_danmaku_file_headers(headers):
+    if headers is None:
+        return {}
+    if not isinstance(headers, dict):
+        raise ValueError("danmaku file headers must be an object")
+    if len(headers) > 32:
+        raise ValueError("danmaku file headers contain too many entries")
+    blocked = {"accept-encoding", "connection", "content-length", "host", "range", "transfer-encoding"}
+    normalized = {}
+    for raw_name, raw_value in headers.items():
+        name = str(raw_name or "").strip()
+        value = str(raw_value or "").strip()
+        if not name or not value:
+            continue
+        if len(name) > 128 or len(value) > 4096 or "\r" in value or "\n" in value:
+            raise ValueError("danmaku file header is invalid")
+        if name.lower() in blocked:
+            continue
+        normalized[name] = value
+    return normalized
+
+
+def fetch_danmaku_file_identity(
+    raw_url,
+    headers=None,
+    timeout=DEFAULT_DANMAKU_FILE_MATCH_TIMEOUT_SECONDS,
+    opener=None,
+):
+    """只读取媒体文件前 16 MiB，返回官方文件识别需要的 MD5 与实际文件大小。"""
+    url = str(raw_url or "").strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("danmaku file URL must be an HTTP(S) URL without user info")
+    request_headers = normalize_danmaku_file_headers(headers)
+    request_headers["Accept-Encoding"] = "identity"
+    request_headers["Range"] = "bytes=0-%d" % (DANMAKU_FILE_MATCH_PREFIX_BYTES - 1)
+    request = urllib.request.Request(url, headers=request_headers, method="GET")
+    open_request = opener or urllib.request.urlopen
+    try:
+        with open_request(request, timeout=max(1, int(timeout))) as response:
+            status = int(getattr(response, "status", response.getcode()))
+            content_range = str(response.headers.get("Content-Range") or "").strip()
+            content_length = str(response.headers.get("Content-Length") or "").strip()
+            body = response.read(DANMAKU_FILE_MATCH_PREFIX_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError("danmaku file prefix request failed: HTTP %s" % exc.code) from exc
+    except (OSError, TimeoutError) as exc:
+        raise RuntimeError("danmaku file prefix request failed: %s" % exc) from exc
+
+    total_size = 0
+    range_match = re.fullmatch(r"bytes\s+0-(\d+)/(\d+)", content_range, flags=re.IGNORECASE)
+    if range_match:
+        range_end = int(range_match.group(1))
+        total_size = int(range_match.group(2))
+        expected = min(DANMAKU_FILE_MATCH_PREFIX_BYTES, total_size)
+        if range_end + 1 != expected:
+            raise RuntimeError("danmaku file prefix response has an unexpected Content-Range")
+    elif status == 206:
+        raise RuntimeError("danmaku file prefix response is missing Content-Range")
+    elif status == 200 and content_length.isdigit():
+        total_size = int(content_length)
+        expected = total_size
+    else:
+        raise RuntimeError("danmaku file prefix request returned HTTP %s without a usable size" % status)
+
+    if status not in (200, 206):
+        raise RuntimeError("danmaku file prefix request returned HTTP %s" % status)
+    if total_size <= 0:
+        raise RuntimeError("danmaku file prefix response has an invalid file size")
+    if status == 200 and total_size > DANMAKU_FILE_MATCH_PREFIX_BYTES:
+        raise RuntimeError("danmaku file server ignored the Range request")
+    expected = min(DANMAKU_FILE_MATCH_PREFIX_BYTES, total_size)
+    if len(body) != expected:
+        raise RuntimeError(
+            "danmaku file prefix response returned %d bytes, expected %d" % (len(body), expected)
+        )
+    return {
+        "file_hash": hashlib.md5(body).hexdigest(),  # nosec B324 -- dandanplay protocol requires MD5.
+        "file_size": total_size,
+        "prefix_bytes": len(body),
+    }
 
 
 class DandanplayProtocolSource(DanmakuSource):
@@ -464,6 +556,17 @@ class DandanplayProtocolSource(DanmakuSource):
         )
         return self._unwrap(payload)
 
+    def _post_json(self, path, body, timeout=None):
+        url = self.base_url + path
+        payload = self.transport.json_request(
+            "POST",
+            url,
+            headers=self._headers(path),
+            data=body,
+            timeout=timeout or self.timeout,
+        )
+        return self._unwrap(payload)
+
     def _unwrap(self, payload):
         if not isinstance(payload, dict):
             raise RuntimeError("%s returned a non-object response" % self.name)
@@ -472,6 +575,33 @@ class DandanplayProtocolSource(DanmakuSource):
             message = payload.get("errorMessage") or "unknown error"
             raise RuntimeError("%s API error %s: %s" % (self.name, code, message))
         return payload
+
+    def match(self, file_name, file_hash="", file_size=None, video_duration=None):
+        normalized_name = danmaku_match_file_name(file_name)
+        if not normalized_name:
+            raise ValueError("fileName is required for danmaku matching")
+        normalized_hash = str(file_hash or "").strip().lower()
+        if normalized_hash and not re.fullmatch(r"[0-9a-f]{32}", normalized_hash):
+            raise ValueError("fileHash must be the MD5 of the first 16 MiB")
+        body = {
+            "fileName": normalized_name,
+            "matchMode": "hashAndFileName" if normalized_hash else "fileNameOnly",
+        }
+        if normalized_hash:
+            body["fileHash"] = normalized_hash
+        if file_size:
+            body["fileSize"] = int(file_size)
+        if video_duration:
+            body["videoDuration"] = int(video_duration)
+        payload = self._post_json("/api/v2/match", body)
+        matches = payload.get("matches")
+        if not isinstance(matches, list):
+            matches = []
+        return {
+            "is_matched": bool(payload.get("isMatched")),
+            "matches": [normalize_danmaku_match(item) for item in matches if isinstance(item, dict)],
+            "request_mode": body["matchMode"],
+        }
 
     def search_episodes(self, tmdb_id, episode=None):
         normalized_tmdb_id = str(tmdb_id or "").strip()
@@ -542,6 +672,27 @@ class AggregatorSource(DandanplayProtocolSource):
         return bool(self.base_url)
 
 
+def danmaku_match_file_name(value):
+    """返回官方 ``fileName`` 字段：只有文件名，不含目录和扩展名。"""
+    name = str(value or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+    if "." in name:
+        name = name.rsplit(".", 1)[0]
+    return name.strip()
+
+
+def normalize_danmaku_match(item):
+    return {
+        "episode_id": normalize_danmaku_episode_id(item.get("episodeId")),
+        "anime_id": normalize_danmaku_cid(item.get("animeId")),
+        "anime_title": str(item.get("animeTitle") or ""),
+        "episode_title": str(item.get("episodeTitle") or ""),
+        "type": str(item.get("type") or ""),
+        "type_description": str(item.get("typeDescription") or ""),
+        "shift": float(item.get("shift") or 0.0),
+        "image_url": str(item.get("imageUrl") or ""),
+    }
+
+
 def normalize_danmaku_anime(item):
     episodes = item.get("episodes")
     if not isinstance(episodes, list):
@@ -567,8 +718,8 @@ def normalize_danmaku_anime(item):
 class DanmakuMatcher:
     """匹配 + 回源 + 缓存的编排层。
 
-    自动匹配只使用 TMDB ID 反查。每个源按配置顺序尝试，结果里必须如实标明
-    用的是哪个源；缺少 TMDB ID 时直接返回未匹配，绝不以标题或文件名回源。
+    自动匹配只信任 ``/match`` 的精确关联标志；文件名模糊候选和 TMDB 搜索候选
+    都只供人工确认，不得按排序、标题或集数自动选中。
     """
 
     def __init__(
@@ -576,6 +727,7 @@ class DanmakuMatcher:
         sources,
         cache=None,
         cache_ttl_seconds=DEFAULT_DANMAKU_CACHE_TTL_SECONDS,
+        match_ttl_seconds=DEFAULT_DANMAKU_MATCH_TTL_SECONDS,
         search_cache_ttl_seconds=DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS,
         max_comments=DEFAULT_DANMAKU_MAX_COMMENTS,
         blacklist=None,
@@ -583,6 +735,7 @@ class DanmakuMatcher:
         self.sources = [source for source in (sources or []) if source is not None]
         self.cache = cache if cache is not None else DanmakuCache()
         self.cache_ttl_seconds = max(0, int(cache_ttl_seconds or 0))
+        self.match_ttl_seconds = max(0, int(match_ttl_seconds or 0))
         self.search_cache_ttl_seconds = max(0, int(search_cache_ttl_seconds or 0))
         self.max_comments = max(1, int(max_comments or DEFAULT_DANMAKU_MAX_COMMENTS))
         self.blacklist = tuple(blacklist or ())
@@ -651,6 +804,106 @@ class DanmakuMatcher:
         )
         return list(body.get("animes") or []), served_from_cache
 
+    def _match_file_source(self, source, file_name, file_hash, file_size=None, video_duration=None):
+        cache_key = self._cache_key(
+            "source_file_match_v1",
+            {
+                "source": self._source_cache_identity(source),
+                "file_name": danmaku_match_file_name(file_name),
+                "file_hash": str(file_hash or "").strip().lower(),
+                "file_size": int(file_size or 0),
+                "video_duration": int(video_duration or 0),
+            },
+        )
+        body, served_from_cache = self._cached_call(
+            cache_key,
+            self.match_ttl_seconds,
+            lambda: source.match(
+                file_name=file_name,
+                file_hash=file_hash,
+                file_size=file_size,
+                video_duration=video_duration,
+            ),
+        )
+        return dict(body or {}), served_from_cache
+
+    def match_file(self, file_name, file_hash, file_size=None, video_duration=None):
+        """按官方文件识别流程匹配；只有明确的唯一精确结果才自动关联。"""
+        sources = self.enabled_sources()
+        if not sources:
+            raise RuntimeError("no danmaku source is configured and enabled")
+        normalized_name = danmaku_match_file_name(file_name)
+        normalized_hash = str(file_hash or "").strip().lower()
+        if not normalized_name:
+            raise ValueError("file_name is required for danmaku file matching")
+        if not re.fullmatch(r"[0-9a-f]{32}", normalized_hash):
+            raise ValueError("file_hash must be the MD5 of the first 16 MiB")
+
+        attempts = []
+        for source in sources:
+            response, cached, error = self._attempt(
+                lambda source=source: self._match_file_source(
+                    source,
+                    normalized_name,
+                    normalized_hash,
+                    file_size=file_size,
+                    video_duration=video_duration,
+                )
+            )
+            matches = list((response or {}).get("matches") or [])
+            exact = bool((response or {}).get("is_matched"))
+            entry = {"source": source.name, "mode": "hash", "cached": bool(cached)}
+            if error:
+                entry.update({"outcome": "error", "error": error})
+                attempts.append(entry)
+                continue
+            entry["candidate_count"] = len(matches)
+            if exact and len(matches) == 1:
+                entry["outcome"] = "matched"
+                attempts.append(entry)
+                return self._match_result(source.name, "hash", matches, attempts)
+            if exact and len(matches) != 1:
+                entry.update({
+                    "outcome": "ambiguous",
+                    "error": "dandanplay marked the file as matched but did not return exactly one candidate",
+                })
+            elif matches:
+                entry.update({
+                    "outcome": "candidates_not_exact",
+                    "error": "dandanplay returned candidates without an exact file match",
+                })
+            else:
+                entry["outcome"] = "no_candidates"
+            attempts.append(entry)
+            # 候选一旦存在但不满足精确唯一条件，就不能再换源选一个“看起来像”的结果。
+            if matches or exact:
+                return {
+                    "matched": False,
+                    "source": source.name,
+                    "match_mode": "hash",
+                    "episode_id": "",
+                    "anime_title": "",
+                    "episode_title": "",
+                    "shift": 0.0,
+                    "candidates": matches,
+                    "ambiguous": len(matches) != 1 or not exact,
+                    "unmatched_reason": "no_unique_exact_file_match",
+                    "attempts": attempts,
+                    "cached": bool(attempts) and all(item.get("cached") for item in attempts),
+                }
+        return {
+            "matched": False,
+            "source": "",
+            "match_mode": "hash",
+            "episode_id": "",
+            "anime_title": "",
+            "episode_title": "",
+            "shift": 0.0,
+            "candidates": [],
+            "attempts": attempts,
+            "cached": bool(attempts) and all(item.get("cached") for item in attempts),
+        }
+
     def match(self, tmdb_id=None, episode=None):
         sources = self.enabled_sources()
         if not sources:
@@ -685,8 +938,28 @@ class DanmakuMatcher:
             )
             candidates = self._episode_candidates_from_animes(animes, episode=episode)
             self._record(attempts, source.name, "tmdb", candidates, error, cached=cached)
-            if candidates:
+            if len(candidates) == 1:
                 return self._match_result(source.name, "tmdb", candidates, attempts)
+            if len(candidates) > 1:
+                attempts[-1]["outcome"] = "ambiguous"
+                attempts[-1]["error"] = (
+                    "TMDB lookup returned multiple episode candidates; "
+                    "dandanplay does not expose a TMDB season discriminator"
+                )
+                return {
+                    "matched": False,
+                    "source": source.name,
+                    "match_mode": "tmdb",
+                    "episode_id": "",
+                    "anime_title": "",
+                    "episode_title": "",
+                    "shift": 0.0,
+                    "candidates": candidates,
+                    "ambiguous": True,
+                    "unmatched_reason": "ambiguous_candidates",
+                    "attempts": attempts,
+                    "cached": bool(attempts) and all(item.get("cached") for item in attempts),
+                }
         return {
             "matched": False,
             "source": "",
@@ -746,6 +1019,8 @@ class DanmakuMatcher:
         return [item for item in candidates if item["episode_id"]]
 
     def _match_result(self, source_name, mode, matches, attempts):
+        if len(matches) != 1:
+            raise ValueError("danmaku match requires exactly one candidate")
         primary = matches[0]
         return {
             "matched": True,
@@ -756,7 +1031,7 @@ class DanmakuMatcher:
             "episode_title": primary.get("episode_title") or "",
             "shift": float(primary.get("shift") or 0.0),
             "candidates": matches,
-            "ambiguous": len(matches) > 1,
+            "ambiguous": False,
             "attempts": attempts,
             "cached": bool(attempts) and all(item.get("cached") for item in attempts),
         }
@@ -852,6 +1127,7 @@ def build_danmaku_matcher_from_config(config):
         sources,
         cache=cache,
         cache_ttl_seconds=getattr(config, "danmaku_cache_ttl_seconds", DEFAULT_DANMAKU_CACHE_TTL_SECONDS),
+        match_ttl_seconds=getattr(config, "danmaku_match_ttl_seconds", DEFAULT_DANMAKU_MATCH_TTL_SECONDS),
         search_cache_ttl_seconds=getattr(
             config,
             "danmaku_search_cache_ttl_seconds",

@@ -1119,6 +1119,7 @@ class FakeDanmakuService(FakePipelineService):
         self.comments_error = comments_error
         self.parse_error = parse_error
         self.match_calls = []
+        self.playback_match_calls = []
         self.comment_calls = []
         self.parse_calls = []
 
@@ -1168,6 +1169,28 @@ class FakeDanmakuService(FakePipelineService):
                     "mode": 1,
                 }
             ],
+        }
+
+    def danmaku_playback_match(self, media_id, file_url, **kwargs):
+        self.playback_match_calls.append(dict(kwargs, media_id=media_id, file_url=file_url))
+        if self.match_error:
+            raise self.match_error
+        return {
+            "media_id": media_id,
+            "target": {"file_name": kwargs.get("file_name"), "prefix_bytes": 16777216},
+            "match": {
+                "matched": True,
+                "source": "dandanplay",
+                "match_mode": "hash",
+                "episode_id": "175500001",
+                "anime_title": "怪兽8号",
+                "episode_title": "第1话 成为怪兽的男人",
+                "shift": 0.0,
+                "candidates": [],
+                "ambiguous": False,
+                "attempts": [{"source": "dandanplay", "mode": "hash", "outcome": "matched"}],
+            },
+            "comment_cache": {"status": "ready", "cached": False, "count": 6588},
         }
 
     def danmaku_parse_local(self, content, source_format="auto", offset_seconds=0.0, ch_convert=0, title=""):
@@ -1248,6 +1271,33 @@ class DanmakuApiTest(InternalApiTestCase):
             self.assertEqual(service.match_calls, ["media-1"])
             self.assertEqual(result["match"]["episode_id"], "95410010")
             self.assertEqual(result["match"]["attempts"][0]["outcome"], "matched")
+        finally:
+            manager.stop()
+
+    def test_playback_match_validates_and_forwards_resolved_file(self):
+        service = FakeDanmakuService()
+        _service, _store, manager, application = self.build_components(service=service)
+        try:
+            with self.assertRaises(ApiError) as raised:
+                application.match_playback_danmaku({"media_id": "media-1"})
+            self.assertEqual(raised.exception.code, "missing_file_url")
+
+            result = application.match_playback_danmaku(
+                {
+                    "media_id": "media-1",
+                    "file_url": "https://cdn.example.test/video.mp4?sign=secret",
+                    "headers": {"User-Agent": "SenPlayer/1.0"},
+                    "file_name": "Kaijuu.S01E01.mp4",
+                    "file_size": 1346864288,
+                    "video_duration": 1440,
+                }
+            )
+
+            call = service.playback_match_calls[0]
+            self.assertEqual(call["headers"]["User-Agent"], "SenPlayer/1.0")
+            self.assertEqual(call["file_size"], 1346864288)
+            self.assertEqual(result["match"]["episode_id"], "175500001")
+            self.assertEqual(result["comment_cache"]["status"], "ready")
         finally:
             manager.stop()
 
@@ -1414,6 +1464,20 @@ class DanmakuHttpRouteTest(InternalApiTestCase):
             matched = http_json(base + "/v1/danmaku/match", {"media_id": "media-1"}, token="secret")
             self.assertEqual(matched["match"]["episode_id"], "95410010")
 
+            playback_matched = http_json(
+                base + "/v1/danmaku/playback-match",
+                {
+                    "media_id": "media-1",
+                    "file_url": "https://cdn.example.test/video.mp4?sign=secret",
+                    "headers": {"User-Agent": "SenPlayer/1.0"},
+                    "file_name": "Kaijuu.S01E01.mp4",
+                    "file_size": 1346864288,
+                    "video_duration": 1440,
+                },
+                token="secret",
+            )
+            self.assertEqual(playback_matched["match"]["episode_id"], "175500001")
+
             fetched = http_json(
                 base + "/v1/danmaku/comment",
                 {"media_id": "media-1", "episode_id": "95410010"},
@@ -1426,6 +1490,7 @@ class DanmakuHttpRouteTest(InternalApiTestCase):
             self.assertEqual(raised.exception.code, 404)
 
             self.assertEqual(service.match_calls, ["media-1"])
+            self.assertEqual(len(service.playback_match_calls), 1)
 
             parsed = http_json(
                 base + "/v1/danmaku/parse",

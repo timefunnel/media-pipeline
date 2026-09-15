@@ -3184,6 +3184,40 @@ class InternalApiApplication:
         except RuntimeError as exc:
             raise ApiError(502, "danmaku_match_failed", str(exc))
 
+    def match_playback_danmaku(self, payload):
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_request", "request body must be a JSON object")
+        media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
+        file_url = require_text(payload.get("file_url"), "file_url", max_length=16384)
+        file_name = str(payload.get("file_name") or "").strip()
+        if len(file_name) > 1024:
+            raise ApiError(400, "invalid_file_name", "file_name is too long")
+        headers = payload.get("headers") or {}
+        if not isinstance(headers, dict):
+            raise ApiError(400, "invalid_headers", "headers must be an object")
+        if len(headers) > 32:
+            raise ApiError(400, "invalid_headers", "headers contain too many entries")
+        try:
+            file_size = int(payload.get("file_size") or 0)
+            video_duration = int(payload.get("video_duration") or 0)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_file_metadata", "file_size and video_duration must be integers")
+        if file_size < 0 or video_duration < 0:
+            raise ApiError(400, "invalid_file_metadata", "file_size and video_duration must not be negative")
+        try:
+            return self.service.danmaku_playback_match(
+                media_id,
+                file_url,
+                headers=headers,
+                file_name=file_name,
+                file_size=file_size,
+                video_duration=video_duration,
+            )
+        except ValueError as exc:
+            raise ApiError(400, "invalid_danmaku_playback_match", str(exc))
+        except RuntimeError as exc:
+            raise ApiError(502, "danmaku_playback_match_failed", str(exc))
+
     def fetch_danmaku(self, payload):
         if not isinstance(payload, dict):
             raise ApiError(400, "invalid_request", "request body must be a JSON object")
@@ -3690,6 +3724,9 @@ class InternalApiServer:
                 return
             if handler.command == "POST" and path == "/v1/danmaku/match":
                 self._send_json(handler, 200, self.application.match_danmaku(self._read_json(handler)))
+                return
+            if handler.command == "POST" and path == "/v1/danmaku/playback-match":
+                self._send_json(handler, 200, self.application.match_playback_danmaku(self._read_json(handler)))
                 return
             if handler.command == "POST" and path == "/v1/danmaku/comment":
                 self._send_json(handler, 200, self.application.fetch_danmaku(self._read_json(handler)))
