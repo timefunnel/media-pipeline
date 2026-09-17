@@ -322,7 +322,7 @@ class BotConfigTest(unittest.TestCase):
 
 
 class DanmakuMatchingPolicyTest(unittest.TestCase):
-    def test_service_passes_only_tmdb_id_and_episode_to_matcher(self):
+    def test_service_passes_tmdb_episode_and_media_title_to_matcher(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
         class Matcher:
@@ -337,7 +337,7 @@ class DanmakuMatchingPolicyTest(unittest.TestCase):
         service = PipelineBotService(BotConfig("token", {700656624}))
         media = {
             "id": "media-1",
-            "title": "会被忽略的标题",
+            "title": "准确作品标题",
             "path": "/media/show.s01e10.mkv",
             "tmdb_id": 1429,
             "season_num": 1,
@@ -351,7 +351,10 @@ class DanmakuMatchingPolicyTest(unittest.TestCase):
         ):
             result = service.danmaku_match("media-1")
 
-        self.assertEqual(matcher.calls, [{"tmdb_id": "1429", "episode": 10}])
+        self.assertEqual(
+            matcher.calls,
+            [{"tmdb_id": "1429", "episode": 10, "anime": "准确作品标题"}],
+        )
         self.assertEqual(result["target"]["file_name"], "show.s01e10.mkv")
 
 

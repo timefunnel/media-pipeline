@@ -3541,13 +3541,14 @@ class PipelineBotService:
         return media
 
     def danmaku_match(self, media_id):
-        """只按 TMDB ID 匹配弹幕库；缺少 TMDB ID 时绝不访问上游。"""
+        """先按 TMDB ID 匹配并消歧；无法得到唯一节目编号时才做一次关键词查询。"""
         matcher = self._require_danmaku_matcher()
         media = self._load_media_detail(media_id)
         target = danmaku_target_from_media(media)
         match = matcher.match(
             tmdb_id=target["tmdb_id"] or None,
             episode=target["episode"] or None,
+            anime=target["title"],
         )
         return {"media_id": media_id, "target": target, "match": match}
 

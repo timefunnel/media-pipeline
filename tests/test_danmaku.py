@@ -263,7 +263,18 @@ class SourceTest(unittest.TestCase):
         self.assertIn("episode=2", url)
         self.assertIn("v2=true", url)
 
-    def test_search_requires_tmdb_id_without_calling_upstream(self):
+    def test_searches_by_keyword_without_tmdb_id(self):
+        transport = FakeTransport([("/api/v2/search/episodes", {"animes": []})])
+        source = danmaku_source(transport)
+
+        source.search_episodes(anime="遮天", episode=148)
+
+        url = transport.calls[0]["url"]
+        self.assertIn("anime=%E9%81%AE%E5%A4%A9", url)
+        self.assertIn("episode=148", url)
+        self.assertNotIn("tmdbId=", url)
+
+    def test_search_requires_keyword_or_tmdb_id_without_calling_upstream(self):
         transport = FakeTransport([])
         source = danmaku_source(transport)
         with self.assertRaises(ValueError):
@@ -317,12 +328,151 @@ class MatcherTest(unittest.TestCase):
         self.assertEqual(result["episode_id"], "95410010")
         self.assertEqual(len(transport.calls), 1)
 
-    def test_tmdb_empty_result_does_not_fall_back_to_other_match_modes(self):
-        transport = FakeTransport([("/api/v2/search/episodes", {"animes": []})])
-        result = self._matcher(transport).match(episode=3, tmdb_id=1)
+    def test_tmdb_empty_result_falls_back_to_unique_exact_keyword_episode(self):
+        def search_response(url, _data):
+            if "tmdbId=" in url:
+                return {"animes": []}
+            return {
+                "animes": [
+                    {
+                        "animeId": 18005,
+                        "animeTitle": "遮天",
+                        "episodes": [
+                            {
+                                "episodeId": 180050148,
+                                "episodeTitle": "第148话",
+                                "episodeNumber": None,
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        transport = FakeTransport(
+            [
+                ("/api/v2/search/episodes", search_response),
+            ]
+        )
+
+        result = self._matcher(transport).match(episode=148, tmdb_id=224839, anime="遮天")
+
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["match_mode"], "keyword")
+        self.assertEqual(result["episode_id"], "180050148")
+        self.assertEqual([item["mode"] for item in result["attempts"]], ["tmdb", "keyword"])
+        self.assertEqual([item["outcome"] for item in result["attempts"]], ["no_candidates", "matched"])
+        self.assertEqual(len(transport.calls), 2)
+        self.assertIn("tmdbId=224839", transport.calls[0]["url"])
+        self.assertNotIn("anime=", transport.calls[0]["url"])
+        self.assertIn("anime=%E9%81%AE%E5%A4%A9", transport.calls[1]["url"])
+        self.assertNotIn("tmdbId=", transport.calls[1]["url"])
+
+    def test_tmdb_error_does_not_fall_back_to_keyword(self):
+        transport = FakeTransport(
+            [("/api/v2/search/episodes", {"success": False, "errorCode": 500, "errorMessage": "upstream down"})]
+        )
+
+        result = self._matcher(transport).match(episode=148, tmdb_id=224839, anime="遮天")
+
         self.assertFalse(result["matched"])
         self.assertEqual([item["mode"] for item in result["attempts"]], ["tmdb"])
+        self.assertEqual(result["attempts"][0]["outcome"], "error")
         self.assertEqual(len(transport.calls), 1)
+
+    def test_keyword_fallback_requires_exact_anime_title(self):
+        def search_response(url, _data):
+            if "tmdbId=" in url:
+                return {"animes": []}
+            return {
+                "animes": [
+                    {
+                        "animeId": 18005,
+                        "animeTitle": "遮天 年番",
+                        "episodes": [
+                            {"episodeId": 180050148, "episodeTitle": "第148话", "episodeNumber": None}
+                        ],
+                    }
+                ]
+            }
+
+        transport = FakeTransport(
+            [
+                ("/api/v2/search/episodes", search_response),
+            ]
+        )
+
+        result = self._matcher(transport).match(episode=148, tmdb_id=224839, anime="遮天")
+
+        self.assertFalse(result["matched"])
+        self.assertEqual(result["attempts"][-1]["mode"], "keyword")
+        self.assertEqual(result["attempts"][-1]["outcome"], "no_candidates")
+
+    def test_keyword_fallback_requires_exact_episode_title_when_number_is_missing(self):
+        def search_response(url, _data):
+            if "tmdbId=" in url:
+                return {"animes": []}
+            return {
+                "animes": [
+                    {
+                        "animeId": 18005,
+                        "animeTitle": "遮天",
+                        "episodes": [
+                            {
+                                "episodeId": 180050148,
+                                "episodeTitle": "第148话 决战",
+                                "episodeNumber": None,
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        transport = FakeTransport(
+            [
+                ("/api/v2/search/episodes", search_response),
+            ]
+        )
+
+        result = self._matcher(transport).match(episode=148, tmdb_id=224839, anime="遮天")
+
+        self.assertFalse(result["matched"])
+        self.assertEqual(result["attempts"][-1]["outcome"], "no_candidates")
+
+    def test_keyword_fallback_rejects_multiple_exact_candidates(self):
+        def search_response(url, _data):
+            if "tmdbId=" in url:
+                return {"animes": []}
+            return {
+                "animes": [
+                    {
+                        "animeId": 18005,
+                        "animeTitle": "遮天",
+                        "episodes": [
+                            {"episodeId": 180050148, "episodeTitle": "第148话", "episodeNumber": None}
+                        ],
+                    },
+                    {
+                        "animeId": 28005,
+                        "animeTitle": "遮天",
+                        "episodes": [
+                            {"episodeId": 280050148, "episodeTitle": "第148话", "episodeNumber": None}
+                        ],
+                    },
+                ]
+            }
+
+        transport = FakeTransport(
+            [
+                ("/api/v2/search/episodes", search_response),
+            ]
+        )
+
+        result = self._matcher(transport).match(episode=148, tmdb_id=224839, anime="遮天")
+
+        self.assertFalse(result["matched"])
+        self.assertTrue(result["ambiguous"])
+        self.assertEqual(result["unmatched_reason"], "ambiguous_keyword_candidates")
+        self.assertEqual(result["attempts"][-1]["outcome"], "ambiguous")
 
     def test_multiple_tmdb_episode_candidates_fail_closed(self):
         transport = FakeTransport(
@@ -360,6 +510,110 @@ class MatcherTest(unittest.TestCase):
         self.assertEqual(len(result["candidates"]), 2)
         self.assertEqual(result["attempts"][0]["outcome"], "ambiguous")
         self.assertEqual(len(transport.calls), 1)
+
+    def test_multiple_tmdb_candidates_use_unique_exact_anime_title(self):
+        transport = FakeTransport(
+            [
+                (
+                    "/api/v2/search/episodes",
+                    {
+                        "animes": [
+                            {
+                                "animeId": 101,
+                                "animeTitle": "示例动画",
+                                "episodes": [
+                                    {"episodeId": 1010001, "episodeTitle": "第1话", "episodeNumber": "1"}
+                                ],
+                            },
+                            {
+                                "animeId": 202,
+                                "animeTitle": "示例动画 第二季",
+                                "episodes": [
+                                    {"episodeId": 2020001, "episodeTitle": "第1话", "episodeNumber": "1"}
+                                ],
+                            },
+                        ]
+                    },
+                )
+            ]
+        )
+
+        result = self._matcher(transport).match(episode=1, tmdb_id=123, anime="示例动画")
+
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["match_mode"], "tmdb")
+        self.assertEqual(result["episode_id"], "1010001")
+        self.assertEqual(result["attempts"][0]["candidate_count"], 1)
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_duplicate_tmdb_candidates_with_same_episode_id_are_not_ambiguous(self):
+        transport = FakeTransport(
+            [
+                (
+                    "/api/v2/search/episodes",
+                    {
+                        "animes": [
+                            {
+                                "animeId": 101,
+                                "animeTitle": "示例动画",
+                                "episodes": [{"episodeId": 1010001, "episodeNumber": "1"}],
+                            },
+                            {
+                                "animeId": 101,
+                                "animeTitle": "示例动画",
+                                "episodes": [{"episodeId": 1010001, "episodeNumber": "1"}],
+                            },
+                        ]
+                    },
+                )
+            ]
+        )
+
+        result = self._matcher(transport).match(episode=1, tmdb_id=123, anime="示例动画")
+
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["episode_id"], "1010001")
+        self.assertEqual(len(result["candidates"]), 1)
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_unresolved_tmdb_candidates_fall_back_to_exact_keyword_match(self):
+        def search_response(url, _data):
+            if "tmdbId=" in url:
+                return {
+                    "animes": [
+                        {
+                            "animeId": 101,
+                            "animeTitle": "遮天 第一季",
+                            "episodes": [{"episodeId": 1010148, "episodeNumber": "148"}],
+                        },
+                        {
+                            "animeId": 202,
+                            "animeTitle": "遮天 第二季",
+                            "episodes": [{"episodeId": 2020148, "episodeNumber": "148"}],
+                        },
+                    ]
+                }
+            return {
+                "animes": [
+                    {
+                        "animeId": 18005,
+                        "animeTitle": "遮天",
+                        "episodes": [
+                            {"episodeId": 180050148, "episodeTitle": "第148话", "episodeNumber": None}
+                        ],
+                    }
+                ]
+            }
+
+        transport = FakeTransport([("/api/v2/search/episodes", search_response)])
+
+        result = self._matcher(transport).match(episode=148, tmdb_id=224839, anime="遮天")
+
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["match_mode"], "keyword")
+        self.assertEqual(result["episode_id"], "180050148")
+        self.assertEqual([item["outcome"] for item in result["attempts"]], ["ambiguous", "matched"])
+        self.assertEqual(len(transport.calls), 2)
 
     def test_tmdb_episode_match_rejects_candidate_without_episode_number(self):
         transport = FakeTransport(
@@ -444,9 +698,9 @@ class MatcherTest(unittest.TestCase):
         self.assertEqual(result["episode_id"], "")
         self.assertTrue(result["attempts"])
 
-    def test_missing_tmdb_id_is_explicit_and_never_calls_upstream(self):
+    def test_missing_tmdb_id_never_starts_directly_from_keyword(self):
         transport = FakeTransport([])
-        result = self._matcher(transport).match(episode=1)
+        result = self._matcher(transport).match(episode=1, anime="示例动画")
         self.assertFalse(result["matched"])
         self.assertEqual(result["attempts"][0]["outcome"], "skipped")
         self.assertEqual(result["attempts"][0]["error"], "tmdb_id is required")
@@ -520,17 +774,21 @@ class MatcherTest(unittest.TestCase):
         self.assertTrue(second_payload["cached"])
 
     def test_unmatched_tmdb_lookup_is_reused_without_another_upstream_call(self):
-        transport = FakeTransport([("/api/v2/search/episodes", {"animes": []})])
+        transport = FakeTransport(
+            [
+                ("/api/v2/search/episodes", {"animes": []}),
+            ]
+        )
         matcher = self._matcher(transport)
 
-        first = matcher.match(tmdb_id=1, episode=1)
-        second = matcher.match(tmdb_id=1, episode=1)
+        first = matcher.match(tmdb_id=1, episode=1, anime="示例动画")
+        second = matcher.match(tmdb_id=1, episode=1, anime="示例动画")
 
         self.assertFalse(first["matched"])
         self.assertFalse(second["matched"])
         self.assertTrue(second["cached"])
         self.assertTrue(all(item["cached"] for item in second["attempts"]))
-        self.assertEqual(len(transport.calls), 1, "第二次 TMDB 匹配必须先命中本地缓存")
+        self.assertEqual(len(transport.calls), 2, "第二次 TMDB 与关键词匹配都必须先命中本地缓存")
 
     def test_tmdb_lookup_reuses_cache_key_written_by_previous_release(self):
         transport = FakeTransport([])
