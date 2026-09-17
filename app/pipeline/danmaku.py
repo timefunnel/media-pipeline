@@ -685,8 +685,28 @@ class DanmakuMatcher:
             )
             candidates = self._episode_candidates_from_animes(animes, episode=episode)
             self._record(attempts, source.name, "tmdb", candidates, error, cached=cached)
-            if candidates:
+            if len(candidates) == 1:
                 return self._match_result(source.name, "tmdb", candidates, attempts)
+            if len(candidates) > 1:
+                attempts[-1]["outcome"] = "ambiguous"
+                attempts[-1]["error"] = (
+                    "TMDB lookup returned multiple episode candidates; "
+                    "dandanplay does not expose a TMDB season discriminator"
+                )
+                return {
+                    "matched": False,
+                    "source": source.name,
+                    "match_mode": "tmdb",
+                    "episode_id": "",
+                    "anime_title": "",
+                    "episode_title": "",
+                    "shift": 0.0,
+                    "candidates": candidates,
+                    "ambiguous": True,
+                    "unmatched_reason": "ambiguous_candidates",
+                    "attempts": attempts,
+                    "cached": bool(attempts) and all(item.get("cached") for item in attempts),
+                }
         return {
             "matched": False,
             "source": "",
@@ -746,6 +766,8 @@ class DanmakuMatcher:
         return [item for item in candidates if item["episode_id"]]
 
     def _match_result(self, source_name, mode, matches, attempts):
+        if len(matches) != 1:
+            raise ValueError("danmaku match requires exactly one candidate")
         primary = matches[0]
         return {
             "matched": True,
@@ -756,7 +778,7 @@ class DanmakuMatcher:
             "episode_title": primary.get("episode_title") or "",
             "shift": float(primary.get("shift") or 0.0),
             "candidates": matches,
-            "ambiguous": len(matches) > 1,
+            "ambiguous": False,
             "attempts": attempts,
             "cached": bool(attempts) and all(item.get("cached") for item in attempts),
         }
