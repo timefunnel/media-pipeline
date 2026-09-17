@@ -573,6 +573,7 @@ class FakeMediaStationClient:
                             }
                         ],
                         "ignored_media": list(self.pipeline_ignored_media_response),
+                        "applied_media_identities": list(request.get("target_media_identities") or []),
                         "deleted_media_prune": prune,
                     },
                 }

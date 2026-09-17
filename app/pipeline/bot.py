@@ -4312,6 +4312,15 @@ class PipelineBotService:
             subscription_target_season = int(progress.get("subscription_target_season") or 0)
             if category == "anime" and subscription_target_season > 0:
                 request["force_season_number"] = subscription_target_season
+            subscription_target_media_identities = progress.get(
+                "subscription_target_media_identities"
+            )
+            if subscription_target_media_identities is not None:
+                if not isinstance(subscription_target_media_identities, list):
+                    raise RuntimeError("subscription target media identities must be a list")
+                request["target_media_identities"] = [
+                    dict(item) for item in subscription_target_media_identities
+                ]
             if (
                 authoritative_paths
                 and (
@@ -4425,6 +4434,11 @@ class PipelineBotService:
         if isinstance(ignored_media, list):
             updates["msg_ingest_ignored_media"] = [dict(item) for item in ignored_media if isinstance(item, dict)]
             updates["msg_ingest_ignored_count"] = len(updates["msg_ingest_ignored_media"])
+        applied_media_identities = result.get("applied_media_identities")
+        if isinstance(applied_media_identities, list):
+            updates["msg_ingest_applied_media_identities"] = [
+                dict(item) for item in applied_media_identities if isinstance(item, dict)
+            ]
         cloud_subtitle_status = str(result.get("cloud_subtitle_status") or "").strip()
         if cloud_subtitle_status:
             updates["msg_cloud_subtitle_status"] = cloud_subtitle_status

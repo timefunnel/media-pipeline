@@ -5166,9 +5166,18 @@ class PipelineBotServiceTest(unittest.TestCase):
                 msg_sync_poll_seconds=0,
             )
         )
-        progress = {"subscription_target_season": 1}
+        progress = {
+            "subscription_target_season": 1,
+            "subscription_target_media_identities": [
+                {
+                    "openlist_path": target_path + "/139.2160p.mkv",
+                    "season_num": 1,
+                    "episode_num": 139,
+                }
+            ],
+        }
 
-        service._run_msg_pipeline_ingest(
+        updates = service._run_msg_pipeline_ingest(
             fake_msg,
             "anime",
             "吞噬星空",
@@ -5180,6 +5189,14 @@ class PipelineBotServiceTest(unittest.TestCase):
         )
 
         self.assertEqual(fake_msg.pipeline_ingest_calls[0]["force_season_number"], 1)
+        self.assertEqual(
+            fake_msg.pipeline_ingest_calls[0]["target_media_identities"],
+            progress["subscription_target_media_identities"],
+        )
+        self.assertEqual(
+            updates["msg_ingest_applied_media_identities"],
+            progress["subscription_target_media_identities"],
+        )
 
     def test_task_status_refreshes_openlist_and_retries_when_115_token_is_invalid(self):
         from pipeline.bot import BotConfig, PipelineBotService

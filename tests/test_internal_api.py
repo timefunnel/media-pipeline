@@ -799,6 +799,9 @@ class FakePipelineService:
                     if item.get("kind") == "video" and item.get("episode") and int(item.get("episode")) > 114
                 }
             ),
+            "msg_ingest_applied_media_identities": list(
+                task.get("subscription_target_media_identities") or []
+            ),
         }
         if self.defer_enhancements and task.get("defer_enhancements") and not task.get("post_enhancement_execution"):
             result.update(
@@ -3254,6 +3257,39 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(len(verify_calls), 2)
         self.assertEqual(len(service.submit_uris), 1)
 
+    def test_subscription_identity_receipt_allows_existing_media_update(self):
+        service, _store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "115.2160p.mkv", "kind": "video", "episode": 115}
+        ]
+        original_sync = service.sync_completed_task
+        sync_calls = []
+
+        def sync_as_existing_media_update(*args, **kwargs):
+            sync_calls.append(True)
+            synced = original_sync(*args, **kwargs)
+            synced["msg_ingest_scan_added"] = 0
+            synced["msg_ingest_scan_updated"] = 1
+            return synced
+
+        service.sync_completed_task = sync_as_existing_media_update
+        task, _ = manager.create_import(
+            "owner-a", "fanren-existing-media-update", self.payload(application, service)
+        )
+
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+
+        self.assertEqual(completed["status"], "completed")
+        audit = completed["result"]["subscription_follow"]
+        self.assertEqual(audit["scan_added"], 0)
+        self.assertEqual(audit["applied_media_identities"], audit["target_media_identities"])
+        self.assertEqual(len(sync_calls), 1)
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+
     def test_direct_subscription_receive_submits_to_the_task_directory(self):
         service, _store, manager, application = self.build_components()
         service.subscription_entries = [
@@ -3724,6 +3760,19 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(len(service.submit_uris), 1)
         self.assertEqual(service.sync_input_tasks[-1]["subscription_target_season"], 1)
+        self.assertEqual(
+            service.sync_input_tasks[-1]["subscription_target_media_identities"],
+            [
+                {
+                    "openlist_path": completed["request"]["subscription_follow"][
+                        "target_openlist_path"
+                    ]
+                    + "/凡人修仙传.S01E115.mkv",
+                    "season_num": 1,
+                    "episode_num": 115,
+                }
+            ],
+        )
         self.assertEqual(len(service.subscription_cleanup_calls), 1)
 
     def test_restart_reuses_existing_staging_without_resubmitting_share(self):

@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import posixpath
 import re
 import sqlite3
 import threading
@@ -2567,10 +2568,15 @@ class ImportTaskManager:
         selected,
         require_scan_added,
     ):
+        target_media_identities = build_subscription_target_media_identities(
+            audit, target_path, season, selected
+        )
+        audit["target_media_identities"] = target_media_identities
         sync_input = dict(offline_task)
         sync_input["subscription_target_openlist_path"] = target_path
         if category == "anime":
             sync_input["subscription_target_season"] = season
+        sync_input["subscription_target_media_identities"] = target_media_identities
 
         def save_progress(progress):
             current = dict(result)
@@ -2586,7 +2592,13 @@ class ImportTaskManager:
             )
 
         self.store.save_running(task["id"], "scanning", result=result, info_hash=info_hash)
+
         def sync_once(current_task):
+            current_task = dict(current_task or {})
+            current_task["subscription_target_openlist_path"] = target_path
+            if category == "anime":
+                current_task["subscription_target_season"] = season
+            current_task["subscription_target_media_identities"] = target_media_identities
             synced_result = self.service.sync_completed_task(
                 category,
                 title,
@@ -2606,14 +2618,23 @@ class ImportTaskManager:
 
         synced, media_id, scan_added = sync_once(sync_input)
         audit["scan_added"] = scan_added
+        applied_media_identities = synced.get("msg_ingest_applied_media_identities")
+        audit["applied_media_identities"] = applied_media_identities
         verified_msg = self.service.verify_subscription_msg_episodes(
             category, target_path, season, selected
         )
         audit["msg_verification"] = verified_msg
         missing_episodes = list(verified_msg.get("missing_episodes") or [])
         duplicate_episodes = dict(verified_msg.get("duplicate_episodes") or {})
-        scan_mismatch = require_scan_added and scan_added != len(selected)
-        if (missing_episodes or scan_mismatch) and not duplicate_episodes:
+        identity_mismatch = not target_media_identities_match(
+            target_media_identities, applied_media_identities
+        )
+        scan_mismatch = (
+            require_scan_added
+            and not target_media_identities
+            and scan_added != len(selected)
+        )
+        if (missing_episodes or identity_mismatch or scan_mismatch) and not duplicate_episodes:
             for retry_number in range(1, SUBSCRIPTION_SCAN_VISIBILITY_RETRY_LIMIT + 1):
                 self._wait_or_stop(SUBSCRIPTION_SCAN_VISIBILITY_RETRY_DELAY_SECONDS)
                 retry_input = reset_subscription_sync_for_retry(synced)
@@ -2623,16 +2644,30 @@ class ImportTaskManager:
                 synced, media_id, scan_added = sync_once(retry_input)
                 audit["scan_visibility_retry_count"] = retry_number
                 audit["scan_added"] = scan_added
+                applied_media_identities = synced.get("msg_ingest_applied_media_identities")
+                audit["applied_media_identities"] = applied_media_identities
                 verified_msg = self.service.verify_subscription_msg_episodes(
                     category, target_path, season, selected
                 )
                 audit["msg_verification"] = verified_msg
                 missing_episodes = list(verified_msg.get("missing_episodes") or [])
                 duplicate_episodes = dict(verified_msg.get("duplicate_episodes") or {})
-                scan_mismatch = require_scan_added and scan_added != len(selected)
-                if not missing_episodes and not duplicate_episodes and not scan_mismatch:
+                identity_mismatch = not target_media_identities_match(
+                    target_media_identities, applied_media_identities
+                )
+                scan_mismatch = (
+                    require_scan_added
+                    and not target_media_identities
+                    and scan_added != len(selected)
+                )
+                if (
+                    not missing_episodes
+                    and not duplicate_episodes
+                    and not identity_mismatch
+                    and not scan_mismatch
+                ):
                     break
-        if duplicate_episodes or missing_episodes or scan_mismatch:
+        if duplicate_episodes or missing_episodes or identity_mismatch or scan_mismatch:
             audit["outcome"] = "failed"
             result["subscription_follow"] = audit
             self.store.save_running(
@@ -2644,6 +2679,8 @@ class ImportTaskManager:
             )
             if duplicate_episodes or missing_episodes:
                 raise RuntimeError("MediaStationGo episode verification did not match the promotion plan")
+            if identity_mismatch:
+                raise RuntimeError("MediaStationGo did not apply the promoted media identities")
             raise RuntimeError(
                 "MediaStationGo scan added %d episodes, expected %d"
                 % (scan_added, len(selected))
@@ -4386,6 +4423,69 @@ def reset_subscription_sync_for_retry(task):
         out.pop(key, None)
     out["msg_sync_status"] = "running"
     return out
+
+
+def build_subscription_target_media_identities(audit, target_path, season, selected_episodes):
+    target_path = normalize_openlist_path(target_path)
+    season = int(season or 0)
+    selected = {int(value) for value in selected_episodes or []}
+    if not target_path or season < 0 or not selected:
+        raise RuntimeError("subscription target media identity input is incomplete")
+
+    identities = []
+    paths = set()
+    episodes = []
+    for item in (audit or {}).get("planned_files") or []:
+        if str(item.get("kind") or "").strip().lower() != "video":
+            continue
+        episode = int(item.get("episode") or 0)
+        if episode not in selected:
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or posixpath.basename(name) != name:
+            raise RuntimeError("subscription promotion plan contains an invalid video name")
+        openlist_path = normalize_openlist_path(posixpath.join(target_path, name))
+        if posixpath.dirname(openlist_path) != target_path:
+            raise RuntimeError("subscription target media identity escaped the target path")
+        if openlist_path in paths:
+            raise RuntimeError("subscription target media identity path is duplicated")
+        paths.add(openlist_path)
+        episodes.append(episode)
+        identities.append(
+            {
+                "openlist_path": openlist_path,
+                "season_num": season,
+                "episode_num": episode,
+            }
+        )
+    if sorted(episodes) != sorted(selected):
+        raise RuntimeError("subscription target media identities do not match selected episodes")
+    return sorted(identities, key=lambda item: item["openlist_path"])
+
+
+def target_media_identities_match(expected, actual):
+    def normalize(values):
+        if not isinstance(values, list):
+            return None
+        normalized = []
+        for item in values:
+            if not isinstance(item, dict):
+                return None
+            try:
+                openlist_path = normalize_openlist_path(item.get("openlist_path"))
+                season_num = int(item.get("season_num"))
+                episode_num = int(item.get("episode_num"))
+            except (TypeError, ValueError):
+                return None
+            if not openlist_path or season_num < 0 or episode_num <= 0:
+                return None
+            normalized.append((openlist_path, season_num, episode_num))
+        if len(normalized) != len(set(normalized)):
+            return None
+        return sorted(normalized)
+
+    expected_values = normalize(expected)
+    return expected_values is not None and expected_values == normalize(actual)
 
 
 def record_subscription_staging_cleanup(audit, cleanup, reason):
