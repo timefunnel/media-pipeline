@@ -1,5 +1,4 @@
 import json
-import io
 import sys
 import tempfile
 import threading
@@ -19,7 +18,6 @@ from pipeline.danmaku import (
     DanmakuLocalImport,
     DanmakuMatcher,
     DandanplayProtocolSource,
-    DANMAKU_FILE_MATCH_PREFIX_BYTES,
     apply_danmaku_offset,
     build_danmaku_payload,
     build_danmaku_local_import_from_config,
@@ -27,7 +25,6 @@ from pipeline.danmaku import (
     dedupe_danmaku,
     detect_danmaku_import_format,
     filter_danmaku_keywords,
-    fetch_danmaku_file_identity,
     normalize_danmaku_cid,
     normalize_danmaku_comments,
     parse_bilibili_xml,
@@ -222,56 +219,6 @@ class CacheTest(unittest.TestCase):
             self.assertIsNotNone(cache.load("stale", ttl_seconds=0))
 
 
-class FileIdentityTest(unittest.TestCase):
-    class Response:
-        def __init__(self, body, headers, status=206):
-            self.body = io.BytesIO(body)
-            self.headers = headers
-            self.status = status
-
-        def getcode(self):
-            return self.status
-
-        def read(self, size=-1):
-            return self.body.read(size)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-    def test_reads_exact_prefix_with_same_user_agent(self):
-        body = b"x" * DANMAKU_FILE_MATCH_PREFIX_BYTES
-        calls = []
-
-        def opener(request, timeout):
-            calls.append((request, timeout))
-            return self.Response(
-                body,
-                {
-                    "Content-Range": "bytes 0-%d/1346864288" % (DANMAKU_FILE_MATCH_PREFIX_BYTES - 1),
-                    "Content-Length": str(DANMAKU_FILE_MATCH_PREFIX_BYTES),
-                },
-            )
-
-        result = fetch_danmaku_file_identity(
-            "https://cdn.example.test/video.mp4?sign=secret",
-            headers={"User-Agent": "SenPlayer/1.0", "Range": "bytes=9-10"},
-            timeout=9,
-            opener=opener,
-        )
-
-        self.assertEqual(result["file_size"], 1346864288)
-        self.assertEqual(result["prefix_bytes"], DANMAKU_FILE_MATCH_PREFIX_BYTES)
-        self.assertEqual(result["file_hash"], "d4760a6c6500b8c7fbb09e4c65bc558a")
-        request, timeout = calls[0]
-        self.assertEqual(timeout, 9)
-        self.assertEqual(request.get_header("User-agent"), "SenPlayer/1.0")
-        self.assertEqual(request.get_header("Range"), "bytes=0-16777215")
-        self.assertEqual(request.get_header("Accept-encoding"), "identity")
-
-
 class SourceTest(unittest.TestCase):
     def test_business_error_is_raised_not_swallowed(self):
         transport = FakeTransport(
@@ -322,47 +269,6 @@ class SourceTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             source.search_episodes(tmdb_id="")
         self.assertEqual(transport.calls, [])
-
-    def test_file_match_sends_official_hash_payload(self):
-        transport = FakeTransport(
-            [
-                (
-                    "/api/v2/match",
-                    {
-                        "isMatched": True,
-                        "matches": [
-                            {
-                                "episodeId": 175500001,
-                                "animeId": 17550,
-                                "animeTitle": "怪兽8号",
-                                "episodeTitle": "第1话 成为怪兽的男人",
-                            }
-                        ],
-                    },
-                )
-            ]
-        )
-        result = danmaku_source(transport).match(
-            "/cloud/Kaijuu.8.gou.S01E01.2024.mp4",
-            file_hash="658d05841b9476ccc7420b3f0bb21c3b",
-            file_size=1346864288,
-            video_duration=1440,
-        )
-
-        self.assertTrue(result["is_matched"])
-        self.assertEqual(result["matches"][0]["episode_id"], "175500001")
-        call = transport.calls[0]
-        self.assertEqual(call["method"], "POST")
-        self.assertEqual(
-            call["data"],
-            {
-                "fileName": "Kaijuu.8.gou.S01E01.2024",
-                "matchMode": "hashAndFileName",
-                "fileHash": "658d05841b9476ccc7420b3f0bb21c3b",
-                "fileSize": 1346864288,
-                "videoDuration": 1440,
-            },
-        )
 
     def test_source_disabled_without_credentials(self):
         self.assertFalse(danmaku_source(FakeTransport([]), app_id="", app_secret="").enabled())
@@ -416,59 +322,6 @@ class MatcherTest(unittest.TestCase):
         result = self._matcher(transport).match(episode=3, tmdb_id=1)
         self.assertFalse(result["matched"])
         self.assertEqual([item["mode"] for item in result["attempts"]], ["tmdb"])
-        self.assertEqual(len(transport.calls), 1)
-
-    def test_file_match_requires_unique_exact_result_and_reuses_cache(self):
-        transport = FakeTransport(
-            [
-                (
-                    "/api/v2/match",
-                    {
-                        "isMatched": True,
-                        "matches": [
-                            {
-                                "episodeId": 175500001,
-                                "animeTitle": "怪兽8号",
-                                "episodeTitle": "第1话 成为怪兽的男人",
-                            }
-                        ],
-                    },
-                )
-            ]
-        )
-        matcher = self._matcher(transport, match_ttl_seconds=3600)
-
-        first = matcher.match_file("Kaijuu.S01E01.mp4", "a" * 32, 1000, 1440)
-        second = matcher.match_file("Kaijuu.S01E01.mp4", "a" * 32, 1000, 1440)
-
-        self.assertTrue(first["matched"])
-        self.assertEqual(first["match_mode"], "hash")
-        self.assertFalse(first["cached"])
-        self.assertTrue(second["cached"])
-        self.assertEqual(len(transport.calls), 1)
-
-    def test_file_match_candidates_without_exact_flag_fail_closed(self):
-        transport = FakeTransport(
-            [
-                (
-                    "/api/v2/match",
-                    {
-                        "isMatched": False,
-                        "matches": [
-                            {"episodeId": 1010001, "animeTitle": "第一季", "episodeTitle": "第1话"},
-                            {"episodeId": 2020001, "animeTitle": "第二季", "episodeTitle": "第1话"},
-                        ],
-                    },
-                )
-            ]
-        )
-
-        result = self._matcher(transport).match_file("Show.S02E01.mkv", "b" * 32, 2000, 1440)
-
-        self.assertFalse(result["matched"])
-        self.assertTrue(result["ambiguous"])
-        self.assertEqual(result["unmatched_reason"], "no_unique_exact_file_match")
-        self.assertEqual(result["attempts"][0]["outcome"], "candidates_not_exact")
         self.assertEqual(len(transport.calls), 1)
 
     def test_multiple_tmdb_episode_candidates_fail_closed(self):

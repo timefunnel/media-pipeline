@@ -76,16 +76,13 @@ from pipeline.danmaku import (
     DEFAULT_DANMAKU_CACHE_DIR,
     DEFAULT_DANMAKU_CACHE_TTL_SECONDS,
     DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS,
-    DEFAULT_DANMAKU_FILE_MATCH_TIMEOUT_SECONDS,
     DEFAULT_DANMAKU_IMPORT_MAX_BYTES,
-    DEFAULT_DANMAKU_MATCH_TTL_SECONDS,
     DEFAULT_DANMAKU_MAX_COMMENTS,
     DEFAULT_DANMAKU_PROVIDERS,
     DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS,
     DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS,
     build_danmaku_local_import_from_config,
     build_danmaku_matcher_from_config,
-    fetch_danmaku_file_identity,
 )
 from pipeline.danmaku_prewarm import (
     DEFAULT_DANMAKU_PREWARM_DELAY_SECONDS,
@@ -498,9 +495,7 @@ class BotConfig:
     danmaku_providers: tuple = DEFAULT_DANMAKU_PROVIDERS
     danmaku_cache_dir: str = DEFAULT_DANMAKU_CACHE_DIR
     danmaku_cache_ttl_seconds: int = DEFAULT_DANMAKU_CACHE_TTL_SECONDS
-    danmaku_match_ttl_seconds: int = DEFAULT_DANMAKU_MATCH_TTL_SECONDS
     danmaku_search_cache_ttl_seconds: int = DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS
-    danmaku_file_match_timeout_seconds: int = DEFAULT_DANMAKU_FILE_MATCH_TIMEOUT_SECONDS
     danmaku_search_timeout_seconds: int = DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS
     danmaku_comment_timeout_seconds: int = DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS
     danmaku_max_comments: int = DEFAULT_DANMAKU_MAX_COMMENTS
@@ -713,10 +708,6 @@ class BotConfig:
                 0,
                 int(env.get("DANMAKU_CACHE_TTL_SECONDS", str(DEFAULT_DANMAKU_CACHE_TTL_SECONDS))),
             ),
-            danmaku_match_ttl_seconds=max(
-                0,
-                int(env.get("DANMAKU_MATCH_TTL_SECONDS", str(DEFAULT_DANMAKU_MATCH_TTL_SECONDS))),
-            ),
             danmaku_search_cache_ttl_seconds=max(
                 0,
                 int(
@@ -729,15 +720,6 @@ class BotConfig:
             danmaku_search_timeout_seconds=max(
                 1,
                 int(env.get("DANMAKU_SEARCH_TIMEOUT_SECONDS", str(DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS))),
-            ),
-            danmaku_file_match_timeout_seconds=max(
-                1,
-                int(
-                    env.get(
-                        "DANMAKU_FILE_MATCH_TIMEOUT_SECONDS",
-                        str(DEFAULT_DANMAKU_FILE_MATCH_TIMEOUT_SECONDS),
-                    )
-                ),
             ),
             danmaku_comment_timeout_seconds=max(
                 1,
@@ -3559,7 +3541,7 @@ class PipelineBotService:
         return media
 
     def danmaku_match(self, media_id):
-        """显式搜索只按 TMDB ID；播放自动匹配走 ``danmaku_playback_match``。"""
+        """只按 TMDB ID 匹配弹幕库；缺少 TMDB ID 时绝不访问上游。"""
         matcher = self._require_danmaku_matcher()
         media = self._load_media_detail(media_id)
         target = danmaku_target_from_media(media)
@@ -3568,83 +3550,6 @@ class PipelineBotService:
             episode=target["episode"] or None,
         )
         return {"media_id": media_id, "target": target, "match": match}
-
-    def danmaku_playback_match(self, media_id, file_url, headers=None, file_name="", file_size=0, video_duration=0):
-        """播放后先做文件识别；未精确命中时再按 TMDB ID 与集号搜索。"""
-        matcher = self._require_danmaku_matcher()
-        media = self._load_media_detail(media_id)
-        target = danmaku_target_from_media(media)
-        requested_name = str(file_name or "").strip() or target["file_name"]
-        if not requested_name:
-            raise ValueError("danmaku playback match requires file_name")
-        try:
-            expected_size = int(file_size or target["file_size"] or 0)
-            duration = int(video_duration or target["video_duration"] or 0)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("danmaku playback file size and duration must be integers") from exc
-        if expected_size < 0 or duration < 0:
-            raise ValueError("danmaku playback file size and duration must not be negative")
-
-        identity = fetch_danmaku_file_identity(
-            file_url,
-            headers=headers,
-            timeout=self.config.danmaku_file_match_timeout_seconds,
-        )
-        actual_size = int(identity["file_size"])
-        if expected_size > 0 and actual_size != expected_size:
-            raise RuntimeError(
-                "danmaku playback file size mismatch: media=%d resolved=%d" % (expected_size, actual_size)
-            )
-        target.update(
-            {
-                "file_name": requested_name,
-                "file_size": actual_size,
-                "video_duration": duration,
-                "prefix_bytes": int(identity["prefix_bytes"]),
-            }
-        )
-        match = matcher.match_file(
-            requested_name,
-            identity["file_hash"],
-            file_size=actual_size,
-            video_duration=duration or None,
-        )
-        if not match.get("matched"):
-            file_attempts = list(match.get("attempts") or [])
-            match = matcher.match(
-                tmdb_id=target["tmdb_id"] or None,
-                episode=target["episode"] or None,
-            )
-            match["attempts"] = file_attempts + list(match.get("attempts") or [])
-            match["cached"] = bool(match["attempts"]) and all(
-                item.get("cached") for item in match["attempts"]
-            )
-        comment_cache = {"status": "skipped", "cached": False, "count": 0}
-        if match.get("matched"):
-            try:
-                comments = matcher.comments(
-                    match.get("episode_id"),
-                    source_name=match.get("source"),
-                    provider_shift_seconds=float(match.get("shift") or 0.0),
-                    anime_title=match.get("anime_title") or "",
-                    episode_title=match.get("episode_title") or "",
-                    match_mode=match.get("match_mode") or "hash",
-                )
-                comment_cache = {
-                    "status": "ready",
-                    "cached": bool(comments.get("cached")),
-                    "count": int(comments.get("count") or 0),
-                }
-            except (RuntimeError, ValueError) as exc:
-                # 匹配结果仍必须交给 MSG 持久化；正文预热失败会显式返回，由 MSG 记录日志，
-                # 下一次实际取弹幕时还可以只重试 /comment，而不是再次消耗 /match。
-                comment_cache = {"status": "failed", "cached": False, "count": 0, "error": str(exc)}
-        return {
-            "media_id": media_id,
-            "target": target,
-            "match": match,
-            "comment_cache": comment_cache,
-        }
 
     def danmaku_comments(
         self,
@@ -8535,8 +8440,8 @@ def normalize_msg_subtitle_presence(value, media_id):
 def danmaku_target_from_media(media):
     """从 MSG 媒体详情里抽出弹幕匹配与诊断展示需要的字段。
 
-    显式搜索使用 ``tmdb_id`` 与集号；播放入口先做官方文件识别，未精确命中时
-    再使用相同的 TMDB 集搜索，并保留两条路径的完整尝试记录。
+    上游匹配只使用 ``tmdb_id`` 与集号；标题、路径、大小和时长只随 target 返回，
+    便于诊断，不得传给弹弹play 形成第二种匹配路径。
     """
     path = media_primary_path(media)
     file_name = path.replace("\\", "/").rsplit("/", 1)[-1] if path else ""
