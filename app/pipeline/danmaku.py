@@ -1001,7 +1001,7 @@ class DanmakuMatcher:
             for entry in anime.get("episodes") or []:
                 if episode:
                     number = str(entry.get("episode_number") or "").strip()
-                    if number and number != str(episode).strip():
+                    if number != str(episode).strip():
                         continue
                 candidates.append(
                     {

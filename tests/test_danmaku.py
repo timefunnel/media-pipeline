@@ -508,6 +508,32 @@ class MatcherTest(unittest.TestCase):
         self.assertEqual(result["attempts"][0]["outcome"], "ambiguous")
         self.assertEqual(len(transport.calls), 1)
 
+    def test_tmdb_episode_match_rejects_candidate_without_episode_number(self):
+        transport = FakeTransport(
+            [
+                (
+                    "/api/v2/search/episodes",
+                    {
+                        "animes": [
+                            {
+                                "animeId": 101,
+                                "animeTitle": "示例动画",
+                                "episodes": [
+                                    {"episodeId": 1010002, "episodeTitle": "未知集", "episodeNumber": ""}
+                                ],
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+
+        result = self._matcher(transport).match(episode=2, tmdb_id=123)
+
+        self.assertFalse(result["matched"])
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(result["attempts"][0]["outcome"], "no_candidates")
+
     def test_ambiguous_primary_tmdb_result_does_not_try_another_source(self):
         primary_transport = FakeTransport(
             [

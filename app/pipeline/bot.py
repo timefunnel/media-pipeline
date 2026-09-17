@@ -3570,7 +3570,7 @@ class PipelineBotService:
         return {"media_id": media_id, "target": target, "match": match}
 
     def danmaku_playback_match(self, media_id, file_url, headers=None, file_name="", file_size=0, video_duration=0):
-        """播放后异步文件识别：固定读取前 16 MiB，唯一命中后预热整集弹幕缓存。"""
+        """播放后先做文件识别；未精确命中时再按 TMDB ID 与集号搜索。"""
         matcher = self._require_danmaku_matcher()
         media = self._load_media_detail(media_id)
         target = danmaku_target_from_media(media)
@@ -3609,6 +3609,16 @@ class PipelineBotService:
             file_size=actual_size,
             video_duration=duration or None,
         )
+        if not match.get("matched"):
+            file_attempts = list(match.get("attempts") or [])
+            match = matcher.match(
+                tmdb_id=target["tmdb_id"] or None,
+                episode=target["episode"] or None,
+            )
+            match["attempts"] = file_attempts + list(match.get("attempts") or [])
+            match["cached"] = bool(match["attempts"]) and all(
+                item.get("cached") for item in match["attempts"]
+            )
         comment_cache = {"status": "skipped", "cached": False, "count": 0}
         if match.get("matched"):
             try:
@@ -8525,8 +8535,8 @@ def normalize_msg_subtitle_presence(value, media_id):
 def danmaku_target_from_media(media):
     """从 MSG 媒体详情里抽出弹幕匹配与诊断展示需要的字段。
 
-    显式搜索只使用 ``tmdb_id`` 与集号；播放触发的官方文件识别使用文件名、
-    前 16 MiB MD5、大小和时长，两条入口不互相猜测或静默回退。
+    显式搜索使用 ``tmdb_id`` 与集号；播放入口先做官方文件识别，未精确命中时
+    再使用相同的 TMDB 集搜索，并保留两条路径的完整尝试记录。
     """
     path = media_primary_path(media)
     file_name = path.replace("\\", "/").rsplit("/", 1)[-1] if path else ""
