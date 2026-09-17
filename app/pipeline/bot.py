@@ -77,9 +77,9 @@ from pipeline.danmaku import (
     DEFAULT_DANMAKU_CACHE_TTL_SECONDS,
     DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS,
     DEFAULT_DANMAKU_IMPORT_MAX_BYTES,
-    DEFAULT_DANMAKU_MATCH_TTL_SECONDS,
     DEFAULT_DANMAKU_MAX_COMMENTS,
     DEFAULT_DANMAKU_PROVIDERS,
+    DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS,
     DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS,
     build_danmaku_local_import_from_config,
     build_danmaku_matcher_from_config,
@@ -495,7 +495,7 @@ class BotConfig:
     danmaku_providers: tuple = DEFAULT_DANMAKU_PROVIDERS
     danmaku_cache_dir: str = DEFAULT_DANMAKU_CACHE_DIR
     danmaku_cache_ttl_seconds: int = DEFAULT_DANMAKU_CACHE_TTL_SECONDS
-    danmaku_match_ttl_seconds: int = DEFAULT_DANMAKU_MATCH_TTL_SECONDS
+    danmaku_search_cache_ttl_seconds: int = DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS
     danmaku_search_timeout_seconds: int = DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS
     danmaku_comment_timeout_seconds: int = DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS
     danmaku_max_comments: int = DEFAULT_DANMAKU_MAX_COMMENTS
@@ -708,9 +708,14 @@ class BotConfig:
                 0,
                 int(env.get("DANMAKU_CACHE_TTL_SECONDS", str(DEFAULT_DANMAKU_CACHE_TTL_SECONDS))),
             ),
-            danmaku_match_ttl_seconds=max(
+            danmaku_search_cache_ttl_seconds=max(
                 0,
-                int(env.get("DANMAKU_MATCH_TTL_SECONDS", str(DEFAULT_DANMAKU_MATCH_TTL_SECONDS))),
+                int(
+                    env.get(
+                        "DANMAKU_SEARCH_CACHE_TTL_SECONDS",
+                        str(DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS),
+                    )
+                ),
             ),
             danmaku_search_timeout_seconds=max(
                 1,
@@ -3536,18 +3541,13 @@ class PipelineBotService:
         return media
 
     def danmaku_match(self, media_id):
-        """按 TMDB ID → 文件名 → 标题 的顺序匹配弹幕库，并如实返回每次尝试。"""
+        """只按 TMDB ID 匹配弹幕库；缺少 TMDB ID 时绝不访问上游。"""
         matcher = self._require_danmaku_matcher()
         media = self._load_media_detail(media_id)
         target = danmaku_target_from_media(media)
         match = matcher.match(
-            title=target["title"],
-            season=target["season"] or None,
-            episode=target["episode"] or None,
-            file_name=target["file_name"],
             tmdb_id=target["tmdb_id"] or None,
-            file_size=target["file_size"],
-            video_duration=target["video_duration"],
+            episode=target["episode"] or None,
         )
         return {"media_id": media_id, "target": target, "match": match}
 
@@ -3594,14 +3594,6 @@ class PipelineBotService:
         )
         payload["media_id"] = media_id
         return payload
-
-    def danmaku_search(self, keyword, episode=None):
-        """手动匹配用的关键词搜索。"""
-        matcher = self._require_danmaku_matcher()
-        keyword = str(keyword or "").strip()
-        if not keyword:
-            raise ValueError("keyword is required")
-        return matcher.search(keyword, episode=episode)
 
     def danmaku_parse_local(self, content, source_format="auto", offset_seconds=0.0, ch_convert=0, title=""):
         """解析本地弹幕文件（B 站 XML / 弹弹play JSON）。
@@ -8460,10 +8452,10 @@ def normalize_msg_subtitle_presence(value, media_id):
 
 
 def danmaku_target_from_media(media):
-    """从 MSG 媒体详情里抽出弹幕匹配需要的字段。
+    """从 MSG 媒体详情里抽出弹幕匹配与诊断展示需要的字段。
 
-    标题优先用原名（日文原名在弹弹play 的命中率明显高于刮削后的中文译名），
-    文件名为媒体路径的 basename；``tmdb_id`` 用于首选的反查路径。
+    上游匹配只使用 ``tmdb_id`` 与集号；标题、路径、大小和时长只随 target 返回，
+    便于诊断，不得传给弹弹play 形成第二种匹配路径。
     """
     path = media_primary_path(media)
     file_name = path.replace("\\", "/").rsplit("/", 1)[-1] if path else ""

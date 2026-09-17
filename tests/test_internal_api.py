@@ -1114,17 +1114,15 @@ class SubtitleApiTest(InternalApiTestCase):
 
 
 class FakeDanmakuService(FakePipelineService):
-    """只补弹幕四个方法的假服务，用于验证 API 契约与错误映射。"""
+    """只补弹幕匹配、正文和本地解析方法，用于验证 API 契约与错误映射。"""
 
-    def __init__(self, match_error=None, comments_error=None, search_error=None, parse_error=None):
+    def __init__(self, match_error=None, comments_error=None, parse_error=None):
         super().__init__()
         self.match_error = match_error
         self.comments_error = comments_error
-        self.search_error = search_error
         self.parse_error = parse_error
         self.match_calls = []
         self.comment_calls = []
-        self.search_calls = []
         self.parse_calls = []
 
     def danmaku_match(self, media_id):
@@ -1174,12 +1172,6 @@ class FakeDanmakuService(FakePipelineService):
                 }
             ],
         }
-
-    def danmaku_search(self, keyword, episode=None):
-        self.search_calls.append({"keyword": keyword, "episode": episode})
-        if self.search_error:
-            raise self.search_error
-        return {"keyword": keyword, "results": [{"source": "dandanplay", "animes": []}], "errors": []}
 
     def danmaku_parse_local(self, content, source_format="auto", offset_seconds=0.0, ch_convert=0, title=""):
         self.parse_calls.append(
@@ -1312,22 +1304,6 @@ class DanmakuApiTest(InternalApiTestCase):
         finally:
             manager.stop()
 
-    def test_search_requires_keyword_and_validates_episode(self):
-        service = FakeDanmakuService()
-        _service, _store, manager, application = self.build_components(service=service)
-        try:
-            with self.assertRaises(ApiError) as raised:
-                application.search_danmaku({})
-            self.assertEqual(raised.exception.code, "missing_keyword")
-            with self.assertRaises(ApiError) as raised:
-                application.search_danmaku({"keyword": "某番", "episode": 0})
-            self.assertEqual(raised.exception.code, "invalid_episode")
-            result = application.search_danmaku({"keyword": "某番", "episode": 3})
-            self.assertEqual(service.search_calls, [{"keyword": "某番", "episode": 3}])
-            self.assertEqual(result["results"][0]["source"], "dandanplay")
-        finally:
-            manager.stop()
-
     def test_parse_validates_content_format_chconvert_and_offset(self):
         service = FakeDanmakuService()
         _service, _store, manager, application = self.build_components(service=service)
@@ -1448,8 +1424,10 @@ class DanmakuHttpRouteTest(InternalApiTestCase):
             )
             self.assertEqual(fetched["comments"][0]["cid"], "1542278977442529280")
 
-            searched = http_json(base + "/v1/danmaku/search", {"keyword": "某番"}, token="secret")
-            self.assertEqual(searched["keyword"], "某番")
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                http_json(base + "/v1/danmaku/search", {"keyword": "某番"}, token="secret")
+            self.assertEqual(raised.exception.code, 404)
+
             self.assertEqual(service.match_calls, ["media-1"])
 
             parsed = http_json(
