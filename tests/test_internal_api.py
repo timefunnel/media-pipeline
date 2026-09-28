@@ -381,10 +381,10 @@ class FakePipelineService:
     def search_pansou(self, query, limit=20):
         return [{"title": query, "download_uri": "https://115.com/s/%s" % query, "rank": 1}]
 
-    def search_bt4g(self, query, limit=20):
+    def search_bt4g(self, query, category="movie", limit=20):
         return ResultList(
             [{"title": query, "download_uri": "magnet:?xt=urn:btih:BT4G%s" % query.upper(), "rank": 1}],
-            metadata={"profile": "bt4g"},
+            metadata={"profile": "bt4g", "category": category},
         )
 
     def validate_media_candidate_migration(self, candidate, target_category):
@@ -1549,6 +1549,26 @@ class DanmakuPrewarmApiTest(InternalApiTestCase):
 
 
 class SearchResponseTest(InternalApiTestCase):
+    def test_bt4g_search_preserves_the_requested_category(self):
+        class RecordingSearchService(FakePipelineService):
+            def __init__(self):
+                super().__init__()
+                self.bt4g_calls = []
+
+            def search_bt4g(self, query, category="movie", limit=20):
+                self.bt4g_calls.append((query, category, limit))
+                return super().search_bt4g(query, category, limit=limit)
+
+        service = RecordingSearchService()
+        _, _, _, application = self.build_components(service)
+
+        response = application.search(
+            {"owner_id": "owner-a", "query": "IPZZ-912", "category": "adult", "source": "bt4g", "limit": 200}
+        )
+
+        self.assertEqual(service.bt4g_calls, [("IPZZ-912", "adult", 200)])
+        self.assertEqual(response["metadata"]["category"], "adult")
+
     def test_subscription_follow_uses_the_dedicated_follow_search(self):
         class FollowSearchService(FakePipelineService):
             def __init__(self):

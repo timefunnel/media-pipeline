@@ -3063,7 +3063,7 @@ class InternalApiApplication:
             if source == "pansou":
                 result = self.service.search_pansou(query, limit=search_limit)
             elif source == "bt4g":
-                result = self.service.search_bt4g(query, limit=search_limit)
+                result = self.service.search_bt4g(query, category, limit=search_limit)
             elif subscription_follow:
                 result = self.service.search_subscription_follow(query, category, limit=search_limit)
             else:

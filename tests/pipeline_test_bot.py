@@ -279,6 +279,7 @@ class BotConfigTest(unittest.TestCase):
         )
 
         self.assertEqual(config.prowlarr_early_return_after_seconds, 6.0)
+        self.assertEqual(config.prowlarr_bt4g_search_timeout_seconds, 65)
         self.assertEqual(config.search_profile_timeout_seconds["general"], 10)
         self.assertEqual(config.search_profile_timeout_seconds["adult"], 10)
         self.assertEqual(config.search_profile_timeout_seconds["anime"], 4)

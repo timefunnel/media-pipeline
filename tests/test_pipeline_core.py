@@ -164,6 +164,11 @@ class FakeProwlarr:
         self.indexer_results = indexer_results or {}
         self.indexer_errors = indexer_errors or {}
         self.search_calls = []
+        self.indexer_search_timeouts = {}
+
+    def set_indexer_search_timeout(self, indexer_ids, timeout):
+        for indexer_id in indexer_ids or ():
+            self.indexer_search_timeouts[int(indexer_id)] = float(timeout)
 
     def search(self, query, limit=20, indexer_ids=None, categories=None):
         key = tuple(indexer_ids or [])

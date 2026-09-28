@@ -438,7 +438,7 @@ from pipeline.subtitle_asr import (
     DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS,
 )
 TYPING_ACTION_INTERVAL_SECONDS = 4
-DEFAULT_BT4G_SEARCH_TIMEOUT_SECONDS = 12
+DEFAULT_BT4G_SEARCH_TIMEOUT_SECONDS = 65
 DEFAULT_SUBSCRIPTION_FOLLOW_SEARCH_TIMEOUT_SECONDS = 45
 DEFAULT_SUBSCRIPTION_STAGING_ROOT = "/115/临时"
 
@@ -1947,6 +1947,16 @@ class PipelineBotService:
             search_cache=self._prowlarr_search_cache,
         )
         indexers = prowlarr.indexers()
+        prowlarr.set_indexer_search_timeout(
+            [
+                indexer.get("id")
+                for indexer in indexers
+                if indexer_enabled(indexer)
+                and indexer.get("id") is not None
+                and indexer_matches_label(indexer, "BT4G")
+            ],
+            self.config.prowlarr_bt4g_search_timeout_seconds,
+        )
         tags = safe_prowlarr_tags(prowlarr)
         max_workers = search_profile_value(
             self.config.search_profile_max_workers,
@@ -2023,7 +2033,7 @@ class PipelineBotService:
     def search_anime(self, query, limit=DEFAULT_SEARCH_LIMIT):
         return self.search(query, "movie", limit=limit, profile=SEARCH_PROFILE_ANIME)
 
-    def search_bt4g(self, query, limit=DEFAULT_SEARCH_LIMIT):
+    def search_bt4g(self, query, category="movie", limit=DEFAULT_SEARCH_LIMIT):
         stats = SearchStats()
         api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
         prowlarr = ProwlarrClient(
@@ -2037,11 +2047,12 @@ class PipelineBotService:
         if not bt4g_indexers:
             raise RuntimeError("Prowlarr indexer not found: BT4G")
 
+        profile = search_profile_for_query(category, query)
         categories_by_profile = self.config.search_profile_categories or SEARCH_PROFILE_CATEGORIES
-        categories = categories_by_profile.get(SEARCH_PROFILE_GENERAL, SEARCH_PROFILE_CATEGORIES[SEARCH_PROFILE_GENERAL])
+        categories = categories_by_profile.get(profile, SEARCH_PROFILE_CATEGORIES[SEARCH_PROFILE_GENERAL])
         upstream_limit = search_profile_value(
             self.config.search_profile_upstream_limits,
-            SEARCH_PROFILE_GENERAL,
+            profile,
             self.config.prowlarr_upstream_search_limit,
         )
         request_limit = max(int(limit), int(upstream_limit))
