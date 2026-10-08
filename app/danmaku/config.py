@@ -11,7 +11,7 @@ class Config:
     host: str = "127.0.0.1"
     port: int = 9322
     danmaku_enabled: bool = True
-    danmaku_providers: tuple = ("tencent", "iqiyi")
+    danmaku_providers: tuple = ("tencent", "iqiyi", "dandanplay")
     danmaku_cache_dir: str = "/danmaku-cache"
     danmaku_cache_ttl_seconds: int = 604800
     danmaku_search_cache_ttl_seconds: int = 86400

@@ -11,7 +11,7 @@
 - 腾讯、爱奇艺按识别后的标题/原名、季号、源站正片集号精确匹配；多季合辑再次检查分集作品名。电影要求标题和年份一致；未知季集、特别篇、综艺等不猜测匹配。
 - 弹弹play/兼容聚合源保留 TMDB → 未得到唯一节目时仅一次精确关键词查询的策略，已知季号时额外校验季号。不读取文件、不计算 hash、不调用 115。
 
-默认启用 `tencent,iqiyi`。加入 `dandanplay` 时必须提供官方凭据；未加入时没有官方计次接口调用。`aggregator` 需要兼容 `/api/v2/search/episodes` 和 `/api/v2/comment/{episodeId}` 的地址。
+默认启用 `tencent,iqiyi,dandanplay`，弹弹play 优先级最低且必须提供官方凭据。腾讯或爱奇艺唯一命中后不会调用弹弹play；配置中移除它则没有官方计次接口调用。`aggregator` 需要兼容 `/api/v2/search/episodes` 和 `/api/v2/comment/{episodeId}` 的地址。
 
 ## 缓存与关联
 
@@ -57,7 +57,7 @@ danmaku:
 
 ## 镜像与验证
 
-`.github/workflows/danmaku-publish.yml` 单独构建 linux/amd64，固定源码 revision/version，独立 BuildKit cache scope。正式部署按顶层生产工作流程先隔离验证，再使用同一 `image@sha256:...` 切换，不在服务器构建。
+`.github/workflows/docker-publish.yml` 选择 `target=danmaku` 单独构建 linux/amd64，固定源码 revision/version，独立 BuildKit cache scope；默认 target 仍为 media-pipeline。正式部署按顶层生产工作流程先隔离验证，再使用同一 `image@sha256:...` 切换，不在服务器构建。
 
 `compose.yml` 要求 `DANMAKU_IMAGE` 为已验证的不可变 digest，并读取同目录 `.env`，仅绑定宿主机 loopback。它不连接 pipeline、MSG 数据库、云盘或 Telegram。源站分片在当前匹配源内最多 2 个并发，失败不保存部分结果。
 

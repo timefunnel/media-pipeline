@@ -58,16 +58,35 @@ class DanmakuServerTest(unittest.TestCase):
         return matcher.match(tmdb_id='68809', anime='爱情公寓', season=4, episode=16)
 
     def test_priority_hit_never_requests_later_source_and_reuses_search_comment_cache(self):
-        first, second = Source('tencent'), Source('iqiyi')
-        matcher = self.matcher([first, second])
+        first, second, last = Source('tencent'), Source('iqiyi'), Source('dandanplay')
+        matcher = self.matcher([first, second, last])
         self.assertTrue(self.match(matcher)['matched'])
         self.assertTrue(self.match(matcher)['cached'])
         matcher.comments('1', source_name='tencent')
         self.assertTrue(matcher.comments('1', source_name='tencent')['cached'])
         self.assertEqual((first.calls, second.calls, first.comment_calls), (1, 0, 1))
-        restarted = self.matcher([first, second])
+        restarted = self.matcher([first, second, last])
         self.assertTrue(self.match(restarted)['cached'])
         self.assertEqual(first.calls, 1)
+        self.assertEqual(last.calls, 0)
+
+    def test_default_official_source_is_last_and_requires_credentials(self):
+        config = Config.from_env({'DANMAKU_SERVER_TOKEN': 'test-token-16-chars',
+                                  'DANDANPLAY_APP_ID': 'test', 'DANDANPLAY_APP_SECRET': 'test'})
+        self.assertEqual(config.danmaku_providers, ('tencent', 'iqiyi', 'dandanplay'))
+        with self.assertRaisesRegex(ValueError, 'requires DANDANPLAY'):
+            Config.from_env({'DANMAKU_SERVER_TOKEN': 'test-token-16-chars'})
+
+    def test_official_source_runs_only_after_both_native_misses_and_is_cached(self):
+        for second_count in (0, 1):
+            with self.subTest(second_count=second_count), tempfile.TemporaryDirectory() as directory:
+                sources = [Source('tencent', count=0), Source('iqiyi', count=second_count), Source('dandanplay')]
+                matcher = DanmakuMatcher(sources, cache=DanmakuCache(directory))
+                result = self.match(matcher)
+                self.assertEqual(result['source'], 'iqiyi' if second_count else 'dandanplay')
+                self.assertEqual([source.calls for source in sources], [1, 1, 0 if second_count else 1])
+                self.match(matcher)
+                self.assertEqual([source.calls for source in sources], [1, 1, 0 if second_count else 1])
 
     def test_no_match_and_ambiguity_allow_next_source(self):
         for count in (0, 2):
