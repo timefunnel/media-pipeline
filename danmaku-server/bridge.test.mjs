@@ -53,17 +53,21 @@ test('movies require matching release year, no movie-series crossover', async ()
   assert.equal(result[0].animeId, 'new');
 });
 
-test('segment downloads stay at concurrency two', async () => {
+test('segment downloads obey default six and configurable bounded concurrency', async () => {
   Globals.init({ LOG_LEVEL: 'error', LIKE_SWITCH: 'false', DANMU_LIMIT: '0', GROUP_MINUTE: '0' });
   let active = 0, maximum = 0;
-  const fake = { getEpisodeDanmuSegments: async () => ({ segmentList: [1, 2, 3, 4, 5] }),
+  const fake = { getEpisodeDanmuSegments: async () => ({ segmentList: Array.from({ length: 13 }, (_, index) => index) }),
     getEpisodeSegmentDanmu: async () => {
       maximum = Math.max(maximum, ++active);
       await new Promise(resolve => setTimeout(resolve, 5));
       active--; return [];
     }, formatComments: items => items };
-  await comments(fake, 'iqiyi', 'unused');
-  assert.equal(maximum, 2);
+  for (const limit of [2, 6, 8]) {
+    maximum = 0;
+    await comments(fake, 'iqiyi', 'unused', limit);
+    assert.equal(maximum, limit);
+  }
+  await assert.rejects(comments(fake, 'iqiyi', 'unused', 9), /invalid segment concurrency/);
 });
 
 test('upstream caught error and risk-control failure cannot turn into a successful empty cache', () => {
@@ -147,7 +151,7 @@ test('one failed segment stops scheduling, waits for active segments, and return
         return [];
       } finally { active--; }
     }, formatComments: entries => entries };
-  await assert.rejects(comments(fake, 'youku', 'unused'), /segment failed/);
+  await assert.rejects(comments(fake, 'youku', 'unused', 2), /segment failed/);
   assert.equal(calls, 2);
   assert.equal(active, 0);
 });

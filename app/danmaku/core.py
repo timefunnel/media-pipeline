@@ -17,6 +17,7 @@
 """
 
 import base64
+from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
 import json
 import logging
@@ -35,7 +36,7 @@ from .transport import DanmakuHttpTransport
 
 DEFAULT_DANDANPLAY_BASE_URL = "https://api.dandanplay.net"
 DEFAULT_DANMAKU_CACHE_DIR = "/danmaku-cache"
-DEFAULT_DANMAKU_PROVIDERS = ("dandanplay",)
+DEFAULT_DANMAKU_PROVIDERS = ("tencent", "iqiyi", "youku")
 DEFAULT_DANMAKU_CACHE_TTL_SECONDS = 7 * 24 * 3600
 DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS = 24 * 3600
 DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS = 12
@@ -616,6 +617,7 @@ class DanmakuMatcher:
         max_comments=DEFAULT_DANMAKU_MAX_COMMENTS,
         blacklist=None,
         negative_cache_ttl_seconds=3600,
+        cache_only_sources=(),
     ):
         self.sources = [source for source in (sources or []) if source is not None]
         self.cache = cache if cache is not None else DanmakuCache()
@@ -624,8 +626,10 @@ class DanmakuMatcher:
         self.max_comments = max(1, int(max_comments or DEFAULT_DANMAKU_MAX_COMMENTS))
         self.blacklist = tuple(blacklist or ())
         self.negative_cache_ttl_seconds = max(1, int(negative_cache_ttl_seconds))
+        self.cache_only_sources = tuple(cache_only_sources)
         # 固定数量的分片锁避免同一缓存键并发未命中时击穿上游，也避免按搜索词永久累积锁对象。
         self._cache_locks = tuple(threading.Lock() for _ in range(64))
+        self._search_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="danmaku-source")
 
     def enabled_sources(self):
         return [source for source in self.sources if source.enabled()]
@@ -634,6 +638,7 @@ class DanmakuMatcher:
         for source in self.sources:
             if hasattr(source, "close"):
                 source.close()
+        self._search_executor.shutdown(wait=True, cancel_futures=True)
 
     def _source_by_name(self, name):
         wanted = str(name or "").strip().lower()
@@ -657,19 +662,19 @@ class DanmakuMatcher:
         digest = hashlib.sha256(str(key).encode("utf-8")).digest()
         return self._cache_locks[int.from_bytes(digest[:4], "big") % len(self._cache_locks)]
 
-    def _cached_call(self, key, ttl_seconds, loader):
-        def load():
-            body = self.cache.load(key, ttl_seconds)
-            if body is not None and ("animes" in body and not body["animes"] or "comments" in body and not body["comments"]):
-                body = self.cache.load(key, min(ttl_seconds, self.negative_cache_ttl_seconds))
-            return body
+    def _load_cached(self, key, ttl_seconds):
+        body = self.cache.load(key, ttl_seconds)
+        if body is not None and ("animes" in body and not body["animes"] or "comments" in body and not body["comments"]):
+            body = self.cache.load(key, min(ttl_seconds, self.negative_cache_ttl_seconds))
+        return body
 
-        cached = load()
+    def _cached_call(self, key, ttl_seconds, loader):
+        cached = self._load_cached(key, ttl_seconds)
         if cached is not None:
             return cached, True
         with self._cache_lock(key):
             # 等锁期间另一个请求可能已经完成回源，必须二次检查。
-            cached = load()
+            cached = self._load_cached(key, ttl_seconds)
             if cached is not None:
                 return cached, True
             body = loader()
@@ -730,16 +735,60 @@ class DanmakuMatcher:
                 ],
                 "cached": False,
             }
+        target = {"tmdb_id": normalized_tmdb_id, "title": normalized_anime,
+                  "original_title": str(original_title or ""), "season": season, "episode": episode, "year": year}
+        native_searches = self._prefetch_native(sources, target)
+        try:
+            return self._match_ordered(sources, normalized_tmdb_id, episode, normalized_anime, season, original_title, native_searches)
+        finally:
+            # 不等待无关低优先级源；未启动任务取消，已回源任务结束后保留整季缓存。
+            for future in native_searches.values():
+                future.cancel()
+
+    def _native_key(self, source, target):
+        season_target = {key: value for key, value in target.items() if key != "episode"}
+        return self._cache_key("native_season_search_v1", {"source": self._source_cache_identity(source), "target": season_target})
+
+    def _prefetch_native(self, sources, target):
+        futures = {}
+        missing = []
+        # 先检查本地缓存；已有高优先级唯一命中时，不再启动更低源的新搜索。
+        for source in sources:
+            if not hasattr(source, "search_target"):
+                continue
+            key = self._native_key(source, target)
+            body, _, error = self._attempt(lambda: (self._load_cached(key, self.search_cache_ttl_seconds), True))
+            if body is None and error is None:
+                missing.append((source, key))
+                continue
+            animes = list(body.get("animes") or []) if body else None
+            future = Future()
+            future.set_result((animes, error is None, error))
+            futures[source] = future
+            candidates = self._unique_episode_candidates(self._episode_candidates_from_animes(
+                animes, episode=target["episode"], allow_episode_title=True))
+            if len(candidates) == 1:
+                break
+        for source, key in missing:
+            futures[source] = self._search_executor.submit(self._run_native_search, source, key, target)
+        return futures
+
+    def _run_native_search(self, source, key, target):
+        started = time.monotonic()
+        result = self._attempt(lambda: self._native_search(source, key, target))
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        if result[2]:
+            logging.warning("danmaku source search source=%s elapsed_ms=%s error=%s", source.name, elapsed_ms, result[2])
+        else:
+            logging.info("danmaku source search source=%s elapsed_ms=%s cached=%s", source.name, elapsed_ms, result[1])
+        return result
+
+    def _match_ordered(self, sources, normalized_tmdb_id, episode, normalized_anime, season, original_title, native_searches):
         attempts = []
         ambiguous_result = None
         for source in sources:
             if hasattr(source, "search_target"):
-                target = {"tmdb_id": normalized_tmdb_id, "title": normalized_anime,
-                          "original_title": str(original_title or ""), "season": season, "episode": episode, "year": year}
-                # 一次缓存该作品整季的节目列表，下一集也先在本地选集，不再次搜索源站。
-                season_target = {key: value for key, value in target.items() if key != "episode"}
-                key = self._cache_key("native_season_search_v1", {"source": self._source_cache_identity(source), "target": season_target})
-                animes, cached, error = self._attempt(lambda: self._native_search(source, key, target))
+                animes, cached, error = native_searches[source].result()
                 candidates = self._unique_episode_candidates(self._episode_candidates_from_animes(
                     animes, episode=episode, allow_episode_title=True,
                 ))
@@ -1041,9 +1090,10 @@ class DanmakuMatcher:
         confidence=None,
     ):
         source = self._source_by_name(source_name) if source_name else None
-        if source is None and source_name:
+        cache_only = source is None and source_name in self.cache_only_sources
+        if source is None and source_name and not cache_only:
             raise ValueError("requested danmaku source is not configured: %s" % source_name)
-        if source is None:
+        if source is None and not cache_only:
             enabled = self.enabled_sources()
             if not enabled:
                 raise RuntimeError("no danmaku source is configured and enabled")
@@ -1052,19 +1102,25 @@ class DanmakuMatcher:
         if not episode:
             raise ValueError("episode_id is required for danmaku comments")
         cache_key = "comment_%s_%s_%s_%s" % (
-            source.name,
+            source_name if cache_only else source.name,
             episode,
             "1" if with_related else "0",
             int(ch_convert or 0),
         )
-        cached, served_from_cache = self._cached_call(
-            cache_key,
-            self.cache_ttl_seconds,
-            lambda: source.comment(episode, with_related=with_related, ch_convert=ch_convert),
-        )
+        if cache_only:
+            cached = self._load_cached(cache_key, self.cache_ttl_seconds)
+            if cached is None:
+                raise RuntimeError("%s is disabled and no valid comments cache is available" % source_name)
+            served_from_cache = True
+        else:
+            cached, served_from_cache = self._cached_call(
+                cache_key,
+                self.cache_ttl_seconds,
+                lambda: source.comment(episode, with_related=with_related, ch_convert=ch_convert),
+            )
         return build_danmaku_payload(
             cached.get("comments") or [],
-            source=source.name,
+            source=source_name if cache_only else source.name,
             episode_id=episode,
             anime_title=anime_title,
             episode_title=episode_title,
@@ -1106,8 +1162,11 @@ def build_danmaku_matcher_from_config(config):
             if pool is None:
                 pool = BridgePool(config.danmaku_bridge)
             sources.append(NativeSource(normalized, cache, config.danmaku_bridge,
-                                        search_timeout=timeout, comment_timeout=comment_timeout, pool=pool))
+                                        search_timeout=timeout, comment_timeout=comment_timeout, pool=pool,
+                                        segment_concurrency=config.danmaku_segment_concurrency))
         elif normalized == "dandanplay":
+            if not getattr(config, "danmaku_dandanplay_enabled", False):
+                raise ValueError("dandanplay is disabled; remove it from DANMAKU_PROVIDERS")
             sources.append(
                 DandanplayProtocolSource(
                     app_id=getattr(config, "dandanplay_app_id", ""),
@@ -1144,6 +1203,7 @@ def build_danmaku_matcher_from_config(config):
         ),
         max_comments=getattr(config, "danmaku_max_comments", DEFAULT_DANMAKU_MAX_COMMENTS),
         blacklist=getattr(config, "danmaku_blacklist", ()),
+        cache_only_sources=() if any(source.name == "dandanplay" for source in sources) else ("dandanplay",),
     )
 
 

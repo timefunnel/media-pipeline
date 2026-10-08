@@ -30,11 +30,11 @@ class DanmakuBridgeTest(unittest.TestCase):
         self.addCleanup(matcher.close)
         self.assertTrue(all(source.pool is matcher.sources[0].pool for source in matcher.sources))
 
-    def test_concurrent_requests_have_at_most_two_processes_and_preserve_responses(self):
+    def test_concurrent_requests_have_at_most_three_processes_and_preserve_responses(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(lambda index: self.call(source=str(index), data={'delay': 20}), range(8)))
         self.assertEqual([result['source'] for result in results], [str(index) for index in range(8)])
-        self.assertEqual(len({result['pid'] for result in results}), 2)
+        self.assertEqual(len({result['pid'] for result in results}), 3)
 
     def test_failure_does_not_retry_or_poison_the_next_request(self):
         for action in ('crash', 'invalid', 'error'):
@@ -51,24 +51,24 @@ class DanmakuBridgeTest(unittest.TestCase):
         self.assertNotEqual(self.call()['pid'], pid)
 
     def test_queue_wait_consumes_the_same_timeout_budget(self):
-        # 占满两个 worker，第三个请求不得在队列上额外等待一个完整处理超时。
+        # 占满三个 worker，第四个请求不得在队列上额外等待一个完整处理超时。
         self.call()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            barrier = threading.Barrier(3)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            barrier = threading.Barrier(4)
             def occupy():
                 barrier.wait()
                 return self.call(data={'delay': 200})
-            first, second = executor.submit(occupy), executor.submit(occupy)
+            futures = [executor.submit(occupy) for _ in range(3)]
             barrier.wait()
-            # 等两个 worker 确实从池中取走；只等待本地状态，不发上游请求。
+            # 等三个 worker 确实从池中取走；只等待本地状态，不发上游请求。
             for _ in range(100):
                 if self.pool.available.empty():
                     break
                 threading.Event().wait(0.005)
             with self.assertRaisesRegex(RuntimeError, 'queue timed out'):
                 self.call(timeout=0.03)
-            first.result()
-            second.result()
+            for future in futures:
+                future.result()
 
     def test_shutdown_reaps_workers_and_rejects_new_requests(self):
         self.call()

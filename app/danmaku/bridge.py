@@ -85,7 +85,7 @@ class _Worker:
 
 
 class BridgePool:
-    def __init__(self, bridge, size=2):
+    def __init__(self, bridge, size=3):
         self.bridge = str(bridge)
         self.workers = tuple(_Worker(self.bridge) for _ in range(size))
         self.available = queue.LifoQueue(maxsize=size)

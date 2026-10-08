@@ -2,6 +2,7 @@ import concurrent.futures
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -11,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
 from danmaku.config import Config
-from danmaku.core import DanmakuCache, DanmakuMatcher
+from danmaku.core import DanmakuCache, DanmakuMatcher, build_danmaku_matcher_from_config
 from danmaku.native import NativeSource
 from danmaku.server import Application, Server, validate_target
 
@@ -44,6 +45,21 @@ class Source:
                               'color': 16777215, 'size': 25, 'user': 'user'}]}
 
 
+class ProtocolSource:
+    """官方协议没有原生 search_target，不应进入并行预取。"""
+    base_url = 'fake-official'
+    enabled = Source.enabled
+    comment = Source.comment
+
+    def __init__(self):
+        Source.__init__(self, 'dandanplay')
+
+    def search_episodes(self, tmdb_id=None, episode=None, anime=None):
+        self.calls += 1
+        return [{'anime_title': '爱情公寓4', 'episodes': [
+            {'episode_id': '1', 'episode_number': str(episode), 'episode_title': '第16集'}]}]
+
+
 class DanmakuServerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -52,44 +68,78 @@ class DanmakuServerTest(unittest.TestCase):
         self.config = Config(token='test-token-16-chars', port=0, danmaku_cache_dir=self.tmp.name, danmaku_prewarm_delay_seconds=0)
 
     def matcher(self, sources):
-        return DanmakuMatcher(sources, cache=self.cache)
+        matcher = DanmakuMatcher(sources, cache=self.cache)
+        self.addCleanup(matcher.close)
+        return matcher
 
     def match(self, matcher):
         return matcher.match(tmdb_id='68809', anime='爱情公寓', season=4, episode=16)
 
-    def test_priority_hit_never_requests_later_source_and_reuses_search_comment_cache(self):
-        first, second, last = Source('tencent'), Source('iqiyi'), Source('dandanplay')
+    def test_cached_priority_hit_skips_later_search_and_reuses_comment_cache(self):
+        first, second, last = Source('tencent'), Source('iqiyi'), ProtocolSource()
         matcher = self.matcher([first, second, last])
         self.assertTrue(self.match(matcher)['matched'])
+        matcher.close()
+        matcher = self.matcher([first, second, last])
+        calls = (first.calls, second.calls, last.calls)
         self.assertTrue(self.match(matcher)['cached'])
         matcher.comments('1', source_name='tencent')
         self.assertTrue(matcher.comments('1', source_name='tencent')['cached'])
-        self.assertEqual((first.calls, second.calls, first.comment_calls), (1, 0, 1))
+        self.assertEqual((first.calls, second.calls, last.calls), calls)
+        self.assertEqual(first.comment_calls, 1)
         restarted = self.matcher([first, second, last])
         self.assertTrue(self.match(restarted)['cached'])
         self.assertEqual(first.calls, 1)
-        self.assertEqual(last.calls, 0)
+        self.assertEqual(last.calls, calls[2])
 
-    def test_default_official_source_is_last_and_requires_credentials(self):
+    def test_default_official_source_is_disabled_even_with_credentials(self):
         config = Config.from_env({'DANMAKU_SERVER_TOKEN': 'test-token-16-chars',
                                   'DANDANPLAY_APP_ID': 'test', 'DANDANPLAY_APP_SECRET': 'test'})
-        self.assertEqual(config.danmaku_providers, ('tencent', 'iqiyi', 'youku', 'dandanplay'))
-        with self.assertRaisesRegex(ValueError, 'requires DANDANPLAY'):
-            Config.from_env({'DANMAKU_SERVER_TOKEN': 'test-token-16-chars'})
+        self.assertEqual(config.danmaku_providers, ('tencent', 'iqiyi', 'youku'))
+        matcher = build_danmaku_matcher_from_config(config)
+        self.addCleanup(matcher.close)
+        self.assertEqual([source.name for source in matcher.sources], ['tencent', 'iqiyi', 'youku'])
+        Config.from_env({'DANMAKU_SERVER_TOKEN': 'test-token-16-chars'})
+        with self.assertRaisesRegex(ValueError, 'disabled'):
+            Config.from_env({'DANMAKU_SERVER_TOKEN': 'test-token-16-chars', 'DANMAKU_PROVIDERS': 'tencent,dandanplay',
+                             'DANDANPLAY_APP_ID': 'test', 'DANDANPLAY_APP_SECRET': 'test'})
+
+    def test_disabled_official_association_can_only_use_existing_comments_cache(self):
+        matcher = build_danmaku_matcher_from_config(self.config)
+        self.addCleanup(matcher.close)
+        matcher.cache.save('comment_dandanplay_123_1_0', Source('dandanplay').comment('123'))
+        with mock.patch('danmaku.core.DandanplayProtocolSource.comment', side_effect=AssertionError('disabled source requested')) as upstream:
+            payload = matcher.comments('123', source_name='dandanplay')
+            self.assertTrue(payload['cached'])
+            self.assertEqual((payload['source'], payload['count']), ('dandanplay', 1))
+            for kwargs in ({'episode_id': '124'}, {'episode_id': '123', 'with_related': False}):
+                with self.assertRaisesRegex(RuntimeError, 'disabled'):
+                    matcher.comments(source_name='dandanplay', **kwargs)
+            with mock.patch('danmaku.core.time.time', return_value=time.time() + 604801):
+                with self.assertRaisesRegex(RuntimeError, 'disabled'):
+                    matcher.comments('123', source_name='dandanplay')
+            upstream.assert_not_called()
 
     def test_official_source_runs_only_after_both_native_misses_and_is_cached(self):
         for second_count in (0, 1):
             with self.subTest(second_count=second_count), tempfile.TemporaryDirectory() as directory:
-                sources = [Source('tencent', count=0), Source('iqiyi', count=second_count), Source('dandanplay')]
+                sources = [Source('tencent', count=0), Source('iqiyi', count=second_count), ProtocolSource()]
                 matcher = DanmakuMatcher(sources, cache=DanmakuCache(directory))
                 result = self.match(matcher)
+                matcher.close()
                 self.assertEqual(result['source'], 'iqiyi' if second_count else 'dandanplay')
-                self.assertEqual([source.calls for source in sources], [1, 1, 0 if second_count else 1])
-                self.match(matcher)
-                self.assertEqual([source.calls for source in sources], [1, 1, 0 if second_count else 1])
+                self.assertEqual([source.calls for source in sources[:2]], [1, 1])
+                self.assertEqual(sources[2].calls, 0 if second_count else 1)
+                calls = [source.calls for source in sources]
+                restarted = DanmakuMatcher(sources, cache=DanmakuCache(directory))
+                try:
+                    self.match(restarted)
+                    self.assertEqual([source.calls for source in sources], calls)
+                finally:
+                    restarted.close()
 
     def test_youku_hit_stops_before_official_and_next_episode_uses_season_cache(self):
-        sources = [Source('tencent', 0), Source('iqiyi', 0), Source('youku'), Source('dandanplay')]
+        sources = [Source('tencent', 0), Source('iqiyi', 0), Source('youku'), ProtocolSource()]
         sources[2].search_target = mock.Mock(return_value=[{'anime_title': '爱情公寓 第一季', 'episodes': [
             {'episode_id': '101', 'episode_number': '1'}, {'episode_id': '102', 'episode_number': '2'}]}])
         matcher = self.matcher(sources)
@@ -98,9 +148,11 @@ class DanmakuServerTest(unittest.TestCase):
             self.assertEqual(result['source'], 'youku')
             self.assertEqual(result['episode_id'], str(100 + episode))
             self.assertEqual(result['cached'], episode == 2)
-        self.assertEqual([source.calls for source in sources], [1, 1, 0, 0])
+        matcher.close()
+        self.assertEqual([source.calls for source in sources[:3]], [1, 1, 0])
         self.assertEqual(sources[2].search_target.call_count, 1)
-        app = Application(self.config, matcher)
+        self.assertEqual(sources[3].calls, 0)
+        app = Application(self.config, self.matcher(sources))
         result = app.match({'target': {**TARGET, 'season': 1, 'episode': 2}})
         self.assertEqual(result['match']['attempts'][0]['mode'], 'priority_v2')
 
@@ -108,7 +160,11 @@ class DanmakuServerTest(unittest.TestCase):
         for count in (0, 2):
             with self.subTest(count=count), tempfile.TemporaryDirectory() as directory:
                 first, second = Source('tencent', count=count), Source('iqiyi')
-                result = self.match(DanmakuMatcher([first, second], cache=DanmakuCache(directory)))
+                matcher = DanmakuMatcher([first, second], cache=DanmakuCache(directory))
+                try:
+                    result = self.match(matcher)
+                finally:
+                    matcher.close()
                 self.assertEqual(result['source'], 'iqiyi')
                 self.assertEqual((first.calls, second.calls), (1, 1))
 
@@ -141,7 +197,7 @@ class DanmakuServerTest(unittest.TestCase):
         first.comment = mock.Mock(side_effect=RuntimeError('comment failed'))
         with self.assertRaisesRegex(RuntimeError, 'comment failed'):
             app.danmaku_comments('media', target=TARGET)
-        self.assertEqual(second.calls, 0)
+        self.assertEqual(second.comment_calls, 0)
 
     def test_concurrent_cache_miss_is_singleflight(self):
         first = Source('tencent')
@@ -150,6 +206,74 @@ class DanmakuServerTest(unittest.TestCase):
             results = list(executor.map(lambda _: self.match(matcher), range(8)))
         self.assertTrue(all(result['matched'] for result in results))
         self.assertEqual(first.calls, 1)
+
+    def test_three_native_searches_overlap_and_selection_preserves_priority(self):
+        sources = [Source('tencent'), Source('iqiyi'), Source('youku')]
+        barrier = threading.Barrier(3)
+        completion = []
+        for index, source in enumerate(sources):
+            original = source.search_target
+            def search(target, index=index, original=original):
+                barrier.wait(timeout=2)
+                time.sleep((2 - index) * 0.03)
+                completion.append(index)
+                return original(target)
+            source.search_target = search
+        result = self.match(self.matcher(sources))
+        self.assertEqual(result['source'], 'tencent')
+        self.assertEqual(completion, [2, 1, 0])
+        self.assertEqual([source.calls for source in sources], [1, 1, 1])
+
+    def test_high_priority_hit_does_not_wait_for_running_lower_source(self):
+        first, second = Source('tencent'), Source('iqiyi')
+        entered, release = threading.Event(), threading.Event()
+        original = second.search_target
+        def slow(target):
+            entered.set()
+            if not release.wait(timeout=3):
+                raise RuntimeError('test lower source timed out')
+            return original(target)
+        second.search_target = slow
+        first_search = first.search_target
+        first.search_target = lambda target: (entered.wait(timeout=2), first_search(target))[1]
+        try:
+            result = self.match(self.matcher([first, second]))
+            self.assertEqual(result['source'], 'tencent')
+            self.assertTrue(entered.is_set())
+            self.assertFalse(release.is_set())
+        finally:
+            release.set()
+
+    def test_cached_high_priority_hit_never_starts_cold_lower_sources(self):
+        first = Source('tencent')
+        self.match(self.matcher([first]))
+        lower = [Source('iqiyi'), Source('youku')]
+        result = self.match(self.matcher([first, *lower]))
+        self.assertTrue(result['cached'])
+        self.assertEqual([source.calls for source in lower], [0, 0])
+
+    def test_all_sources_errors_are_explicit_and_not_negative_cached(self):
+        sources = [Source(name, error=True) for name in ('tencent', 'iqiyi', 'youku')]
+        app = Application(self.config, self.matcher(sources))
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, 'source matching failed'):
+                app.match({'target': TARGET})
+        self.assertEqual([source.calls for source in sources], [2, 2, 2])
+
+    def test_explicit_official_enable_and_segment_concurrency_validation(self):
+        base = {'DANMAKU_SERVER_TOKEN': 'test-token-16-chars'}
+        for bad in ('0', '9', '-1'):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, 'CONCURRENCY'):
+                Config.from_env({**base, 'DANMAKU_SEGMENT_CONCURRENCY': bad})
+        with self.assertRaisesRegex(ValueError, 'must be true or false'):
+            Config.from_env({**base, 'DANMAKU_DANDANPLAY_ENABLED': 'invalid'})
+        enabled = {**base, 'DANMAKU_PROVIDERS': 'dandanplay', 'DANMAKU_DANDANPLAY_ENABLED': 'true'}
+        with self.assertRaisesRegex(ValueError, 'requires DANDANPLAY'):
+            Config.from_env(enabled)
+        config = Config.from_env({**enabled, 'DANDANPLAY_APP_ID': 'test', 'DANDANPLAY_APP_SECRET': 'test'})
+        matcher = build_danmaku_matcher_from_config(config)
+        self.addCleanup(matcher.close)
+        self.assertEqual([source.name for source in matcher.sources], ['dandanplay'])
 
     def test_negative_cache_expires_before_positive_cache(self):
         matcher = self.matcher([Source('tencent')])
@@ -213,7 +337,7 @@ class DanmakuServerTest(unittest.TestCase):
         status, body = request('/v1/danmaku/match', {'media_id': 'm', 'target': TARGET})
         self.assertEqual(status, 200)
         self.assertEqual(body['match']['source'], 'tencent')
-        self.assertEqual(second.calls, 0)
+        self.assertEqual(second.comment_calls, 0)
         self.assertEqual(request('/v1/danmaku/match', {'target': {}})[0], 400)
         self.assertEqual(request('/v1/danmaku/parse', {'content': '<i><d p="1,1,25,16777215,0,0,user,1">hello</d></i>'})[1]['count'], 1)
         self.assertEqual(request('/unknown')[0], 404)
@@ -232,7 +356,7 @@ class DanmakuServerTest(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(progress['status'], 'completed')
         self.assertEqual(progress['matched'], 1)
-        self.assertEqual(second.calls, 0)
+        self.assertEqual(second.comment_calls, 0)
         self.assertEqual(request('/v1/danmaku/season/prewarm?limit=1')[1]['items'][0]['task_id'], task['task_id'])
         self.assertEqual(request('/v1/danmaku/season/prewarm?limit=51')[0], 400)
         broken = Source('broken', error=True)

@@ -1,4 +1,4 @@
-// 复用固定提交的 danmu_api 源适配器；此入口从不同时搜索不同源。
+// 复用固定提交的源适配器；不同源在独立桥接进程内并行，单进程串行。
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline';
@@ -95,15 +95,16 @@ export function assertSourceSuccess(provider) {
   if (errors.length) throw new Error(safeError(`${provider}: ${errors.map(entry => entry.message).join('; ')}`));
 }
 
-export async function comments(source, provider, url) {
+export async function comments(source, provider, url, concurrency = 6) {
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8) throw new Error('invalid segment concurrency');
   const segments = await source.getEpisodeDanmuSegments(url);
   assertSourceSuccess(provider);
   if (!segments || !Array.isArray(segments.segmentList)) throw new Error(`${provider}: invalid segment response`);
   const raw = [];
   let next = 0;
-  // 只在当前已命中的源内抓取分片，最多 2 个并发；任何分片错误都不保存部分成功结果。
+  // 只抓当前命中源；并发有界，任何分片错误都不保存部分成功结果。
   let failure;
-  await Promise.all([0, 1].map(async () => {
+  await Promise.all(Array.from({ length: Math.min(concurrency, segments.segmentList.length) }, async () => {
     while (!failure && next < segments.segmentList.length) {
       try {
         const batch = await source.getEpisodeSegmentDanmu(segments.segmentList[next++]);
@@ -131,7 +132,7 @@ export async function run(action, provider, data) {
       : provider === 'iqiyi' ? parsed.hostname === 'www.iqiyi.com' && /^\/v_[a-z0-9]+\.html$/.test(parsed.pathname)
       : parsed.hostname === 'v.youku.com' && /^\/v_show\/id_[A-Za-z0-9=_-]+\.html$/.test(parsed.pathname);
     if (parsed.protocol !== 'https:' || !allowed || parsed.username || parsed.password || parsed.port || parsed.search || parsed.hash) throw new Error('invalid source episode URL');
-    result = { comments: await comments(source, provider, data.url) };
+    result = { comments: await comments(source, provider, data.url, data.segment_concurrency ?? 6) };
   } else throw new Error('unknown bridge action');
   // 上游源库可能记录错误后返回 []，必须把这种失败显式带回主服务，不能缓存为空。
   assertSourceSuccess(provider);
