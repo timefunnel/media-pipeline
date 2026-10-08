@@ -58,20 +58,6 @@ class BotConfigTest(unittest.TestCase):
         self.assertEqual(config.subscription_staging_folder_id, "")
         self.assertFalse(config.subtitle_auto_match_adult_only)
 
-    def test_bot_config_reads_danmaku_cache_ttls(self):
-        from pipeline.bot import BotConfig
-
-        config = BotConfig.from_env(
-            {
-                "TG_BOT_TOKEN": "123:token",
-                "TG_ALLOWED_USER_IDS": "700656624",
-                "DANMAKU_CACHE_TTL_SECONDS": "604800",
-                "DANMAKU_SEARCH_CACHE_TTL_SECONDS": "86400",
-            }
-        )
-
-        self.assertEqual(config.danmaku_cache_ttl_seconds, 604800)
-        self.assertEqual(config.danmaku_search_cache_ttl_seconds, 86400)
 
     def test_bot_config_reads_subscription_staging_settings(self):
         from pipeline.bot import BotConfig
@@ -322,41 +308,6 @@ class BotConfigTest(unittest.TestCase):
             )
 
 
-class DanmakuMatchingPolicyTest(unittest.TestCase):
-    def test_service_passes_tmdb_episode_and_media_title_to_matcher(self):
-        from pipeline.bot import BotConfig, PipelineBotService
-
-        class Matcher:
-            def __init__(self):
-                self.calls = []
-
-            def match(self, **kwargs):
-                self.calls.append(kwargs)
-                return {"matched": False, "attempts": []}
-
-        matcher = Matcher()
-        service = PipelineBotService(BotConfig("token", {700656624}))
-        media = {
-            "id": "media-1",
-            "title": "准确作品标题",
-            "path": "/media/show.s01e10.mkv",
-            "tmdb_id": 1429,
-            "season_num": 1,
-            "episode_num": 10,
-            "size_bytes": 123456,
-            "duration_sec": 1500,
-        }
-
-        with patch.object(service, "_require_danmaku_matcher", return_value=matcher), patch.object(
-            service, "_load_media_detail", return_value=media
-        ):
-            result = service.danmaku_match("media-1")
-
-        self.assertEqual(
-            matcher.calls,
-            [{"tmdb_id": "1429", "episode": 10, "anime": "准确作品标题"}],
-        )
-        self.assertEqual(result["target"]["file_name"], "show.s01e10.mkv")
 
 
 class CandidateStoreTest(unittest.TestCase):

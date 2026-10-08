@@ -37,6 +37,8 @@ The compose file includes a local PanSou API service bound to `127.0.0.1:8888`. 
 
 ## Documentation
 
+- Independent danmaku service: [danmaku-server/README.md](danmaku-server/README.md). It has its own image and cache; the pipeline no longer hosts danmaku routes.
+
 - Fresh deployment guide: [docs/deployment-guide.md](docs/deployment-guide.md)
 - Current design and operating state: [docs/project-design-and-progress-2026-07-02.md](docs/project-design-and-progress-2026-07-02.md)
 - Refactor notes: [docs/optimization-plan.md](docs/optimization-plan.md)

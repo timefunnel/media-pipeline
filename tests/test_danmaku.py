@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 
-from pipeline.danmaku import (
+from danmaku.core import (
     AggregatorSource,
     DanmakuCache,
     DanmakuImportError,
@@ -641,7 +641,7 @@ class MatcherTest(unittest.TestCase):
         self.assertEqual(result["candidates"], [])
         self.assertEqual(result["attempts"][0]["outcome"], "no_candidates")
 
-    def test_ambiguous_primary_tmdb_result_does_not_try_another_source(self):
+    def test_ambiguous_primary_tmdb_result_allows_next_priority_source(self):
         primary_transport = FakeTransport(
             [
                 (
@@ -686,10 +686,11 @@ class MatcherTest(unittest.TestCase):
 
         result = self._matcher(primary_transport, sources=sources).match(episode=1, tmdb_id=123)
 
-        self.assertFalse(result["matched"])
-        self.assertTrue(result["ambiguous"])
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["source"], "aggregator")
+        self.assertEqual(result["attempts"][0]["outcome"], "ambiguous")
         self.assertEqual(len(primary_transport.calls), 1)
-        self.assertEqual(fallback_transport.calls, [])
+        self.assertEqual(len(fallback_transport.calls), 1)
 
     def test_unmatched_result_is_reported_with_attempts(self):
         transport = FakeTransport([("/api/v2/search/episodes", {"animes": []})])

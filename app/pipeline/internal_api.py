@@ -24,15 +24,6 @@ from pipeline.search import (
     valid_btih_info_hash,
 )
 from pipeline.season_subtitles import SeasonSubtitleTaskManager
-from pipeline.danmaku import (
-    DEFAULT_DANMAKU_IMPORT_MAX_BYTES,
-    DanmakuImportError,
-)
-from pipeline.danmaku_prewarm import (
-    DEFAULT_DANMAKU_PREWARM_DELAY_SECONDS,
-    DEFAULT_DANMAKU_PREWARM_MAX_EPISODES,
-    DanmakuPrewarmManager,
-)
 from pipeline.external_subtitles import (
     subtitle_application_key,
     subtitle_candidate_application_status,
@@ -3024,14 +3015,12 @@ class InternalApiApplication:
         manager,
         subtitle_asr_manager=None,
         season_subtitle_manager=None,
-        danmaku_prewarm_manager=None,
     ):
         self.service = service
         self.store = store
         self.manager = manager
         self.subtitle_asr_manager = subtitle_asr_manager
         self.season_subtitle_manager = season_subtitle_manager
-        self.danmaku_prewarm_manager = danmaku_prewarm_manager
 
     def search(self, payload):
         if not isinstance(payload, dict):
@@ -3175,145 +3164,6 @@ class InternalApiApplication:
         }
 
 
-    def create_danmaku_prewarm(self, payload):
-        """整季弹幕预热：只由调用方显式触发，串行限速执行。"""
-        if not isinstance(payload, dict):
-            raise ApiError(400, "invalid_request", "request body must be a JSON object")
-        owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
-        media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
-        try:
-            season = int(payload.get("season"))
-        except (TypeError, ValueError):
-            raise ApiError(400, "invalid_season", "season must be an integer")
-        if season < 1 or season > 99:
-            raise ApiError(400, "invalid_season", "season must be between 1 and 99")
-        if self.danmaku_prewarm_manager is None:
-            raise ApiError(503, "danmaku_prewarm_unavailable", "danmaku prewarm is unavailable")
-        try:
-            task = self.danmaku_prewarm_manager.submit(
-                owner_id, media_id, season, payload.get("episodes")
-            )
-        except ValueError as exc:
-            raise ApiError(400, "invalid_episodes", str(exc))
-        return task
-
-    def get_danmaku_prewarm(self, task_id):
-        if self.danmaku_prewarm_manager is None:
-            raise ApiError(503, "danmaku_prewarm_unavailable", "danmaku prewarm is unavailable")
-        task = self.danmaku_prewarm_manager.get(task_id)
-        if task is None:
-            raise ApiError(404, "danmaku_prewarm_not_found", "danmaku prewarm task not found")
-        return task
-
-    def list_danmaku_prewarm(self, limit):
-        if self.danmaku_prewarm_manager is None:
-            raise ApiError(503, "danmaku_prewarm_unavailable", "danmaku prewarm is unavailable")
-        return {"items": self.danmaku_prewarm_manager.recent(limit=limit)}
-
-    def match_danmaku(self, payload):
-        if not isinstance(payload, dict):
-            raise ApiError(400, "invalid_request", "request body must be a JSON object")
-        media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
-        try:
-            return self.service.danmaku_match(media_id)
-        except ValueError as exc:
-            raise ApiError(409, "danmaku_unavailable", str(exc))
-        except RuntimeError as exc:
-            raise ApiError(502, "danmaku_match_failed", str(exc))
-
-    def fetch_danmaku(self, payload):
-        if not isinstance(payload, dict):
-            raise ApiError(400, "invalid_request", "request body must be a JSON object")
-        media_id = require_text(payload.get("media_id"), "media_id", max_length=200)
-        episode_id = str(payload.get("episode_id") or "").strip()
-        if episode_id and not episode_id.isdigit():
-            raise ApiError(400, "invalid_episode_id", "episode_id must be a numeric string")
-        source = str(payload.get("source") or "").strip().lower()
-        if source and source not in {"dandanplay", "aggregator"}:
-            raise ApiError(400, "invalid_source", "source must be dandanplay or aggregator")
-        try:
-            ch_convert = int(payload.get("ch_convert") or 0)
-        except (TypeError, ValueError):
-            raise ApiError(400, "invalid_ch_convert", "ch_convert must be an integer")
-        if ch_convert not in (0, 1, 2):
-            raise ApiError(400, "invalid_ch_convert", "ch_convert must be 0, 1 or 2")
-        try:
-            offset_seconds = float(payload.get("offset_seconds") or 0.0)
-        except (TypeError, ValueError):
-            raise ApiError(400, "invalid_offset", "offset_seconds must be a number")
-        if offset_seconds < -600 or offset_seconds > 600:
-            raise ApiError(400, "invalid_offset", "offset_seconds must be within -600..600")
-        try:
-            provider_shift_seconds = float(payload.get("provider_shift_seconds") or 0.0)
-        except (TypeError, ValueError):
-            raise ApiError(400, "invalid_provider_shift", "provider_shift_seconds must be a number")
-        try:
-            return self.service.danmaku_comments(
-                media_id,
-                episode_id=episode_id,
-                source=source,
-                ch_convert=ch_convert,
-                offset_seconds=offset_seconds,
-                provider_shift_seconds=provider_shift_seconds,
-                anime_title=str(payload.get("anime_title") or ""),
-                episode_title=str(payload.get("episode_title") or ""),
-                match_mode=str(payload.get("match_mode") or ""),
-                with_related=payload.get("with_related", True) is not False,
-            )
-        except ValueError as exc:
-            raise ApiError(409, "danmaku_unavailable", str(exc))
-        except RuntimeError as exc:
-            raise ApiError(502, "danmaku_fetch_failed", str(exc))
-
-    def parse_danmaku(self, payload):
-        """解析用户提供的本地弹幕文件，输出与上游弹幕同构的归一化结果。"""
-        if not isinstance(payload, dict):
-            raise ApiError(400, "invalid_request", "request body must be a JSON object")
-        content = payload.get("content")
-        if content is None or (isinstance(content, str) and not content.strip()):
-            raise ApiError(400, "missing_content", "content is required")
-        if not isinstance(content, str):
-            raise ApiError(400, "invalid_content", "content must be the danmaku file text")
-        source_format = str(payload.get("format") or "auto").strip().lower()
-        try:
-            ch_convert = int(payload.get("ch_convert") or 0)
-        except (TypeError, ValueError):
-            raise ApiError(400, "invalid_ch_convert", "ch_convert must be an integer")
-        if ch_convert not in (0, 1, 2):
-            raise ApiError(400, "invalid_ch_convert", "ch_convert must be 0, 1 or 2")
-        try:
-            offset_seconds = float(payload.get("offset_seconds") or 0.0)
-        except (TypeError, ValueError):
-            raise ApiError(400, "invalid_offset", "offset_seconds must be a number")
-        if offset_seconds < -600 or offset_seconds > 600:
-            raise ApiError(400, "invalid_offset", "offset_seconds must be within -600..600")
-        try:
-            return self.service.danmaku_parse_local(
-                content,
-                source_format=source_format,
-                offset_seconds=offset_seconds,
-                ch_convert=ch_convert,
-                title=str(payload.get("title") or ""),
-            )
-        except DanmakuImportError as exc:
-            raise ApiError(400, exc.code, str(exc))
-        except ValueError as exc:
-            raise ApiError(409, "danmaku_unavailable", str(exc))
-        except RuntimeError as exc:
-            raise ApiError(502, "danmaku_parse_failed", str(exc))
-
-    def danmaku_request_body_limit(self):
-        """``/v1/danmaku/parse`` 的请求体上限：以 ``DANMAKU_IMPORT_MAX_BYTES`` 为准。
-
-        其余路由仍走默认的 1MiB 限制，这里只为整集弹幕文件放宽。
-        """
-        config = getattr(self.service, "config", None)
-        raw_limit = getattr(config, "danmaku_import_max_bytes", None)
-        try:
-            limit = int(raw_limit)
-        except (TypeError, ValueError):
-            limit = DEFAULT_DANMAKU_IMPORT_MAX_BYTES
-        return max(limit, 64 * 1024)
 
     def search_subtitles(self, payload):
         owner_id = require_text(payload.get("owner_id"), "owner_id", max_length=200)
@@ -3609,22 +3459,12 @@ class InternalApiServer:
         )
         self.season_subtitle_manager = SeasonSubtitleTaskManager(service, db_path)
         config = getattr(service, "config", None)
-        self.danmaku_prewarm_manager = DanmakuPrewarmManager(
-            service,
-            delay_seconds=getattr(
-                config, "danmaku_prewarm_delay_seconds", DEFAULT_DANMAKU_PREWARM_DELAY_SECONDS
-            ),
-            max_episodes=getattr(
-                config, "danmaku_prewarm_max_episodes", DEFAULT_DANMAKU_PREWARM_MAX_EPISODES
-            ),
-        )
         self.application = InternalApiApplication(
             service,
             self.store,
             self.manager,
             subtitle_asr_manager=self.subtitle_asr_manager,
             season_subtitle_manager=self.season_subtitle_manager,
-            danmaku_prewarm_manager=self.danmaku_prewarm_manager,
         )
         self._httpd = None
         self._thread = None
@@ -3639,7 +3479,6 @@ class InternalApiServer:
         self.manager.start()
         self.subtitle_asr_manager.start()
         self.season_subtitle_manager.start()
-        self.danmaku_prewarm_manager.start()
         self._thread = threading.Thread(target=httpd.serve_forever, name="internal-api-http", daemon=True)
         self._thread.start()
         print("internal API listening on http://%s:%d" % (self.host, self.port), flush=True)
@@ -3653,7 +3492,6 @@ class InternalApiServer:
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
-        self.danmaku_prewarm_manager.stop()
         self.season_subtitle_manager.stop()
         self.subtitle_asr_manager.stop()
         self.manager.stop()
@@ -3724,33 +3562,6 @@ class InternalApiServer:
                 return
             if handler.command == "POST" and path == "/v1/subtitles/apply":
                 self._send_json(handler, 200, self.application.apply_subtitle(self._read_json(handler)))
-                return
-            if handler.command == "POST" and path == "/v1/danmaku/match":
-                self._send_json(handler, 200, self.application.match_danmaku(self._read_json(handler)))
-                return
-            if handler.command == "POST" and path == "/v1/danmaku/comment":
-                self._send_json(handler, 200, self.application.fetch_danmaku(self._read_json(handler)))
-                return
-            if handler.command == "POST" and path == "/v1/danmaku/parse":
-                payload = self._read_json(handler, max_bytes=self.application.danmaku_request_body_limit())
-                self._send_json(handler, 200, self.application.parse_danmaku(payload))
-                return
-            if handler.command == "POST" and path == "/v1/danmaku/season/prewarm":
-                self._send_json(handler, 202, self.application.create_danmaku_prewarm(self._read_json(handler)))
-                return
-            if handler.command == "GET" and path == "/v1/danmaku/season/prewarm":
-                raw_limit = (query.get("limit") or ["10"])[0]
-                try:
-                    limit = int(raw_limit)
-                except (TypeError, ValueError):
-                    raise ApiError(400, "invalid_limit", "limit must be an integer")
-                if limit < 1 or limit > 50:
-                    raise ApiError(400, "invalid_limit", "limit must be between 1 and 50")
-                self._send_json(handler, 200, self.application.list_danmaku_prewarm(limit))
-                return
-            if handler.command == "GET" and path.startswith("/v1/danmaku/season/prewarm/"):
-                task_id = path.rsplit("/", 1)[-1]
-                self._send_json(handler, 200, self.application.get_danmaku_prewarm(task_id))
                 return
             if handler.command == "POST" and path == "/v1/subtitles/asr":
                 task, created = self.application.create_subtitle_asr(self._read_json(handler))

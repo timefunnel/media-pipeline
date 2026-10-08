@@ -10,7 +10,7 @@ LABEL org.opencontainers.image.title="Media Pipeline" \
 RUN apk add --no-cache 7zip libarchive-tools
 
 WORKDIR /app
-COPY app/ /app/
+COPY app/pipeline/ /app/pipeline/
 
 ENV PYTHONUNBUFFERED=1
 ENV MEDIA_PIPELINE_VERSION=${MEDIA_PIPELINE_VERSION}

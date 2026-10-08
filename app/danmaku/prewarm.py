@@ -55,7 +55,12 @@ def normalize_prewarm_episodes(value, max_episodes=DEFAULT_DANMAKU_PREWARM_MAX_E
         if media_id in seen:
             continue
         seen.add(media_id)
-        episodes.append({"media_id": media_id, "episode_key": episode_key})
+        entry = {"media_id": media_id, "episode_key": episode_key}
+        if isinstance(raw, dict) and "target" in raw:
+            if not isinstance(raw["target"], dict):
+                raise ValueError("episode target must be an object")
+            entry["target"] = dict(raw["target"])
+        episodes.append(entry)
     if not episodes:
         raise ValueError("episodes must not be empty")
     if len(episodes) > int(max_episodes):
@@ -232,7 +237,10 @@ class DanmakuPrewarmManager:
             task["current_episode"] = episode.get("episode_key") or media_id
             task["updated_at"] = self._now()
         try:
-            payload = self.service.danmaku_comments(media_id)
+            if "target" in episode:
+                payload = self.service.danmaku_comments(media_id, target=episode["target"])
+            else:
+                payload = self.service.danmaku_comments(media_id)
         except (RuntimeError, ValueError) as exc:
             self._record(
                 task_id,
