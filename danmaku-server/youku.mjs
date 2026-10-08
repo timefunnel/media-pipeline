@@ -2,6 +2,36 @@
 import YoukuSource from 'danmu-api-server/danmu_api/sources/youku.js';
 import { Globals } from 'danmu-api-server/danmu_api/configs/globals.js';
 import { httpPost, buildQueryString } from 'danmu-api-server/danmu_api/utils/http-util.js';
+import { getExplicitSeasonNumber } from 'danmu-api-server/danmu_api/utils/common-util.js';
+
+function explicitTitleSeason(title) {
+  // 只拆明确的尾部季号，保留作品名中的数字、空格和标点。
+  const marker = /(?:第\s*[0-9一二三四五六七八九十]+\s*季|\s+(?:Season|S)\s*\d+)\s*$/i.exec(title);
+  if (!marker) return { baseTitle: title, season: null };
+  const season = getExplicitSeasonNumber(marker[0]);
+  const baseTitle = title.slice(0, marker.index).trim();
+  if (!baseTitle || !Number.isInteger(season) || season < 1) throw new Error('youku: invalid explicit title season');
+  return { baseTitle, season };
+}
+
+export function parseYoukuTitle(value) {
+  const raw = String(value || '').trim();
+  // 仅提取源站明示的完整尾注，不把英文标题内的逗号当作别名分隔符。
+  const annotation = /^(.*?)\s*(?:\(\s*别名\s*[:：]\s*([^()（）]+)\)|（\s*别名\s*[:：]\s*([^()（）]+)）)\s*$/.exec(raw);
+  const title = annotation ? annotation[1].trim() : raw;
+  const alias = annotation ? (annotation[2] || annotation[3]).trim() : '';
+  if (annotation && (!title || !alias)) throw new Error('youku: invalid explicit title alias');
+  const canonical = explicitTitleSeason(title);
+  const alternate = alias ? explicitTitleSeason(alias) : null;
+  const seasons = new Set([canonical.season, alternate?.season].filter(season => season != null));
+  if (seasons.size > 1) throw new Error('youku: canonical and alias season conflict');
+  const aliases = [...new Set([
+    ...(canonical.season != null ? [canonical.baseTitle] : []),
+    ...(alias ? [alias] : []),
+    ...(alternate?.season != null ? [alternate.baseTitle] : []),
+  ])].filter(text => text !== title);
+  return { title, aliases, season: [...seasons][0] ?? null };
+}
 
 export function parseYoukuSegment(payload) {
   if (!Array.isArray(payload?.ret) || !payload.ret.length || !payload.ret.every(code => String(code).startsWith('SUCCESS'))) {
@@ -26,6 +56,11 @@ export default class StrictYoukuSource extends YoukuSource {
 
   _getFallbackCna() {
     throw new Error('youku: anonymous client identifier unavailable; local fallback is disabled');
+  }
+
+  filterYoukuSearchItem(component, keyword) {
+    const program = super.filterYoukuSearchItem(component, keyword);
+    return program ? { ...program, ...parseYoukuTitle(program.title) } : null;
   }
 
   async search(keyword) {

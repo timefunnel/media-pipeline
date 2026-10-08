@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Globals } from 'danmu-api-server/danmu_api/configs/globals.js';
 import TencentSource from 'danmu-api-server/danmu_api/sources/tencent.js';
 import { exactTitle, stableEpisodeId, search, comments, assertSourceSuccess, youkuEpisodeNumber, safeError, run } from './bridge.mjs';
-import StrictYoukuSource, { parseYoukuSegment } from './youku.mjs';
+import StrictYoukuSource, { parseYoukuSegment, parseYoukuTitle } from './youku.mjs';
 
 test('exact title and season: intrinsic numbers, explicit seasons, no fuzzy match', () => {
   for (const [text, title, season, expected] of [
@@ -140,6 +140,85 @@ test('Youku uses stage and original episode title, never seq or list position', 
   assert.equal(result[0].episodes[1].url, 'https://v.youku.com/v_show/id_first.html');
   fake.getEpisodes = async () => [{ stage: '1', title: `${title} 01`, id: 'first', link: 'https://v.youku.com/v_show/id_other.html' }];
   await assert.rejects(search(fake, 'youku', { title: '爱情公寓', season: 1, episode: 1 }), /disagree/);
+});
+
+const loveDeathTarget = { title: 'Love, Death & Robots', original_title: 'Love, Death & Robots',
+  season: 1, episode: 1, year: 2019 };
+
+function youkuProgram(source, title, id = 'show', year = 2019) {
+  return source.filterYoukuSearchItem({ commonData: { isYouku: 1, showId: id,
+    titleDTO: { displayName: title }, feature: `${year} 动漫`, cats: '动漫', episodeTotal: 18 } }, loveDeathTarget.title);
+}
+
+test('Youku parses only an explicit trailing alias annotation and preserves title punctuation', () => {
+  for (const suffix of ['(别名:Love, Death & Robots)', '(别名：Love, Death & Robots)', '（别名：Love, Death & Robots）']) {
+    const parsed = parseYoukuTitle(`爱，死亡和机器人 第一季${suffix}`);
+    assert.equal(parsed.title, '爱，死亡和机器人 第一季');
+    assert.equal(parsed.season, 1);
+    assert.deepEqual(parsed.aliases, ['爱，死亡和机器人', 'Love, Death & Robots']);
+  }
+  for (const title of ['86', '怪兽8号', '作品(导演剪辑版)', '作品(别名：)', '作品(别名：Another）',
+    '作品(别名：Another) 花絮']) {
+    const parsed = parseYoukuTitle(title);
+    assert.equal(parsed.title, title);
+    assert.deepEqual(parsed.aliases, []);
+    assert.equal(parsed.season, null);
+  }
+  const parsed = parseYoukuTitle('爱、死亡和机器人 第三季(别名：Love, Death & Robots Season 3)');
+  assert.equal(parsed.season, 3);
+  assert.deepEqual(parsed.aliases, ['爱、死亡和机器人', 'Love, Death & Robots Season 3', 'Love, Death & Robots']);
+});
+
+test('Youku explicit aliases share the canonical season and never bypass season conflicts', () => {
+  const source = new StrictYoukuSource();
+  const first = youkuProgram(source, '爱，死亡和机器人 第一季(别名:Love, Death & Robots)');
+  assert.equal(first.title, '爱，死亡和机器人 第一季');
+  assert.equal(first.type, '动漫');
+  assert.equal(first.year, 2019);
+  assert.equal(exactTitle(first, loveDeathTarget), true);
+  assert.equal(exactTitle(first, { ...loveDeathTarget, title: '爱，死亡和机器人', original_title: '' }), true);
+  assert.equal(exactTitle(first, { ...loveDeathTarget, season: 3 }), false);
+  assert.equal(exactTitle(first, { ...loveDeathTarget, title: 'Love, Death & Robots Movie', original_title: '' }), false);
+  assert.equal(exactTitle(first, { ...loveDeathTarget, title: 'Love Death Robots', original_title: '' }), false);
+  for (const alias of ['Love, Death & Robots', 'Love, Death & Robots Season 3']) {
+    const third = youkuProgram(source, `爱、死亡和机器人 第三季(别名：${alias})`, 'third', 2022);
+    assert.equal(exactTitle(third, loveDeathTarget), false);
+    assert.equal(exactTitle(third, { ...loveDeathTarget, season: 3 }), true);
+  }
+  assert.throws(() => youkuProgram(source, '爱，死亡和机器人 第一季(别名：Love, Death & Robots Season 3)'), /season.*conflict/);
+  assert.throws(() => parseYoukuTitle('作品 第0季(别名：Another)'), /invalid explicit title season/);
+});
+
+test('Youku alias match selects canonical season and still checks episode stage, title and URL', async () => {
+  const source = new StrictYoukuSource();
+  const first = youkuProgram(source, '爱，死亡和机器人 第一季(别名：Love, Death & Robots)', 'first');
+  const third = youkuProgram(source, '爱、死亡和机器人 第三季(别名：Love, Death & Robots Season 3)', 'third', 2022);
+  source.search = async () => [third, first];
+  const calls = [];
+  source.getEpisodes = async (id, season) => {
+    calls.push([id, season]);
+    const title = id === 'first' ? first.title : third.title;
+    return [{ id: 'one', stage: '1', seq: '99', title: `${title} 01` },
+      { id: 'two', stage: '2', title: `${title} 02` },
+      { id: 'wrong-season', stage: '1', title: '爱，死亡和机器人 第二季 01' },
+      { id: 'wrong-stage', stage: '2', title: `${title} 01` },
+      { id: 'missing-stage', seq: '1', title: `${title} 01` },
+      { id: 'trailer', stage: '1', title: `${title} 01 预告` }];
+  };
+  for (const season of [1, 3]) {
+    const result = await search(source, 'youku', { ...loveDeathTarget, season });
+    assert.equal(result.length, 1);
+    assert.equal(result[0].animeTitle, season === 1 ? first.title : third.title);
+    assert.deepEqual(result[0].episodes.map(ep => ep.episodeNumber), ['1', '2']);
+    assert.equal(result[0].episodes[0].url, 'https://v.youku.com/v_show/id_one.html');
+  }
+  assert.deepEqual(calls, [['first', 1], ['third', 3]]);
+  // 真实接口可能只有作品卡而没有可用分集；别名命中不能凭空生成节目编号。
+  source.getEpisodes = async () => [];
+  assert.deepEqual(await search(source, 'youku', loveDeathTarget), []);
+  source.getEpisodes = async () => [{ id: 'one', stage: '1', title: `${first.title} 01`,
+    link: 'https://v.youku.com/v_show/id_different.html' }];
+  await assert.rejects(search(source, 'youku', loveDeathTarget), /disagree/);
 });
 
 test('Youku accepts successful empty segments, rejects API errors and incomplete results', async () => {

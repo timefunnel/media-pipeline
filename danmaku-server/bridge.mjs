@@ -13,13 +13,17 @@ import { convertToDanmakuJson } from 'danmu-api-server/danmu_api/utils/danmu-uti
 const normalize = value => String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
 
 export function exactTitle(candidate, target) {
+  // 别名与主标题属于同一季，不能因英文别名未带季号而绕过源站明确的季号。
+  if (candidate.season != null && (!Number.isInteger(candidate.season) || candidate.season < 1 ||
+      candidate.season !== target.season)) return false;
   const wanted = [target.title, target.original_title].filter(Boolean);
   const texts = [candidate.title, ...(candidate.aliases || [])].filter(Boolean);
   return texts.some(text => wanted.some(title => {
     // 作品名本身含数字时必须先比较完整名称，不能把“怪兽8号”等数字当季号。
     if (normalize(text) === normalize(title)) {
       const explicit = /第\s*([0-9一二三四五六七八九十]+)\s*季|(?:Season|\bS)\s*\d+/i.test(text);
-      return explicit ? extractSeasonNumberFromAnimeTitle(text).season === target.season : target.season <= 1;
+      if (explicit) return extractSeasonNumberFromAnimeTitle(text).season === target.season;
+      return candidate.season != null || target.season <= 1;
     }
     const parsed = extractSeasonNumberFromAnimeTitle(text);
     return parsed.season === target.season && normalize(parsed.baseTitle) === normalize(title);
