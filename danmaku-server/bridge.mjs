@@ -1,9 +1,12 @@
 // 复用固定提交的 danmu_api 源适配器；此入口从不同时搜索不同源。
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import { createInterface } from 'node:readline';
 import { Globals } from 'danmu-api-server/danmu_api/configs/globals.js';
 import TencentSource from 'danmu-api-server/danmu_api/sources/tencent.js';
 import IqiyiSource from 'danmu-api-server/danmu_api/sources/iqiyi.js';
+import YoukuSource from './youku.mjs';
+import { runWithHttpCache } from 'danmu-api-server/danmu_api/utils/http-util.js';
 import { extractSeasonNumberFromAnimeTitle } from 'danmu-api-server/danmu_api/utils/common-util.js';
 import { convertToDanmakuJson } from 'danmu-api-server/danmu_api/utils/danmu-util.js';
 
@@ -28,6 +31,27 @@ export function stableEpisodeId(source, url) {
   return (BigInt('0x' + createHash('sha256').update(source + '\n' + url).digest('hex').slice(0, 15)) + 1n).toString();
 }
 
+export function youkuEpisodeNumber(ep, programTitle) {
+  const stage = String(ep.stage || '').trim();
+  const title = normalize(ep.title);
+  if (!/^[1-9]\d*$/.test(stage) || !title.startsWith(normalize(programTitle)) || /预告|花絮|片花|抢先看|解说|特辑/.test(title)) return null;
+  const suffix = title.slice(normalize(programTitle).length);
+  // 优酷有明确 stage；标题中的集号必须一致，不用 seq 或数组位置推断。
+  const match = /^\s+(?:第\s*)?(\d+)(?:\s*集)?(?=$|[\s:：·._-])/.exec(suffix);
+  return match && Number(match[1]) === Number(stage) ? Number(stage) : null;
+}
+
+function youkuEpisodeUrl(ep) {
+  if (!/^[A-Za-z0-9=_-]+$/.test(String(ep.id || ''))) throw new Error('youku: invalid episode video ID');
+  const url = `https://v.youku.com/v_show/id_${ep.id}.html`;
+  if (ep.link) {
+    const parsed = new URL(ep.link);
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.hostname !== 'v.youku.com' || parsed.pathname !== new URL(url).pathname ||
+        parsed.username || parsed.password || parsed.port) throw new Error('youku: episode ID and URL disagree');
+  }
+  return url;
+}
+
 export async function search(source, provider, target) {
   const title = target.title;
   const query = target.season > 1 ? `${title} 第${target.season}季` : title;
@@ -39,30 +63,36 @@ export async function search(source, provider, target) {
   const animes = [];
   for (const program of candidates) {
     const episodes = await source.getEpisodes(program.mediaId, provider === 'tencent' ? (program.chapterContexts || []) : target.season || null);
-    const selected = episodes.filter(ep => movie ? episodes.length === 1 :
+    const selected = episodes.filter(ep => movie ? episodes.length === 1 : provider === 'youku' ? youkuEpisodeNumber(ep, program.title) !== null :
       Number.isInteger(Number(provider === 'tencent' ? ep.title : ep.order)) && Number(provider === 'tencent' ? ep.title : ep.order) > 0);
     const entries = [];
     for (const ep of selected) {
-      const url = provider === 'tencent' ? `https://v.qq.com/x/cover/${program.mediaId}/${ep.vid}.html` : ep.link;
+      const url = provider === 'tencent' ? `https://v.qq.com/x/cover/${program.mediaId}/${ep.vid}.html` : provider === 'youku' ? youkuEpisodeUrl(ep) : ep.link;
       const episodeTitle = provider === 'tencent' ? ep.unionTitle : ep.title;
       // 多季合辑中不能只按数组下标选集；明确带作品名的分集必须再次核对作品与季。
-      if (!movie) {
+      if (!movie && provider !== 'youku') {
         const remainder = normalize(episodeTitle).slice(normalize(program.title).length);
         if (!normalize(episodeTitle).startsWith(normalize(program.title)) || /^\d/.test(remainder)) continue;
       }
       if (!url) throw new Error(`${provider}: selected episode has no URL`);
       entries.push({ episodeId: stableEpisodeId(provider, url), episodeTitle,
-        episodeNumber: movie ? '' : String(Number(provider === 'tencent' ? ep.title : ep.order)), url });
+        episodeNumber: movie ? '' : String(provider === 'youku' ? youkuEpisodeNumber(ep, program.title) : Number(provider === 'tencent' ? ep.title : ep.order)), url });
     }
     if (entries.length) animes.push({ animeId: program.mediaId, animeTitle: program.title, type: movie ? 'movie' : 'tv', typeDescription: program.type, episodes: entries });
   }
   return animes;
 }
 
+export function safeError(message) {
+  return String(message).replace(/https?:\/\/[^\s"'<>]+/g, value => {
+    try { const url = new URL(value); return url.origin + url.pathname; } catch { return '[URL]'; }
+  }).replace(/(_m_h5_tk(?:_enc)?|cookie|token|sign)(\s*[:=]\s*)[^\s;,"}]+/gi, '$1$2[redacted]').slice(0, 1500);
+}
+
 export function assertSourceSuccess(provider) {
   const errors = Globals.logBuffer.filter(entry => entry.level === 'error' ||
     /响应为空|重试后仍失败/.test(entry.message));
-  if (errors.length) throw new Error(`${provider}: ${errors.map(entry => entry.message).join('; ').slice(0, 1500)}`);
+  if (errors.length) throw new Error(safeError(`${provider}: ${errors.map(entry => entry.message).join('; ')}`));
 }
 
 export async function comments(source, provider, url) {
@@ -72,29 +102,35 @@ export async function comments(source, provider, url) {
   const raw = [];
   let next = 0;
   // 只在当前已命中的源内抓取分片，最多 2 个并发；任何分片错误都不保存部分成功结果。
+  let failure;
   await Promise.all([0, 1].map(async () => {
-    while (next < segments.segmentList.length) {
-      const batch = await source.getEpisodeSegmentDanmu(segments.segmentList[next++]);
-      assertSourceSuccess(provider);
-      if (!Array.isArray(batch)) throw new Error(`${provider}: invalid segment comments`);
-      raw.push(...batch);
+    while (!failure && next < segments.segmentList.length) {
+      try {
+        const batch = await source.getEpisodeSegmentDanmu(segments.segmentList[next++]);
+        assertSourceSuccess(provider);
+        if (!Array.isArray(batch)) throw new Error(`${provider}: invalid segment comments`);
+        raw.push(...batch);
+      } catch (error) { failure ??= error; }
     }
   }));
-  return convertToDanmakuJson(source.formatComments(raw), provider === 'tencent' ? 'qq' : 'qiyi');
+  if (failure) throw failure;
+  return convertToDanmakuJson(source.formatComments(raw), provider === 'tencent' ? 'qq' : provider === 'iqiyi' ? 'qiyi' : 'youku');
 }
 
 export async function run(action, provider, data) {
-  if (!['tencent', 'iqiyi'].includes(provider)) throw new Error('unsupported native source');
+  if (!['tencent', 'iqiyi', 'youku'].includes(provider)) throw new Error('unsupported native source');
+  Globals.logBuffer = [];
   Globals.init({ SOURCE_ORDER: provider, LOG_LEVEL: 'info', VOD_REQUEST_TIMEOUT: '15000', STRICT_TITLE_MATCH: 'true',
     LOCAL_CACHE_ENABLED: 'false', DANMU_LIMIT: '0', GROUP_MINUTE: '0', LIKE_SWITCH: 'false' });
-  const source = provider === 'tencent' ? new TencentSource() : new IqiyiSource();
+  const source = provider === 'tencent' ? new TencentSource() : provider === 'iqiyi' ? new IqiyiSource() : new YoukuSource();
   let result;
   if (action === 'search') result = await search(source, provider, data);
   else if (action === 'comment') {
     const parsed = new URL(data.url);
     const allowed = provider === 'tencent' ? parsed.hostname === 'v.qq.com' && /^\/x\/cover\/[a-z0-9]+\/[a-z0-9]+\.html$/.test(parsed.pathname)
-      : parsed.hostname === 'www.iqiyi.com' && /^\/v_[a-z0-9]+\.html$/.test(parsed.pathname);
-    if (parsed.protocol !== 'https:' || !allowed || parsed.username || parsed.password) throw new Error('invalid source episode URL');
+      : provider === 'iqiyi' ? parsed.hostname === 'www.iqiyi.com' && /^\/v_[a-z0-9]+\.html$/.test(parsed.pathname)
+      : parsed.hostname === 'v.youku.com' && /^\/v_show\/id_[A-Za-z0-9=_-]+\.html$/.test(parsed.pathname);
+    if (parsed.protocol !== 'https:' || !allowed || parsed.username || parsed.password || parsed.port || parsed.search || parsed.hash) throw new Error('invalid source episode URL');
     result = { comments: await comments(source, provider, data.url) };
   } else throw new Error('unknown bridge action');
   // 上游源库可能记录错误后返回 []，必须把这种失败显式带回主服务，不能缓存为空。
@@ -103,16 +139,24 @@ export async function run(action, provider, data) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  // 源库日志走 stderr，stdout 只承载一个 JSON 对象。
-  console.log = console.info = console.debug = console.warn = (...args) => console.error(...args);
-  try {
+  // 第三方日志可能包含匿名 cookie/签名；不输出原始日志，错误由脱敏协议显式返回。
+  console.log = console.info = console.debug = console.warn = console.error = () => {};
+  const execute = async input => {
+    const { action, source, data } = JSON.parse(input);
+    return runWithHttpCache(() => run(action, source, data));
+  };
+  if (process.argv.includes('--worker')) {
+    for await (const input of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
+      try { process.stdout.write(JSON.stringify({ ok: true, result: await execute(input) }) + '\n'); }
+      catch (error) { process.stdout.write(JSON.stringify({ ok: false, error: safeError(error.message) }) + '\n'); }
+    }
+  } else try {
     let input = '';
     for await (const chunk of process.stdin) input += chunk;
-    const { action, source, data } = JSON.parse(input);
-    const result = await run(action, source, data);
+    const result = await execute(input);
     process.stdout.write(JSON.stringify(result));
   } catch (error) {
-    console.error(error.message);
+    process.stderr.write(safeError(error.message));
     process.exitCode = 1;
   }
 }

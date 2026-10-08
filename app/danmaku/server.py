@@ -44,7 +44,7 @@ def validate_target(value):
 class Application:
     def __init__(self, config, matcher=None):
         self.config = config
-        if matcher is None and any(name in ('tencent', 'iqiyi') for name in config.danmaku_providers):
+        if matcher is None and any(name in ('tencent', 'iqiyi', 'youku') for name in config.danmaku_providers):
             bridge = Path(config.danmaku_bridge)
             if shutil.which('node') is None or not bridge.is_file() or not (bridge.parent / 'node_modules/danmu-api-server/package.json').is_file():
                 raise RuntimeError('native source runtime is missing; install Node.js and run npm ci in danmaku-server')
@@ -58,7 +58,7 @@ class Application:
         target = validate_target(payload.get("target"))
         result = self.matcher.match(tmdb_id=target["tmdb_id"], anime=target["title"], season=target["season"],
                                     episode=target["episode"] or None, original_title=target["original_title"], year=target["year"])
-        result.setdefault("attempts", []).insert(0, {"source": "danmaku_server", "mode": "priority_v1", "outcome": "evaluated", "cached": result.get("cached", False)})
+        result.setdefault("attempts", []).insert(0, {"source": "danmaku_server", "mode": "priority_v2", "outcome": "evaluated", "cached": result.get("cached", False)})
         if not result.get("matched") and any(item.get("outcome") == "error" for item in result.get("attempts", [])):
             raise RuntimeError("danmaku source matching failed: " + json.dumps(result["attempts"], ensure_ascii=False))
         logging.info("danmaku match media=%s source=%s matched=%s attempts=%s", payload.get("media_id", ""),
@@ -205,6 +205,7 @@ class Server:
         if self.thread is not None:
             self.thread.join(timeout=5)
         self.application.prewarm.stop()
+        self.application.matcher.close()
 
 
 def validate_options(payload):

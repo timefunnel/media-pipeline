@@ -73,7 +73,7 @@ class DanmakuServerTest(unittest.TestCase):
     def test_default_official_source_is_last_and_requires_credentials(self):
         config = Config.from_env({'DANMAKU_SERVER_TOKEN': 'test-token-16-chars',
                                   'DANDANPLAY_APP_ID': 'test', 'DANDANPLAY_APP_SECRET': 'test'})
-        self.assertEqual(config.danmaku_providers, ('tencent', 'iqiyi', 'dandanplay'))
+        self.assertEqual(config.danmaku_providers, ('tencent', 'iqiyi', 'youku', 'dandanplay'))
         with self.assertRaisesRegex(ValueError, 'requires DANDANPLAY'):
             Config.from_env({'DANMAKU_SERVER_TOKEN': 'test-token-16-chars'})
 
@@ -87,6 +87,22 @@ class DanmakuServerTest(unittest.TestCase):
                 self.assertEqual([source.calls for source in sources], [1, 1, 0 if second_count else 1])
                 self.match(matcher)
                 self.assertEqual([source.calls for source in sources], [1, 1, 0 if second_count else 1])
+
+    def test_youku_hit_stops_before_official_and_next_episode_uses_season_cache(self):
+        sources = [Source('tencent', 0), Source('iqiyi', 0), Source('youku'), Source('dandanplay')]
+        sources[2].search_target = mock.Mock(return_value=[{'anime_title': '爱情公寓 第一季', 'episodes': [
+            {'episode_id': '101', 'episode_number': '1'}, {'episode_id': '102', 'episode_number': '2'}]}])
+        matcher = self.matcher(sources)
+        for episode in (1, 2):
+            result = matcher.match(tmdb_id='68809', anime='爱情公寓', season=1, episode=episode)
+            self.assertEqual(result['source'], 'youku')
+            self.assertEqual(result['episode_id'], str(100 + episode))
+            self.assertEqual(result['cached'], episode == 2)
+        self.assertEqual([source.calls for source in sources], [1, 1, 0, 0])
+        self.assertEqual(sources[2].search_target.call_count, 1)
+        app = Application(self.config, matcher)
+        result = app.match({'target': {**TARGET, 'season': 1, 'episode': 2}})
+        self.assertEqual(result['match']['attempts'][0]['mode'], 'priority_v2')
 
     def test_no_match_and_ambiguity_allow_next_source(self):
         for count in (0, 2):
@@ -145,10 +161,14 @@ class DanmakuServerTest(unittest.TestCase):
 
     def test_native_reference_is_persisted_and_reusable_without_search(self):
         source = NativeSource('iqiyi', self.cache, 'unused')
+        self.addCleanup(source.close)
         with mock.patch.object(source, '_call', return_value=[{'animeTitle': '爱情公寓4', 'episodes': [
             {'episodeId': '123', 'episodeTitle': '第16集', 'episodeNumber': '16', 'url': 'https://www.iqiyi.com/v_19rrgzfn2k.html'}]}]):
             source.search_target(TARGET)
+            with mock.patch.object(self.cache, 'save', side_effect=AssertionError('unchanged reference was rewritten')):
+                source.search_target(TARGET)
         restarted = NativeSource('iqiyi', self.cache, 'unused')
+        self.addCleanup(restarted.close)
         with mock.patch.object(restarted, '_call', return_value={'comments': []}) as call:
             restarted.comment('123')
             self.assertEqual(call.call_args.args[1]['url'], 'https://www.iqiyi.com/v_19rrgzfn2k.html')

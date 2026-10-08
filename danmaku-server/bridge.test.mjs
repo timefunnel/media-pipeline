@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Globals } from 'danmu-api-server/danmu_api/configs/globals.js';
-import { exactTitle, stableEpisodeId, search, comments, assertSourceSuccess } from './bridge.mjs';
+import { exactTitle, stableEpisodeId, search, comments, assertSourceSuccess, youkuEpisodeNumber, safeError, run } from './bridge.mjs';
+import StrictYoukuSource, { parseYoukuSegment } from './youku.mjs';
 
 test('exact title and season: intrinsic numbers, explicit seasons, no fuzzy match', () => {
   for (const [text, title, season, expected] of [
@@ -71,4 +72,95 @@ test('upstream caught error and risk-control failure cannot turn into a successf
   Globals.logBuffer = [{ level: 'info', message: '搜索接口风控，重试后仍失败' }];
   assert.throws(() => assertSourceSuccess('iqiyi'), /仍失败/);
   Globals.logBuffer = [];
+});
+
+test('Youku uses stage and original episode title, never seq or list position', async () => {
+  const title = '爱情公寓 第一季';
+  for (const [ep, expected] of [
+    [{ stage: '1', seq: '99', title: `${title} 01` }, 1],
+    [{ stage: '2', title: `${title} 第2集` }, 2],
+    [{ stage: '1', title: '爱情公寓 第二季 01' }, null],
+    [{ stage: '2', title: `${title} 01` }, null],
+    [{ seq: '1', title: `${title} 01` }, null],
+    [{ stage: '1.5', title: `${title} 01` }, null],
+    [{ stage: '1', title: `${title} 01 预告` }, null],
+    [{ stage: '1', title: `${title} 01花絮` }, null],
+  ]) assert.equal(youkuEpisodeNumber(ep, title), expected);
+  const fake = { search: async () => [{ title, type: '电视剧', mediaId: 'show' }],
+    getEpisodes: async () => [
+      { stage: '2', title: `${title} 02`, id: 'second' },
+      { stage: '1', title: `${title} 01`, id: 'first', link: 'http://v.youku.com/v_show/id_first.html' },
+      { stage: '3', title: '爱情公寓 第二季 03', id: 'wrong' },
+    ] };
+  const result = await search(fake, 'youku', { title: '爱情公寓', season: 1, episode: 1 });
+  assert.deepEqual(result[0].episodes.map(ep => ep.episodeNumber), ['2', '1']);
+  assert.equal(result[0].episodes[1].url, 'https://v.youku.com/v_show/id_first.html');
+  fake.getEpisodes = async () => [{ stage: '1', title: `${title} 01`, id: 'first', link: 'https://v.youku.com/v_show/id_other.html' }];
+  await assert.rejects(search(fake, 'youku', { title: '爱情公寓', season: 1, episode: 1 }), /disagree/);
+});
+
+test('Youku accepts successful empty segments, rejects API errors and incomplete results', async () => {
+  const payload = { ret: ['SUCCESS::调用成功'], data: { result: JSON.stringify({ code: 1, data: { result: [] } }) } };
+  assert.deepEqual(parseYoukuSegment(payload), []);
+  assert.throws(() => parseYoukuSegment({ ...payload, ret: ['FAIL_SYS_TOKEN_EXPIRED::secret detail'] }), /FAIL_SYS_TOKEN_EXPIRED/);
+  for (const bad of [{}, { ...payload, ret: [] }, { ...payload, ret: ['FAIL_SYS_TOKEN_EXPIRED'] },
+    { ...payload, data: { result: '{' } },
+    { ...payload, data: { result: JSON.stringify({ code: -1, data: { result: [] } }) } },
+    { ...payload, data: { result: JSON.stringify({ code: 0, data: { result: [] } }) } },
+    { ...payload, data: { result: JSON.stringify({ code: 1, data: {} }) } },
+  ]) assert.throws(() => parseYoukuSegment(bad));
+  const source = new StrictYoukuSource(async () => ({ data: payload }));
+  assert.deepEqual(await source.getEpisodeSegmentDanmu({ url: 'unused', data: '{}' }), []);
+  const converted = await comments({ getEpisodeDanmuSegments: async () => ({ segmentList: [1] }),
+    getEpisodeSegmentDanmu: async () => [{ playat: 1500, content: '优酷弹幕', propertis: '{"pos":1,"color":65280}' }],
+    formatComments: entries => source.formatComments(entries) }, 'youku', 'unused');
+  assert.equal(converted[0].m, '优酷弹幕');
+  assert.match(converted[0].p, /^1\.50,5,65280,/);
+});
+
+test('Youku episode pages are complete and bounded; local anonymous identity fallback is disabled', async () => {
+  const source = new StrictYoukuSource();
+  const calls = [];
+  source._getEpisodesPage = async (id, page, size) => {
+    calls.push(page);
+    return { total: 101, videos: Array.from({ length: page === 1 ? size : 1 }, (_, i) => ({ id: `${page}-${i}` })) };
+  };
+  assert.equal((await source.getEpisodes('show')).length, 101);
+  assert.deepEqual(calls, [1, 2]);
+  for (const bad of [null, {}, { total: 1, videos: [] }, { total: 10001, videos: [] },
+    { total: 2, videos: [{ id: 'same' }, { id: 'same' }] }]) {
+    source._getEpisodesPage = async () => bad;
+    await assert.rejects(source.getEpisodes('show'));
+  }
+  assert.throws(() => source._getFallbackCna(), /disabled/);
+});
+
+test('one failed segment stops scheduling, waits for active segments, and returns no partial result', async () => {
+  Globals.logBuffer = [];
+  let calls = 0, active = 0;
+  const fake = { getEpisodeDanmuSegments: async () => ({ segmentList: [0, 1, 2, 3, 4] }),
+    getEpisodeSegmentDanmu: async index => {
+      calls++; active++;
+      try {
+        if (index === 0) throw new Error('segment failed');
+        await new Promise(resolve => setTimeout(resolve, 10));
+        return [];
+      } finally { active--; }
+    }, formatComments: entries => entries };
+  await assert.rejects(comments(fake, 'youku', 'unused'), /segment failed/);
+  assert.equal(calls, 2);
+  assert.equal(active, 0);
+});
+
+test('worker resets request logs and rejects noncanonical Youku episode URLs without fetching', async () => {
+  Globals.logBuffer = [{ level: 'error', message: 'previous request error' }];
+  await assert.rejects(run('invalid', 'youku', {}), /unknown bridge action/);
+  assert.deepEqual(Globals.logBuffer, []);
+  for (const url of ['https://example.com/v_show/id_first.html', 'http://v.youku.com/v_show/id_first.html',
+    'https://v.youku.com/v_show/id_first.html?token=secret', 'https://user@v.youku.com/v_show/id_first.html']) {
+    await assert.rejects(run('comment', 'youku', { url }), /invalid source episode URL/);
+  }
+  const error = safeError('_m_h5_tk: secret; https://acs.youku.com/path/?sign=anothersecret');
+  assert.ok(!error.includes('secret'));
+  assert.ok(!error.includes('?'));
 });

@@ -11,7 +11,7 @@ class Config:
     host: str = "127.0.0.1"
     port: int = 9322
     danmaku_enabled: bool = True
-    danmaku_providers: tuple = ("tencent", "iqiyi", "dandanplay")
+    danmaku_providers: tuple = ("tencent", "iqiyi", "youku", "dandanplay")
     danmaku_cache_dir: str = "/danmaku-cache"
     danmaku_cache_ttl_seconds: int = 604800
     danmaku_search_cache_ttl_seconds: int = 86400
@@ -54,7 +54,7 @@ class Config:
             raise ValueError('DANMAKU_CACHE_DIR must not be empty')
         if not config.danmaku_providers or len(set(config.danmaku_providers)) != len(config.danmaku_providers):
             raise ValueError("DANMAKU_PROVIDERS must be a nonempty unique ordered list")
-        if any(name not in ("tencent", "iqiyi", "dandanplay", "aggregator") for name in config.danmaku_providers):
+        if any(name not in ("tencent", "iqiyi", "youku", "dandanplay", "aggregator") for name in config.danmaku_providers):
             raise ValueError("unsupported DANMAKU_PROVIDERS entry")
         if "dandanplay" in config.danmaku_providers and not (config.dandanplay_app_id and config.dandanplay_app_secret):
             raise ValueError("dandanplay requires DANDANPLAY_APP_ID and DANDANPLAY_APP_SECRET")

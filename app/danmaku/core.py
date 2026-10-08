@@ -630,6 +630,11 @@ class DanmakuMatcher:
     def enabled_sources(self):
         return [source for source in self.sources if source.enabled()]
 
+    def close(self):
+        for source in self.sources:
+            if hasattr(source, "close"):
+                source.close()
+
     def _source_by_name(self, name):
         wanted = str(name or "").strip().lower()
         for source in self.enabled_sources():
@@ -1091,13 +1096,17 @@ def build_danmaku_matcher_from_config(config):
     transport = DanmakuHttpTransport(proxy_url=getattr(config, "danmaku_proxy_url", ""))
     cache = DanmakuCache(getattr(config, "danmaku_cache_dir", DEFAULT_DANMAKU_CACHE_DIR))
     sources = []
+    from .bridge import BridgePool
+    pool = None
     names = tuple(getattr(config, "danmaku_providers", DEFAULT_DANMAKU_PROVIDERS) or ())
     for name in names:
         normalized = str(name or "").strip().lower()
-        if normalized in ("tencent", "iqiyi"):
+        if normalized in ("tencent", "iqiyi", "youku"):
             from .native import NativeSource
+            if pool is None:
+                pool = BridgePool(config.danmaku_bridge)
             sources.append(NativeSource(normalized, cache, config.danmaku_bridge,
-                                        search_timeout=timeout, comment_timeout=comment_timeout))
+                                        search_timeout=timeout, comment_timeout=comment_timeout, pool=pool))
         elif normalized == "dandanplay":
             sources.append(
                 DandanplayProtocolSource(
