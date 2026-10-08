@@ -7,6 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
 from danmaku.bridge import BridgePool
+from danmaku.circuit import SourceRiskControlError
 from danmaku.config import Config
 from danmaku.core import build_danmaku_matcher_from_config
 
@@ -49,6 +50,22 @@ class DanmakuBridgeTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'timed out'):
             self.call(data={'delay': 1000}, timeout=0.05)
         self.assertNotEqual(self.call()['pid'], pid)
+
+    def test_structured_risk_error_is_not_retried_and_recycles_worker(self):
+        pid = self.call()['pid']
+        with self.assertRaises(SourceRiskControlError) as caught:
+            self.call('risk_control')
+        self.assertEqual(caught.exception.reason, 'http_429')
+        self.assertNotEqual(self.call()['pid'], pid)
+
+    def test_gate_after_queue_does_not_start_worker_on_cooldown(self):
+        def blocked():
+            raise RuntimeError('source cooling down')
+        with self.assertRaisesRegex(RuntimeError, 'cooling down'):
+            self.pool.call('ping', 'youku', {}, 5, before_request=blocked)
+        self.assertTrue(all(worker.process is None for worker in self.pool.workers))
+        self.assertEqual(self.pool.available.qsize(), 3)
+        self.assertEqual(self.call()['source'], 'youku')
 
     def test_queue_wait_consumes_the_same_timeout_budget(self):
         # 占满三个 worker，第四个请求不得在队列上额外等待一个完整处理超时。

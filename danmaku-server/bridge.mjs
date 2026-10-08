@@ -9,6 +9,7 @@ import YoukuSource from './youku.mjs';
 import { runWithHttpCache } from 'danmu-api-server/danmu_api/utils/http-util.js';
 import { extractSeasonNumberFromAnimeTitle } from 'danmu-api-server/danmu_api/utils/common-util.js';
 import { convertToDanmakuJson } from 'danmu-api-server/danmu_api/utils/danmu-util.js';
+import { withSourceRiskGuard, SourceRiskControlError } from './risk.mjs';
 
 const normalize = value => String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
 
@@ -123,7 +124,7 @@ export async function comments(source, provider, url, concurrency = 6) {
   return convertToDanmakuJson(source.formatComments(raw), provider === 'tencent' ? 'qq' : provider === 'iqiyi' ? 'qiyi' : 'youku');
 }
 
-export async function run(action, provider, data) {
+async function runSource(action, provider, data) {
   if (!['tencent', 'iqiyi', 'youku'].includes(provider)) throw new Error('unsupported native source');
   Globals.logBuffer = [];
   Globals.init({ SOURCE_ORDER: provider, LOG_LEVEL: 'info', VOD_REQUEST_TIMEOUT: '15000', STRICT_TITLE_MATCH: 'true',
@@ -144,6 +145,19 @@ export async function run(action, provider, data) {
   return result;
 }
 
+export async function run(action, provider, data) {
+  return withSourceRiskGuard(provider, () => runSource(action, provider, data));
+}
+
+export function sourceErrorEnvelope(error) {
+  const result = { ok: false, error: safeError(error.message) };
+  if (error instanceof SourceRiskControlError) {
+    result.code = error.code;
+    result.risk_reason = error.riskReason;
+  }
+  return result;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   // 第三方日志可能包含匿名 cookie/签名；不输出原始日志，错误由脱敏协议显式返回。
   console.log = console.info = console.debug = console.warn = console.error = () => {};
@@ -154,7 +168,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   if (process.argv.includes('--worker')) {
     for await (const input of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
       try { process.stdout.write(JSON.stringify({ ok: true, result: await execute(input) }) + '\n'); }
-      catch (error) { process.stdout.write(JSON.stringify({ ok: false, error: safeError(error.message) }) + '\n'); }
+      catch (error) { process.stdout.write(JSON.stringify(sourceErrorEnvelope(error)) + '\n'); }
     }
   } else try {
     let input = '';

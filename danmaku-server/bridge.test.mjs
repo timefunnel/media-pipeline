@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Globals } from 'danmu-api-server/danmu_api/configs/globals.js';
 import TencentSource from 'danmu-api-server/danmu_api/sources/tencent.js';
-import { exactTitle, stableEpisodeId, search, comments, assertSourceSuccess, youkuEpisodeNumber, safeError, run } from './bridge.mjs';
+import { exactTitle, stableEpisodeId, search, comments, assertSourceSuccess, youkuEpisodeNumber, safeError, run, sourceErrorEnvelope } from './bridge.mjs';
 import StrictYoukuSource, { parseYoukuSegment, parseYoukuTitle } from './youku.mjs';
+import { SourceRiskControlError, responseRiskReason, withSourceRiskGuard } from './risk.mjs';
+import { httpGet } from 'danmu-api-server/danmu_api/utils/http-util.js';
 
 test('exact title and season: intrinsic numbers, explicit seasons, no fuzzy match', () => {
   for (const [text, title, season, expected] of [
@@ -285,4 +287,117 @@ test('worker resets request logs and rejects noncanonical Youku episode URLs wit
   const error = safeError('_m_h5_tk: secret; https://acs.youku.com/path/?sign=anothersecret');
   assert.ok(!error.includes('secret'));
   assert.ok(!error.includes('?'));
+});
+
+test('risk detection only uses failed status and error fields, never titles or comment content', () => {
+  const url = 'https://mesh.if.iqiyi.com/portal/lw/search/homePageV3';
+  for (const code of ['-1', -1]) assert.equal(responseRiskReason('iqiyi', url, { code }), 'iqiyi_search_risk_control');
+  assert.equal(responseRiskReason('iqiyi', 'https://www.iqiyi.com/other', { code: -1 }), null);
+  for (const payload of [{ ret: -1, msg: '请求过于频繁' }, { code: -1, message: '验证码' },
+    { ret: ['FAIL_SYS_USER_VALIDATE::验证请求'] }, { ret: ['FAIL_SYS_RGV587_ERROR::受限'] }]) {
+    assert.equal(responseRiskReason('youku', 'https://acs.youku.com/api', payload), 'explicit_risk_control');
+  }
+  for (const payload of [{ code: 0, message: '验证码' }, { ret: 0, msg: '验证码', data: [] },
+    { ret: ['SUCCESS::调用成功'], data: { comments: [{ content: '风控、验证码、请求过于频繁' }] } },
+    { ret: ['FAIL_SYS_TOKEN_EXPIRED::令牌过期'] }, { ret: -1, msg: '节目不存在' },
+    { code: 0, data: { templates: [] } }]) {
+    assert.equal(responseRiskReason('youku', 'https://acs.youku.com/api', payload), null);
+  }
+});
+
+test('iqiyi actual adapter risk response stops at one HTTP call without its three-second retries', async t => {
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async url => {
+    calls++;
+    assert.equal(new URL(url).pathname, '/portal/lw/search/homePageV3');
+    return new Response(JSON.stringify({ code: '-1', data: null }));
+  });
+  const original = globalThis.fetch;
+  await assert.rejects(run('search', 'iqiyi', { title: '测试作品', season: 1, episode: 1 }), error =>
+    error instanceof SourceRiskControlError && error.riskReason === 'iqiyi_search_risk_control');
+  assert.equal(calls, 1);
+  assert.equal(globalThis.fetch, original);
+});
+
+test('HTTP 403 and 429 survive caught errors and block attempted retries for all native providers', async t => {
+  let calls = 0;
+  let status;
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response('', { status }); });
+  for (const provider of ['tencent', 'iqiyi', 'youku']) for (status of [403, 429]) {
+    calls = 0;
+    await assert.rejects(withSourceRiskGuard(provider, async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try { await fetch('https://example.test/segment'); } catch { /* 模拟第三方内部 catch + retry。 */ }
+      }
+      return [];
+    }), error => error instanceof SourceRiskControlError && error.riskReason === `http_${status}`);
+    assert.equal(calls, 1, `${provider}: ${status}`);
+  }
+});
+
+test('pinned HTTP helper retry does not send another upstream request after risk control', async t => {
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response('', { status: 429 }); });
+  // 适配器的物理重试可能仍有一次本地退避，但第二次 fetch 被拦截，不回源。
+  t.mock.method(console, 'log', () => {});
+  await assert.rejects(withSourceRiskGuard('tencent', () =>
+    httpGet('https://example.test/segment', { retries: 1 })),
+  error => error instanceof SourceRiskControlError && error.riskReason === 'http_429');
+  assert.equal(calls, 1);
+});
+
+test('risk aborts active segments, stops scheduling, and never returns partial comments', async t => {
+  Globals.logBuffer = [];
+  let calls = 0, aborted = 0;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    calls++;
+    if (url.endsWith('/0')) return new Response('', { status: 429 });
+    return new Promise((resolve, reject) => {
+      if (options.signal.aborted) { aborted++; reject(options.signal.reason); return; }
+      options.signal.addEventListener('abort', () => { aborted++; reject(options.signal.reason); }, { once: true });
+    });
+  });
+  const source = { getEpisodeDanmuSegments: async () => ({ segmentList: [0, 1, 2, 3, 4] }),
+    getEpisodeSegmentDanmu: async index => {
+      await fetch(`https://example.test/${index}`);
+      return [];
+    }, formatComments: entries => entries };
+  await assert.rejects(withSourceRiskGuard('youku', () => comments(source, 'youku', 'unused', 2)),
+    error => error instanceof SourceRiskControlError && error.riskReason === 'http_429');
+  assert.equal(calls, 2);
+  assert.equal(aborted, 1);
+});
+
+test('ordinary HTTP errors do not latch the risk guard and another provider request is unaffected', async t => {
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response('', { status: 500 }); });
+  const original = globalThis.fetch;
+  await assert.rejects(withSourceRiskGuard('tencent', async () => {
+    const response = await fetch('https://example.test/api');
+    throw new Error(`HTTP ${response.status}`);
+  }), /HTTP 500/);
+  assert.equal(globalThis.fetch, original);
+  assert.equal(await withSourceRiskGuard('iqiyi', async () => (await fetch('https://example.test/api')).status), 500);
+  assert.equal(calls, 2);
+});
+
+test('successful empty responses, binary segments and normal Youku token bootstrap are unchanged', async t => {
+  let payload;
+  t.mock.method(globalThis, 'fetch', async () => new Response(payload));
+  for (payload of [JSON.stringify({ code: 0, data: [] }), JSON.stringify({ ret: ['FAIL_SYS_TOKEN_EXPIRED'] }), 'not-json']) {
+    const result = await withSourceRiskGuard('youku', async () => (await fetch('https://acs.youku.com/api')).text());
+    assert.equal(result, payload);
+  }
+  payload = 'binary segment';
+  assert.equal(new TextDecoder().decode(await withSourceRiskGuard('iqiyi', async () =>
+    (await fetch('https://example.test/segment')).arrayBuffer())), payload);
+});
+
+test('structured worker risk error contains only a stable code and safe reason', () => {
+  assert.deepEqual(sourceErrorEnvelope(new SourceRiskControlError('http_403')), {
+    ok: false, error: 'danmaku_source_risk_control: http_403', code: 'danmaku_source_risk_control', risk_reason: 'http_403',
+  });
+  assert.deepEqual(sourceErrorEnvelope(new Error('https://example.test/api?token=secret failed')), {
+    ok: false, error: 'https://example.test/api failed',
+  });
 });

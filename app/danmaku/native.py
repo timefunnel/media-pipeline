@@ -13,13 +13,14 @@ class NativeSource:
         self.timeout = search_timeout
         self.comment_timeout = comment_timeout
         self.segment_concurrency = segment_concurrency
+        self.before_request = None
         self.base_url = "danmu_api/afc8b8119f981492a5caee52f1e1ebf756bd0d41/" + name
 
     def enabled(self):
         return True
 
     def _call(self, action, data, timeout):
-        return self.pool.call(action, self.name, data, timeout)
+        return self.pool.call(action, self.name, data, timeout, before_request=self.before_request)
 
     def close(self):
         self.pool.close()

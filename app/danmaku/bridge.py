@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from .circuit import SourceRiskControlError
 
 
 class _Worker:
@@ -77,6 +78,8 @@ class _Worker:
         if not response["ok"]:
             self.reset()
             # 上游业务失败显式返回；不重试，也不让本次错误污染下一次请求。
+            if response.get("code") == SourceRiskControlError.code:
+                raise SourceRiskControlError(response.get("risk_reason"))
             raise RuntimeError(str(response.get("error") or "native source request failed"))
         if "result" not in response:
             self.reset()
@@ -94,7 +97,7 @@ class BridgePool:
             self.available.put(worker)
         atexit.register(self.close)
 
-    def call(self, action, source, data, timeout):
+    def call(self, action, source, data, timeout, before_request=None):
         if self.closed.is_set():
             raise RuntimeError("native source bridge is closed")
         if not Path(self.bridge).is_file():
@@ -105,6 +108,8 @@ class BridgePool:
         except queue.Empty as exc:
             raise RuntimeError("native source request queue timed out") from exc
         try:
+            if before_request is not None:
+                before_request()
             return worker.call({"action": action, "source": source, "data": data}, deadline)
         finally:
             self.available.put(worker)

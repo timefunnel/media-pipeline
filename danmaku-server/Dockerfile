@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-cert
 WORKDIR /app/danmaku-server
 COPY danmaku-server/package.json danmaku-server/package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund --legacy-peer-deps && npm cache clean --force
-COPY danmaku-server/bridge.mjs danmaku-server/youku.mjs ./
+COPY danmaku-server/bridge.mjs danmaku-server/youku.mjs danmaku-server/risk.mjs ./
 COPY app/danmaku /app/danmaku
 ENV PYTHONPATH=/app PYTHONUNBUFFERED=1 DANMAKU_SERVER_HOST=0.0.0.0 \
     DANMAKU_BRIDGE=/app/danmaku-server/bridge.mjs \

@@ -32,6 +32,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from .transport import DanmakuHttpTransport
+from .circuit import SourceCircuitBreaker
 
 
 DEFAULT_DANDANPLAY_BASE_URL = "https://api.dandanplay.net"
@@ -621,6 +622,10 @@ class DanmakuMatcher:
     ):
         self.sources = [source for source in (sources or []) if source is not None]
         self.cache = cache if cache is not None else DanmakuCache()
+        self.circuit = SourceCircuitBreaker(self.cache)
+        for source in self.sources:
+            if hasattr(source, "before_request"):
+                source.before_request = lambda source=source: self.circuit.check(self._source_cache_identity(source))
         self.cache_ttl_seconds = max(0, int(cache_ttl_seconds or 0))
         self.search_cache_ttl_seconds = max(0, int(search_cache_ttl_seconds or 0))
         self.max_comments = max(1, int(max_comments or DEFAULT_DANMAKU_MAX_COMMENTS))
@@ -681,6 +686,9 @@ class DanmakuMatcher:
             self.cache.save(key, body)
             return body, False
 
+    def _upstream_call(self, source, loader):
+        return self.circuit.call(self._source_cache_identity(source), loader)
+
     def _search_source(self, source, tmdb_id="", episode=None, anime=""):
         normalized_tmdb_id = str(tmdb_id or "").strip()
         normalized_anime = str(anime or "").strip()
@@ -697,13 +705,13 @@ class DanmakuMatcher:
         body, served_from_cache = self._cached_call(
             cache_key,
             self.search_cache_ttl_seconds,
-            lambda: {
+            lambda: self._upstream_call(source, lambda: {
                 "animes": source.search_episodes(
                     tmdb_id=normalized_tmdb_id,
                     episode=episode,
                     anime=normalized_anime,
                 )
-            },
+            }),
         )
         return list(body.get("animes") or []), served_from_cache
 
@@ -1116,7 +1124,7 @@ class DanmakuMatcher:
             cached, served_from_cache = self._cached_call(
                 cache_key,
                 self.cache_ttl_seconds,
-                lambda: source.comment(episode, with_related=with_related, ch_convert=ch_convert),
+                lambda: self._upstream_call(source, lambda: source.comment(episode, with_related=with_related, ch_convert=ch_convert)),
             )
         return build_danmaku_payload(
             cached.get("comments") or [],
@@ -1138,7 +1146,7 @@ class DanmakuMatcher:
     def _native_search(self, source, key, target):
         body, cached = self._cached_call(
             key, self.search_cache_ttl_seconds,
-            lambda: {"animes": source.search_target(target)},
+            lambda: self._upstream_call(source, lambda: {"animes": source.search_target(target)}),
         )
         return list(body.get("animes") or []), cached
 

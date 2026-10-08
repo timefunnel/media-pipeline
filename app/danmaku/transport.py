@@ -4,6 +4,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from .circuit import SourceRiskControlError
 
 
 class DanmakuHttpTransport:
@@ -26,6 +27,8 @@ class DanmakuHttpTransport:
             with self.opener.open(request, timeout=timeout) as response:
                 raw = response.read(32 * 1024 * 1024 + 1)
         except urllib.error.HTTPError as exc:
+            if exc.code in (403, 429):
+                raise SourceRiskControlError("http_%s" % exc.code) from exc
             raise RuntimeError("danmaku upstream HTTP %s" % exc.code) from exc
         except (OSError, TimeoutError) as exc:
             raise RuntimeError("danmaku upstream request failed: %s" % exc) from exc
