@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Globals } from 'danmu-api-server/danmu_api/configs/globals.js';
+import TencentSource from 'danmu-api-server/danmu_api/sources/tencent.js';
 import { exactTitle, stableEpisodeId, search, comments, assertSourceSuccess, youkuEpisodeNumber, safeError, run } from './bridge.mjs';
 import StrictYoukuSource, { parseYoukuSegment } from './youku.mjs';
 
@@ -41,6 +42,44 @@ test('animation supported, title prefix cannot accept another numbered season', 
   const result = await search(fake, 'tencent', { title: '遮天', season: 1, episode: 148 });
   assert.equal(result[0].episodes.length, 1);
   assert.equal(result[0].episodes[0].url, 'https://v.qq.com/x/cover/album/correct.html');
+});
+
+test('Tencent 2D and 3D animation tags preserve exact title, season and episode checks', async () => {
+  const adapter = new TencentSource();
+  for (const dimension of ['', '2D', '3D']) {
+    const program = adapter.filterTencentSearchItem({ doc: { id: 'album' }, videoInfo: {
+      title: '遮天', year: 2023, typeName: '动漫', playSites: [{ enName: 'qq' }],
+      coverDoc: { richTags: dimension ? [{ text: `${dimension}动画` }] : [] },
+    } }, '遮天');
+    assert.equal(program.type, `${dimension}动漫`);
+    const calls = [];
+    const fake = { search: async () => [program, { ...program, title: '遮天剧场版' },
+      { ...program, title: '遮天 第二季' }],
+      getEpisodes: async (id, chapters) => {
+        calls.push([id, chapters]);
+        return [{ title: '148', unionTitle: '遮天 第148集', vid: 'correct' },
+          { title: '148', unionTitle: '遮天2 第148集', vid: 'wrong-season' },
+          { title: '148', unionTitle: '另一个作品 第148集', vid: 'wrong-title' },
+          { title: '预告', unionTitle: '遮天 第148集预告', vid: 'trailer' }];
+      } };
+    const result = await search(fake, 'tencent', { title: '遮天', season: 1, episode: 148, year: 2023 });
+    assert.deepEqual(calls, [['album', []]], dimension);
+    assert.equal(result.length, 1, dimension);
+    assert.equal(result[0].typeDescription, `${dimension}动漫`);
+    assert.equal(result[0].episodes.length, 1);
+    assert.equal(result[0].episodes[0].episodeNumber, '148');
+    assert.equal(result[0].episodes[0].url, 'https://v.qq.com/x/cover/album/correct.html');
+  }
+});
+
+test('animation type additions do not admit unknown types or movie-series crossover', async () => {
+  const fake = { search: async () => ['电影', '综艺', '3D综艺', '短剧', '3D动漫解说', '未知动漫'].map(type =>
+    ({ title: '遮天', type, mediaId: 'rejected', year: 2023 })),
+    getEpisodes: async () => { assert.fail('rejected program must not fetch episodes'); } };
+  assert.deepEqual(await search(fake, 'tencent', { title: '遮天', season: 1, episode: 148, year: 2023 }), []);
+  fake.search = async () => ['动漫', '2D动漫', '3D动漫'].map(type =>
+    ({ title: '遮天', type, mediaId: 'rejected', year: 2023 }));
+  assert.deepEqual(await search(fake, 'tencent', { title: '遮天', season: 0, episode: 0, year: 2023 }), []);
 });
 
 test('movies require matching release year, no movie-series crossover', async () => {

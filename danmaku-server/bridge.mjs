@@ -57,9 +57,10 @@ export async function search(source, provider, target) {
   const query = target.season > 1 ? `${title} 第${target.season}季` : title;
   const programs = await source.search(query);
   const movie = !target.season && !target.episode;
+  // 腾讯适配器保留 2D/3D 标签；它们仍是动漫，不采用任意前缀或模糊类型匹配。
   const candidates = programs.filter(program => exactTitle(program, target) &&
     (movie ? program.type === '电影' && target.year > 0 && Number(program.year) === target.year
-      : ['电视剧', '动漫', '纪录片'].includes(program.type)));
+      : ['电视剧', '动漫', '2D动漫', '3D动漫', '纪录片'].includes(program.type)));
   const animes = [];
   for (const program of candidates) {
     const episodes = await source.getEpisodes(program.mediaId, provider === 'tencent' ? (program.chapterContexts || []) : target.season || null);
