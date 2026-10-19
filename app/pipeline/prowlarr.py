@@ -31,7 +31,51 @@ class ProwlarrSearchCache:
         self.max_entries = max(1, int(max_entries))
         self.clock = clock or time.monotonic
         self._entries = {}
+        self._inflight = {}
         self._lock = threading.Lock()
+
+    def acquire(self, key):
+        now = self.clock()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None:
+                expires_at, value = entry
+                if expires_at > now:
+                    return "cached", copy.deepcopy(value)
+                self._entries.pop(key, None)
+            flight = self._inflight.get(key)
+            if flight is not None:
+                return "wait", flight
+            flight = _ProwlarrSearchFlight()
+            self._inflight[key] = flight
+            return "leader", flight
+
+    def wait(self, flight, timeout=None):
+        wait_timeout = None if timeout is None else max(0, float(timeout))
+        if not flight.event.wait(wait_timeout):
+            raise TimeoutError("timed out waiting for in-flight Prowlarr search")
+        if flight.error is not None:
+            raise flight.error
+        return copy.deepcopy(flight.value)
+
+    def complete(self, key, flight, value):
+        cached = copy.deepcopy(value)
+        now = self.clock()
+        with self._lock:
+            if self.ttl_seconds > 0:
+                self._prune_expired(now)
+                self._store(key, cached, now)
+            if self._inflight.get(key) is flight:
+                self._inflight.pop(key, None)
+            flight.value = cached
+            flight.event.set()
+
+    def fail(self, key, flight, error):
+        with self._lock:
+            if self._inflight.get(key) is flight:
+                self._inflight.pop(key, None)
+            flight.error = error
+            flight.event.set()
 
     def get(self, key):
         now = self.clock()
@@ -50,13 +94,26 @@ class ProwlarrSearchCache:
             return
         now = self.clock()
         with self._lock:
-            expired = [entry_key for entry_key, (expires_at, _) in self._entries.items() if expires_at <= now]
-            for entry_key in expired:
-                self._entries.pop(entry_key, None)
-            if key not in self._entries and len(self._entries) >= self.max_entries:
-                oldest_key = min(self._entries, key=lambda entry_key: self._entries[entry_key][0])
-                self._entries.pop(oldest_key, None)
-            self._entries[key] = (now + self.ttl_seconds, copy.deepcopy(value))
+            self._prune_expired(now)
+            self._store(key, value, now)
+
+    def _prune_expired(self, now):
+        expired = [entry_key for entry_key, (expires_at, _) in self._entries.items() if expires_at <= now]
+        for entry_key in expired:
+            self._entries.pop(entry_key, None)
+
+    def _store(self, key, value, now):
+        if key not in self._entries and len(self._entries) >= self.max_entries:
+            oldest_key = min(self._entries, key=lambda entry_key: self._entries[entry_key][0])
+            self._entries.pop(oldest_key, None)
+        self._entries[key] = (now + self.ttl_seconds, copy.deepcopy(value))
+
+
+class _ProwlarrSearchFlight:
+    def __init__(self):
+        self.event = threading.Event()
+        self.value = None
+        self.error = None
 
 
 def safe_prowlarr_download_uri(value):
@@ -152,6 +209,19 @@ class ProwlarrClient:
         self.transport = transport or ProwlarrTransport()
         self.timeout = timeout
         self.search_cache = search_cache
+        self.indexer_search_timeouts = {}
+
+    def set_indexer_search_timeout(self, indexer_ids, timeout):
+        timeout = max(0, float(timeout))
+        for indexer_id in indexer_ids or ():
+            self.indexer_search_timeouts[int(indexer_id)] = timeout
+
+    def search_timeout(self, indexer_ids):
+        timeout = float(self.timeout)
+        ids = tuple(indexer_ids or ())
+        if len(ids) == 1:
+            timeout = max(timeout, self.indexer_search_timeouts.get(int(ids[0]), 0))
+        return timeout
 
     def search(self, query, limit=20, indexer_ids=None, categories=None):
         if not query:
@@ -164,18 +234,28 @@ class ProwlarrClient:
         params = urllib.parse.urlencode(params)
         url = self.base_url + "/api/v1/search?" + params
         cache_key = url
+        request_timeout = self.search_timeout(indexer_ids)
+        flight = None
         if self.search_cache is not None:
-            hit, cached = self.search_cache.get(cache_key)
-            if hit:
-                return cached
-        results = self.transport.request(
-            "GET",
-            url,
-            headers={"X-Api-Key": self.api_key},
-            timeout=self.timeout,
-        )
+            state, cached_or_flight = self.search_cache.acquire(cache_key)
+            if state == "cached":
+                return cached_or_flight
+            if state == "wait":
+                return self.search_cache.wait(cached_or_flight, timeout=request_timeout)
+            flight = cached_or_flight
+        try:
+            results = self.transport.request(
+                "GET",
+                url,
+                headers={"X-Api-Key": self.api_key},
+                timeout=request_timeout,
+            )
+        except Exception as error:
+            if self.search_cache is not None:
+                self.search_cache.fail(cache_key, flight, error)
+            raise
         if self.search_cache is not None:
-            self.search_cache.put(cache_key, results)
+            self.search_cache.complete(cache_key, flight, results)
         return results
 
     def tags(self):

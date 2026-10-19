@@ -71,23 +71,6 @@ from pipeline.external_subtitles import (
     adult_source_declares_chinese_subtitles,
     build_subtitle_matcher_from_config,
 )
-from pipeline.danmaku import (
-    DEFAULT_DANDANPLAY_BASE_URL,
-    DEFAULT_DANMAKU_CACHE_DIR,
-    DEFAULT_DANMAKU_CACHE_TTL_SECONDS,
-    DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS,
-    DEFAULT_DANMAKU_IMPORT_MAX_BYTES,
-    DEFAULT_DANMAKU_MAX_COMMENTS,
-    DEFAULT_DANMAKU_PROVIDERS,
-    DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS,
-    DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS,
-    build_danmaku_local_import_from_config,
-    build_danmaku_matcher_from_config,
-)
-from pipeline.danmaku_prewarm import (
-    DEFAULT_DANMAKU_PREWARM_DELAY_SECONDS,
-    DEFAULT_DANMAKU_PREWARM_MAX_EPISODES,
-)
 from pipeline.openlist_utils import (
     is_openlist_video_file,
     normalize_openlist_path,
@@ -438,7 +421,7 @@ from pipeline.subtitle_asr import (
     DEFAULT_ASR_TRANSLATION_TIMEOUT_SECONDS,
 )
 TYPING_ACTION_INTERVAL_SECONDS = 4
-DEFAULT_BT4G_SEARCH_TIMEOUT_SECONDS = 12
+DEFAULT_BT4G_SEARCH_TIMEOUT_SECONDS = 65
 DEFAULT_SUBSCRIPTION_FOLLOW_SEARCH_TIMEOUT_SECONDS = 45
 DEFAULT_SUBSCRIPTION_STAGING_ROOT = "/115/临时"
 
@@ -491,23 +474,6 @@ class BotConfig:
     opensubtitles_api_key: str = ""
     opensubtitles_username: str = ""
     opensubtitles_password: str = ""
-    danmaku_enabled: bool = False
-    danmaku_providers: tuple = DEFAULT_DANMAKU_PROVIDERS
-    danmaku_cache_dir: str = DEFAULT_DANMAKU_CACHE_DIR
-    danmaku_cache_ttl_seconds: int = DEFAULT_DANMAKU_CACHE_TTL_SECONDS
-    danmaku_search_cache_ttl_seconds: int = DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS
-    danmaku_search_timeout_seconds: int = DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS
-    danmaku_comment_timeout_seconds: int = DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS
-    danmaku_max_comments: int = DEFAULT_DANMAKU_MAX_COMMENTS
-    danmaku_import_max_bytes: int = DEFAULT_DANMAKU_IMPORT_MAX_BYTES
-    danmaku_blacklist: tuple = ()
-    danmaku_proxy_url: str = ""
-    dandanplay_base_url: str = DEFAULT_DANDANPLAY_BASE_URL
-    dandanplay_app_id: str = ""
-    dandanplay_app_secret: str = ""
-    danmaku_aggregator_url: str = ""
-    danmaku_prewarm_delay_seconds: float = DEFAULT_DANMAKU_PREWARM_DELAY_SECONDS
-    danmaku_prewarm_max_episodes: int = DEFAULT_DANMAKU_PREWARM_MAX_EPISODES
     openlist_scan_username: str = ""
     openlist_scan_password: str = ""
     search_page_size: int = SEARCH_PAGE_SIZE
@@ -701,52 +667,6 @@ class BotConfig:
             opensubtitles_api_key=env.get("OPENSUBTITLES_API_KEY", ""),
             opensubtitles_username=env.get("OPENSUBTITLES_USERNAME", ""),
             opensubtitles_password=env.get("OPENSUBTITLES_PASSWORD", ""),
-            danmaku_enabled=parse_bool(env.get("DANMAKU_ENABLED"), False),
-            danmaku_providers=parse_csv_strings(env.get("DANMAKU_PROVIDERS"), DEFAULT_DANMAKU_PROVIDERS),
-            danmaku_cache_dir=env.get("DANMAKU_CACHE_DIR", DEFAULT_DANMAKU_CACHE_DIR),
-            danmaku_cache_ttl_seconds=max(
-                0,
-                int(env.get("DANMAKU_CACHE_TTL_SECONDS", str(DEFAULT_DANMAKU_CACHE_TTL_SECONDS))),
-            ),
-            danmaku_search_cache_ttl_seconds=max(
-                0,
-                int(
-                    env.get(
-                        "DANMAKU_SEARCH_CACHE_TTL_SECONDS",
-                        str(DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS),
-                    )
-                ),
-            ),
-            danmaku_search_timeout_seconds=max(
-                1,
-                int(env.get("DANMAKU_SEARCH_TIMEOUT_SECONDS", str(DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS))),
-            ),
-            danmaku_comment_timeout_seconds=max(
-                1,
-                int(env.get("DANMAKU_COMMENT_TIMEOUT_SECONDS", str(DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS))),
-            ),
-            danmaku_max_comments=max(
-                1,
-                int(env.get("DANMAKU_MAX_COMMENTS", str(DEFAULT_DANMAKU_MAX_COMMENTS))),
-            ),
-            danmaku_import_max_bytes=max(
-                1024,
-                int(env.get("DANMAKU_IMPORT_MAX_BYTES", str(DEFAULT_DANMAKU_IMPORT_MAX_BYTES))),
-            ),
-            danmaku_blacklist=parse_csv_strings(env.get("DANMAKU_BLACKLIST"), ()),
-            danmaku_proxy_url=str(env.get("DANMAKU_PROXY_URL") or "").strip(),
-            dandanplay_base_url=str(env.get("DANDANPLAY_BASE_URL") or DEFAULT_DANDANPLAY_BASE_URL).strip(),
-            dandanplay_app_id=str(env.get("DANDANPLAY_APP_ID") or "").strip(),
-            dandanplay_app_secret=str(env.get("DANDANPLAY_APP_SECRET") or "").strip(),
-            danmaku_aggregator_url=str(env.get("DANMAKU_AGGREGATOR_URL") or "").strip(),
-            danmaku_prewarm_delay_seconds=max(
-                0.0,
-                float(env.get("DANMAKU_PREWARM_DELAY_SECONDS", str(DEFAULT_DANMAKU_PREWARM_DELAY_SECONDS))),
-            ),
-            danmaku_prewarm_max_episodes=max(
-                1,
-                int(env.get("DANMAKU_PREWARM_MAX_EPISODES", str(DEFAULT_DANMAKU_PREWARM_MAX_EPISODES))),
-            ),
             search_page_size=int(env.get("BOT_SEARCH_PAGE_SIZE", str(SEARCH_PAGE_SIZE))),
             task_list_page_size=int(env.get("BOT_TASK_LIST_PAGE_SIZE", str(DEFAULT_TASK_LIST_PAGE_SIZE))),
             task_list_fetch_limit=int(env.get("BOT_TASK_LIST_FETCH_LIMIT", str(DEFAULT_TASK_LIST_FETCH_LIMIT))),
@@ -1883,8 +1803,6 @@ class PipelineBotService:
         self._llm_rerank_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-rerank")
         self._llm_rerank_lock = threading.Lock()
         self._subtitle_matcher = None
-        self._danmaku_matcher = None
-        self._danmaku_local_import = None
         self._search_capabilities_lock = threading.Lock()
         self._search_capabilities_cache = None
         self._search_capabilities_cached_at = 0.0
@@ -1947,6 +1865,16 @@ class PipelineBotService:
             search_cache=self._prowlarr_search_cache,
         )
         indexers = prowlarr.indexers()
+        prowlarr.set_indexer_search_timeout(
+            [
+                indexer.get("id")
+                for indexer in indexers
+                if indexer_enabled(indexer)
+                and indexer.get("id") is not None
+                and indexer_matches_label(indexer, "BT4G")
+            ],
+            self.config.prowlarr_bt4g_search_timeout_seconds,
+        )
         tags = safe_prowlarr_tags(prowlarr)
         max_workers = search_profile_value(
             self.config.search_profile_max_workers,
@@ -2023,7 +1951,7 @@ class PipelineBotService:
     def search_anime(self, query, limit=DEFAULT_SEARCH_LIMIT):
         return self.search(query, "movie", limit=limit, profile=SEARCH_PROFILE_ANIME)
 
-    def search_bt4g(self, query, limit=DEFAULT_SEARCH_LIMIT):
+    def search_bt4g(self, query, category="movie", limit=DEFAULT_SEARCH_LIMIT):
         stats = SearchStats()
         api_key = ProwlarrConfig(self.config.prowlarr_config).load_api_key()
         prowlarr = ProwlarrClient(
@@ -2037,11 +1965,12 @@ class PipelineBotService:
         if not bt4g_indexers:
             raise RuntimeError("Prowlarr indexer not found: BT4G")
 
+        profile = search_profile_for_query(category, query)
         categories_by_profile = self.config.search_profile_categories or SEARCH_PROFILE_CATEGORIES
-        categories = categories_by_profile.get(SEARCH_PROFILE_GENERAL, SEARCH_PROFILE_CATEGORIES[SEARCH_PROFILE_GENERAL])
+        categories = categories_by_profile.get(profile, SEARCH_PROFILE_CATEGORIES[SEARCH_PROFILE_GENERAL])
         upstream_limit = search_profile_value(
             self.config.search_profile_upstream_limits,
-            SEARCH_PROFILE_GENERAL,
+            profile,
             self.config.prowlarr_upstream_search_limit,
         )
         request_limit = max(int(limit), int(upstream_limit))
@@ -3504,24 +3433,6 @@ class PipelineBotService:
             self._subtitle_matcher = build_subtitle_matcher_from_config(self.config)
         return self._subtitle_matcher
 
-    def _build_danmaku_matcher(self):
-        if self._danmaku_matcher is None:
-            self._danmaku_matcher = build_danmaku_matcher_from_config(self.config)
-        return self._danmaku_matcher
-
-    def _build_danmaku_local_import(self):
-        if self._danmaku_local_import is None:
-            self._danmaku_local_import = build_danmaku_local_import_from_config(self.config)
-        return self._danmaku_local_import
-
-    def _require_danmaku_matcher(self):
-        """未启用/无可用源时抛 ``ValueError``（配置问题），上游故障抛 ``RuntimeError``。"""
-        matcher = self._build_danmaku_matcher()
-        if matcher is None:
-            raise ValueError("danmaku is disabled or has no usable source configured")
-        if not matcher.enabled_sources():
-            raise ValueError("danmaku has no enabled source (missing credentials or aggregator url)")
-        return matcher
 
     def _load_media_detail(self, media_id):
         if not self.config.msg_enabled:
@@ -3540,77 +3451,6 @@ class PipelineBotService:
             )
         return media
 
-    def danmaku_match(self, media_id):
-        """只按 TMDB ID 匹配弹幕库；缺少 TMDB ID 时绝不访问上游。"""
-        matcher = self._require_danmaku_matcher()
-        media = self._load_media_detail(media_id)
-        target = danmaku_target_from_media(media)
-        match = matcher.match(
-            tmdb_id=target["tmdb_id"] or None,
-            episode=target["episode"] or None,
-        )
-        return {"media_id": media_id, "target": target, "match": match}
-
-    def danmaku_comments(
-        self,
-        media_id,
-        episode_id="",
-        source="",
-        ch_convert=0,
-        offset_seconds=0.0,
-        provider_shift_seconds=0.0,
-        anime_title="",
-        episode_title="",
-        match_mode="",
-        with_related=True,
-    ):
-        """取回并归一化整集弹幕；未指定 episode_id 时先自动匹配，匹配不上就如实失败。"""
-        matcher = self._require_danmaku_matcher()
-        episode = str(episode_id or "").strip()
-        if not episode:
-            matched = self.danmaku_match(media_id)
-            match = matched.get("match") or {}
-            if not match.get("matched"):
-                raise RuntimeError(
-                    "danmaku match failed for media %s: %s"
-                    % (media_id, json.dumps(match.get("attempts") or [], ensure_ascii=False))
-                )
-            episode = match.get("episode_id") or ""
-            source = source or match.get("source") or ""
-            provider_shift_seconds = provider_shift_seconds or float(match.get("shift") or 0.0)
-            anime_title = anime_title or match.get("anime_title") or ""
-            episode_title = episode_title or match.get("episode_title") or ""
-            match_mode = match_mode or match.get("match_mode") or ""
-        payload = matcher.comments(
-            episode,
-            source_name=source,
-            with_related=with_related,
-            ch_convert=ch_convert,
-            offset_seconds=offset_seconds,
-            provider_shift_seconds=provider_shift_seconds,
-            anime_title=anime_title,
-            episode_title=episode_title,
-            match_mode=match_mode,
-        )
-        payload["media_id"] = media_id
-        return payload
-
-    def danmaku_parse_local(self, content, source_format="auto", offset_seconds=0.0, ch_convert=0, title=""):
-        """解析本地弹幕文件（B 站 XML / 弹弹play JSON）。
-
-        不依赖任何上游源或凭证；文件本身有问题时抛 ``DanmakuImportError``（由 API 层
-        映射成 400），功能未启用时抛 ``ValueError``（映射成 409），两者不可混为一谈。
-        """
-        helper = self._build_danmaku_local_import()
-        if helper is None:
-            raise ValueError("danmaku is disabled")
-        return helper.payload(
-            content,
-            source_format=source_format,
-            offset_seconds=offset_seconds,
-            ch_convert=ch_convert,
-            title=title,
-        )
 
     def _call_115(self, category, callback):
         client = self._build_115_client(category)
@@ -8451,33 +8291,6 @@ def normalize_msg_subtitle_presence(value, media_id):
     }
 
 
-def danmaku_target_from_media(media):
-    """从 MSG 媒体详情里抽出弹幕匹配与诊断展示需要的字段。
-
-    上游匹配只使用 ``tmdb_id`` 与集号；标题、路径、大小和时长只随 target 返回，
-    便于诊断，不得传给弹弹play 形成第二种匹配路径。
-    """
-    path = media_primary_path(media)
-    file_name = path.replace("\\", "/").rsplit("/", 1)[-1] if path else ""
-    try:
-        season = int(media_first_value(media, ("season_num", "season")) or 0)
-    except (TypeError, ValueError):
-        season = 0
-    try:
-        episode = int(media_first_value(media, ("episode_num", "episode")) or 0)
-    except (TypeError, ValueError):
-        episode = 0
-    return {
-        "media_id": extract_media_id(media),
-        "title": subtitle_search_title(media) or media_display_title(media),
-        "display_title": media_display_title(media),
-        "season": season,
-        "episode": episode,
-        "tmdb_id": normalized_media_identity(media, ("tmdb_id", "tmdbId")),
-        "file_name": file_name,
-        "file_size": media_first_value(media, ("size_bytes", "size")),
-        "video_duration": media_first_value(media, ("duration_sec", "duration")),
-    }
 
 
 def subtitle_backfill_task_from_media(media, category="adult"):

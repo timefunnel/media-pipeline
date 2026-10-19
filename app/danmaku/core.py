@@ -7,7 +7,8 @@
   其中 Path 不含域名与查询参数。
 - 弹幕接口没有分页能力（``from``/``to`` 官方文档存在但实测无效），因此**整集缓存**，
   下发前再做密度采样。
-- 自动匹配只允许 TMDB ID 反查；没有 TMDB ID 时不访问上游，失败如实上报。
+- 自动匹配先用 TMDB ID 反查并消歧；只有 TMDB 无法得到唯一节目编号时，才允许
+  用作品标题与同一集号再查一次。关键词结果必须作品名完全一致且唯一，失败如实上报。
 
 字段事实（实测，勿照抄 B 站 8 段解析）：
 - 弹弹play 的 ``p`` 是 **4 段**：``时间(秒),模式,颜色(十进制RGB),用户/来源``。
@@ -16,21 +17,27 @@
 """
 
 import base64
+from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
 import json
+import logging
+import os
 import re
+import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from .external_subtitles import SubtitleHttpTransport
+from .transport import DanmakuHttpTransport
+from .circuit import SourceCircuitBreaker
 
 
 DEFAULT_DANDANPLAY_BASE_URL = "https://api.dandanplay.net"
 DEFAULT_DANMAKU_CACHE_DIR = "/danmaku-cache"
-DEFAULT_DANMAKU_PROVIDERS = ("dandanplay",)
+DEFAULT_DANMAKU_PROVIDERS = ("tencent", "iqiyi", "youku")
 DEFAULT_DANMAKU_CACHE_TTL_SECONDS = 7 * 24 * 3600
 DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS = 24 * 3600
 DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS = 12
@@ -365,8 +372,11 @@ class DanmakuCache:
             return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except ValueError:
+            logging.warning("invalid danmaku cache record: %s", path.name)
             return None
+        except OSError as exc:
+            raise RuntimeError("cannot read danmaku cache: %s" % exc) from exc
         if not isinstance(payload, dict):
             return None
         fetched_at = payload.get("fetched_at")
@@ -387,9 +397,13 @@ class DanmakuCache:
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         record = {"fetched_at": time.time(), "body": body}
-        tmp_path = path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
-        tmp_path.replace(path)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(json.dumps(record, ensure_ascii=False))
+        try:
+            os.replace(tmp_path, path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
         return path
 
 
@@ -401,7 +415,7 @@ class DanmakuSource:
     def enabled(self):
         raise NotImplementedError
 
-    def search_episodes(self, tmdb_id, episode=None):
+    def search_episodes(self, tmdb_id=None, episode=None, anime=None):
         raise NotImplementedError
 
     def comment(self, episode_id, with_related=True, ch_convert=0):
@@ -428,7 +442,7 @@ class DandanplayProtocolSource(DanmakuSource):
         self.base_url = normalize_danmaku_base_url(base_url)
         self.timeout = max(1, int(timeout or DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS))
         self.comment_timeout = max(1, int(comment_timeout or DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS))
-        self.transport = transport or SubtitleHttpTransport()
+        self.transport = transport or DanmakuHttpTransport()
 
     def enabled(self):
         if not self.app_id:
@@ -473,11 +487,12 @@ class DandanplayProtocolSource(DanmakuSource):
             raise RuntimeError("%s API error %s: %s" % (self.name, code, message))
         return payload
 
-    def search_episodes(self, tmdb_id, episode=None):
+    def search_episodes(self, tmdb_id=None, episode=None, anime=None):
         normalized_tmdb_id = str(tmdb_id or "").strip()
-        if not normalized_tmdb_id:
-            raise ValueError("tmdbId is required for danmaku search")
-        params = {"tmdbId": normalized_tmdb_id, "v2": "true"}
+        normalized_anime = str(anime or "").strip()
+        if not normalized_tmdb_id and not normalized_anime:
+            raise ValueError("anime or tmdbId is required for danmaku search")
+        params = {"tmdbId": normalized_tmdb_id, "anime": normalized_anime, "v2": "true"}
         if episode:
             params["episode"] = str(episode)
         payload = self._get_json("/api/v2/search/episodes", params=params)
@@ -564,11 +579,34 @@ def normalize_danmaku_anime(item):
     }
 
 
+def normalize_danmaku_search_title(value):
+    """只折叠 Unicode、大小写与空白；标点和正文必须仍然完全一致。"""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def normalize_danmaku_episode_number(value):
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if re.fullmatch(r"\d+", text):
+        return str(int(text))
+    return text
+
+
+def episode_number_from_exact_title(value):
+    """只接受完整的“第 N 话/集/期”，避免从描述文字里猜集号。"""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    matched = re.fullmatch(r"第\s*0*(\d+)\s*(?:话|集|期)", text)
+    if not matched:
+        return ""
+    return str(int(matched.group(1)))
+
+
 class DanmakuMatcher:
     """匹配 + 回源 + 缓存的编排层。
 
-    自动匹配只使用 TMDB ID 反查。每个源按配置顺序尝试，结果里必须如实标明
-    用的是哪个源；缺少 TMDB ID 时直接返回未匹配，绝不以标题或文件名回源。
+    自动匹配先使用 TMDB ID 反查并消歧；只有无法得到唯一节目编号时才使用作品标题
+    和同一集号查询一次。每个源按配置顺序尝试，结果里必须如实标明来源与模式；
+    缺少 TMDB ID 时直接返回未匹配，绝不直接从标题起步。
     """
 
     def __init__(
@@ -579,18 +617,33 @@ class DanmakuMatcher:
         search_cache_ttl_seconds=DEFAULT_DANMAKU_SEARCH_CACHE_TTL_SECONDS,
         max_comments=DEFAULT_DANMAKU_MAX_COMMENTS,
         blacklist=None,
+        negative_cache_ttl_seconds=3600,
+        cache_only_sources=(),
     ):
         self.sources = [source for source in (sources or []) if source is not None]
         self.cache = cache if cache is not None else DanmakuCache()
+        self.circuit = SourceCircuitBreaker(self.cache)
+        for source in self.sources:
+            if hasattr(source, "before_request"):
+                source.before_request = lambda source=source: self.circuit.check(self._source_cache_identity(source))
         self.cache_ttl_seconds = max(0, int(cache_ttl_seconds or 0))
         self.search_cache_ttl_seconds = max(0, int(search_cache_ttl_seconds or 0))
         self.max_comments = max(1, int(max_comments or DEFAULT_DANMAKU_MAX_COMMENTS))
         self.blacklist = tuple(blacklist or ())
+        self.negative_cache_ttl_seconds = max(1, int(negative_cache_ttl_seconds))
+        self.cache_only_sources = tuple(cache_only_sources)
         # 固定数量的分片锁避免同一缓存键并发未命中时击穿上游，也避免按搜索词永久累积锁对象。
         self._cache_locks = tuple(threading.Lock() for _ in range(64))
+        self._search_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="danmaku-source")
 
     def enabled_sources(self):
         return [source for source in self.sources if source.enabled()]
+
+    def close(self):
+        for source in self.sources:
+            if hasattr(source, "close"):
+                source.close()
+        self._search_executor.shutdown(wait=True, cancel_futures=True)
 
     def _source_by_name(self, name):
         wanted = str(name or "").strip().lower()
@@ -614,27 +667,37 @@ class DanmakuMatcher:
         digest = hashlib.sha256(str(key).encode("utf-8")).digest()
         return self._cache_locks[int.from_bytes(digest[:4], "big") % len(self._cache_locks)]
 
+    def _load_cached(self, key, ttl_seconds):
+        body = self.cache.load(key, ttl_seconds)
+        if body is not None and ("animes" in body and not body["animes"] or "comments" in body and not body["comments"]):
+            body = self.cache.load(key, min(ttl_seconds, self.negative_cache_ttl_seconds))
+        return body
+
     def _cached_call(self, key, ttl_seconds, loader):
-        cached = self.cache.load(key, ttl_seconds)
+        cached = self._load_cached(key, ttl_seconds)
         if cached is not None:
             return cached, True
         with self._cache_lock(key):
             # 等锁期间另一个请求可能已经完成回源，必须二次检查。
-            cached = self.cache.load(key, ttl_seconds)
+            cached = self._load_cached(key, ttl_seconds)
             if cached is not None:
                 return cached, True
             body = loader()
             self.cache.save(key, body)
             return body, False
 
-    def _search_source(self, source, tmdb_id, episode=None):
+    def _upstream_call(self, source, loader):
+        return self.circuit.call(self._source_cache_identity(source), loader)
+
+    def _search_source(self, source, tmdb_id="", episode=None, anime=""):
         normalized_tmdb_id = str(tmdb_id or "").strip()
+        normalized_anime = str(anime or "").strip()
         cache_key = self._cache_key(
             "source_search_v1",
             {
                 "source": self._source_cache_identity(source),
-                # 保留旧键结构中的空 anime 字段，让已发布版本写入的 TMDB 缓存继续命中。
-                "anime": "",
+                # TMDB 路线仍写空 anime，继续命中已发布版本的缓存键。
+                "anime": normalized_anime,
                 "tmdb_id": normalized_tmdb_id,
                 "episode": str(episode or "").strip(),
             },
@@ -642,20 +705,22 @@ class DanmakuMatcher:
         body, served_from_cache = self._cached_call(
             cache_key,
             self.search_cache_ttl_seconds,
-            lambda: {
+            lambda: self._upstream_call(source, lambda: {
                 "animes": source.search_episodes(
                     tmdb_id=normalized_tmdb_id,
                     episode=episode,
+                    anime=normalized_anime,
                 )
-            },
+            }),
         )
         return list(body.get("animes") or []), served_from_cache
 
-    def match(self, tmdb_id=None, episode=None):
+    def match(self, tmdb_id=None, episode=None, anime="", season=None, original_title="", year=0):
         sources = self.enabled_sources()
         if not sources:
             raise RuntimeError("no danmaku source is configured and enabled")
         normalized_tmdb_id = str(tmdb_id or "").strip()
+        normalized_anime = str(anime or "").strip()
         if not normalized_tmdb_id:
             return {
                 "matched": False,
@@ -678,35 +743,186 @@ class DanmakuMatcher:
                 ],
                 "cached": False,
             }
-        attempts = []
+        target = {"tmdb_id": normalized_tmdb_id, "title": normalized_anime,
+                  "original_title": str(original_title or ""), "season": season, "episode": episode, "year": year}
+        native_searches = self._prefetch_native(sources, target)
+        try:
+            return self._match_ordered(sources, normalized_tmdb_id, episode, normalized_anime, season, original_title, native_searches)
+        finally:
+            # 不等待无关低优先级源；未启动任务取消，已回源任务结束后保留整季缓存。
+            for future in native_searches.values():
+                future.cancel()
+
+    def _native_key(self, source, target):
+        season_target = {key: value for key, value in target.items() if key != "episode"}
+        return self._cache_key("native_season_search_v1", {"source": self._source_cache_identity(source), "target": season_target})
+
+    def _prefetch_native(self, sources, target):
+        futures = {}
+        missing = []
+        # 先检查本地缓存；已有高优先级唯一命中时，不再启动更低源的新搜索。
         for source in sources:
+            if not hasattr(source, "search_target"):
+                continue
+            key = self._native_key(source, target)
+            body, _, error = self._attempt(lambda: (self._load_cached(key, self.search_cache_ttl_seconds), True))
+            if body is None and error is None:
+                missing.append((source, key))
+                continue
+            animes = list(body.get("animes") or []) if body else None
+            future = Future()
+            future.set_result((animes, error is None, error))
+            futures[source] = future
+            candidates = self._unique_episode_candidates(self._episode_candidates_from_animes(
+                animes, episode=target["episode"], allow_episode_title=True))
+            if len(candidates) == 1:
+                break
+        for source, key in missing:
+            futures[source] = self._search_executor.submit(self._run_native_search, source, key, target)
+        return futures
+
+    def _run_native_search(self, source, key, target):
+        started = time.monotonic()
+        result = self._attempt(lambda: self._native_search(source, key, target))
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        if result[2]:
+            logging.warning("danmaku source search source=%s elapsed_ms=%s error=%s", source.name, elapsed_ms, result[2])
+        else:
+            logging.info("danmaku source search source=%s elapsed_ms=%s cached=%s", source.name, elapsed_ms, result[1])
+        return result
+
+    def _match_ordered(self, sources, normalized_tmdb_id, episode, normalized_anime, season, original_title, native_searches):
+        attempts = []
+        ambiguous_result = None
+        for source in sources:
+            if hasattr(source, "search_target"):
+                animes, cached, error = native_searches[source].result()
+                candidates = self._unique_episode_candidates(self._episode_candidates_from_animes(
+                    animes, episode=episode, allow_episode_title=True,
+                ))
+                self._record(attempts, source.name, "season_episode", candidates, error, cached=cached)
+                if len(candidates) == 1:
+                    return self._match_result(source.name, "season_episode", candidates, attempts)
+                if len(candidates) > 1:
+                    attempts[-1]["outcome"] = "ambiguous"
+                    ambiguous_result = self._ambiguous_match_result(source.name, "season_episode", candidates, attempts, "ambiguous_candidates")
+                continue
             animes, cached, error = self._attempt(
                 lambda: self._search_source(source, tmdb_id=normalized_tmdb_id, episode=episode)
             )
-            candidates = self._episode_candidates_from_animes(animes, episode=episode)
+            candidates = self._episode_candidates_from_animes(
+                self._filter_season(animes, season, normalized_anime, original_title),
+                episode=episode,
+                allow_episode_title=True,
+            )
+            candidates = self._unique_episode_candidates(candidates)
+            tmdb_ambiguous = False
+            if len(candidates) > 1:
+                exact_title_candidates = self._candidates_with_exact_anime_title(
+                    candidates,
+                    normalized_anime,
+                )
+                exact_title_candidates = self._unique_episode_candidates(exact_title_candidates)
+                if len(exact_title_candidates) == 1:
+                    candidates = exact_title_candidates
+                else:
+                    candidates = exact_title_candidates or candidates
+                    tmdb_ambiguous = True
             self._record(attempts, source.name, "tmdb", candidates, error, cached=cached)
             if len(candidates) == 1:
                 return self._match_result(source.name, "tmdb", candidates, attempts)
-            if len(candidates) > 1:
+            if tmdb_ambiguous:
                 attempts[-1]["outcome"] = "ambiguous"
                 attempts[-1]["error"] = (
-                    "TMDB lookup returned multiple episode candidates; "
-                    "dandanplay does not expose a TMDB season discriminator"
+                    "TMDB lookup remained ambiguous after exact anime title and episode filtering"
                 )
-                return {
-                    "matched": False,
-                    "source": source.name,
-                    "match_mode": "tmdb",
-                    "episode_id": "",
-                    "anime_title": "",
-                    "episode_title": "",
-                    "shift": 0.0,
-                    "candidates": candidates,
-                    "ambiguous": True,
-                    "unmatched_reason": "ambiguous_candidates",
-                    "attempts": attempts,
-                    "cached": bool(attempts) and all(item.get("cached") for item in attempts),
-                }
+            if error:
+                # 上游错误不是“未命中”，不能用另一种查询掩盖。
+                continue
+            if not normalized_anime:
+                attempts.append(
+                    {
+                        "source": source.name,
+                        "mode": "keyword",
+                        "outcome": "skipped",
+                        "error": "anime title is required for keyword fallback",
+                        "cached": False,
+                    }
+                )
+                if tmdb_ambiguous:
+                    ambiguous_result = self._ambiguous_match_result(
+                        source.name,
+                        "tmdb",
+                        candidates,
+                        attempts,
+                        "ambiguous_candidates",
+                    )
+                continue
+            if not normalize_danmaku_episode_number(episode).isdigit():
+                attempts.append(
+                    {
+                        "source": source.name,
+                        "mode": "keyword",
+                        "outcome": "skipped",
+                        "error": "numeric episode is required for keyword fallback",
+                        "cached": False,
+                    }
+                )
+                if tmdb_ambiguous:
+                    ambiguous_result = self._ambiguous_match_result(
+                        source.name,
+                        "tmdb",
+                        candidates,
+                        attempts,
+                        "ambiguous_candidates",
+                    )
+                continue
+            keyword_animes, keyword_cached, keyword_error = self._attempt(
+                lambda: self._search_source(
+                    source,
+                    anime=normalized_anime,
+                    episode=episode,
+                )
+            )
+            keyword_candidates = self._episode_candidates_from_animes(
+                self._filter_season(keyword_animes, season, normalized_anime, original_title, require_title=True),
+                episode=episode,
+                anime_title=normalized_anime,
+                allow_episode_title=True,
+                require_exact_anime_title=season is None or season <= 1,
+            )
+            keyword_candidates = self._unique_episode_candidates(keyword_candidates)
+            self._record(
+                attempts,
+                source.name,
+                "keyword",
+                keyword_candidates,
+                keyword_error,
+                cached=keyword_cached,
+            )
+            if len(keyword_candidates) == 1:
+                return self._match_result(source.name, "keyword", keyword_candidates, attempts)
+            if len(keyword_candidates) > 1:
+                attempts[-1]["outcome"] = "ambiguous"
+                attempts[-1]["error"] = "keyword lookup returned multiple exact episode candidates"
+                ambiguous_result = self._ambiguous_match_result(
+                    source.name,
+                    "keyword",
+                    keyword_candidates,
+                    attempts,
+                    "ambiguous_keyword_candidates",
+                )
+                continue
+            if tmdb_ambiguous:
+                ambiguous_result = self._ambiguous_match_result(
+                    source.name,
+                    "tmdb",
+                    candidates,
+                    attempts,
+                    "ambiguous_candidates",
+                )
+        if ambiguous_result is not None:
+            return ambiguous_result
         return {
             "matched": False,
             "source": "",
@@ -728,6 +944,37 @@ class DanmakuMatcher:
         except (RuntimeError, ValueError) as exc:
             return None, False, str(exc)
 
+    def _filter_season(self, animes, season, title, original_title, require_title=False):
+        if season is None or season == 0:
+            return animes
+        accepted = []
+        for anime in animes or []:
+            text = normalize_danmaku_search_title(anime.get("anime_title"))
+            explicit = re.search(r"(?:第\s*([0-9一二三四五六七八九十]+)\s*季|season\s*(\d+)|\bs\s*(\d+))", text, re.I)
+            if explicit:
+                raw = next(value for value in explicit.groups() if value)
+                digits = {char: index for index, char in enumerate("零一二三四五六七八九")}
+                number = int(raw) if raw.isdigit() else (sum(digits.get(char, 0) for char in raw) if "十" not in raw else
+                    (digits.get(raw.split("十")[0], 1) * 10 + digits.get(raw.split("十")[1], 0)))
+                base = (text[:explicit.start()] + text[explicit.end():]).strip()
+                title_ok = not require_title or any(base == normalize_danmaku_search_title(value) for value in (title, original_title) if value)
+                if number == season and title_ok:
+                    accepted.append(anime)
+                continue
+            if any(text == normalize_danmaku_search_title(value) for value in (title, original_title) if value):
+                if season == 1:
+                    accepted.append(anime)
+                continue
+            numbered = re.fullmatch(r"(.+?)\s*(\d{1,2})", text)
+            if numbered and any(normalize_danmaku_search_title(numbered[1]) == normalize_danmaku_search_title(value)
+                                 for value in (title, original_title) if value):
+                if int(numbered[2]) == season:
+                    accepted.append(anime)
+            elif season == 1:
+                # TMDB 已关联作品，但没有任何季号信息时仅允许第一季。
+                accepted.append(anime)
+        return accepted
+
     def _record(self, attempts, source_name, mode, candidates, error, cached=False):
         """把每次尝试都记录进 attempts —— 未匹配时也必须能解释「试过什么、为什么没中」。"""
         entry = {"source": source_name, "mode": mode, "cached": bool(cached)}
@@ -742,13 +989,67 @@ class DanmakuMatcher:
         attempts.append(entry)
         return entry
 
-    def _episode_candidates_from_animes(self, animes, episode=None):
+    def _candidates_with_exact_anime_title(self, candidates, anime_title):
+        expected = normalize_danmaku_search_title(anime_title)
+        if not expected:
+            return []
+        return [
+            candidate
+            for candidate in candidates or []
+            if normalize_danmaku_search_title(candidate.get("anime_title")) == expected
+        ]
+
+    def _unique_episode_candidates(self, candidates):
+        """同一 episodeId 的重复返回不是歧义；保留第一次出现的完整候选。"""
+        unique = []
+        seen_episode_ids = set()
+        for candidate in candidates or []:
+            episode_id = str(candidate.get("episode_id") or "").strip()
+            if not episode_id or episode_id in seen_episode_ids:
+                continue
+            seen_episode_ids.add(episode_id)
+            unique.append(candidate)
+        return unique
+
+    def _ambiguous_match_result(self, source_name, mode, candidates, attempts, reason):
+        return {
+            "matched": False,
+            "source": source_name,
+            "match_mode": mode,
+            "episode_id": "",
+            "anime_title": "",
+            "episode_title": "",
+            "shift": 0.0,
+            "candidates": candidates,
+            "ambiguous": True,
+            "unmatched_reason": reason,
+            "attempts": attempts,
+            "cached": bool(attempts) and all(item.get("cached") for item in attempts),
+        }
+
+    def _episode_candidates_from_animes(
+        self,
+        animes,
+        episode=None,
+        anime_title="",
+        allow_episode_title=False,
+        require_exact_anime_title=False,
+    ):
         candidates = []
+        expected_episode = normalize_danmaku_episode_number(episode)
+        expected_anime_title = normalize_danmaku_search_title(anime_title)
         for anime in animes or []:
+            if require_exact_anime_title and (
+                not expected_anime_title
+                or normalize_danmaku_search_title(anime.get("anime_title")) != expected_anime_title
+            ):
+                continue
             for entry in anime.get("episodes") or []:
                 if episode:
-                    number = str(entry.get("episode_number") or "").strip()
-                    if number != str(episode).strip():
+                    number = normalize_danmaku_episode_number(entry.get("episode_number"))
+                    if not number and allow_episode_title:
+                        number = episode_number_from_exact_title(entry.get("episode_title"))
+                    if number != expected_episode:
                         continue
                 candidates.append(
                     {
@@ -797,7 +1098,10 @@ class DanmakuMatcher:
         confidence=None,
     ):
         source = self._source_by_name(source_name) if source_name else None
-        if source is None:
+        cache_only = source is None and source_name in self.cache_only_sources
+        if source is None and source_name and not cache_only:
+            raise ValueError("requested danmaku source is not configured: %s" % source_name)
+        if source is None and not cache_only:
             enabled = self.enabled_sources()
             if not enabled:
                 raise RuntimeError("no danmaku source is configured and enabled")
@@ -806,19 +1110,25 @@ class DanmakuMatcher:
         if not episode:
             raise ValueError("episode_id is required for danmaku comments")
         cache_key = "comment_%s_%s_%s_%s" % (
-            source.name,
+            source_name if cache_only else source.name,
             episode,
             "1" if with_related else "0",
             int(ch_convert or 0),
         )
-        cached, served_from_cache = self._cached_call(
-            cache_key,
-            self.cache_ttl_seconds,
-            lambda: source.comment(episode, with_related=with_related, ch_convert=ch_convert),
-        )
+        if cache_only:
+            cached = self._load_cached(cache_key, self.cache_ttl_seconds)
+            if cached is None:
+                raise RuntimeError("%s is disabled and no valid comments cache is available" % source_name)
+            served_from_cache = True
+        else:
+            cached, served_from_cache = self._cached_call(
+                cache_key,
+                self.cache_ttl_seconds,
+                lambda: self._upstream_call(source, lambda: source.comment(episode, with_related=with_related, ch_convert=ch_convert)),
+            )
         return build_danmaku_payload(
             cached.get("comments") or [],
-            source=source.name,
+            source=source_name if cache_only else source.name,
             episode_id=episode,
             anime_title=anime_title,
             episode_title=episode_title,
@@ -833,18 +1143,38 @@ class DanmakuMatcher:
             cached=served_from_cache,
         )
 
+    def _native_search(self, source, key, target):
+        body, cached = self._cached_call(
+            key, self.search_cache_ttl_seconds,
+            lambda: self._upstream_call(source, lambda: {"animes": source.search_target(target)}),
+        )
+        return list(body.get("animes") or []), cached
+
+
 def build_danmaku_matcher_from_config(config):
     """按配置构建 matcher；未启用或缺少凭证时返回 ``None``（由调用方如实上报）。"""
     if not getattr(config, "danmaku_enabled", False):
         return None
     timeout = getattr(config, "danmaku_search_timeout_seconds", DEFAULT_DANMAKU_SEARCH_TIMEOUT_SECONDS)
     comment_timeout = getattr(config, "danmaku_comment_timeout_seconds", DEFAULT_DANMAKU_COMMENT_TIMEOUT_SECONDS)
-    transport = SubtitleHttpTransport(proxy_url=getattr(config, "danmaku_proxy_url", ""))
+    transport = DanmakuHttpTransport(proxy_url=getattr(config, "danmaku_proxy_url", ""))
+    cache = DanmakuCache(getattr(config, "danmaku_cache_dir", DEFAULT_DANMAKU_CACHE_DIR))
     sources = []
+    from .bridge import BridgePool
+    pool = None
     names = tuple(getattr(config, "danmaku_providers", DEFAULT_DANMAKU_PROVIDERS) or ())
     for name in names:
         normalized = str(name or "").strip().lower()
-        if normalized == "dandanplay":
+        if normalized in ("tencent", "iqiyi", "youku"):
+            from .native import NativeSource
+            if pool is None:
+                pool = BridgePool(config.danmaku_bridge)
+            sources.append(NativeSource(normalized, cache, config.danmaku_bridge,
+                                        search_timeout=timeout, comment_timeout=comment_timeout, pool=pool,
+                                        segment_concurrency=config.danmaku_segment_concurrency))
+        elif normalized == "dandanplay":
+            if not getattr(config, "danmaku_dandanplay_enabled", False):
+                raise ValueError("dandanplay is disabled; remove it from DANMAKU_PROVIDERS")
             sources.append(
                 DandanplayProtocolSource(
                     app_id=getattr(config, "dandanplay_app_id", ""),
@@ -869,11 +1199,11 @@ def build_danmaku_matcher_from_config(config):
             )
     if not sources:
         return None
-    cache = DanmakuCache(getattr(config, "danmaku_cache_dir", DEFAULT_DANMAKU_CACHE_DIR))
     return DanmakuMatcher(
         sources,
         cache=cache,
         cache_ttl_seconds=getattr(config, "danmaku_cache_ttl_seconds", DEFAULT_DANMAKU_CACHE_TTL_SECONDS),
+        negative_cache_ttl_seconds=getattr(config, "danmaku_negative_cache_ttl_seconds", 3600),
         search_cache_ttl_seconds=getattr(
             config,
             "danmaku_search_cache_ttl_seconds",
@@ -881,6 +1211,7 @@ def build_danmaku_matcher_from_config(config):
         ),
         max_comments=getattr(config, "danmaku_max_comments", DEFAULT_DANMAKU_MAX_COMMENTS),
         blacklist=getattr(config, "danmaku_blacklist", ()),
+        cache_only_sources=() if any(source.name == "dandanplay" for source in sources) else ("dandanplay",),
     )
 
 

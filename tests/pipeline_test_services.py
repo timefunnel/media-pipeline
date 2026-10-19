@@ -2763,6 +2763,7 @@ class SearchProfileTest(unittest.TestCase):
         self.assertEqual(metadata["settings"]["upstream_limit"], 42)
         self.assertEqual(metadata["settings"]["timeout_seconds"], 8)
         self.assertEqual(metadata["settings"]["max_workers"], 1)
+        self.assertEqual(fake_prowlarr.indexer_search_timeouts, {})
         self.assertEqual(prowlarr_cls.call_args.kwargs["timeout"], 8)
 
     def test_bot_subscription_follow_requires_bt4g_with_extended_timeout(self):
@@ -2798,6 +2799,7 @@ class SearchProfileTest(unittest.TestCase):
         self.assertEqual({item["infoHash"] for item in results}, {"M1", "B1"})
         self.assertEqual(metadata["settings"]["timeout_seconds"], 45)
         self.assertEqual(metadata["settings"]["required_indexers"], ["BT4G"])
+        self.assertEqual(fake_prowlarr.indexer_search_timeouts, {2: 65.0})
         self.assertEqual(prowlarr_cls.call_args.kwargs["timeout"], 45)
 
     def test_bot_search_bt4g_uses_only_bt4g_indexer(self):
@@ -2833,6 +2835,37 @@ class SearchProfileTest(unittest.TestCase):
         self.assertEqual(fake_prowlarr.search_calls, [("sintel", 40, (2,), (2000, 5000))])
         self.assertEqual(metadata["profile"], "bt4g")
         self.assertEqual(metadata["settings"]["indexers"], ["BT4G"])
+
+    def test_bot_search_bt4g_uses_the_requested_profile_categories(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+        from pipeline.search_stats import search_result_metadata
+
+        fake_prowlarr = FakeProwlarr(
+            [],
+            indexers=[
+                {"id": 2, "name": "BT4G", "enable": True, "priority": 25, "capabilities": {"categories": [{"id": 6000}]}},
+            ],
+            indexer_results={
+                (2,): [{"title": "IPZZ-912", "indexer": "BT4G", "seeders": 5, "infoHash": "B1"}],
+            },
+        )
+
+        with patch("pipeline.bot.ProwlarrConfig") as config_cls, patch("pipeline.bot.ProwlarrClient", return_value=fake_prowlarr):
+            config_cls.return_value.load_api_key.return_value = "prowlarr-key"
+            service = PipelineBotService(
+                BotConfig(
+                    "token",
+                    {700656624},
+                    "/tmp/state.db",
+                    search_profile_upstream_limits={"adult": 40},
+                )
+            )
+            results = service.search_bt4g("IPZZ-912", "adult", limit=5)
+
+        metadata = search_result_metadata(results)
+        self.assertEqual([item["infoHash"] for item in results], ["B1"])
+        self.assertEqual(fake_prowlarr.search_calls, [("IPZZ-912", 40, (2,), (6000,))])
+        self.assertEqual(metadata["settings"]["categories"], [6000])
 
     def test_primary_search_falls_back_to_single_indexers_when_aggregate_times_out(self):
         from pipeline.bot import search_primary_indexer_results

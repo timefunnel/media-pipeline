@@ -1,0 +1,10 @@
+{
+  "name": "mediastation-danmaku-sources",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test bridge.test.mjs" },
+  "dependencies": {
+    "danmu-api-server": "https://codeload.github.com/huangxd-/danmu_api/tar.gz/afc8b8119f981492a5caee52f1e1ebf756bd0d41"
+  }
+}

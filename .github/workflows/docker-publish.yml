@@ -1,9 +1,17 @@
 name: Publish immutable candidate image
-run-name: candidate ${{ inputs.ref }}
+run-name: candidate ${{ inputs.target || 'media-pipeline' }} ${{ inputs.ref }}
 
 on:
   workflow_dispatch:
     inputs:
+      target:
+        description: Service image to build
+        required: true
+        default: media-pipeline
+        type: choice
+        options:
+          - media-pipeline
+          - danmaku
       ref:
         description: Git commit, tag, or branch to build
         required: true
@@ -20,7 +28,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: media-pipeline-candidate-${{ inputs.ref }}
+  group: media-pipeline-candidate-${{ inputs.target || 'media-pipeline' }}-${{ inputs.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -36,6 +44,7 @@ jobs:
         shell: bash
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_TARGET: ${{ inputs.target }}
         run: |
           set -euo pipefail
           revision="$(git rev-parse HEAD)"
@@ -55,7 +64,14 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "created=$created" >> "$GITHUB_OUTPUT"
           echo "source_date_epoch=$source_date_epoch" >> "$GITHUB_OUTPUT"
-          echo "image=ghcr.io/$owner/media-pipeline" >> "$GITHUB_OUTPUT"
+          case "${REQUESTED_TARGET:-media-pipeline}" in
+            media-pipeline) image_name=media-pipeline; dockerfile=Dockerfile ;;
+            danmaku) image_name=mediastation-danmaku; dockerfile=danmaku-server/Dockerfile ;;
+            *) echo "Unknown service target" >&2; exit 1 ;;
+          esac
+          echo "image=ghcr.io/$owner/$image_name" >> "$GITHUB_OUTPUT"
+          echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
+          echo "cache_scope=$image_name-linux-amd64" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -85,6 +101,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ steps.release.outputs.dockerfile }}
           platforms: linux/amd64
           push: true
           provenance: false
@@ -95,8 +112,10 @@ jobs:
             SOURCE_DATE_EPOCH=${{ steps.release.outputs.source_date_epoch }}
             MEDIA_PIPELINE_VERSION=${{ steps.release.outputs.version }}
             MEDIA_PIPELINE_REVISION=${{ steps.release.outputs.revision }}
-          cache-from: type=gha,scope=media-pipeline-linux-amd64
-          cache-to: type=gha,mode=max,scope=media-pipeline-linux-amd64
+            DANMAKU_VERSION=${{ steps.release.outputs.version }}
+            DANMAKU_REVISION=${{ steps.release.outputs.revision }}
+          cache-from: type=gha,scope=${{ steps.release.outputs.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ steps.release.outputs.cache_scope }}
 
       - name: Record immutable image reference
         shell: bash

@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 
-from pipeline.danmaku_prewarm import (
+from danmaku.prewarm import (
     STATUS_CANCELED,
     STATUS_COMPLETED,
     STATUS_QUEUED,

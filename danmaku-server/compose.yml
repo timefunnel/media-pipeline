@@ -1,0 +1,20 @@
+# 生产只使用已验证的 image@sha256:...；本地源码运行见 README。
+services:
+  danmaku:
+    image: ${DANMAKU_IMAGE:?set an immutable image@sha256 reference}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9322:9322"
+    env_file: .env
+    volumes:
+      - danmaku-cache:/danmaku-cache
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  danmaku-cache:
