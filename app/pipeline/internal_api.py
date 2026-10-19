@@ -2702,11 +2702,21 @@ class ImportTaskManager:
         attempts[-1].update({"outcome": "imported", "finished_at": int(time.time())})
         result["subscription_follow"] = audit
         result["msg_media_id"] = media_id
+        warnings = sync_warnings(synced)
+        if warnings:
+            result["warnings"] = warnings
+            result["warning_stage"] = warning_retry_stage(result, request)
+        else:
+            result.pop("warnings", None)
+            result.pop("warning_stage", None)
+        result.pop("retry_from_stage", None)
+        status = "completed_with_warning" if warnings else "completed"
         self.store.finish_import(
             task["id"],
-            "completed",
-            "completed",
+            status,
+            status,
             result=result,
+            error="; ".join(warnings) if warnings else None,
             info_hash=info_hash,
             msg_media_id=media_id,
         )

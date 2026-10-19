@@ -3192,6 +3192,57 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(service.subscription_cleanup_calls[0][1]["openlist_path"], audit["staging"]["openlist_path"])
         self.assertEqual(service.duplicate_calls, [])
 
+    def test_subscription_scrape_failure_is_completed_with_warning_after_verified_ingest(self):
+        for scrape_status in ("failed", "running"):
+            with self.subTest(scrape_status=scrape_status):
+                service, _store, manager, application = self.build_components()
+                service.subscription_entries = [
+                    {"fid": "video-115", "fn": "凡人修仙传.S01E115.mkv", "kind": "video", "episode": 115}
+                ]
+                original_sync = service.sync_completed_task
+                scrape_error = "路径缺少明确季集号"
+
+                def sync_with_scrape_failure(*args, **kwargs):
+                    synced = original_sync(*args, **kwargs)
+                    synced.update(
+                        {"msg_sync_status": "failed", "msg_scrape_status": scrape_status, "msg_error": scrape_error}
+                    )
+                    return synced
+
+                service.sync_completed_task = sync_with_scrape_failure
+                task, _ = manager.create_import(
+                    "owner-a", "fanren-scrape-failed-" + scrape_status, self.payload(application, service)
+                )
+                manager.start()
+                try:
+                    completed = self.wait_final(manager, "owner-a", task["id"])
+                finally:
+                    manager.stop()
+
+                self.assertEqual(completed["status"], "completed_with_warning")
+                self.assertIn(scrape_error, completed["error"])
+                self.assertIn("MSG error: " + scrape_error, completed["result"]["warnings"])
+                self.assertEqual(completed["result"]["task"]["msg_scrape_status"], scrape_status)
+                self.assertEqual(completed["result"]["subscription_follow"]["outcome"], "imported")
+                self.assertEqual(len(service.subscription_cleanup_calls), 1)
+                self.assertEqual(len(service.submit_uris), 1)
+
+                service.sync_completed_task = original_sync
+                manager.retry_import("owner-a", task["id"])
+                manager.start()
+                try:
+                    retried = self.wait_final(manager, "owner-a", task["id"])
+                finally:
+                    manager.stop()
+
+                self.assertEqual(retried["status"], "completed")
+                self.assertIsNone(retried["error"])
+                self.assertNotIn("warnings", retried["result"])
+                self.assertNotIn("warning_stage", retried["result"])
+                self.assertEqual(retried["result"]["task"]["msg_scrape_status"], "success")
+                self.assertEqual(len(service.subscription_cleanup_calls), 1)
+                self.assertEqual(len(service.submit_uris), 1)
+
     def test_subscription_promotion_retries_once_after_scan_visibility_race(self):
         service, _store, manager, application = self.build_components()
         service.subscription_entries = [
