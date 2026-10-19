@@ -32,7 +32,7 @@ from pipeline.bot import (
     wait_openlist_receive_move,
     wait_openlist_receive_root_entries,
 )
-from pipeline.config import category_to_folder_id, category_to_openlist_path
+from pipeline.config import category_to_folder_id, category_to_msg_library_root, category_to_openlist_path
 from pipeline.internal_api import (
     ApiError,
     ImportTaskManager,
@@ -1670,6 +1670,135 @@ class ImportPersistenceTest(InternalApiTestCase):
             manager.create_import("owner-a", "bad-target", payload)
         self.assertEqual(raised.exception.status, 409)
         self.assertEqual(raised.exception.code, "target_transfer_not_configured")
+        self.assertEqual(service.duplicate_calls, [])
+        self.assertEqual(service.submit_uris, [])
+
+    def test_other_library_movie_search_uses_configured_other_transfer_target(self):
+        service, store, manager, application = self.build_components()
+        session_id, candidate_id, _ = self.search_candidate(application, category="movie")
+        root = category_to_msg_library_root("other")
+        target = target_for(
+            "other", library_id=root["library_id"], root_id=root["root_id"], provider="tmdb", media_type="movie"
+        )
+        payload = self.import_payload(session_id, candidate_id, target=target)
+        expected_target = {**target, "scrape_enabled": root["scrape_enabled"]}
+
+        task, created = manager.create_import("owner-a", "other-library", payload)
+        self.assertTrue(created)
+        self.assertEqual(task["request"]["category"], "other")
+        self.assertEqual(task["request"]["search_category"], "movie")
+        self.assertEqual(task["request"]["target"], expected_target)
+        bot = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        self.assertEqual(bot._msg_target("other", task["request"]["target"])["scrape_enabled"], root["scrape_enabled"])
+        repeated, repeated_created = manager.create_import("owner-a", "other-library", payload)
+        self.assertFalse(repeated_created)
+        self.assertEqual(repeated["id"], task["id"])
+        with self.assertRaises(ApiError) as raised:
+            manager.create_import("owner-a", "other-library", {**payload, "category": "other"})
+        self.assertEqual(raised.exception.code, "idempotency_conflict")
+
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(service.import_prepare_calls, [("other", task["id"], "sintel", "import")])
+        self.assertEqual(service.sync_targets, [expected_target])
+
+    def test_other_library_transfer_uses_custom_configured_path(self):
+        service, store, manager, application = self.build_components()
+        session_id, candidate_id, _ = self.search_candidate(application, category="other")
+        root = category_to_msg_library_root("other")
+        target = target_for(
+            "other", library_id=root["library_id"], root_id=root["root_id"], root_openlist_path="/custom/misc/"
+        )
+        configured_paths = {category: category_to_openlist_path(category) for category in ("movie", "other")}
+        configured_paths["other"] = "/custom/misc"
+        with mock.patch("pipeline.internal_api.category_to_openlist_path", side_effect=configured_paths.__getitem__):
+            task, _ = manager.create_import(
+                "owner-a", "custom-other-library", self.import_payload(session_id, candidate_id, category="other", target=target)
+            )
+        self.assertEqual(task["request"]["category"], "other")
+        self.assertEqual(task["request"]["target"]["root_openlist_path"], "/custom/misc")
+
+    def test_existing_import_without_search_category_remains_idempotent(self):
+        service, store, manager, application = self.build_components()
+        session_id, candidate_id, _ = self.search_candidate(application)
+        payload = self.import_payload(session_id, candidate_id)
+        task, _ = manager.create_import("owner-a", "existing-import", payload)
+        legacy_request = dict(task["request"])
+        legacy_request.pop("search_category")
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "update internal_api_imports set request_json = ? where id = ?",
+                (json.dumps(legacy_request), task["id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        repeated, created = manager.create_import("owner-a", "existing-import", payload)
+        self.assertFalse(created)
+        self.assertEqual(repeated["id"], task["id"])
+        self.assertEqual(len(service.duplicate_calls), 1)
+
+    def test_existing_other_import_without_scrape_policy_remains_idempotent(self):
+        service, store, manager, application = self.build_components()
+        session_id, candidate_id, _ = self.search_candidate(application, category="other")
+        root = category_to_msg_library_root("other")
+        target = target_for("other", library_id=root["library_id"], root_id=root["root_id"])
+        payload = self.import_payload(session_id, candidate_id, category="other", target=target)
+        task, _ = manager.create_import("owner-a", "existing-other-import", payload)
+        legacy_request = dict(task["request"])
+        legacy_request.pop("search_category")
+        legacy_request["target"].pop("scrape_enabled")
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "update internal_api_imports set request_json = ? where id = ?",
+                (json.dumps(legacy_request), task["id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        repeated, created = manager.create_import("owner-a", "existing-other-import", payload)
+        self.assertFalse(created)
+        self.assertEqual(repeated["id"], task["id"])
+        self.assertEqual(len(service.duplicate_calls), 1)
+
+    def test_other_library_still_requires_configured_identity_and_path(self):
+        service, store, manager, application = self.build_components()
+        session_id, candidate_id, _ = self.search_candidate(application)
+        root = category_to_msg_library_root("other")
+        target = target_for("other", library_id=root["library_id"], root_id=root["root_id"])
+        for index, updates in enumerate(
+            (
+                {"library_id": "unconfigured-library"},
+                {"root_id": "unconfigured-root"},
+                {"root_openlist_path": category_to_openlist_path("movie")},
+            )
+        ):
+            with self.subTest(updates=updates):
+                with self.assertRaises(ApiError) as raised:
+                    manager.create_import(
+                        "owner-a", "wrong-other-target-%d" % index,
+                        self.import_payload(session_id, candidate_id, target={**target, **updates}),
+                    )
+                self.assertEqual(raised.exception.code, "target_transfer_not_configured")
+        self.assertEqual(service.duplicate_calls, [])
+        self.assertEqual(service.submit_uris, [])
+
+    def test_other_library_does_not_bypass_search_category_check(self):
+        service, store, manager, application = self.build_components()
+        session_id, candidate_id, _ = self.search_candidate(application, category="tv")
+        root = category_to_msg_library_root("other")
+        target = target_for("other", library_id=root["library_id"], root_id=root["root_id"])
+        with self.assertRaises(ApiError) as raised:
+            manager.create_import(
+                "owner-a", "wrong-other-search-category", self.import_payload(session_id, candidate_id, target=target)
+            )
+        self.assertEqual(raised.exception.code, "category_mismatch")
         self.assertEqual(service.duplicate_calls, [])
         self.assertEqual(service.submit_uris, [])
 

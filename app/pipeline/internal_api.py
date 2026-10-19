@@ -13,7 +13,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from pipeline.config import category_to_openlist_path
+from pipeline.config import category_to_openlist_path, configured_msg_library_roots
 from pipeline.client115 import parse_115_share_url
 from pipeline.dedupe import candidate_info_hash
 from pipeline.openlist_utils import normalize_openlist_path
@@ -1458,8 +1458,18 @@ class ImportTaskManager:
             raise ApiError(400, "invalid_request", "request body must be a JSON object")
         session_id = require_text(payload.get("search_session_id"), "search_session_id", max_length=100)
         candidate_id = require_text(payload.get("candidate_id"), "candidate_id", max_length=100)
-        category = require_category(payload.get("category"))
+        search_category = require_category(payload.get("category"))
         target = normalize_target(payload)
+        category = search_category
+        if search_category in {"movie", "other"}:
+            # MSG stores the "other" library as movie. Its transfer category
+            # comes from the existing configured library/root identity.
+            other_root = configured_msg_library_roots().get("other")
+            if other_root and (target["library_id"], target["root_id"]) == (
+                other_root["library_id"], other_root["root_id"]
+            ):
+                category = "other"
+                target["scrape_enabled"] = other_root["scrape_enabled"]
         configured_openlist_path = normalize_openlist_path(category_to_openlist_path(category))
         if normalize_openlist_path(target["root_openlist_path"]) != configured_openlist_path:
             raise ApiError(
@@ -1480,7 +1490,9 @@ class ImportTaskManager:
                 "search_session_id": session_id,
                 "candidate_id": candidate_id,
                 "category": category,
-                "target": target,
+                "search_category": search_category,
+                # Scrape policy is server configuration, not caller identity.
+                "target": {key: value for key, value in target.items() if key != "scrape_enabled"},
                 "force_duplicate": force_duplicate,
                 "upgrade_media_id": upgrade_media_id,
                 "upgrade_scope": upgrade_scope,
@@ -1488,11 +1500,14 @@ class ImportTaskManager:
                 "subscription_follow": subscription_follow,
             }
             persisted_identity = {key: existing_request.get(key) for key in incoming_identity}
+            persisted_identity["target"] = {key: existing_request["target"].get(key) for key in incoming_identity["target"]}
+            # Older tasks used category for both search and transfer.
+            persisted_identity["search_category"] = existing_request.get("search_category", existing_request.get("category"))
             if json_dumps(persisted_identity) != json_dumps(incoming_identity):
                 raise ApiError(409, "idempotency_conflict", "Idempotency-Key was already used with a different request")
             return existing, False
         candidate_record = self.store.load_search_candidate(owner_id, session_id, candidate_id)
-        if candidate_record["category"] != category:
+        if candidate_record["category"] != search_category:
             raise ApiError(409, "category_mismatch", "category does not match the search session")
         candidate = candidate_record["candidate"]
         download_uri = str(candidate.get("download_uri") or "").strip()
@@ -1503,6 +1518,7 @@ class ImportTaskManager:
             "candidate_id": candidate_id,
             "query": candidate_record["query"],
             "category": category,
+            "search_category": search_category,
             "title": require_text(candidate.get("title"), "candidate title", max_length=1000),
             "candidate": candidate,
             "target": target,
