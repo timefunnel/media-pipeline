@@ -4354,6 +4354,36 @@ class LlmSearchRerankClientTest(unittest.TestCase):
         self.assertNotIn("download_uri", request_content)
 
 
+class ReconcileFake115Client:
+    """115 client stub with scripted add responses and a scripted task list."""
+
+    def __init__(self, responses=None, tasks=None, add_error=None, task_lists=None):
+        self.responses = list(responses or [])
+        self.tasks = list(tasks or [])
+        self.add_error = add_error
+        self.task_lists = list(task_lists) if task_lists is not None else None
+        self.add_calls = []
+        self.list_calls = 0
+
+    def add_offline_urls(self, urls, folder_id):
+        self.add_calls.append((list(urls), folder_id))
+        if self.add_error is not None:
+            raise self.add_error
+        if self.responses:
+            return self.responses.pop(0)
+        return {"state": True, "data": [{}]}
+
+    def get_offline_tasks(self, page=1):
+        self.list_calls += 1
+        tasks = self.tasks
+        if self.task_lists is not None:
+            tasks = self.task_lists.pop(0) if self.task_lists else []
+        return {
+            "state": True,
+            "data": {"tasks": [dict(task) for task in tasks], "page_count": 1},
+        }
+
+
 class PipelineBotServiceTest(unittest.TestCase):
     def test_msg_ingest_episode_batch_requires_explicit_rows_and_preserves_mapping(self):
         from pipeline.bot import msg_ingest_episode_batch
@@ -5107,23 +5137,71 @@ class PipelineBotServiceTest(unittest.TestCase):
         self.assertEqual(result["tasks"], [])
         self.assertEqual(result["state"], False)
 
-    def test_submit_resets_existing_finished_115_task_and_resubmits_to_target(self):
+    def test_submit_reuses_existing_successful_115_task_instead_of_resubmitting(self):
         from pipeline.bot import BotConfig, PipelineBotService
 
         class SubmitService(PipelineBotService):
             def __init__(self, config):
                 super().__init__(config)
-                self.responses = [
-                    {"state": False, "code": 10008, "message": "任务已存在"},
-                    {"state": True, "data": [{"info_hash": "D00D7132F75BEB644A19E6A1CC011AA3523CF233"}]},
-                ]
-                self.fake_115s = []
+                self.client = ReconcileFake115Client(
+                    responses=[{"state": False, "code": 10008, "message": "任务已存在"}],
+                    tasks=[
+                        {
+                            "info_hash": "D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+                            "status": 2,
+                            "file_id": "file-1",
+                            "wp_path_id": "task-folder",
+                            "name": "SNOS-410",
+                        }
+                    ],
+                )
                 self.reset_calls = []
 
             def _call_115(self, category, callback):
-                client = Fake115SubmitClient(self.responses.pop(0))
-                self.fake_115s.append(client)
-                return callback(client)
+                return callback(self.client)
+
+            def reset_task_for_resubmit(self, category, info_hash):
+                self.reset_calls.append((category, info_hash))
+                return {"deleted": True}
+
+        service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
+
+        result = service.submit(
+            "adult",
+            "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+            target_folder_id="task-folder",
+        )
+
+        self.assertTrue(result["reconciled"])
+        self.assertEqual(result["tasks"][0]["status_name"], "success")
+        self.assertEqual(result["tasks"][0]["file_id"], "file-1")
+        self.assertEqual(len(service.client.add_calls), 1)
+        self.assertEqual(service.reset_calls, [])
+
+    def test_submit_resets_existing_failed_115_task_and_resubmits_to_target(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class SubmitService(PipelineBotService):
+            def __init__(self, config):
+                super().__init__(config)
+                self.client = ReconcileFake115Client(
+                    responses=[
+                        {"state": False, "code": 10008, "message": "任务已存在"},
+                        {"state": True, "data": [{"info_hash": "D00D7132F75BEB644A19E6A1CC011AA3523CF233"}]},
+                    ],
+                    tasks=[
+                        {
+                            "info_hash": "D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+                            "status": -1,
+                            "file_id": "file-1",
+                            "wp_path_id": "task-folder",
+                        }
+                    ],
+                )
+                self.reset_calls = []
+
+            def _call_115(self, category, callback):
+                return callback(self.client)
 
             def reset_task_for_resubmit(self, category, info_hash):
                 self.reset_calls.append((category, info_hash))
@@ -5138,8 +5216,138 @@ class PipelineBotServiceTest(unittest.TestCase):
         )
 
         self.assertEqual(result["tasks"][0]["info_hash"], "D00D7132F75BEB644A19E6A1CC011AA3523CF233")
+        self.assertNotIn("reconciled", result)
         self.assertEqual(service.reset_calls, [("adult", "D00D7132F75BEB644A19E6A1CC011AA3523CF233")])
-        self.assertEqual([client.folder_id for client in service.fake_115s], ["task-folder", "task-folder"])
+        self.assertEqual(
+            [folder for _urls, folder in service.client.add_calls],
+            ["task-folder", "task-folder"],
+        )
+
+    def test_submit_reuses_115_task_after_add_timeout(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class SubmitService(PipelineBotService):
+            def __init__(self, config):
+                super().__init__(config)
+                self.client = ReconcileFake115Client(
+                    add_error=RuntimeError("<urlopen error _ssl.c:993: The handshake operation timed out>"),
+                    tasks=[
+                        {
+                            "info_hash": "D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+                            "status": 1,
+                            "file_id": "file-2",
+                            "wp_path_id": "task-folder",
+                        }
+                    ],
+                )
+
+            def _call_115(self, category, callback):
+                return callback(self.client)
+
+        service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
+
+        result = service.submit(
+            "adult",
+            "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+            target_folder_id="task-folder",
+        )
+
+        self.assertTrue(result["reconciled"])
+        self.assertEqual(result["tasks"][0]["status_name"], "downloading")
+        self.assertEqual(len(service.client.add_calls), 1)
+
+    def test_submit_reraises_add_timeout_when_no_115_task_exists(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class SubmitService(PipelineBotService):
+            def __init__(self, config):
+                super().__init__(config)
+                self.client = ReconcileFake115Client(
+                    add_error=RuntimeError("<urlopen error _ssl.c:993: The handshake operation timed out>"),
+                )
+
+            def _call_115(self, category, callback):
+                return callback(self.client)
+
+        service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
+
+        with patch("pipeline.bot.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "handshake operation timed out"):
+                service.submit(
+                    "adult",
+                    "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+                    target_folder_id="task-folder",
+                )
+
+    def test_submit_reuses_115_task_discovered_after_reset_and_resubmit(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class SubmitService(PipelineBotService):
+            def __init__(self, config):
+                super().__init__(config)
+                self.client = ReconcileFake115Client(
+                    responses=[
+                        {"state": False, "code": 10008, "message": "任务已存在"},
+                        {"state": False, "code": 10008, "message": "任务已存在"},
+                    ],
+                    task_lists=[
+                        [],
+                        [
+                            {
+                                "info_hash": "D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+                                "status": 2,
+                                "file_id": "file-3",
+                                "wp_path_id": "task-folder",
+                            }
+                        ],
+                    ],
+                )
+                self.reset_calls = []
+
+            def _call_115(self, category, callback):
+                return callback(self.client)
+
+            def reset_task_for_resubmit(self, category, info_hash):
+                self.reset_calls.append((category, info_hash))
+                return {"deleted": False, "reason": "task_not_found"}
+
+        service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
+
+        with patch("pipeline.bot.time.sleep"):
+            result = service.submit(
+                "adult",
+                "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+                target_folder_id="task-folder",
+            )
+
+        self.assertTrue(result["reconciled"])
+        self.assertEqual(result["tasks"][0]["status_name"], "success")
+        self.assertEqual(result["tasks"][0]["file_id"], "file-3")
+        self.assertEqual(service.reset_calls, [("adult", "D00D7132F75BEB644A19E6A1CC011AA3523CF233")])
+
+    def test_submit_does_not_reconcile_non_transient_115_errors(self):
+        from pipeline.bot import BotConfig, PipelineBotService
+
+        class SubmitService(PipelineBotService):
+            def __init__(self, config):
+                super().__init__(config)
+                self.client = ReconcileFake115Client(
+                    add_error=RuntimeError("115入库目标目录不存在"),
+                )
+
+            def _call_115(self, category, callback):
+                return callback(self.client)
+
+        service = SubmitService(BotConfig("token", {700656624}, "/tmp/state.db"))
+
+        with self.assertRaisesRegex(RuntimeError, "115入库目标目录不存在"):
+            service.submit(
+                "adult",
+                "magnet:?xt=urn:btih:D00D7132F75BEB644A19E6A1CC011AA3523CF233",
+                target_folder_id="task-folder",
+            )
+
+        self.assertEqual(service.client.list_calls, 0)
 
     def test_anime_subscription_ingest_forces_target_season(self):
         from pipeline.bot import BotConfig, PipelineBotService

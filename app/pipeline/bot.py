@@ -2133,19 +2133,60 @@ class PipelineBotService:
                 target_folder_id=folder_id,
             )
         download_uri = self._resolve_download_uri(download_uri)
-        response = self._call_115(
-            category, lambda client: client.add_offline_urls([download_uri], folder_id)
-        )
+        try:
+            response = self._call_115(
+                category, lambda client: client.add_offline_urls([download_uri], folder_id)
+            )
+        except RuntimeError as exc:
+            # 115 在请求超时/SSL 握手失败时可能已经建好了任务，先对账再决定是否判失败。
+            if not offline_submit_error_is_transient(str(exc)):
+                raise
+            reconciled = self._reconcile_offline_submit(
+                category,
+                download_uri,
+                reason=str(exc),
+                attempts=3,
+                delay_seconds=3,
+            )
+            if reconciled is not None:
+                return reconciled
+            raise
         if submit_response_task_exists(response):
             info_hash = candidate_info_hash({"download_uri": download_uri})
             if not info_hash:
                 raise RuntimeError("115 existing offline task response has no info_hash")
+            # 10008 表示 115 侧已有同 info_hash 的任务，优先复用而不是删任务重提。
+            reconciled = self._reconcile_offline_submit(category, download_uri)
+            if reconciled is not None:
+                return reconciled
             self.reset_task_for_resubmit(category, info_hash)
-            response = self._call_115(
-                category, lambda client: client.add_offline_urls([download_uri], folder_id)
-            )
+            try:
+                response = self._call_115(
+                    category, lambda client: client.add_offline_urls([download_uri], folder_id)
+                )
+            except RuntimeError as exc:
+                if not offline_submit_error_is_transient(str(exc)):
+                    raise
+                reconciled = self._reconcile_offline_submit(
+                    category,
+                    download_uri,
+                    reason=str(exc),
+                    attempts=3,
+                    delay_seconds=3,
+                )
+                if reconciled is not None:
+                    return reconciled
+                raise
             if submit_response_task_exists(response):
-                raise RuntimeError("115 offline task still exists after reset")
+                reconciled = self._reconcile_offline_submit(
+                    category,
+                    download_uri,
+                    attempts=3,
+                    delay_seconds=5,
+                )
+                if reconciled is not None:
+                    return reconciled
+                raise RuntimeError("115 offline task still exists after reset: %s" % info_hash)
         result = summarize_submit(response)
         ensure_submit_result_has_task_identity(result, download_uri)
         result["submit_kind"] = "115_offline"
@@ -2774,6 +2815,52 @@ class PipelineBotService:
             category,
             lambda client: reset_task_for_resubmit(client, info_hash, max_pages=10),
         )
+
+    def _reconcile_offline_submit(
+        self,
+        category,
+        download_uri,
+        reason="",
+        attempts=1,
+        delay_seconds=0,
+    ):
+        info_hash = candidate_info_hash({"download_uri": download_uri})
+        if not info_hash:
+            return None
+        task = None
+        for attempt in range(max(1, int(attempts))):
+            task = self._lookup_offline_task(category, info_hash)
+            if task is not None:
+                break
+            if attempt + 1 < max(1, int(attempts)):
+                time.sleep(max(0, delay_seconds))
+        if task is None:
+            return None
+        if str(task.get("status_name") or "") == "failed":
+            # 失败任务仍需走 reset + 重新提交，交给调用方处理。
+            return None
+        result = submit_result_from_existing_task(task, info_hash)
+        print(
+            "115 offline task reused instead of resubmitting: %s status=%s%s"
+            % (
+                info_hash,
+                task.get("status_name"),
+                " reason=%s" % reason if reason else "",
+            ),
+            flush=True,
+        )
+        return result
+
+    def _lookup_offline_task(self, category, info_hash, max_pages=10):
+        try:
+            return self._call_115(
+                category,
+                lambda client: find_task_by_info_hash(client, info_hash, max_pages=max_pages),
+            )
+        except RuntimeError as exc:
+            if str(exc).startswith("offline task not found:"):
+                return None
+            raise
 
     def validate_media_candidate_migration(self, candidate, target_category):
         return self._prepare_media_candidate_migration(candidate, target_category)[4]
@@ -9842,6 +9929,40 @@ def submit_response_task_exists(result):
         return False
     text = " ".join(str(result.get(key) or "") for key in ("code", "message", "msg"))
     return str(result.get("code") or "") == "10008" or "任务已存在" in text
+
+
+def submit_result_from_existing_task(task, info_hash):
+    task = dict(task or {})
+    task.setdefault("info_hash", info_hash)
+    task.setdefault("status_name", "submitted")
+    return {
+        "state": True,
+        "code": 0,
+        "message": "115 offline task already exists; reused existing task",
+        "submit_kind": "115_offline",
+        "reconciled": True,
+        "tasks": [task],
+        "task_status": task,
+    }
+
+
+TRANSIENT_115_SUBMIT_ERROR_MARKERS = (
+    "urlopen error",
+    "timed out",
+    "timeout",
+    "handshake",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "remote end closed",
+    "bad gateway",
+    "temporary failure",
+)
+
+
+def offline_submit_error_is_transient(message):
+    text = str(message or "").lower()
+    return any(marker in text for marker in TRANSIENT_115_SUBMIT_ERROR_MARKERS)
 
 
 def first_submit_task_info_hash(result):
