@@ -1,3 +1,4 @@
+import http.client
 import json
 import re
 import time
@@ -10,6 +11,8 @@ from http.cookiejar import CookieJar
 
 API_BASE = "https://proapi.115.com"
 ACCESS_TOKEN_REFRESH_CODES = frozenset({40140123, 40140124, 40140125, 40140126})
+RETRYABLE_HTTP_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+TRANSIENT_TRANSPORT_ERRORS = (urllib.error.URLError, OSError, http.client.HTTPException)
 ADD_OFFLINE_URLS = API_BASE + "/open/offline/add_task_urls"
 DELETE_OFFLINE_TASK = API_BASE + "/open/offline/del_task"
 OFFLINE_TASK_LIST = API_BASE + "/open/offline/get_task_list"
@@ -84,7 +87,35 @@ class P115OpenAPIError(RuntimeError):
 
 
 class UrllibTransport:
+    """HTTP transport with bounded retry for transient network failures.
+
+    115 的 proapi 偶发 TLS 握手超时、读超时和连接重置；单次抖动不应让整个入库
+    判失败。这里只对「没拿到响应」的传输层错误和 429/5xx 重试，业务错误码照常
+    返回给调用方判断。
+    """
+
+    def __init__(self, retries=2, post_retries=1, backoff_seconds=1.0):
+        self.retries = max(0, int(retries))
+        self.post_retries = max(0, int(post_retries))
+        self.backoff_seconds = max(0.0, float(backoff_seconds))
+
     def request(self, method, url, headers=None, data=None, timeout=None):
+        attempts = self.retries if str(method or "").upper() == "GET" else self.post_retries
+        attempt = 0
+        while True:
+            try:
+                return self._request_once(method, url, headers, data, timeout)
+            except urllib.error.HTTPError as exc:
+                if exc.code not in RETRYABLE_HTTP_STATUS_CODES or attempt >= attempts:
+                    raise
+            except TRANSIENT_TRANSPORT_ERRORS:
+                if attempt >= attempts:
+                    raise
+            attempt += 1
+            if self.backoff_seconds:
+                time.sleep(self.backoff_seconds * attempt)
+
+    def _request_once(self, method, url, headers=None, data=None, timeout=None):
         req_headers = dict(headers or {})
         body = None
         if data is not None:

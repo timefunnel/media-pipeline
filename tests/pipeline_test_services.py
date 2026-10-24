@@ -1,5 +1,6 @@
 import copy
 import json
+import urllib.error
 import urllib.request
 
 from tests.test_pipeline_core import *
@@ -2199,6 +2200,21 @@ class ResourceSelectorTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no acceptable resource"):
             selector.select_best([{"title": "Sintel 1080p", "seeders": 0, "magnetUrl": "magnet:?xt=urn:btih:abc"}])
 
+class FakeUrllibResponse:
+    def __init__(self, payload, charset=None):
+        self.body = json.dumps(payload).encode("utf-8")
+        self.headers = type("Headers", (), {"get_content_charset": staticmethod(lambda: charset)})()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self):
+        return self.body
+
+
 class Client115Test(unittest.TestCase):
     def test_decodes_gbk_error_body_despite_utf8_response_header(self):
         from pipeline.client115 import _decode_response_body
@@ -2312,6 +2328,112 @@ class Client115Test(unittest.TestCase):
             call["url"],
             "https://proapi.115.com/open/folder/get_info?file_id=REPLACE_WITH_115_MOVIE_CID",
         )
+
+
+    def test_transport_retries_transient_network_error_for_get(self):
+        from pipeline.client115 import UrllibTransport
+
+        class FlakyOpener:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, request, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise TimeoutError("The handshake operation timed out")
+                return FakeUrllibResponse({"state": True})
+
+        opener = FlakyOpener()
+        transport = UrllibTransport(backoff_seconds=0)
+
+        with patch("pipeline.client115.urllib.request.urlopen", side_effect=opener):
+            payload = transport.request("GET", "https://proapi.115.com/open/offline/get_task_list", timeout=5)
+
+        self.assertEqual(payload, {"state": True})
+        self.assertEqual(opener.calls, 2)
+
+    def test_transport_retries_post_once_by_default(self):
+        from pipeline.client115 import UrllibTransport
+
+        class FlakyOpener:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, request, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ConnectionResetError("connection reset by peer")
+                return FakeUrllibResponse({"state": True, "code": 0})
+
+        opener = FlakyOpener()
+        transport = UrllibTransport(backoff_seconds=0)
+
+        with patch("pipeline.client115.urllib.request.urlopen", side_effect=opener):
+            payload = transport.request(
+                "POST",
+                "https://proapi.115.com/open/offline/add_task_urls",
+                data={"urls": "magnet:?xt=urn:btih:abc"},
+                timeout=5,
+            )
+
+        self.assertEqual(payload["state"], True)
+        self.assertEqual(opener.calls, 2)
+
+    def test_transport_raises_after_retries_are_exhausted(self):
+        from pipeline.client115 import UrllibTransport
+
+        calls = []
+
+        def failing_opener(request, timeout=None):
+            calls.append(request.get_method())
+            raise TimeoutError("The read operation timed out")
+
+        transport = UrllibTransport(backoff_seconds=0)
+
+        with patch("pipeline.client115.urllib.request.urlopen", side_effect=failing_opener):
+            with self.assertRaises(TimeoutError):
+                transport.request("GET", "https://proapi.115.com/open/offline/get_task_list", timeout=5)
+
+        self.assertEqual(len(calls), 3)
+
+    def test_transport_does_not_retry_business_http_errors(self):
+        from pipeline.client115 import UrllibTransport
+
+        calls = []
+
+        def failing_opener(request, timeout=None):
+            calls.append(request.get_method())
+            raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, None)
+
+        transport = UrllibTransport(backoff_seconds=0)
+
+        with patch("pipeline.client115.urllib.request.urlopen", side_effect=failing_opener):
+            with self.assertRaises(urllib.error.HTTPError):
+                transport.request("GET", "https://proapi.115.com/open/offline/get_task_list", timeout=5)
+
+        self.assertEqual(len(calls), 1)
+
+    def test_transport_retries_server_errors(self):
+        from pipeline.client115 import UrllibTransport
+
+        class FlakyOpener:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, request, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise urllib.error.HTTPError(request.full_url, 502, "Bad Gateway", {}, None)
+                return FakeUrllibResponse({"state": True})
+
+        opener = FlakyOpener()
+        transport = UrllibTransport(backoff_seconds=0)
+
+        with patch("pipeline.client115.urllib.request.urlopen", side_effect=opener):
+            payload = transport.request("GET", "https://proapi.115.com/open/offline/get_task_list", timeout=5)
+
+        self.assertEqual(payload, {"state": True})
+        self.assertEqual(opener.calls, 2)
 
 
 class OfflineTaskTest(unittest.TestCase):
