@@ -13,7 +13,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from pipeline.config import category_to_openlist_path, configured_msg_library_roots
+from pipeline.config import category_to_folder_id, category_to_openlist_path, configured_msg_library_roots
 from pipeline.client115 import parse_115_share_url
 from pipeline.dedupe import candidate_info_hash
 from pipeline.openlist_utils import normalize_openlist_path
@@ -3048,6 +3048,24 @@ class InternalApiApplication:
         self.subtitle_asr_manager = subtitle_asr_manager
         self.season_subtitle_manager = season_subtitle_manager
 
+    def media_probe_roots(self, root_ids=None):
+        # Configuration only: never list/refresh OpenList or request 115 here.
+        if root_ids is not None:
+            if not isinstance(root_ids, list) or not 1 <= len(root_ids) <= 5:
+                raise ApiError(400, "invalid_probe_roots", "select between 1 and 5 library roots")
+            root_ids = {require_text(value, "root_id", max_length=200) for value in root_ids}
+        roots = []
+        for category, target in configured_msg_library_roots().items():
+            if root_ids is not None and target["root_id"] not in root_ids:
+                continue
+            folder_id = str(category_to_folder_id(category))
+            if not folder_id.isascii() or not folder_id.isdigit() or int(folder_id) <= 0:
+                raise ApiError(409, "probe_root_unconfigured", "115 library root is not configured")
+            roots.append({"root_id": target["root_id"], "library_id": target["library_id"],
+                          "path": "cloud://openlist" + category_to_openlist_path(category),
+                          "directory_id": folder_id})
+        return {"roots": roots}
+
     def search(self, payload):
         if not isinstance(payload, dict):
             raise ApiError(400, "invalid_request", "request body must be a JSON object")
@@ -3551,6 +3569,9 @@ class InternalApiServer:
                 self._send_json(handler, 200, {"status": "ok"})
                 return
             self._authenticate(handler)
+            if handler.command == "GET" and path == "/v1/media-probe/roots":
+                self._send_json(handler, 200, self.application.media_probe_roots(query.get("root_id")))
+                return
             if handler.command == "POST" and path == "/v1/search":
                 self._send_json(handler, 200, self.application.search(self._read_json(handler)))
                 return
