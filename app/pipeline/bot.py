@@ -81,6 +81,7 @@ from pipeline.openlist_utils import (
     openlist_item_size,
     replace_openlist_path_prefix,
 )
+from pipeline.subscription_media import is_subscription_format_pair
 from pipeline.migration import (
     build_migration_target,
     format_migration_confirm_message,
@@ -2623,7 +2624,13 @@ class PipelineBotService:
         names = [str(item.get("name") or "").casefold() for item in files]
         if len(names) != len(set(names)):
             raise RuntimeError("OpenList staging contains duplicate selected file names")
-        if sorted(int(item["episode"]) for item in selected_videos) != sorted(selected):
+        by_episode = defaultdict(list)
+        for item in selected_videos:
+            by_episode[item["episode"]].append(item["name"])
+        if set(by_episode) != selected or any(
+            len(names) > 1 and not is_subscription_format_pair(names)
+            for names in by_episode.values()
+        ):
             raise RuntimeError("OpenList staging promotion plan does not match selected episodes")
         return {"files": files, "episodes": sorted(selected)}
 
@@ -2691,6 +2698,7 @@ class PipelineBotService:
         expected = {int(value) for value in selected_episodes or []}
         target = normalize_openlist_path(target_openlist_path)
         matched = defaultdict(list)
+        matched_names = defaultdict(list)
         page = 1
         page_size = 200
         while True:
@@ -2703,19 +2711,31 @@ class PipelineBotService:
                 if episode not in expected or item_season != int(season or 1):
                     continue
                 paths = [msg_media_openlist_path(value) for value in media_path_values(media)]
-                if any(posixpath.dirname(value) == target for value in paths if value):
+                target_paths = [value for value in paths if value and posixpath.dirname(value) == target]
+                if target_paths:
                     matched[episode].append(extract_media_id(media) or media_primary_path(media))
+                    # Each database row must identify one exact target file.
+                    matched_names[episode].append(
+                        posixpath.basename(target_paths[0]) if len(set(target_paths)) == 1 else ""
+                    )
             if len(rows) < page_size:
                 break
             page += 1
             if page > 50:
                 raise RuntimeError("MediaStationGo episode verification page limit exceeded")
         missing = sorted(expected - set(matched))
-        duplicates = {str(episode): values for episode, values in matched.items() if len(values) != 1}
+        duplicates = {
+            str(episode): values for episode, values in matched.items()
+            if len(values) > 1 and not is_subscription_format_pair(matched_names[episode])
+        }
         return {
             "verified_episodes": sorted(matched),
             "missing_episodes": missing,
             "duplicate_episodes": duplicates,
+            "format_variants": {
+                str(episode): names for episode, names in matched_names.items()
+                if is_subscription_format_pair(names)
+            },
         }
 
     def cleanup_subscription_staging(self, category, staging):
@@ -5291,7 +5311,12 @@ def classify_subscription_follow_videos(
         "ambiguous_videos": sorted(ambiguous),
         "supplemental_videos": sorted(supplemental),
         "duplicate_episodes": {
-            str(episode): names for episode, names in by_episode.items() if len(names) > 1
+            str(episode): names for episode, names in by_episode.items()
+            if len(names) > 1 and not is_subscription_format_pair(names)
+        },
+        "format_variants": {
+            str(episode): names for episode, names in by_episode.items()
+            if is_subscription_format_pair(names)
         },
     }
 
@@ -5310,6 +5335,9 @@ def parse_multi_video_episode(name, expected_season):
     cjk_episode = re.search(r"第\s*(?P<episode>\d{1,4})\s*[集话話期]", stem)
     if cjk_episode:
         return int(cjk_episode.group("episode"))
+    episode_label = FOLLOW_EPISODE_PATTERNS[1].search(stem)
+    if episode_label:
+        return int(episode_label.group("episode")) or None
     values = []
     for match in re.finditer(r"(?<!\d)(\d{1,4})(?!\d)", stem):
         value = int(match.group(1))

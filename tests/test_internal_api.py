@@ -2490,6 +2490,34 @@ class ImportResultSemanticsTest(InternalApiTestCase):
 
 
 class SubscriptionFollowImportTest(InternalApiTestCase):
+    def test_format_pair_completes_with_both_exact_media_identities(self):
+        service, _store, manager, application = self.build_components()
+        names = ["Show.2021.E115.2160p.H265.mkv", "Show.2021.E115.2160p.H265.mp4"]
+
+        class FakeOpenList:
+            def list_all(self, path, refresh=False):
+                if not (service.subscription_staging or {}).get("claimed_at"):
+                    return []
+                return [{"path": path + "/" + name, "name": name, "is_dir": False} for name in names]
+
+        service._build_openlist_client = lambda: FakeOpenList()
+        service.inspect_subscription_staging = lambda category, staging, season, episode_hints=None, expected_episodes=None: PipelineBotService.inspect_subscription_staging(
+            service, category, staging, season, episode_hints, expected_episodes
+        )
+        service.plan_subscription_promotion = lambda staging, selected, season: PipelineBotService.plan_subscription_promotion(service, staging, selected, season)
+        task, _ = manager.create_import("owner-a", "format-pair", self.payload(application, service))
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+        self.assertEqual(completed["status"], "completed", completed.get("error"))
+        audit = completed["result"]["subscription_follow"]
+        self.assertEqual(audit["format_variants"], {"115": names})
+        self.assertEqual(audit["promotion"]["moved_names"], names)
+        self.assertEqual(len(audit["target_media_identities"]), 2)
+        self.assertEqual(audit["applied_media_identities"], audit["target_media_identities"])
+
     def test_direct_receive_does_not_scan_staging_before_115_success(self):
         service = FakePipelineService(download_delay=0.02)
         service, _store, manager, application = self.build_components(service)
@@ -3886,6 +3914,93 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
 
 
 class SubscriptionPromotionTest(unittest.TestCase):
+    def test_recent_failed_releases_keep_both_container_formats(self):
+        releases = [
+            ("吞噬星空.Swallowed.Star.2021.E247.2160p.WEB-DL.H265.AAC-ColorWEB", 247),
+            ("凡人修仙传.A.Mortal's.Journey.S01E197.2020.2160p.WEB-DL.H265.10bit.HDR.AAC-ColorWEB", 197),
+        ]
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        from pipeline.internal_api import build_subscription_target_media_identities, target_media_identities_match
+
+        for stem, episode in releases:
+            with self.subTest(episode=episode):
+                names = [stem + ".mkv", stem + ".mp4"]
+                classified = classify_115_resource_entries(
+                    [{"fid": str(i), "fn": name, "fc": "1"} for i, name in enumerate(names)]
+                    + [{"fid": "ad", "fn": "【更多资源请访问 www.example.com】.MP4", "fc": "1"}],
+                    1, expected_episodes=[episode],
+                )
+                self.assertEqual(classified["verified_episodes"], [episode])
+                self.assertEqual(classified["duplicate_episodes"], {})
+                self.assertEqual(classified["format_variants"], {str(episode): names})
+                staging_path = "/115/temp/test"
+                staging = {
+                    "entries": [],
+                    "videos": [{"path": staging_path + "/" + name, "name": name, "episode": episode} for name in names],
+                }
+                plan = service.plan_subscription_promotion(staging, [episode], 1)
+                self.assertEqual([item["name"] for item in plan["files"]], names)
+                identities = build_subscription_target_media_identities(
+                    {"planned_files": plan["files"]}, "/115/anime/show", 1, [episode]
+                )
+                self.assertEqual(len(identities), 2)
+                self.assertEqual({item["episode_num"] for item in identities}, {episode})
+                self.assertFalse(target_media_identities_match(identities, identities[:1]))
+
+    def test_episode_labels_in_multi_video_releases_override_codec_numbers(self):
+        for label in ("E247", "EP247", "E-247"):
+            self.assertEqual(parse_multi_video_episode("Show.2021." + label + ".2160p.H265.AAC.mkv", 1), 247)
+        self.assertIsNone(parse_multi_video_episode("Show.S02E247.2021.H265.mkv", 1))
+        self.assertIsNone(parse_multi_video_episode("Show.2021.2160p.mkv", 1))
+
+    def test_other_duplicate_episode_layouts_remain_rejected(self):
+        from pipeline.internal_api import build_subscription_target_media_identities
+
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        for names in (
+            ["Show.S01E197.1080p.mkv", "Show.S01E197.2160p.mp4"],
+            ["Show.S01E197.mkv", "Show.S01E197.mkv"],
+            ["Show.S01E197.mkv", "Show.S01E197.mp4", "Show.S01E197.avi"],
+        ):
+            with self.subTest(names=names):
+                classified = classify_115_resource_entries(
+                    [{"fid": str(i), "fn": name, "fc": "1"} for i, name in enumerate(names)],
+                    1, expected_episodes=[197],
+                )
+                self.assertEqual(classified["duplicate_episodes"], {"197": names})
+                videos = [{"path": "/115/temp/" + name, "name": name, "episode": 197, "kind": "video"} for name in names]
+                with self.assertRaises(RuntimeError):
+                    service.plan_subscription_promotion({"videos": videos}, [197], 1)
+                with self.assertRaises(RuntimeError):
+                    build_subscription_target_media_identities({"planned_files": videos}, "/115/anime/show", 1, [197])
+
+    def test_msg_verification_accepts_format_pair_but_rejects_duplicate_rows(self):
+        service = PipelineBotService(BotConfig(token="token", allowed_user_ids={1}))
+        target = "/115/anime/show"
+        rows = []
+
+        class FakeMsg:
+            def list_library_media(self, library_id, **kwargs):
+                self.group_versions = kwargs["group_versions"]
+                return rows
+
+        client = FakeMsg()
+        service._build_msg_client = lambda: client
+        for names, duplicate in (
+            (["Show.S01E197.mkv", "Show.S01E197.mp4"], False),
+            (["Show.S01E197.mkv", "Show.S01E197.mkv"], True),
+            (["Show.S01E197.mkv", "Other.S01E197.mp4"], True),
+        ):
+            with self.subTest(names=names):
+                rows[:] = [
+                    {"id": str(i), "path": "cloud://openlist" + target + "/" + name, "season_num": 1, "episode_num": 197}
+                    for i, name in enumerate(names)
+                ]
+                result = service.verify_subscription_msg_episodes("anime", target, 1, [197])
+                self.assertEqual(result["missing_episodes"], [])
+                self.assertEqual(bool(result["duplicate_episodes"]), duplicate)
+                self.assertEqual(client.group_versions, 0)
+
     def test_partial_openlist_move_is_detected_by_target_verification(self):
         service = PipelineBotService(
             BotConfig(token="token", allowed_user_ids={1}, subscription_move_timeout_seconds=0)

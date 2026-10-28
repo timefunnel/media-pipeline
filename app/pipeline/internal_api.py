@@ -32,6 +32,7 @@ from pipeline.external_subtitles import (
 from pipeline.subtitle_asr import DEFAULT_ASR_MODEL, SubtitleAsrProcessor
 from pipeline.telegram_ui import task_from_submit_result
 from pipeline.task_state import ACTIVE_115_TIMEOUT_SECONDS
+from pipeline.subscription_media import is_subscription_format_pair
 
 
 DEFAULT_API_HOST = "127.0.0.1"
@@ -798,6 +799,7 @@ class InternalApiStore:
                     follow_result.pop("ambiguous_videos", None)
                     follow_result.pop("unknown_videos", None)
                     follow_result.pop("duplicate_episodes", None)
+                    follow_result.pop("format_variants", None)
                     follow_result.pop("verified_episodes", None)
                     follow_result.pop("selected_episodes", None)
                     result["subscription_follow"] = follow_result
@@ -2449,6 +2451,7 @@ class ImportTaskManager:
                     "ambiguous_videos": list(staging_state.get("ambiguous_videos") or []),
                     "supplemental_videos": list(staging_state.get("supplemental_videos") or []),
                     "duplicate_episodes": dict(staging_state.get("duplicate_episodes") or {}),
+                    "format_variants": dict(staging_state.get("format_variants") or {}),
                     "openlist_query_mode": staging_state.get("openlist_query_mode"),
                     "openlist_request_count": int(
                         staging_state.get("openlist_request_count") or 0
@@ -2461,6 +2464,7 @@ class ImportTaskManager:
                     "verified_episodes": sorted(verified),
                     "unknown_videos": list(staging_state.get("unknown_videos") or []),
                     "duplicate_episodes": dict(staging_state.get("duplicate_episodes") or {}),
+                    "format_variants": dict(staging_state.get("format_variants") or {}),
                 }
             )
             if follow.get("manual_replenish"):
@@ -4268,7 +4272,7 @@ def build_subscription_target_media_identities(audit, target_path, season, selec
 
     identities = []
     paths = set()
-    episodes = []
+    episode_names = defaultdict(list)
     for item in (audit or {}).get("planned_files") or []:
         if str(item.get("kind") or "").strip().lower() != "video":
             continue
@@ -4284,7 +4288,7 @@ def build_subscription_target_media_identities(audit, target_path, season, selec
         if openlist_path in paths:
             raise RuntimeError("subscription target media identity path is duplicated")
         paths.add(openlist_path)
-        episodes.append(episode)
+        episode_names[episode].append(name)
         identities.append(
             {
                 "openlist_path": openlist_path,
@@ -4292,7 +4296,10 @@ def build_subscription_target_media_identities(audit, target_path, season, selec
                 "episode_num": episode,
             }
         )
-    if sorted(episodes) != sorted(selected):
+    if set(episode_names) != selected or any(
+        len(names) > 1 and not is_subscription_format_pair(names)
+        for names in episode_names.values()
+    ):
         raise RuntimeError("subscription target media identities do not match selected episodes")
     return sorted(identities, key=lambda item: item["openlist_path"])
 
