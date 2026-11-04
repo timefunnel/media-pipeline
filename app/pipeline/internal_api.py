@@ -2610,13 +2610,18 @@ class ImportTaskManager:
             if category == "anime":
                 current_task["subscription_target_season"] = season
             current_task["subscription_target_media_identities"] = target_media_identities
-            synced_result = self.service.sync_completed_task(
-                category,
-                title,
-                current_task,
-                progress_callback=save_progress,
-                target=request["target"],
-            )
+            sync_lock = self._target_lock(request["target"])
+            self._acquire_target_lock(sync_lock)
+            try:
+                synced_result = self.service.sync_completed_task(
+                    category,
+                    title,
+                    current_task,
+                    progress_callback=save_progress,
+                    target=request["target"],
+                )
+            finally:
+                sync_lock.release()
             if not isinstance(synced_result, dict):
                 raise RuntimeError("pipeline sync_completed_task returned invalid response")
             synced_result = dict(synced_result)

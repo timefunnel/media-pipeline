@@ -2490,6 +2490,35 @@ class ImportResultSemanticsTest(InternalApiTestCase):
 
 
 class SubscriptionFollowImportTest(InternalApiTestCase):
+    def test_subscription_sync_serializes_same_root_but_allows_different_roots(self):
+        for same_root in (True, False):
+            with self.subTest(same_root=same_root):
+                service = FakePipelineService(sync_delay=0.2)
+                service, _store, manager, application = self.build_components(service, workers=2, owner_workers=2)
+                service.subscription_entries = [
+                    {"fid": "video-115", "fn": "Show.S01E115.mkv", "kind": "video", "episode": 115}
+                ]
+                tasks = []
+                for index in range(2):
+                    payload = self.payload(application, service)
+                    payload["work_key"] = "series-%d" % index
+                    payload["subscription_id"] = "subscription-%d" % index
+                    payload["target_openlist_path"] = category_to_openlist_path("anime") + "/Show%d" % index
+                    if not same_root:
+                        payload["root_id"] = "root-%d" % index
+                    task, _ = manager.create_import(
+                        "owner-a", "root-sync-%s-%d" % (same_root, index), payload
+                    )
+                    tasks.append(task)
+                manager.start()
+                try:
+                    completed = [self.wait_final(manager, "owner-a", task["id"]) for task in tasks]
+                finally:
+                    manager.stop()
+                self.assertEqual([task["status"] for task in completed], ["completed", "completed"])
+                self.assertEqual(service.max_active, 1 if same_root else 2)
+                self.assertEqual(len(service.submit_uris), 2)
+
     def test_format_pair_completes_with_both_exact_media_identities(self):
         service, _store, manager, application = self.build_components()
         names = ["Show.2021.E115.2160p.H265.mkv", "Show.2021.E115.2160p.H265.mp4"]
