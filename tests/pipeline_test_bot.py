@@ -5389,6 +5389,15 @@ class PipelineBotServiceTest(unittest.TestCase):
             ],
         }
 
+        identity = progress["subscription_target_media_identities"][0]
+        media = {"id": "media-139", "title": "吞噬星空", "path": "cloud://openlist" + identity["openlist_path"],
+                 "season_num": 1, "episode_num": 139}
+        fake_msg.pipeline_ingest_response = {
+            "id": "subscription-ingest", "status": "completed",
+            "result": {"media": media, "media_items": [media],
+                       "applied_media_identities": progress["subscription_target_media_identities"]},
+        }
+
         updates = service._run_msg_pipeline_ingest(
             fake_msg,
             "anime",

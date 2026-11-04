@@ -2692,37 +2692,85 @@ class PipelineBotService:
         client.list_path(path, refresh=True)
         return {"path": path, "refreshed_at": int(time.time())}
 
-    def verify_subscription_msg_episodes(self, category, target_openlist_path, season, selected_episodes):
-        root = category_to_msg_library_root(category)
+    def read_subscription_media_items(self, target, task, identities):
+        """Read the exact planned rows, including receipts from older releases."""
+        selected = subscription_media_items_for_plan(task, identities)
         client = self._build_msg_client()
+        rows = []
+        for item, identity in zip(selected, identities):
+            media_id = str(item["id"])
+            media = extract_media_detail(client.get_media(media_id))
+            if (
+                str(media.get("id") or "") != media_id
+                or media.get("library_id") != target["library_id"]
+                or media.get("library_root_id") != target["root_id"]
+                or msg_media_openlist_path(media.get("path")) != normalize_openlist_path(identity["openlist_path"])
+                or int(media.get("season_num") or 0) != int(identity["season_num"])
+                or int(media.get("episode_num") or 0) != int(identity["episode_num"])
+            ):
+                raise RuntimeError("MediaStationGo planned media changed or is outside the target root: %s" % media_id)
+            rows.append(media)
+        return rows
+
+    def refresh_subscription_media_receipt(self, category, target, task, identities):
+        out = dict(task)
+        rows = self.read_subscription_media_items(target, out, identities)
+        out.update({
+            "subscription_target_media_identities": [dict(item) for item in identities],
+            "msg_ingest_media_items": rows,
+            "msg_ingest_media_ids": [row["id"] for row in rows],
+            "msg_ingest_media_count": len(rows),
+            "msg_media_id": rows[0]["id"],
+            "msg_media_title": media_display_title(rows[0]),
+            "msg_scan_status": "success",
+            "msg_ingest_status": "completed",
+            "msg_ingest_applied_media_identities": [dict(item) for item in identities],
+            "openlist_clean_status": "skipped",
+            "openlist_clean_reason": "subscription_planned_files_only",
+            "openlist_clean_error": None,
+        })
+        id_field = {"tmdb": "tmdb_id", "bangumi": "bangumi_id", "douban": "douban_id", "thetvdb": "thetvdb_id"}.get(target["provider"])
+        provider_ids = {str(row[id_field]) for row in rows if str(row.get(id_field) or "") not in {"", "0"}} if id_field else set()
+        if len(provider_ids) > 1:
+            raise RuntimeError("MediaStationGo planned media have conflicting provider identities")
+        metadata_present = (
+            id_field and len(provider_ids) == 1
+            and all(row.get("scrape_status") == "matched" for row in rows)
+            and all(str(row.get(id_field) or "") in provider_ids for row in rows)
+            and (id_field != "tmdb_id" or all(row.get("episode_title") for row in rows))
+        )
+        if metadata_present:
+            verification = self._scrape_msg_media(self._build_msg_client(), category, rows[0]["id"],
+                                                  media_display_title(rows[0]), out, rows[0], target,
+                                                  verify_only=True)
+            out.update(verification)
+            out.update({"msg_scrape_status": "success", "msg_scrape_error": None, "msg_error": None})
+        elif target.get("scrape_enabled", True) and out.get("msg_scrape_status") in {"success", "skipped"}:
+            out.update({"msg_scrape_status": "pending", "msg_sync_status": "running", "msg_error": None})
+        if out.get("msg_scrape_status") in {"success", "skipped"} and not any(
+            key.endswith("_status") and key != "msg_sync_status"
+            and value in {"failed", "running", "needs_attention", "deferred", "pending"}
+            for key, value in out.items()
+        ):
+            out.update({"msg_sync_status": "success", "msg_error": None})
+        return out
+
+    def verify_subscription_msg_episodes(self, category, target_openlist_path, season, selected_episodes, target, media_items):
         expected = {int(value) for value in selected_episodes or []}
-        target = normalize_openlist_path(target_openlist_path)
+        target_path = normalize_openlist_path(target_openlist_path)
         matched = defaultdict(list)
         matched_names = defaultdict(list)
-        page = 1
-        page_size = 200
-        while True:
-            rows = extract_media_items(client.list_library_media(root["library_id"], page=page, page_size=page_size, group_versions=0))
-            if not rows:
-                break
-            for media in rows:
-                episode = int(media.get("episode_num") or media.get("episode") or 0)
-                item_season = int(media.get("season_num") or media.get("season") or 1)
-                if episode not in expected or item_season != int(season or 1):
-                    continue
-                paths = [msg_media_openlist_path(value) for value in media_path_values(media)]
-                target_paths = [value for value in paths if value and posixpath.dirname(value) == target]
-                if target_paths:
-                    matched[episode].append(extract_media_id(media) or media_primary_path(media))
-                    # Each database row must identify one exact target file.
-                    matched_names[episode].append(
-                        posixpath.basename(target_paths[0]) if len(set(target_paths)) == 1 else ""
-                    )
-            if len(rows) < page_size:
-                break
-            page += 1
-            if page > 50:
-                raise RuntimeError("MediaStationGo episode verification page limit exceeded")
+        identities = [{"openlist_path": msg_media_openlist_path(row.get("path")),
+                       "season_num": int(row.get("season_num") or 0),
+                       "episode_num": int(row.get("episode_num") or 0)} for row in media_items]
+        rows = self.read_subscription_media_items(target, {"msg_ingest_media_items": media_items}, identities)
+        for media in rows:
+            episode = int(media.get("episode_num") or 0)
+            path = msg_media_openlist_path(media.get("path"))
+            if episode not in expected or int(media.get("season_num") or 0) != int(season) or posixpath.dirname(path) != target_path:
+                raise RuntimeError("MediaStationGo receipt is outside the subscription plan")
+            matched[episode].append(media["id"])
+            matched_names[episode].append(posixpath.basename(path))
         missing = sorted(expected - set(matched))
         duplicates = {
             str(episode): values for episode, values in matched.items()
@@ -3678,7 +3726,14 @@ class PipelineBotService:
         apply_progress(trash_hide_result)
 
         clean_result = prefixed_task_fields(progress, "openlist_clean_")
-        if import_target_path and self.config.openlist_pre_scan_clean_enabled:
+        if progress.get("subscription_target_media_identities"):
+            clean_result = {
+                "openlist_clean_status": "skipped",
+                "openlist_clean_reason": "subscription_planned_files_only",
+                "openlist_clean_error": None,
+            }
+            apply_progress(clean_result)
+        elif import_target_path and self.config.openlist_pre_scan_clean_enabled:
             if stage_is_complete(progress.get("openlist_clean_status")):
                 apply_progress(clean_result)
             else:
@@ -3723,6 +3778,8 @@ class PipelineBotService:
         if progress.get("msg_scan_status") == "success" and media_id:
             media = self._load_existing_msg_media(get_msg_client(), media_id)
             if media is None:
+                if progress.get("subscription_target_media_identities"):
+                    raise RuntimeError("MediaStationGo planned media was removed before post-processing")
                 emit(stale_msg_media_reset_updates(progress, media_id))
                 media_id = None
                 media_title = None
@@ -3888,7 +3945,12 @@ class PipelineBotService:
                 apply_progress(extras_result)
         visibility_result = prefixed_task_fields(progress, "msg_visibility_repair_")
         if category in ("tv", "anime"):
-            if not stage_is_complete(progress.get("msg_visibility_repair_status")):
+            if progress.get("subscription_target_media_identities"):
+                visibility_result = {"msg_visibility_repair_status": "skipped",
+                                     "msg_visibility_repair_reason": "explicit_episode_identities",
+                                     "msg_visibility_repair_error": None}
+                apply_progress(visibility_result)
+            elif not stage_is_complete(progress.get("msg_visibility_repair_status")):
                 emit({"msg_visibility_repair_status": "running", "msg_visibility_repair_error": None})
                 visibility_result = self._repair_msg_episode_visibility(
                     get_msg_client(), category, media_id, msg_target
@@ -4003,6 +4065,7 @@ class PipelineBotService:
         media=None,
         target=None,
         preferred_queries=None,
+        verify_only=False,
     ):
         root = self._msg_target(category, target)
         provider = root.get("provider")
@@ -4014,6 +4077,10 @@ class PipelineBotService:
                 "media_ids": episode_batch[0],
                 "episode_mappings": episode_batch[1],
             }
+        if task.get("subscription_target_media_identities"):
+            scrape_kwargs["use_existing_episode_identity"] = True
+        if verify_only:
+            scrape_kwargs["verify_only"] = True
         result = client.pipeline_scrape_media(
             media_id,
             category,
@@ -4023,15 +4090,20 @@ class PipelineBotService:
             media_type,
             **scrape_kwargs,
         )
-        if not isinstance(result, dict) or result.get("mode") not in ("apply", "smart"):
+        if not isinstance(result, dict) or result.get("mode") not in ("apply", "smart", "verified"):
             raise RuntimeError("MediaStationGo pipeline scrape returned invalid response")
+        if verify_only and result.get("mode") != "verified":
+            raise RuntimeError("MediaStationGo did not return a read-only metadata verification")
         scrape_status = str(result.get("scrape_status") or "").strip().lower()
         if scrape_status != "matched":
             raise RuntimeError("MediaStationGo metadata scrape %s" % (scrape_status or "returned no match status"))
+        verified_count = int(result.get("verified_count") or 0)
+        if verify_only and verified_count != int(task.get("msg_ingest_media_count") or 0):
+            raise RuntimeError("MediaStationGo metadata verification did not cover the planned media")
         return {
             "msg_scrape_mode": result.get("mode"),
             "msg_scrape_query": result.get("query"),
-            "msg_scrape_applied_count": int(result.get("applied_count") or 0),
+            "msg_scrape_applied_count": verified_count if verify_only else int(result.get("applied_count") or 0),
         }
 
     def _msg_target(self, category, target=None):
@@ -4365,6 +4437,14 @@ class PipelineBotService:
                         )
                     }
                 )
+            identities = progress.get("subscription_target_media_identities")
+            if identities:
+                normalized_media_items = subscription_media_items_for_plan(
+                    {"msg_ingest_media_items": normalized_media_items}, identities
+                )
+                selected = next((item for item in normalized_media_items if item["id"] == media["id"]), normalized_media_items[0])
+                media.update(id=selected["id"], title=selected.get("title"), path=selected["path"],
+                             _pipeline_match_path=selected["path"], _pipeline_match_mode="path")
             media_ids = [item["id"] for item in normalized_media_items]
             updates["msg_ingest_media_ids"] = media_ids
             updates["msg_ingest_media_count"] = len(media_ids)
@@ -7887,7 +7967,7 @@ def require_msg_scrape_coverage(category, task, scrape_result):
     if str(category or "").strip().lower() not in {"tv", "anime"}:
         return
     ingested_count = int((task or {}).get("msg_ingest_media_count") or 0)
-    if ingested_count <= 1:
+    if ingested_count <= 1 and not (task or {}).get("subscription_target_media_identities"):
         return
     applied_count = int((scrape_result or {}).get("msg_scrape_applied_count") or 0)
     if applied_count < ingested_count:
@@ -7895,6 +7975,31 @@ def require_msg_scrape_coverage(category, task, scrape_result):
             "MediaStationGo metadata scrape covered %d of %d ingested media items"
             % (applied_count, ingested_count)
         )
+
+
+def subscription_media_items_for_plan(task, identities):
+    if not identities:
+        raise RuntimeError("subscription media identities are missing")
+    by_path = defaultdict(list)
+    for item in task.get("msg_ingest_media_items") or []:
+        if not isinstance(item, dict) or not item.get("id"):
+            raise RuntimeError("MediaStationGo ingest returned invalid media items")
+        by_path[msg_media_openlist_path(item.get("path"))].append(item)
+    selected = []
+    seen = set()
+    for identity in identities:
+        path = normalize_openlist_path(identity["openlist_path"])
+        matches = by_path.get(path) or []
+        if path in seen or len(matches) != 1:
+            raise RuntimeError("MediaStationGo receipt does not uniquely identify planned file: %s" % path)
+        if (int(matches[0].get("season_num") or 0) != int(identity["season_num"])
+                or int(matches[0].get("episode_num") or 0) != int(identity["episode_num"])):
+            raise RuntimeError("MediaStationGo receipt has an incorrect planned episode mapping: %s" % path)
+        seen.add(path)
+        selected.append(matches[0])
+    if len({str(row["id"]) for row in selected}) != len(selected):
+        raise RuntimeError("MediaStationGo planned media IDs are duplicated")
+    return selected
 
 
 def msg_ingest_episode_batch(category, task, anchor_media_id):
@@ -7908,7 +8013,7 @@ def msg_ingest_episode_batch(category, task, anchor_media_id):
     if str(category or "").strip().lower() not in {"tv", "anime"}:
         return None
     ingested_count = int((task or {}).get("msg_ingest_media_count") or 0)
-    if ingested_count <= 1:
+    if ingested_count <= 1 and not (task or {}).get("subscription_target_media_identities"):
         return None
     items = (task or {}).get("msg_ingest_media_items")
     if not isinstance(items, list) or len(items) != ingested_count:

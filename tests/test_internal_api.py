@@ -652,10 +652,16 @@ class FakePipelineService:
     def refresh_subscription_target(self, target_openlist_path):
         return {"path": target_openlist_path}
 
-    def verify_subscription_msg_episodes(self, category, target_openlist_path, season, selected_episodes):
+    def verify_subscription_msg_episodes(self, category, target_openlist_path, season, selected_episodes, target=None, media_items=None):
         if self.subscription_verify_result is not None:
             return dict(self.subscription_verify_result)
         return {"verified_episodes": sorted(selected_episodes), "missing_episodes": [], "duplicate_episodes": {}}
+
+    def refresh_subscription_media_receipt(self, category, target, task, identities):
+        out = dict(task)
+        if out.get("msg_scan_status") != "success":
+            raise AssertionError("post-processing retry discarded the scan receipt")
+        return out
 
     def cleanup_subscription_staging(self, category, staging):
         self.subscription_cleanup_calls.append((category, dict(staging)))
@@ -3057,6 +3063,79 @@ class SubscriptionFollowImportTest(InternalApiTestCase):
         self.assertEqual(len(verify_calls), 2)
         self.assertEqual(len(service.submit_uris), 1)
 
+    def test_subscription_cleanup_warning_retries_only_cleanup(self):
+        service, store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "Show.S01E115.mkv", "kind": "video", "episode": 115}
+        ]
+        service.subscription_cleanup_error = RuntimeError("permission denied")
+        task, _ = manager.create_import("owner-a", "cleanup-warning-retry", self.payload(application, service))
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+        self.assertEqual(completed["status"], "completed_with_warning", completed.get("error"))
+        self.assertEqual(completed["result"]["subscription_follow"]["outcome"], "imported")
+        self.assertEqual(completed["result"]["warning_stage"], "cleanup")
+        self.assertEqual(completed["result"]["warnings"], ["subscription staging cleanup failed: permission denied"])
+        self.assertEqual(completed["result"]["subscription_follow"]["attempts"][-1]["warnings"], completed["result"]["warnings"])
+        calls_before = len(service.sync_input_tasks)
+        service.subscription_cleanup_error = None
+        store.block_subscription_source(
+            subscription_source_block_key(completed["request"]["candidate"]["download_uri"]),
+            reason="offline_failed", origin_import_id="later-failed-source",
+        )
+        manager.retry_import("owner-a", task["id"])
+        manager.start()
+        try:
+            recovered = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+        self.assertEqual(recovered["status"], "completed", recovered.get("error"))
+        self.assertEqual(len(service.sync_input_tasks), calls_before)
+        self.assertEqual(len(service.submit_uris), 1)
+        self.assertEqual(len(service.subscription_cleanup_calls), 2)
+        self.assertNotIn("warnings", recovered["result"])
+        self.assertEqual(recovered["result"]["subscription_follow"]["attempts"][-2]["warnings"], completed["result"]["warnings"])
+
+    def test_subscription_scrape_retry_keeps_successful_ingest_receipt(self):
+        service, _store, manager, application = self.build_components()
+        service.subscription_entries = [
+            {"fid": "video-115", "fn": "Show.S01E115.mkv", "kind": "video", "episode": 115}
+        ]
+        original_sync = service.sync_completed_task
+
+        def scrape_failure(*args, **kwargs):
+            result = original_sync(*args, **kwargs)
+            result.update({"msg_sync_status": "failed", "msg_scrape_status": "failed",
+                           "msg_error": "metadata unavailable", "msg_ingest_status": "completed",
+                           "msg_ingest_job_id": "successful-ingest-id"})
+            return result
+
+        service.sync_completed_task = scrape_failure
+        task, _ = manager.create_import("owner-a", "scrape-receipt-retry", self.payload(application, service))
+        manager.start()
+        try:
+            completed = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+        self.assertEqual(completed["status"], "completed_with_warning")
+        service.sync_completed_task = original_sync
+        manager.retry_import("owner-a", task["id"])
+        manager.start()
+        try:
+            recovered = self.wait_final(manager, "owner-a", task["id"])
+        finally:
+            manager.stop()
+        self.assertEqual(recovered["status"], "completed", recovered.get("error"))
+        retry_input = service.sync_input_tasks[-1]
+        self.assertEqual(retry_input["msg_scan_status"], "success")
+        self.assertEqual(retry_input["msg_ingest_status"], "completed")
+        self.assertEqual(retry_input["msg_ingest_job_id"], "successful-ingest-id")
+        self.assertEqual(len(service.submit_uris), 1)
+        self.assertEqual(len(service.subscription_cleanup_calls), 1)
+
     def test_subscription_identity_receipt_allows_existing_media_update(self):
         service, _store, manager, application = self.build_components()
         service.subscription_entries = [
@@ -4009,9 +4088,8 @@ class SubscriptionPromotionTest(unittest.TestCase):
         rows = []
 
         class FakeMsg:
-            def list_library_media(self, library_id, **kwargs):
-                self.group_versions = kwargs["group_versions"]
-                return rows
+            def get_media(self, media_id):
+                return next(row for row in rows if row["id"] == media_id)
 
         client = FakeMsg()
         service._build_msg_client = lambda: client
@@ -4022,13 +4100,19 @@ class SubscriptionPromotionTest(unittest.TestCase):
         ):
             with self.subTest(names=names):
                 rows[:] = [
-                    {"id": str(i), "path": "cloud://openlist" + target + "/" + name, "season_num": 1, "episode_num": 197}
+                    {"id": str(i), "path": "cloud://openlist" + target + "/" + name,
+                     "season_num": 1, "episode_num": 197, "library_id": "library-a", "library_root_id": "root-a"}
                     for i, name in enumerate(names)
                 ]
-                result = service.verify_subscription_msg_episodes("anime", target, 1, [197])
-                self.assertEqual(result["missing_episodes"], [])
-                self.assertEqual(bool(result["duplicate_episodes"]), duplicate)
-                self.assertEqual(client.group_versions, 0)
+                if names[0] == names[1]:
+                    with self.assertRaisesRegex(RuntimeError, "uniquely identify"):
+                        service.verify_subscription_msg_episodes("anime", target, 1, [197],
+                            {"library_id": "library-a", "root_id": "root-a"}, rows)
+                else:
+                    result = service.verify_subscription_msg_episodes("anime", target, 1, [197],
+                        {"library_id": "library-a", "root_id": "root-a"}, rows)
+                    self.assertEqual(result["missing_episodes"], [])
+                    self.assertEqual(bool(result["duplicate_episodes"]), duplicate)
 
     def test_partial_openlist_move_is_detected_by_target_verification(self):
         service = PipelineBotService(

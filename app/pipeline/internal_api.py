@@ -64,7 +64,7 @@ SYNC_STAGES = {
     "removing_old_version",
     "cleanup",
 }
-RETRY_RESUME_STAGES = {"syncing", "scanning", "scraping", "subtitles", "post_enhancement", "removing_old_version"}
+RETRY_RESUME_STAGES = {"syncing", "scanning", "scraping", "subtitles", "post_enhancement", "removing_old_version", "cleanup"}
 RETRY_STAGE_BY_FAILED_TASK_STATUS = (
     ("openlist_adult_format_status", "syncing"),
     ("openlist_trash_hide_status", "syncing"),
@@ -784,8 +784,9 @@ class InternalApiStore:
             elif preserve_sync:
                 result = dict(result or {})
                 task = dict(result.get("task") or {})
-                task["msg_sync_status"] = "running"
-                task["msg_error"] = None
+                if not (request.get("subscription_follow") and subscription_core_ingest_verified(result.get("subscription_follow") or {})):
+                    task["msg_sync_status"] = "running"
+                    task["msg_error"] = None
                 result["task"] = task
                 if request.get("subscription_follow"):
                     # A subscription retry that reached 115 success but failed
@@ -795,6 +796,10 @@ class InternalApiStore:
                     # compare the old failed classification with the fresh
                     # OpenList scan and fail again before episode mapping.
                     follow_result = dict(result.get("subscription_follow") or {})
+                    attempts = [dict(item) for item in follow_result.get("attempts") or []]
+                    if attempts and result.get("warnings"):
+                        attempts[-1].setdefault("warnings", list(result["warnings"]))
+                        follow_result["attempts"] = attempts
                     follow_result.pop("resource_manifest", None)
                     follow_result.pop("ambiguous_videos", None)
                     follow_result.pop("unknown_videos", None)
@@ -1622,7 +1627,8 @@ class ImportTaskManager:
         current = self.store.get_import(owner_id, import_id)
         if current["status"] in RETRYABLE_IMPORT_STATUSES:
             if current["request"].get("subscription_follow"):
-                if not current["request"]["subscription_follow"].get("manual_replenish"):
+                if (not current["request"]["subscription_follow"].get("manual_replenish")
+                        and not subscription_core_ingest_verified((current.get("result") or {}).get("subscription_follow") or {})):
                     self._check_subscription_source_block(current["request"])
             elif not (current.get("msg_media_id") or result_task_is_offline_success(current.get("result"))):
                 self._check_duplicate(current["request"])
@@ -2144,7 +2150,13 @@ class ImportTaskManager:
                 staging = dict(audit.get("staging") or {})
                 if not staging.get("openlist_path"):
                     raise RuntimeError("promoted subscription retry is missing staging state")
-                offline_task = reset_subscription_sync_for_retry(offline_task)
+                if subscription_core_ingest_verified(audit):
+                    identities = build_subscription_target_media_identities(audit, target_path, season, resumed_episodes)
+                    offline_task = self.service.refresh_subscription_media_receipt(
+                        category, request["target"], offline_task, identities
+                    )
+                else:
+                    offline_task = reset_subscription_sync_for_retry(offline_task)
                 result["task"] = offline_task
                 self._complete_subscription_promotion(
                     task,
@@ -2632,12 +2644,19 @@ class ImportTaskManager:
                 int(synced_result.get("msg_ingest_scan_added") or 0),
             )
 
-        synced, media_id, scan_added = sync_once(sync_input)
+        if subscription_core_ingest_verified(audit) and not subscription_sync_warnings(sync_input, {}):
+            synced = sync_input
+            result["task"] = synced
+            media_id = str(synced.get("msg_media_id") or "")
+            scan_added = int(synced.get("msg_ingest_scan_added") or 0)
+        else:
+            synced, media_id, scan_added = sync_once(sync_input)
         audit["scan_added"] = scan_added
         applied_media_identities = synced.get("msg_ingest_applied_media_identities")
         audit["applied_media_identities"] = applied_media_identities
         verified_msg = self.service.verify_subscription_msg_episodes(
-            category, target_path, season, selected
+            category, target_path, season, selected,
+            target=request["target"], media_items=synced.get("msg_ingest_media_items") or [],
         )
         audit["msg_verification"] = verified_msg
         missing_episodes = list(verified_msg.get("missing_episodes") or [])
@@ -2663,7 +2682,8 @@ class ImportTaskManager:
                 applied_media_identities = synced.get("msg_ingest_applied_media_identities")
                 audit["applied_media_identities"] = applied_media_identities
                 verified_msg = self.service.verify_subscription_msg_episodes(
-                    category, target_path, season, selected
+                    category, target_path, season, selected,
+                    target=request["target"], media_items=synced.get("msg_ingest_media_items") or [],
                 )
                 audit["msg_verification"] = verified_msg
                 missing_episodes = list(verified_msg.get("missing_episodes") or [])
@@ -2701,6 +2721,9 @@ class ImportTaskManager:
                 "MediaStationGo scan added %d episodes, expected %d"
                 % (scan_added, len(selected))
             )
+        audit["core_ingest_verified_at"] = int(time.time())
+        audit["outcome"] = "imported"
+        result["subscription_follow"] = audit
         self.store.save_running(
             task["id"],
             "cleanup",
@@ -2708,20 +2731,31 @@ class ImportTaskManager:
             info_hash=info_hash,
             msg_media_id=media_id,
         )
-        if not audit.get("staging_cleaned_at"):
-            cleanup = self._with_subscription_staging_lock(
-                request["subscription_follow"]["work_key"],
-                lambda: self.service.cleanup_subscription_staging(category, staging),
-            )
-            record_subscription_staging_cleanup(audit, cleanup, "import_completed")
+        if not audit.get("staging_cleaned_at") or (audit.get("staging_cleanup") or {}).get("parent_prune_error"):
+            try:
+                cleanup = self._with_subscription_staging_lock(
+                    request["subscription_follow"]["work_key"],
+                    lambda: self.service.cleanup_subscription_staging(category, staging),
+                )
+                record_subscription_staging_cleanup(audit, cleanup, "import_completed")
+            except (RuntimeError, ValueError) as exc:
+                audit["staging_cleanup"] = {"status": "failed", "error": str(exc),
+                                            "path": staging["openlist_path"], "reason": "import_completed"}
         audit["outcome"] = "imported"
         attempts[-1].update({"outcome": "imported", "finished_at": int(time.time())})
         result["subscription_follow"] = audit
         result["msg_media_id"] = media_id
-        warnings = sync_warnings(synced)
+        warnings = subscription_sync_warnings(synced, audit)
+        if warnings:
+            attempts[-1]["warnings"] = list(warnings)
         if warnings:
             result["warnings"] = warnings
-            result["warning_stage"] = warning_retry_stage(result, request)
+            result.pop("warning_stage", None)
+            result["warning_stage"] = (
+                "cleanup" if (audit.get("staging_cleanup", {}).get("status") == "failed"
+                              or audit.get("staging_cleanup", {}).get("parent_prune_error"))
+                else warning_retry_stage(result, request)
+            )
         else:
             result.pop("warnings", None)
             result.pop("warning_stage", None)
@@ -4250,6 +4284,19 @@ def subscription_retry_resubmit(result, request, msg_media_id=None):
     )
 
 
+def subscription_core_ingest_verified(audit):
+    verification = audit.get("msg_verification") or {}
+    return bool(
+        audit.get("outcome") == "imported"
+        and audit.get("moved_episodes")
+        and audit.get("target_media_identities")
+        and target_media_identities_match(audit.get("target_media_identities"), audit.get("applied_media_identities"))
+        and not verification.get("missing_episodes")
+        and not verification.get("duplicate_episodes")
+        and set(audit["moved_episodes"]) == set(verification.get("verified_episodes") or [])
+    )
+
+
 def reset_subscription_sync_for_retry(task):
     out = dict(task or {})
     for key in (
@@ -4407,6 +4454,32 @@ def sync_stage(task):
     if task.get("subtitle_match_status") == "running":
         return "subtitles"
     return "syncing"
+
+
+def subscription_sync_warnings(task, audit):
+    """Current stage results are authoritative; attempt history is not a warning source."""
+    warnings = []
+    sync_error = str(task.get("msg_error") or "").strip() if task.get("msg_sync_status") != "success" else ""
+    for key, status in sorted(task.items()):
+        if not key.endswith("_status") or key == "msg_sync_status" or status not in {"failed", "running", "needs_attention", "deferred", "pending"}:
+            continue
+        label = key[:-len("_status")]
+        error = str(task.get(label + "_error") or "").strip()
+        if sync_error and (error == sync_error or (not error and key in {"msg_scrape_status", "msg_scan_status", "msg_ingest_status"})):
+            continue
+        warnings.append("%s %s%s" % (label, status, ": " + error if error else ""))
+    if sync_error:
+        warnings.append("MSG error: " + sync_error)
+    elif task.get("msg_sync_status") != "success" and not warnings:
+        warnings.append("MSG sync status: %s" % (task.get("msg_sync_status") or "missing"))
+    if task.get("msg_scrape_status") not in {"success", "skipped"} and not warnings:
+        warnings.append("MSG scrape status: %s" % (task.get("msg_scrape_status") or "missing"))
+    cleanup = audit.get("staging_cleanup") or {}
+    if cleanup.get("status") == "failed":
+        warnings.append("subscription staging cleanup failed: " + str(cleanup.get("error") or "unknown error"))
+    if cleanup.get("parent_prune_error"):
+        warnings.append("subscription empty parent cleanup failed: " + str(cleanup["parent_prune_error"]))
+    return warnings
 
 
 def sync_warnings(task):

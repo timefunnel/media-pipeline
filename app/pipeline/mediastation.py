@@ -164,6 +164,8 @@ class MediaStationClient:
         media_type,
         media_ids=None,
         episode_mappings=None,
+        use_existing_episode_identity=False,
+        verify_only=False,
     ):
         data = {
             "category": category,
@@ -180,6 +182,10 @@ class MediaStationClient:
                 for media_id, mapping in episode_mappings.items()
                 if str(media_id).strip()
             }
+        if use_existing_episode_identity:
+            data["use_existing_episode_identity"] = True
+        if verify_only:
+            data["verify_only"] = True
         return self._pipeline_request(
             "POST",
             "/pipeline/media/%s/scrape" % quote_path(media_id),
