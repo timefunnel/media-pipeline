@@ -2078,6 +2078,81 @@ class ImportPersistenceTest(InternalApiTestCase):
         self.assertEqual(len(service.sync_input_tasks), 2)
         self.assertEqual(service.sync_input_tasks[-1]["subtitle_match_status"], "failed")
 
+    def test_upgrade_retry_before_ingest_resumes_sync_and_preserves_completed_transfer(self):
+        for failed_stage in ("transfer_verify", "import_target_finalize", ""):
+            with self.subTest(failed_stage=failed_stage):
+                service, store, manager, application = self.build_components()
+                session_id, candidate_id, _ = self.search_candidate(
+                    application, query="EXAMPLE-101", category="adult"
+                )
+                payload = self.import_payload(
+                    session_id, candidate_id, category="adult", target=target_for("adult")
+                )
+                payload.update(upgrade_media_id="media-upgrade-target", keep_old_version=False)
+                task, _ = manager.create_import(
+                    "owner-a", "upgrade-before-ingest-" + failed_stage, payload
+                )
+                original_sync = service.sync_completed_task
+
+                def fail_before_ingest(category, title, offline_task, progress_callback=None, **kwargs):
+                    progress = {
+                        **offline_task,
+                        "msg_sync_status": "failed",
+                        "msg_error": "OpenList TLS handshake timeout",
+                    }
+                    if failed_stage:
+                        progress[failed_stage + "_status"] = "failed"
+                        progress[failed_stage + "_error"] = progress["msg_error"]
+                    progress_callback(progress)
+                    return progress
+
+                with mock.patch.object(service, "sync_completed_task", side_effect=fail_before_ingest):
+                    manager.start()
+                    try:
+                        failed = self.wait_final(manager, "owner-a", task["id"])
+                    finally:
+                        manager.stop()
+
+                self.assertEqual(failed["status"], "failed")
+                self.assertFalse(failed["msg_media_id"])
+                self.assertEqual(service.upgrade_remove_calls, [])
+                self.assertEqual(len(service.submit_uris), 1)
+
+                # Earlier retries can already have persisted the wrong resume stage.
+                failed_result = dict(failed["result"], retry_from_stage="removing_old_version")
+                store.finish_import(
+                    task["id"], "failed", "failed", result=failed_result,
+                    error=failed["error"], info_hash=failed["info_hash"],
+                )
+                retried = manager.retry_import("owner-a", task["id"])
+                self.assertIn(retried["stage"], {"queued", "syncing"})
+                self.assertNotEqual(retried["result"].get("retry_from_stage"), "removing_old_version")
+                self.assertEqual(retried["info_hash"], failed["info_hash"])
+                self.assertEqual(retried["result"]["import_target"], failed_result["import_target"])
+
+                def complete_sync(category, title, offline_task, **kwargs):
+                    progress = dict(offline_task)
+                    if failed_stage:
+                        progress[failed_stage + "_status"] = "success"
+                        progress[failed_stage + "_error"] = None
+                    self.assertEqual(service.upgrade_remove_calls, [])
+                    return original_sync(category, title, progress, **kwargs)
+
+                with mock.patch.object(service, "sync_completed_task", side_effect=complete_sync):
+                    manager.start()
+                    try:
+                        completed = self.wait_final(manager, "owner-a", task["id"])
+                    finally:
+                        manager.stop()
+
+                self.assertEqual(completed["status"], "completed")
+                self.assertTrue(completed["msg_media_id"])
+                self.assertEqual(len(service.submit_uris), 1)
+                self.assertEqual(service.reset_resubmit_calls, [])
+                self.assertEqual(len(service.upgrade_remove_calls), 1)
+                self.assertEqual(service.upgrade_remove_calls[0][1], completed["msg_media_id"])
+                self.assertEqual(len(service.sync_input_tasks), 1)
+
     def test_upgrade_warning_retry_starts_at_cleanup_without_resyncing(self):
         duplicate = {
             "level": "strong",

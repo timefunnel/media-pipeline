@@ -66,6 +66,8 @@ SYNC_STAGES = {
 }
 RETRY_RESUME_STAGES = {"syncing", "scanning", "scraping", "subtitles", "post_enhancement", "removing_old_version", "cleanup"}
 RETRY_STAGE_BY_FAILED_TASK_STATUS = (
+    ("transfer_verify_status", "syncing"),
+    ("import_target_finalize_status", "syncing"),
     ("openlist_adult_format_status", "syncing"),
     ("openlist_trash_hide_status", "syncing"),
     ("openlist_clean_status", "syncing"),
@@ -768,7 +770,7 @@ class InternalApiStore:
                     )
                 )
             )
-            resume_stage = warning_retry_stage(result, request) if preserve_sync else ""
+            resume_stage = warning_retry_stage(result) if preserve_sync else ""
             if retry_resubmit:
                 result = {
                     "subscription_retry": {
@@ -1986,7 +1988,7 @@ class ImportTaskManager:
                         result["warning_stage"] = "removing_old_version"
                 if warnings:
                     result["warnings"] = warnings
-                    result["warning_stage"] = warning_retry_stage(result, request)
+                    result["warning_stage"] = warning_retry_stage(result)
                     result.pop("retry_from_stage", None)
                     self.store.finish_import(
                         task["id"],
@@ -2754,7 +2756,7 @@ class ImportTaskManager:
             result["warning_stage"] = (
                 "cleanup" if (audit.get("staging_cleanup", {}).get("status") == "failed"
                               or audit.get("staging_cleanup", {}).get("parent_prune_error"))
-                else warning_retry_stage(result, request)
+                else warning_retry_stage(result)
             )
         else:
             result.pop("warnings", None)
@@ -4420,7 +4422,7 @@ def retry_resume_stage(result):
     return stage if stage in RETRY_RESUME_STAGES else ""
 
 
-def warning_retry_stage(result, request=None):
+def warning_retry_stage(result):
     if not isinstance(result, dict):
         return ""
     stage = str(result.get("warning_stage") or "").strip()
@@ -4431,13 +4433,6 @@ def warning_retry_stage(result, request=None):
         for status_key, retry_stage in RETRY_STAGE_BY_FAILED_TASK_STATUS:
             if task.get(status_key) == "failed":
                 return retry_stage
-    request = request or {}
-    if (
-        isinstance(request, dict)
-        and str(request.get("upgrade_media_id") or "").strip()
-        and not bool(request.get("keep_old_version", True))
-    ):
-        return "removing_old_version"
     return ""
 
 
